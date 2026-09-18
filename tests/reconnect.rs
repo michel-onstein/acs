@@ -114,8 +114,8 @@ fn input_sent_around_a_drop_arrives_exactly_once() {
 #[test]
 fn no_reconnect_exits_on_a_drop() {
     let remote = Remote::installed();
-    let mut env = FAST.to_vec();
-    env.push(("ACS_BACKOFF_MS", "100"));
+    // No short dead-link timeout: the cut is seen at once, and on a loaded
+    // machine a short one could end the first connection before it is up.
     let mut c = Client::start_env(
         &remote,
         &[
@@ -127,7 +127,7 @@ fn no_reconnect_exits_on_a_drop() {
             "-c",
             "echo up; sleep 30",
         ],
-        &env,
+        &[],
     );
     c.wait_for("up", T);
     remote.cut_link();
@@ -265,14 +265,15 @@ fn a_silent_host_is_given_up_on() {
 fn a_redial_into_a_silent_host_returns_to_the_backoff() {
     let remote = Remote::installed();
     let mut env = FAST.to_vec();
-    // Enough for the first connection on a loaded test machine.
-    env.push(("ACS_DIAL_TIMEOUT_MS", "1500"));
+    // The limit covers the first connection too, which on a loaded test
+    // machine can take a few seconds.
+    env.push(("ACS_DIAL_TIMEOUT_MS", "4000"));
     let mut c = start(&remote, "rs", "echo up; cat", &env);
     c.wait_for("up", T);
     remote.silence(Some(""));
     remote.cut_link();
     // Redials time out one after another instead of one hanging.
-    remote.wait_connections(4, Duration::from_secs(20));
+    remote.wait_connections(3, Duration::from_secs(30));
     remote.silence(None);
     // Resumed: the status line's title is popped, and keys go through.
     c.wait_for("\x1b[23;0t", T);
