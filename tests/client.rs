@@ -171,11 +171,14 @@ fn new_flag_creates_numbered_sessions() {
 }
 
 #[test]
-fn missing_remote_binary_is_reported() {
+fn unsupported_remote_platform_is_reported() {
+    // A missing binary is installed (tests/install.rs); a platform acs has
+    // no build for is an error.
     let remote = Remote::new();
+    remote.fake_uname("SunOS", "i86pc");
     let mut c = Client::start(&remote, &["devbox"]);
     assert_eq!(c.wait(T), 254);
-    c.wait_for("is not installed on devbox", T);
+    c.wait_for("devbox runs SunOS i86pc, which acs does not support", T);
 }
 
 #[test]

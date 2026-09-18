@@ -49,7 +49,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Parsed::Version => {
-            println!("acs {} (protocol {})", crate::VERSION, proto::PROTO_VERSION);
+            crate::print_version();
             return ExitCode::SUCCESS;
         }
         Parsed::Run(a) => a,

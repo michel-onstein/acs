@@ -57,21 +57,41 @@ impl Role {
     }
 }
 
+/// `acs --version`: version, protocol, build target, and the remote
+/// targets this binary can install (DESIGN §8.1).
+pub fn print_version() {
+    println!(
+        "acs {VERSION} (protocol {}, {})",
+        proto::PROTO_VERSION,
+        payload::OWN_TARGET
+    );
+    let mut targets = vec![payload::OWN_TARGET];
+    let carried = payload::Payloads::from_self();
+    for t in carried.iter().flat_map(|p| p.targets()) {
+        if !targets.contains(&t) {
+            targets.push(t);
+        }
+    }
+    let slim = if carried.is_none() {
+        " (slim build)"
+    } else {
+        ""
+    };
+    println!("installs remotes: {}{slim}", targets.join(", "));
+}
+
 /// Entry point shared by `main` and the integration tests.
 pub fn run(args: Vec<OsString>) -> ExitCode {
     let role = Role::from_first_arg(args.get(1));
     match role {
         Role::Version => {
-            println!("acs {VERSION} (protocol {})", proto::PROTO_VERSION);
+            print_version();
             ExitCode::SUCCESS
         }
         Role::Master => master::main(&args[2..]),
         Role::Proxy => proxy::main(&args[2..]),
         Role::Client => client::main(&args[1..]),
-        other => {
-            eprintln!("acs: role {other:?} is not implemented yet");
-            ExitCode::from(70)
-        }
+        Role::Install => install::finish_main(&args[2..]),
     }
 }
 

@@ -68,16 +68,41 @@ impl Remote {
         let script = self.root.path().join("transport.sh");
         if !script.exists() {
             let body = format!(
-                "#!/bin/sh\necho $$ >> '{pids}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}'\nexec /bin/sh -c \"$1\"\n",
+                "#!/bin/sh\necho $$ >> '{pids}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\nexec /bin/sh -c \"$1\"\n",
                 pids = self.pid_file().display(),
                 home = self.home().display(),
                 sock = self.sockets().display(),
+                fake = self.fake_bin().display(),
             );
             std::fs::write(&script, body).unwrap();
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         script.display().to_string()
+    }
+
+    fn fake_bin(&self) -> PathBuf {
+        self.root.path().join("fakebin")
+    }
+
+    /// Make the remote's `uname -s` / `uname -m` report another platform.
+    pub fn fake_uname(&self, os: &str, arch: &str) {
+        std::fs::create_dir_all(self.fake_bin()).unwrap();
+        let script = self.fake_bin().join("uname");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in -s) echo {os};; -m) echo {arch};; *) echo {os};; esac\n"
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The installed binary for `version`, if any.
+    pub fn installed_binary(&self, version: &str) -> PathBuf {
+        self.home().join(format!(".local/share/acs/{version}/acs"))
     }
 
     /// Pids of transport connections made so far.
@@ -143,6 +168,11 @@ impl Client {
     }
 
     pub fn start_env(remote: &Remote, args: &[&str], env: &[(&str, &str)]) -> Client {
+        Client::start_exe(&exe(), remote, args, env)
+    }
+
+    /// Run a specific acs binary as the client.
+    pub fn start_exe(exe: &Path, remote: &Remote, args: &[&str], env: &[(&str, &str)]) -> Client {
         let (master, slave) = sys::openpty().unwrap();
         sys::set_winsize(
             slave.as_raw_fd(),
@@ -154,7 +184,7 @@ impl Client {
             },
         )
         .unwrap();
-        let mut cmd = Command::new(exe());
+        let mut cmd = Command::new(exe);
         cmd.arg("--transport-cmd")
             .arg(remote.transport())
             .args(args);
@@ -298,4 +328,41 @@ pub fn binary_pattern(path: &Path, len: usize) -> Vec<u8> {
         .collect();
     std::fs::write(path, &data).unwrap();
     data
+}
+
+/// gzip -9 -n of `data`.
+pub fn gzip(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut child = Command::new("gzip")
+        .args(["-9", "-n", "-c"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = data.to_vec();
+    let w = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output().unwrap();
+    w.join().unwrap().unwrap();
+    out.stdout
+}
+
+/// A "complete" test client: this acs binary with a payload set appended
+/// whose `target` entry is this same binary (so a fake remote of that
+/// platform can run what gets installed).
+pub fn complete_client(dir: &Path, target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) {
+    let slim = std::fs::read(exe()).unwrap();
+    let gz = gzip(&slim);
+    let blob = acs::payload::build(&[acs::payload::Input {
+        target,
+        raw: &slim,
+        gz: &gz,
+    }]);
+    let path = dir.join("acs-complete");
+    let mut full = slim.clone();
+    full.extend_from_slice(&blob);
+    std::fs::write(&path, &full).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (path, slim, blob)
 }
