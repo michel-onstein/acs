@@ -406,3 +406,128 @@ pub fn complete_client(dir: &Path, target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) 
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     (path, slim, blob)
 }
+
+/// A stand-in for GitHub Releases over plain HTTP, for `ACS_RELEASES_URL`:
+/// the real `curl` downloads from it. Paths are as on GitHub
+/// (`/latest/download/…`, `/download/v<version>/…`).
+pub struct ReleaseServer {
+    pub url: String,
+    files: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    hits: Arc<Mutex<Vec<String>>>,
+    root: TempDir,
+}
+
+impl ReleaseServer {
+    pub fn start() -> ReleaseServer {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let files: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>> = Arc::default();
+        let hits: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (f, h) = (files.clone(), hits.clone());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let path = text
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split(' ').nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                h.lock().unwrap().push(path.clone());
+                let body = f.lock().unwrap().get(&path).cloned();
+                let _ = match body {
+                    Some(b) => conn
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                b.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .and_then(|_| conn.write_all(&b)),
+                    None => conn.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    ),
+                };
+            }
+        });
+        ReleaseServer {
+            url,
+            files,
+            hits,
+            root: TempDir::new(),
+        }
+    }
+
+    pub fn put(&self, path: &str, data: impl Into<Vec<u8>>) {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), data.into());
+    }
+
+    /// Paths requested so far.
+    pub fn hits(&self) -> Vec<String> {
+        self.hits.lock().unwrap().clone()
+    }
+
+    /// A fake acs for `version`: a script that answers `--version` as acs
+    /// does.
+    pub fn fake_acs(version: &str) -> Vec<u8> {
+        format!(
+            "#!/bin/sh\necho 'acs {version} (protocol 9, {t})'\necho 'installs remotes: {t}'\n",
+            t = acs::payload::OWN_TARGET
+        )
+        .into_bytes()
+    }
+
+    /// Publish `binary` as release `version` for this machine's target, with
+    /// a matching SHA256SUMS (or a wrong one, with `tamper`). `latest` also
+    /// makes it the latest release.
+    pub fn release(&self, version: &str, binary: &[u8], latest: bool, tamper: bool) {
+        let target = acs::release::archive_target(acs::payload::OWN_TARGET);
+        let name = format!("acs-{version}-{target}");
+        let stage = self.root.path().join(version);
+        std::fs::create_dir_all(stage.join(&name)).unwrap();
+        let bin = stage.join(&name).join("acs");
+        std::fs::write(&bin, binary).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let archive = stage.join(format!("{name}.tar.gz"));
+        let st = Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&stage)
+            .arg(&name)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let data = std::fs::read(&archive).unwrap();
+        let mut sum = acs::sha256::hex(&acs::sha256::digest(&data));
+        if tamper {
+            sum = "0".repeat(64);
+        }
+        // Another target's line first, as in a real SHA256SUMS.
+        let sums = format!(
+            "{}  acs-{version}-riscv64-unknown-linux-musl.tar.gz\n{sum}  {name}.tar.gz\n",
+            "a".repeat(64)
+        );
+        self.put(&format!("/download/v{version}/{name}.tar.gz"), data);
+        self.put(&format!("/download/v{version}/SHA256SUMS"), sums.clone());
+        if latest {
+            self.put("/latest/download/SHA256SUMS", sums);
+        }
+    }
+}

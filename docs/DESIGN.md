@@ -647,9 +647,47 @@ their YAML shape:
   file the client would refuse — nor overwrites one that is already broken.
 - Removing something that lives in the other file fails with a pointer to it
   (`it is set in /etc/acs/config.yaml:1 (use --global)`).
-- `config` is a reserved **first** argument. A host literally called
-  `config` is reached as `user@config`, or with any option before it
-  (`acs -p 22 config`).
+- `config` is a reserved **first** argument (as is `upgrade`, §7.5). A host
+  literally called `config` is reached as `user@config`, or with any option
+  before it (`acs -p 22 config`).
+
+### 7.5 `acs upgrade`
+
+`acs upgrade [--version X.Y.Z] [--check]` replaces the running acs with the
+latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
+
+- **What is newest** comes from the release's `SHA256SUMS`
+  (`…/releases/latest/download/SHA256SUMS`): its archive names carry the
+  version, and it holds the checksum the download must match — the same file
+  the one-line installer reads, so the two always agree. No GitHub API call,
+  so no rate limit. `ACS_RELEASES_URL` points both elsewhere (a mirror, the
+  tests' server).
+- **Downloads use `curl`** (or `wget` when there is no curl, as on Alpine):
+  an HTTP and TLS client of our own would cost more than the whole binary
+  (§9).
+- **Decisions**: a newer release installs; the same version does nothing; a
+  client newer than the latest release does nothing unless `--version` asks
+  for that release, which is how to downgrade. `--check` only reports.
+- **Checks before replacing**: the directories it will write are probed
+  first, so an unwritable one (`/usr/local/bin`) fails before any download
+  with `re-run with sudo: sudo acs upgrade`; the archive must match its
+  SHA-256; the new binary must run and report the expected version. Only
+  then is it copied next to the destination under a temporary name and
+  renamed over it, keeping the old file's mode — the path is never missing or
+  half-written, and a running acs keeps its old inode.
+- **Layouts**: a plain file (a manual install, `ACS_INSTALL_DIR`) is replaced
+  in place. A versioned install — `…/acs/<version>/acs`, as the installer and
+  the remote install lay it out (§8) — gets the new version beside it, and
+  the links that pointed at the running binary (the path it was run as,
+  `~/.local/bin/acs`, `/usr/local/bin/acs`, `acs` on `PATH`) are repointed.
+  The old version stays: clients of that version may still use it on this
+  host, and `prune.rs` removes it once unused.
+- **macOS**: a curl download carries no quarantine attribute, and the
+  ad-hoc signature is part of the file, so it still verifies after the
+  rename (VERIFICATION.md).
+- **Remote hosts need nothing**: the upgraded client's next connection finds
+  no binary of its version there and installs it (§8).
+- `upgrade` is a reserved first argument, like `config` (§7.4).
 
 ## 8. Installing the remote binary
 
@@ -799,6 +837,8 @@ src/
   list.rs       --list table
   config.rs     configuration files: locations, merging, validation
   config_cmd.rs acs config: show, get/set/unset, host list/add/remove
+  release.rs    published releases: SHA256SUMS, versions, curl downloads
+  upgrade.rs    acs upgrade: replace this binary with a newer release
   alias.rs      host aliases: ping check and fallback hosts
   yaml.rs       the YAML subset those files use, parsed and written back
   install.rs    remote self-install and _install --finish
