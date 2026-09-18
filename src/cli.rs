@@ -7,6 +7,7 @@
 
 use std::ffi::OsString;
 
+use crate::config::Config;
 use crate::session;
 use crate::ssh::Transport;
 
@@ -33,7 +34,9 @@ in a session: Ctrl-] Ctrl-] then  d  detach (session keeps running)
                                   x  exit (ends the session)
 
 environment: ACS_DEFAULT_SESSION ACS_IDENTITY ACS_ESCAPE_KEY ACS_ESCAPE_TIMEOUT_MS
-             ACS_SSH ACS_SOCKET_DIR";
+             ACS_SSH ACS_SOCKET_DIR
+
+configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml";
 
 /// Which session the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,11 +56,14 @@ pub struct ClientArgs {
     pub force: bool,
     pub verbose: u8,
     pub command: Vec<String>,
+    /// The configuration file's settings (DESIGN §7.2); defaults until the
+    /// client loads them.
+    pub config: Config,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
-    Run(ClientArgs),
+    Run(Box<ClientArgs>),
     Help,
     Version,
 }
@@ -172,7 +178,7 @@ where
     transport.user_opts = user_opts;
     transport.transport_cmd = transport_cmd;
 
-    Ok(Parsed::Run(ClientArgs {
+    Ok(Parsed::Run(Box::new(ClientArgs {
         transport,
         target,
         list,
@@ -180,7 +186,8 @@ where
         force,
         verbose,
         command,
-    }))
+        config: Config::default(),
+    })))
 }
 
 #[cfg(test)]
@@ -189,7 +196,7 @@ mod tests {
 
     fn run(args: &[&str]) -> Result<ClientArgs, String> {
         match parse(args.iter().map(OsString::from), None)? {
-            Parsed::Run(a) => Ok(a),
+            Parsed::Run(a) => Ok(*a),
             other => panic!("{other:?}"),
         }
     }

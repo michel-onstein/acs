@@ -43,7 +43,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(code::USAGE);
         }
     };
-    let args = match parsed {
+    let mut args = match parsed {
         Parsed::Help => {
             println!("{}", cli::USAGE);
             return ExitCode::SUCCESS;
@@ -52,7 +52,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
             crate::print_version();
             return ExitCode::SUCCESS;
         }
-        Parsed::Run(a) => a,
+        Parsed::Run(a) => *a,
+    };
+    args.config = match crate::config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("acs: {e}");
+            return ExitCode::from(code::USAGE);
+        }
     };
     if args.list {
         return crate::list::run(&args);
@@ -347,6 +354,10 @@ pub fn connect_and_serve(
         }
         Marker::Need { os, arch } => {
             link.close();
+            if !args.config.install_on_remote.value {
+                note(&crate::install::not_installing(args, &os, &arch));
+                return Outcome::Exit(code::INSTALL_FAILED);
+            }
             return match crate::install::install(args, &os, &arch) {
                 Ok(()) => connect_and_serve(args, state, raw, signals, resuming),
                 Err(e) => {

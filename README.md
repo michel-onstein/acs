@@ -89,6 +89,25 @@ acs: session 'main' on devbox is attached from alice@laptop since 10:02 — take
 `--force` skips the question. `ACS_DEFAULT_SESSION` gives each person their
 own default instead of `main`.
 
+## Configuration
+
+Settings live in YAML files: the global `/etc/acs/config.yaml`, then your
+own `~/.config/acs/config.yaml` (or `$XDG_CONFIG_HOME/acs/config.yaml`).
+Both are optional. A setting in your file replaces the global one; mappings
+merge key by key and lists add up, global entries first.
+
+```yaml
+# ~/.config/acs/config.yaml
+install_on_remote: false   # never install acs on a host (default: true)
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `install_on_remote` | install acs on a host that lacks it (default `true`); when `false`, acs says what is missing and exits with 254 |
+
+A mistake in a file stops acs with the file and line, for example
+`~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
+
 ## Environment
 
 | Variable | Meaning |
@@ -100,6 +119,8 @@ own default instead of `main`.
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
+| `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
+| `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 
 ## Development
 
