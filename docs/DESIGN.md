@@ -3,11 +3,12 @@
 **Status:** Built — acs v1 implemented and verified (see
 [VERIFICATION.md](VERIFICATION.md)).
 
-`acs` replaces the `dsh` shell function (`ssh` + `dtach`) with **one Rust
-binary** that is both the local client and the remote session holder. It keeps
-the property `dsh` exists for — an **unfiltered** byte stream between the remote
-program and the local terminal — and adds what `dsh` cannot do: lossless resume
-after a network drop, a local command key, and self-installation on the remote.
+`acs` (*Ad-hoc Connectivity Shell*) replaces the `dsh` shell function (`ssh` +
+`dtach`) with **one Rust binary** that is both the local client and the remote
+session holder. It keeps the property `dsh` exists for — an **unfiltered** byte
+stream between the remote program and the local terminal — and adds what `dsh`
+cannot do: lossless resume after a network drop, a local command key, and
+self-installation on the remote.
 
 ## 1. What exists today
 
