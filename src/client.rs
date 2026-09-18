@@ -104,6 +104,16 @@ pub struct Link {
 }
 
 impl Link {
+    /// The pipe carrying the remote's output.
+    pub fn from_fd(&self) -> &OwnedFd {
+        &self.from
+    }
+
+    /// The pipe carrying our input to the remote.
+    pub fn to_fd(&self) -> &OwnedFd {
+        &self.to
+    }
+
     pub fn close(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
