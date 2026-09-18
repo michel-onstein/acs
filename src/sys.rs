@@ -146,6 +146,17 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// `HH:MM` in local time for Unix seconds `t`.
+pub fn local_hhmm(t: u64) -> String {
+    let secs = t as libc::time_t;
+    // SAFETY: zeroed tm is a valid out-parameter for localtime_r.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return "?".into();
+    }
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
 /// Milliseconds on a monotonic clock (the command-key detector's clock).
 pub fn now_ms() -> u64 {
     use std::sync::OnceLock;

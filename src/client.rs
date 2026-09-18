@@ -279,7 +279,10 @@ pub fn run(args: ClientArgs) -> u8 {
     let _ = sys::signals::ignore(libc::SIGPIPE);
     let mut state = State {
         host: args.transport.destination.clone(),
-        session: None,
+        session: match &args.target {
+            Target::Named(n) => Some(n.clone()),
+            Target::New => None,
+        },
         instance: None,
         offset: 0,
         unacked: Unacked::new(0),

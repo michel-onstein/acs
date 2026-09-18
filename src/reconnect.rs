@@ -218,12 +218,32 @@ pub fn on_welcome(state: &mut State, kind: AttachKind, out: &mut Vec<u8>) {
     }
 }
 
-/// Another identity is attached: may we take over?
-pub fn ask_takeover(_state: &mut State, identity: &str, _since: u64) -> bool {
-    note(&format!(
-        "the session is attached from {identity}; use --force to take it over"
-    ));
-    false
+/// Another identity is attached (DESIGN §4.5): ask before taking over.
+/// Runs in cooked mode (before raw mode, or while redialling), so the
+/// answer is a line.
+pub fn ask_takeover(state: &mut State, identity: &str, since: u64) -> bool {
+    let name = state.session.clone().unwrap_or_default();
+    if !sys::isatty(0) {
+        note(&format!(
+            "session '{name}' is attached from {identity}; use --force to take it over"
+        ));
+        return false;
+    }
+    let question = format!(
+        "acs: session '{name}' on {} is attached from {identity} since {} — take over? [y/N] ",
+        state.host,
+        sys::local_hhmm(since)
+    );
+    let _ = sys::write_all(2, question.as_bytes());
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    while let Ok(1) = sys::read(0, &mut b) {
+        if b[0] == b'\n' || b[0] == b'\r' {
+            break;
+        }
+        line.push(b[0]);
+    }
+    matches!(line.first(), Some(b'y' | b'Y'))
 }
 
 #[derive(Debug, PartialEq, Eq)]
