@@ -9,6 +9,7 @@ pub mod modes;
 pub mod proto;
 pub mod resume;
 pub mod session;
+pub mod ssh;
 pub mod sys;
 #[doc(hidden)]
 pub mod testutil;

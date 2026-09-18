@@ -80,6 +80,8 @@ pub enum AttachKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Welcome {
     pub proto: u16,
+    /// The session's name (the client may not know it: `--new`).
+    pub session: String,
     pub instance: u64,
     /// Offset of the next byte the master will send.
     pub offset: u64,
@@ -327,6 +329,7 @@ impl Msg {
                 }
                 Msg::Welcome(x) => {
                     w.u16(x.proto);
+                    w.str(&x.session);
                     w.u64(x.instance);
                     w.u64(x.offset);
                     w.u8(x.created as u8);
@@ -457,6 +460,7 @@ impl Msg {
             }
             ty::WELCOME => Msg::Welcome(Welcome {
                 proto: r.u16("proto")?,
+                session: r.str("session")?,
                 instance: r.u64("instance")?,
                 offset: r.u64("offset")?,
                 created: r.bool("created")?,
@@ -693,6 +697,7 @@ mod tests {
             }),
             Msg::Welcome(Welcome {
                 proto: 1,
+                session: "3".into(),
                 instance: 42,
                 offset: 9,
                 created: true,
@@ -818,6 +823,7 @@ mod tests {
     fn bad_enum_and_utf8_values_are_errors() {
         let mut frame = Msg::Welcome(Welcome {
             proto: 1,
+            session: String::new(),
             instance: 1,
             offset: 1,
             created: false,
