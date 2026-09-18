@@ -148,9 +148,9 @@ lives in the master and the client.
 child process; the `-o` options above are per-invocation overrides and never
 touch `~/.ssh/config` or `sshd_config`. The remote needs only what `dsh`
 needs today — `sshd` allowing a command, and a POSIX `sh` — plus `gzip` and a
-writable `~/.local/bin` for self-install (§8). Hosts that pin what ssh may run
-(`ForceCommand`, `command=` in `authorized_keys`, restricted shells) cannot
-work, as they cannot with `dsh`.
+writable `~/.local/share/acs` for self-install (§8). Hosts that pin what ssh
+may run (`ForceCommand`, `command=` in `authorized_keys`, restricted shells)
+cannot work, as they cannot with `dsh`.
 
 **Noise before the protocol.** Shell startup files sometimes print to stdout
 even for non-interactive sessions (an `echo` in `.bashrc`, a `motd` script),
@@ -164,8 +164,11 @@ found the same way.
 
 ### 4.1 Session directory and naming
 
-- Directory: `${TMPDIR:-/tmp}/acs-$UID/`, created `0700`; the master refuses to
-  start if it exists and is not owned by the user or is group/other writable.
+- Directory: `$ACS_SOCKET_DIR` if set, otherwise `/tmp/acs-$UID/` — keyed by
+  the numeric uid from `getuid()`, never `$USER`. Not `$TMPDIR`: it can differ
+  between login paths for the same user (`pam_tmpdir`, macOS per-session
+  values), and a session must be found the same way from every ssh login.
+  Created `0700`; see §4.5 for how it is checked.
 - Socket: `<dir>/<session>.sock`. Names keep `dsh`'s `[A-Za-z0-9._-]` rule;
   every session has one (§4.4).
 - **Not `$XDG_RUNTIME_DIR`**: `systemd-logind` deletes it when the user's last
@@ -201,6 +204,8 @@ found the same way.
   drop, the old connection can look alive on the server for a while. (dtach
   allows several mirrored clients; nobody uses that with `dsh`, and two
   terminals fighting over the window size is worse than a clean handover.)
+  Takeover is silent only when the new client has the **same client
+  identity** as the attached one; otherwise it needs confirmation (§4.5).
 - **Resize**: `TIOCSWINSZ`, which makes the kernel `SIGWINCH` the foreground
   group when the size changes. To force a redraw when the size is *unchanged*
   (fresh attach), signal `tcgetpgrp(pty)` with `SIGWINCH` directly — dtach's
@@ -220,7 +225,8 @@ found the same way.
 the master, then splice bytes both ways until either side closes. It does not
 parse frames beyond checking the protocol version in the HELLO. `acs _proxy
 --list` enumerates `<dir>/*.sock`, sends each master `STATUS`, and prints name,
-attached/detached, created-at, idle time, child command, and size. Sockets that
+attached/detached, the client identity attached (or last attached), created-at,
+idle time, child command, and size. Sockets that
 refuse connections are reported stale and removed — no `ps` parsing.
 
 ### 4.4 Session names and getting back in
@@ -239,7 +245,7 @@ know anything:
 
 | Command | Session |
 | --- | --- |
-| `acs <host>` | `main` — attach, or create it if absent (as `dsh`) |
+| `acs <host>` | `main` (or `$ACS_DEFAULT_SESSION`, §4.5) — attach, or create it if absent (as `dsh`) |
 | `acs <host> <name>` | `<name>` — attach, or create it if absent |
 | `acs <host> --new` | a new session named with the lowest free number: `1`, `2`, … (picked under the directory lock, so two `--new`s never collide) |
 | `acs <host> --list` | list sessions: name, attached/detached, idle time, command |
@@ -266,6 +272,51 @@ If you still lose track, `acs <host> --list` tells you. With exactly one
 session, `acs <host>` is still `main`, not "whatever is there" — the default
 never depends on what else happens to exist.
 
+### 4.5 Multiple users on one host
+
+Nothing on the remote is shared between invocations except the filesystem:
+no system daemon, no root, no shared socket, no port. Each master belongs to
+the user who started it. Two cases need care.
+
+#### Different Unix accounts — isolation
+
+| Concern | Handling |
+| --- | --- |
+| Session names collide (`main` for everyone) | One directory per uid: `/tmp/acs-1000/main.sock` and `/tmp/acs-1001/main.sock` are unrelated |
+| Another user pre-creates `/tmp/acs-<my uid>` (squatting, or a symlink to redirect sockets) | After `mkdir` (or on `EEXIST`), `lstat` the path: it must be a real directory, not a symlink, owned by my uid, mode `0700`. Otherwise refuse with an error naming the owner, and suggest `ACS_SOCKET_DIR`. The sticky bit on `/tmp` stops others from deleting it once it is mine |
+| Another user connects to my socket | The directory is `0700`, and additionally the master checks the peer's uid on every accepted connection (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and closes anything that is not its own uid. `root` can always get in; nothing can stop that |
+| Binaries | Installed per user under `~/.local/share/acs/` (§8); no user runs another's binary |
+| `x` kills something else | The master signals only its own child's process group |
+| Session names visible to others | `ps` shows `acs _master <name>` to other users unless `/proc` is mounted with `hidepid`; the name is not a secret, but that is where it shows |
+
+#### One account, several people — no accidents
+
+On edge devices and shared lab boxes several people often log in as the same
+account (`root`, `ubuntu`). There is no security boundary between them — the
+same uid can always read the same sockets — so the aim is only that nobody
+steals or breaks someone else's session **by accident**:
+
+- **Client identity.** `HELLO` carries a display identity,
+  `<local user>@<local hostname>` (for example `michel@mbp`), overridable with
+  `ACS_IDENTITY`. The master records it for the attached client and for the
+  session's creator.
+- **Takeover across identities needs confirmation.** If the session is attached
+  by a different identity, the master answers `BUSY{identity, since}` instead
+  of `WELCOME`, and the client asks on the terminal:
+  `session 'main' is attached from alice@laptop since 10:02 — take over? [y/N]`.
+  `--force` skips the question; without a terminal the attach fails. The same
+  identity (your own dropped connection, your own second terminal) takes over
+  silently as before.
+- **`--list` shows who** is attached and who created each session, so picking
+  another name is easy.
+- **Default name per person** when an account is shared: `ACS_DEFAULT_SESSION`
+  (e.g. set to `$USER` in each person's local shell) replaces `main` as what
+  plain `acs <host>` means. `main` stays the default otherwise, for `dsh`
+  compatibility.
+- **Different `acs` versions side by side.** Binaries are installed per
+  version (§8), so a colleague with a newer or older client never overwrites
+  the binary your sessions run on, and two clients never ping-pong upgrades.
+
 ## 5. Protocol
 
 ### 5.1 Frames
@@ -280,7 +331,8 @@ Length-prefixed, same format on the ssh leg and the unix-socket leg:
 
 | Type | Dir | Payload |
 | --- | --- | --- |
-| `HELLO` | c→m | proto version, session, mode (`attach`/`create`/`attach-or-create`), `TERM`, `COLORTERM`, cols, rows, xpixel, ypixel, optional `resume{instance, output_offset}` |
+| `HELLO` | c→m | proto version, session, mode (`attach`/`create`/`attach-or-create`), client identity, `force` flag, `TERM`, `COLORTERM`, cols, rows, xpixel, ypixel, optional `resume{instance, output_offset}` |
+| `BUSY` | m→c | identity attached and since when; the client may retry `HELLO` with `force` (§4.5) |
 | `WELCOME` | m→c | proto version, instance id, current output offset, `created` flag, `resumed` / `gap` / `fresh` |
 | `DATA` | m→c | `u64` offset of first byte, then raw pty bytes |
 | `INPUT` | c→m | `u64` sequence of first byte, then raw bytes for the pty |
@@ -488,14 +540,29 @@ reconnects, `--list` and remote install — so a host reachable as
 
 ## 8. Installing the remote binary
 
-The remote command is a short POSIX `sh` prelude, so a missing or outdated
-binary is detected in the same ssh round trip:
+Remote binaries are installed **per version**:
+`~/.local/share/acs/<version>/acs`. A client always runs exactly its own
+version on the remote, so different users of one account, or one user with
+two laptops on different releases, never replace each other's binary. The
+remote command is a short POSIX `sh` prelude with the client's version baked
+in, so a missing binary is detected in the same ssh round trip:
 
 ```sh
-b="$HOME/.local/bin/acs"
-[ -x "$b" ] && "$b" _version-check 1 && exec "$b" _proxy main --create
+v=0.3.1
+for b in "$HOME/.local/share/acs/$v/acs" "/usr/local/lib/acs/$v/acs"; do
+  [ -x "$b" ] && exec "$b" _proxy main --create
+done
 printf 'ACS-NEED %s %s\n' "$(uname -s)" "$(uname -m)"
 ```
+
+- `/usr/local/lib/acs/<version>/` is an optional system-wide location an
+  administrator can populate once for all users; `acs` never writes there.
+- After an install, `~/.local/bin/acs` is repointed (symlink created under a
+  temporary name, then renamed over) at the newest installed version, so the
+  remote can be used as a client for the next hop. Nothing in the protocol
+  depends on that link.
+- `acs _proxy` touches its version directory on start; versions untouched for
+  30 days whose sessions have all ended are removed by the next proxy start.
 
 When the client reads `ACS-NEED`, it maps the `uname` pair to a target,
 installs a binary for it (below), and redials. Protocol versions are checked in
@@ -545,15 +612,18 @@ multiplexed connection:
 
 ```sh
 # 1: unpack the slim binary; stdin is gz(slim_r) from P
-mkdir -p ~/.local/bin && gzip -dc > ~/.local/bin/acs.new && chmod 755 ~/.local/bin/acs.new
+d=~/.local/share/acs/0.3.1; mkdir -p $d && gzip -dc > $d/acs.new.<token> && chmod 755 $d/acs.new.<token>
 # 2: stdin is P; append it as a trailer, check the SHA-256 the client
-#    computed, then rename over ~/.local/bin/acs
-~/.local/bin/acs.new _install --finish --sha256 <digest>
+#    computed, then rename over $d/acs and repoint ~/.local/bin/acs
+$d/acs.new.<token> _install --finish --sha256 <digest>
 ```
 
 Step 2 is skipped in case 1 (the file sent is already complete, and step 1
-then uses `cat` rather than `gzip -dc`). The final `mv` is an atomic rename,
-so running masters keep the old binary they already have mapped.
+then uses `cat` rather than `gzip -dc`). `<token>` is random per install, so
+two clients installing the same version at once write separate files and the
+final atomic rename puts identical content in place either way. A version's
+binary is never replaced by different content, so running masters are never
+affected by someone else's install.
 
 **Size** (estimates, to be measured in phase 1): slim ≈ 0.7 MB, gzip'd
 ≈ 0.35 MB, so a complete binary with two Linux payloads ≈ 1.4 MB.
@@ -610,6 +680,11 @@ xtask/           cargo xtask dist: slim builds, payload set, complete builds, si
   Plus: detach and re-attach, `x` killing the child's process group, takeover,
   a stale socket, two concurrent creates racing on the lock, and a gap after
   ring overflow.
+- **Multi-user** (integration, needs a second test uid or root in CI):
+  a squatted or symlinked socket directory is refused; a peer with another
+  uid is disconnected; same-identity takeover is silent and cross-identity
+  takeover returns `BUSY` until `force`; two versions installed side by side
+  each serve their own clients; concurrent same-version installs converge.
 - **Manual matrix**: vim (tag jump, mouse), Claude Code, htop, `less`, OSC 52
   copy, kitty-protocol TUIs, over a link broken with `pfctl` or by switching
   Wi-Fi.
@@ -629,3 +704,4 @@ run side by side. Once it has been in use for a while, `dsh` becomes
 | 3 | Reconnect on by default | Yes. Resume after a drop is automatic because the running client knows the session; re-attaching from a new client uses the session name, which always exists — `main` by default, numbered with `--new` (§4.4) |
 | 4 | Takeover vs. mirrored clients | Takeover (§4.2) |
 | 5 | Escape key | Ctrl-] Ctrl-] with a 400 ms window, configurable (§6.2) |
+| 6 | Multiple users per host | Per-uid socket directory with ownership and peer-uid checks; per-version installs; on shared accounts, client identity with confirmed cross-identity takeover (§4.5) |
