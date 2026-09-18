@@ -2,12 +2,10 @@
 
 mod common;
 
-use std::process::Command;
-
 use common::*;
 
 fn list(remote: &Remote) -> (i32, String) {
-    let out = Command::new(exe())
+    let out = acs_cmd()
         .args(["--transport-cmd", &remote.transport(), "devbox", "--list"])
         .output()
         .unwrap();

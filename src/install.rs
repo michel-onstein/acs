@@ -78,6 +78,20 @@ pub fn plan(
     ))
 }
 
+/// What to say when the remote lacks acs and `install_on_remote` is off.
+pub fn not_installing(args: &ClientArgs, os: &str, arch: &str) -> String {
+    let v = crate::VERSION;
+    let why = match &args.config.install_on_remote.origin {
+        Some(o) => format!(" ({o})"),
+        None => String::new(),
+    };
+    format!(
+        "acs {v} is not installed on {host} ({os} {arch}), and install_on_remote is false{why}; \
+         put acs {v} at ~/.local/share/acs/{v}/acs on the host, or set install_on_remote: true",
+        host = args.transport.destination
+    )
+}
+
 /// The remote has no acs of our version for `os`/`arch`: install it.
 pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
     let host = &args.transport.destination;

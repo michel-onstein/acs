@@ -15,6 +15,28 @@ use acs::testutil::TempDir;
 
 pub const T: Duration = Duration::from_secs(15);
 
+/// A directory that does not exist: the client finds no configuration file
+/// unless a test gives it one.
+pub const NO_CONFIG: &str = "/nonexistent/acs-test-config";
+
+/// `acs` as a plain command (no pty), isolated from the developer's own
+/// configuration.
+pub fn acs_cmd() -> Command {
+    let mut c = Command::new(exe());
+    c.env("XDG_CONFIG_HOME", NO_CONFIG)
+        .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"));
+    c
+}
+
+/// Write `yaml` as the client's local configuration under `dir`; returns the
+/// environment that makes the client read it.
+pub fn config_env(dir: &Path, yaml: &str) -> Vec<(String, String)> {
+    let file = dir.join("acs/config.yaml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, yaml).unwrap();
+    vec![("XDG_CONFIG_HOME".into(), dir.display().to_string())]
+}
+
 pub fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_acs"))
 }
@@ -206,6 +228,9 @@ impl Client {
         cmd.env("TERM", "xterm-256color")
             .env_remove("ACS_DEFAULT_SESSION")
             .env_remove("ACS_SOCKET_DIR")
+            // Never the developer's own configuration files.
+            .env("XDG_CONFIG_HOME", NO_CONFIG)
+            .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
             .env("ACS_IDENTITY", "tester@local");
         for (k, v) in env {
             cmd.env(k, v);

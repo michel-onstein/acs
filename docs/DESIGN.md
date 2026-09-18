@@ -550,6 +550,53 @@ reconnects, `--list` and remote install — so a host reachable as
   the user's. A stray `-o ControlMaster=auto` cannot break reconnects; every
   other option, including all `-i` keys, applies as given.
 
+### 7.2 Configuration file
+
+The client reads YAML settings from two files, following the XDG Base
+Directory spec; either may be missing:
+
+1. **global** `/etc/acs/config.yaml` (`ACS_GLOBAL_CONFIG` names another file,
+   for packagers and tests), then
+2. **local** `$XDG_CONFIG_HOME/acs/config.yaml`, by default
+   `~/.config/acs/config.yaml`.
+
+```yaml
+install_on_remote: true        # install acs on a host that lacks it (§8)
+hosts:                         # aliases: acs devbox tries these in order
+  devbox:
+    - host: devbox.lan
+      reachability_check: true # ping once first (the default)
+    - host: devbox.example.com
+      user: michel             # otherwise ~/.ssh/config decides
+```
+
+- **Merging**: a setting in the local file replaces the global one; mappings
+  (`hosts`) merge key by key; lists (an alias's hosts) concatenate, global
+  entries first. An empty value (`key:`) sets nothing.
+- **Errors are not defaults**: a malformed file, an unknown key or a value of
+  the wrong type stops the client with the file and line
+  (`~/.config/acs/config.yaml:3: install_on_remote: expected true or false`).
+  `--help` and `--version` do not read the files.
+- **`install_on_remote: false`**: when the prelude reports `ACS-NEED` (§8)
+  the client installs nothing; it says which host lacks which version, where
+  the setting came from, and exits with the install-failed code (254).
+- `hosts` is parsed and validated: `host` is required, `user` and
+  `reachability_check` (default `true`) are optional, and one entry may be
+  written without the list. **Not built yet:** resolving `acs <alias>`
+  through these entries.
+- Only the local client reads the files; `_proxy`, `_master` and `_install`
+  never do.
+
+**Parser.** The files use a small subset of YAML — block mappings and lists,
+plain and quoted scalars, one-line `[…]`/`{…}`, comments — parsed by hand in
+`yaml.rs`, which refuses anchors, tags, block scalars and multi-line flow
+collections with the line they are on. The tree keeps every node's line and
+the comments around it, so a file rewritten by the client keeps its comments
+and order. Measured on the release profile, a minimal load-and-dump binary
+grows by about 100 KB with `yaml-rust2` and 150 KB with `serde_yaml`, and
+neither keeps comments; the hand-written parser adds 17 KB to `acs` (slim
+build 490 → 507 KB).
+
 ## 8. Installing the remote binary
 
 Remote binaries are installed **per version**:
@@ -661,8 +708,9 @@ for anything else.
   `flock`, peer credentials — wrapped in `sys.rs`) and `lexopt` for arguments
   (clap adds hundreds of KB); hand-written frame codec; no compression crate
   (the remote's `gzip` unpacks payloads, §8.1); an in-crate SHA-256 for the
-  install digest. **No async runtime**: the single-threaded poll loops do not
-  need tokio.
+  install digest; a hand-written parser for the YAML subset of the
+  configuration file (§7.2). **No async runtime**: the single-threaded poll
+  loops do not need tokio.
 - **Profile**: `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
   `panic = "abort"`, `strip = true`.
 - **Targets**: `aarch64-apple-darwin` (local, installed), `x86_64-apple-darwin`,
@@ -689,6 +737,8 @@ src/
   proxy.rs      acs _proxy: connect-or-spawn, relay, --list
   master.rs     acs _master: pty, child, ring, protocol
   list.rs       --list table
+  config.rs     configuration files: locations, merging, validation
+  yaml.rs       the YAML subset those files use, parsed and written back
   install.rs    remote self-install and _install --finish
   payload.rs    payload set format, ELF trailer, Mach-O embed
   prune.rs      pruning of unused remote versions

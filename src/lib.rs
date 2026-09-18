@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 pub mod cli;
 pub mod client;
+pub mod config;
 pub mod install;
 pub mod keys;
 pub mod list;
@@ -25,6 +26,7 @@ pub mod sys;
 #[doc(hidden)]
 pub mod testutil;
 pub mod tty;
+pub mod yaml;
 
 /// The crate version, baked into the remote prelude so a client always runs
 /// its own version on the remote (DESIGN §8).
