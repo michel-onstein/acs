@@ -205,6 +205,26 @@ so these calls run with ssh's `BatchMode`: list a host that needs a password
 on its own, with `acs <alias> --list`. With no aliases configured, it says so
 and exits with 2.
 
+### Sessions on every host
+
+`acs --list` without a host lists the sessions on every alias at once:
+
+```text
+HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
+devbox  main  attached  michel@mbp    3s    2h   /bin/zsh -l
+devbox  work  detached  (michel@mbp)  4m    1d   htop
+no sessions on nas
+acs: pi: no host for 'pi' is reachable (tried pi.lan)
+```
+
+Each alias is resolved as above and all are asked in parallel, so a host
+that is down or slow only costs its own line — on stderr, after at most 30 s
+(`ACS_DIAL_TIMEOUT_MS`). The exit status is 0 when every host answered and
+255 when any did not. Several ssh cannot ask for passwords on one terminal,
+so these calls run with ssh's `BatchMode`: list a host that needs a password
+on its own, with `acs <alias> --list`. With no aliases configured, it says so
+and exits with 2.
+
 ### Editing it from the command line
 
 ```sh
