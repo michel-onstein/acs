@@ -445,7 +445,7 @@ lossless resume will not repaint it. So:
 | --- | --- |
 | Ctrl-] | Held for up to **400 ms**. If nothing else arrives, it is sent to the remote. |
 | Ctrl-] then any other key within 400 ms | Both keys sent to the remote, in order, immediately. |
-| Ctrl-] Ctrl-] within 400 ms | Enter command mode: the next key is a command. |
+| Ctrl-] Ctrl-] within 400 ms | Enter command mode: the next key is a command. The terminal bell rings. |
 | … then `d` | **Detach.** `DETACH` to the master, restore the local terminal, exit 0. The session keeps running. Works even while the link is down (it is purely local then). |
 | … then `x` | **Exit.** `KILL` to the master, wait for `EXIT`, restore the terminal, exit with the child's status. Needs the link; if it is down the client says so and stays in the session. |
 | … then any other key, or nothing for 2 s | All the held keys are sent to the remote as typed. |
@@ -453,10 +453,35 @@ lossless resume will not repaint it. So:
 The only cost is that a lone Ctrl-] reaches the remote up to 400 ms late. The
 window is a setting (`ACS_ESCAPE_TIMEOUT_MS`), and so is the key.
 
-Command mode prints nothing on the screen: the local terminal shows only what
-the remote sent. The table is intended to grow — `r` (force redraw) and `?`
-(help, followed by a redraw) are obvious next entries — but only `d` and `x`
-are in scope.
+Command mode prints nothing on the screen — it only rings the bell (below):
+the local terminal shows only what the remote sent. The table is intended to
+grow — `r` (force redraw) and `?` (help, followed by a redraw) are obvious
+next entries — but only `d` and `x` are in scope.
+
+**The bell.** Entering command mode rings the terminal bell (`BEL`, `0x07`),
+so the user knows the next key is a command. It is on by default;
+`command_bell: false` (§7.2) turns it off, and `ACS_COMMAND_BELL` overrides
+the file (`0` off, `1` on). The bell does not break the transparent stream:
+
+- The client writes it to the **local terminal**, as it writes the status
+  line (§5.4). Nothing is added to the program's input, and the output bytes
+  are unchanged — the bell goes between them.
+- It goes only at a **boundary** of the output: not inside an escape
+  sequence, not inside a UTF-8 character, and above all not inside an
+  OSC/DCS/APC/PM/SOS string, which a `BEL` would end early (an unfinished
+  title or OSC 52 copy would be cut short). The mode observer (§6.4) already
+  lexes the output and knows where it is. If the output is inside such a
+  sequence, the bell waits and is written as soon as the output reaches a
+  boundary — right after the ST or `BEL` that ends the string. It is dropped
+  if command mode ends first (a key, or the 2 s timeout), so a late bell never
+  announces a command mode that is over.
+- It rings only when command mode arms and then waits: Ctrl-] Ctrl-] and the
+  command key arriving in one read (a paste without bracketed paste, or
+  typed faster than the terminal is read) need no announcement. Inside a
+  bracketed paste the escape key is never recognised (§6.3), so it never
+  rings there.
+- The same holds while the link is down (§5.4), where the offline wait arms
+  command mode with the same detector.
 
 ### 6.2 Is Ctrl-] a good choice?
 
@@ -579,6 +604,7 @@ Directory spec; either may be missing:
 ```yaml
 install_on_remote: true        # install acs on a host that lacks it (§8)
 update_check: true             # look for a newer release once a week (§7.6)
+command_bell: true             # ring the bell when command mode arms (§6.1)
 hosts:                         # aliases: acs devbox tries these in order
   devbox:
     - host: devbox.lan
@@ -732,7 +758,7 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`); `set` checks the type |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`); `set` checks the type |
 | `host list` | every alias and its hosts, in the order they are tried, with where each is defined |
 | `host add <alias> <host> [--user U] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one), or the alias |

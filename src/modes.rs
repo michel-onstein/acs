@@ -8,6 +8,9 @@
 //!
 //! It never modifies, delays or reorders the stream: the caller writes the
 //! bytes to the terminal and hands the same bytes to [`ModeObserver::observe`].
+//! It also knows where the stream is between sequences and characters
+//! ([`ModeObserver::at_boundary`]), the only place the client may put a byte
+//! of its own, the command-mode bell (DESIGN §6.1).
 
 use std::collections::BTreeMap;
 
@@ -59,6 +62,8 @@ pub struct ModeObserver {
     keypad_app: bool,
     /// A scroll region was set.
     scroll_region: bool,
+    /// Continuation bytes still due for a UTF-8 character.
+    utf8_left: u8,
 }
 
 impl ModeObserver {
@@ -84,60 +89,91 @@ impl ModeObserver {
 
     pub fn observe(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            let lex = self.lex.unwrap_or(Lex::Ground);
-            self.lex = Some(match lex {
-                Lex::Ground => {
-                    if b == 0x1b {
-                        self.seq.clear();
-                        Lex::Esc
-                    } else {
-                        Lex::Ground
-                    }
-                }
-                Lex::Esc => match b {
-                    b'[' => Lex::Csi,
-                    b']' | b'P' | b'_' | b'^' | b'X' => Lex::Str { esc: false },
-                    b'=' => {
-                        self.keypad_app = true;
-                        Lex::Ground
-                    }
-                    b'>' => {
-                        self.keypad_app = false;
-                        Lex::Ground
-                    }
-                    b'c' => {
-                        // RIS: full reset.
-                        self.clear();
-                        Lex::Ground
-                    }
-                    0x1b => Lex::Esc,
-                    _ => Lex::Ground,
-                },
-                Lex::Csi => {
-                    if (0x20..=0x3f).contains(&b) {
-                        if self.seq.len() < 64 {
-                            self.seq.push(b);
-                        }
-                        Lex::Csi
-                    } else if (0x40..=0x7e).contains(&b) {
-                        let body = std::mem::take(&mut self.seq);
-                        self.csi(&body, b);
-                        Lex::Ground
-                    } else if b == 0x1b {
-                        self.seq.clear();
-                        Lex::Esc
-                    } else {
-                        // C0 controls inside CSI are executed; keep lexing.
-                        Lex::Csi
-                    }
-                }
-                Lex::Str { esc } => match (esc, b) {
-                    (_, 0x07) | (true, b'\\') => Lex::Ground,
-                    (_, 0x1b) => Lex::Str { esc: true },
-                    _ => Lex::Str { esc: false },
-                },
-            });
+            self.step(b);
         }
+    }
+
+    /// True between sequences and characters: a byte written here (a BEL)
+    /// cannot end an OSC/DCS string early or split a UTF-8 character.
+    pub fn at_boundary(&self) -> bool {
+        self.lex.unwrap_or(Lex::Ground) == Lex::Ground && self.utf8_left == 0
+    }
+
+    /// Observe `bytes` up to the first boundary ([`ModeObserver::at_boundary`]);
+    /// returns how many were observed to get there (0 if already at one), or
+    /// `None` when all of them were and none came.
+    pub fn observe_to_boundary(&mut self, bytes: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        loop {
+            if self.at_boundary() {
+                return Some(i);
+            }
+            self.step(*bytes.get(i)?);
+            i += 1;
+        }
+    }
+
+    fn step(&mut self, b: u8) {
+        let lex = self.lex.unwrap_or(Lex::Ground);
+        self.lex = Some(match lex {
+            Lex::Ground => {
+                self.utf8_left = match b {
+                    0x80..=0xbf => self.utf8_left.saturating_sub(1),
+                    0xc2..=0xdf => 1,
+                    0xe0..=0xef => 2,
+                    0xf0..=0xf4 => 3,
+                    _ => 0,
+                };
+                if b == 0x1b {
+                    self.seq.clear();
+                    Lex::Esc
+                } else {
+                    Lex::Ground
+                }
+            }
+            Lex::Esc => match b {
+                b'[' => Lex::Csi,
+                b']' | b'P' | b'_' | b'^' | b'X' => Lex::Str { esc: false },
+                b'=' => {
+                    self.keypad_app = true;
+                    Lex::Ground
+                }
+                b'>' => {
+                    self.keypad_app = false;
+                    Lex::Ground
+                }
+                b'c' => {
+                    // RIS: full reset.
+                    self.clear();
+                    Lex::Ground
+                }
+                0x1b => Lex::Esc,
+                _ => Lex::Ground,
+            },
+            Lex::Csi => {
+                if (0x20..=0x3f).contains(&b) {
+                    if self.seq.len() < 64 {
+                        self.seq.push(b);
+                    }
+                    Lex::Csi
+                } else if (0x40..=0x7e).contains(&b) {
+                    let body = std::mem::take(&mut self.seq);
+                    self.csi(&body, b);
+                    Lex::Ground
+                } else if b == 0x1b {
+                    self.seq.clear();
+                    Lex::Esc
+                } else {
+                    // C0 controls inside CSI are executed; keep lexing.
+                    Lex::Csi
+                }
+            }
+            Lex::Str { esc } => match (esc, b) {
+                (_, 0x07) | (true, b'\\') => Lex::Ground,
+                (_, 0x1b) => Lex::Str { esc: true },
+                _ => Lex::Str { esc: false },
+            },
+        });
     }
 
     fn csi(&mut self, body: &[u8], fin: u8) {
@@ -292,6 +328,58 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&o.reset_sequence())
         );
+    }
+
+    #[test]
+    fn boundaries_are_outside_sequences_strings_and_characters() {
+        let at = |bytes: &[u8]| {
+            let mut o = ModeObserver::new();
+            o.observe(bytes);
+            o.at_boundary()
+        };
+        assert!(at(b""));
+        assert!(at(
+            b"text \x1b[1m\x1b]0;t\x07\x1bP1$r\x1b\\\x1b=caf\xc3\xa9"
+        ));
+        for inside in [
+            &b"\x1b"[..],
+            b"\x1b[1;3",
+            b"\x1b]0;title",
+            b"\x1b]0;title\x1b",
+            b"\x1bPq#0",
+            b"\x1b_Gf=100",
+            b"caf\xc3",
+            b"\xe2\x82",
+            b"\xf0\x9f\x98",
+        ] {
+            assert!(!at(inside), "{inside:?}");
+        }
+        // An ESC inside a UTF-8 character ends it.
+        assert!(at(b"\xe2\x1b[m"));
+    }
+
+    #[test]
+    fn observe_to_boundary_stops_where_the_string_ends() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b]2;ti");
+        // The rest of the title, its ST, then more output and another OSC.
+        let rest: &[u8] = b"tle\x1b\\after\x1b]2;next";
+        assert_eq!(o.observe_to_boundary(rest), Some(5));
+        assert!(o.at_boundary());
+        o.observe(&rest[5..]);
+        assert!(!o.at_boundary());
+        // Already at one: nothing to observe.
+        let mut o = ModeObserver::new();
+        assert_eq!(o.observe_to_boundary(b"abc"), Some(0));
+        // None comes: everything was observed.
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b]0;");
+        assert_eq!(o.observe_to_boundary(b"a"), None);
+        assert_eq!(o.observe_to_boundary(b"b\x07"), Some(2));
+        // A BEL ends an OSC as ST does.
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b]0;x");
+        assert_eq!(o.observe_to_boundary(b"\x07z"), Some(1));
     }
 
     #[test]

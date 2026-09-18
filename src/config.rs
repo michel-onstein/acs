@@ -69,6 +69,8 @@ pub struct Config {
     pub install_on_remote: Setting<bool>,
     /// Check GitHub once a week for a newer release (default true).
     pub update_check: Setting<bool>,
+    /// Ring the terminal bell when command mode arms (default true).
+    pub command_bell: Setting<bool>,
     /// Aliases in the order first defined, each with its hosts in order.
     pub hosts: Vec<(String, Vec<HostEntry>)>,
     /// The files that were read, global first.
@@ -80,6 +82,7 @@ impl Default for Config {
         Config {
             install_on_remote: Setting::default(true),
             update_check: Setting::default(true),
+            command_bell: Setting::default(true),
             hosts: Vec::new(),
             files: Vec::new(),
         }
@@ -87,10 +90,10 @@ impl Default for Config {
 }
 
 /// Every top-level setting, for error messages and `acs config`.
-pub const KEYS: &[&str] = &["install_on_remote", "update_check", "hosts"];
+pub const KEYS: &[&str] = &["install_on_remote", "update_check", "command_bell", "hosts"];
 
 /// The settings that are true or false.
-pub const BOOLS: &[&str] = &["install_on_remote", "update_check"];
+pub const BOOLS: &[&str] = &["install_on_remote", "update_check", "command_bell"];
 
 /// Every key of a host entry.
 pub const HOST_KEYS: &[&str] = &["host", "user", "reachability_check"];
@@ -237,6 +240,7 @@ impl Config {
         match key {
             "install_on_remote" => Some(&self.install_on_remote),
             "update_check" => Some(&self.update_check),
+            "command_bell" => Some(&self.command_bell),
             _ => None,
         }
     }
@@ -245,6 +249,7 @@ impl Config {
         match key {
             "install_on_remote" => Some(&mut self.install_on_remote),
             "update_check" => Some(&mut self.update_check),
+            "command_bell" => Some(&mut self.command_bell),
             _ => None,
         }
     }
@@ -387,6 +392,7 @@ mod tests {
         let c = Config::load_files(&[dir.path().join("none.yaml")]).unwrap();
         assert!(c.install_on_remote.value);
         assert_eq!(c.install_on_remote.origin, None);
+        assert!(c.command_bell.value);
         assert!(c.hosts.is_empty());
         assert!(c.files.is_empty());
         assert_eq!(c, Config::default());
@@ -445,7 +451,7 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, hosts)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, hosts)",
             ),
             ("hosts: [a]\n", ":1: hosts: expected a mapping"),
             (
