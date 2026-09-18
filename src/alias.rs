@@ -3,14 +3,15 @@
 
 use std::process::{Command, Stdio};
 
-use crate::config::{Config, HostEntry};
+use crate::config::{Alias, Config, HostEntry};
 
 /// The entry `name` stands for: `Ok(None)` if it is not an alias, the chosen
 /// entry otherwise, and an error naming every host tried when none answers.
 ///
 /// `user@<alias>` goes through the alias as that user: the chosen entry's
-/// `user` is the given one, whatever the entry says. `reachable` pings one
-/// host; `log` receives why each entry was taken or skipped.
+/// `user` is the given one, whatever the entry says. An entry without an
+/// `identity_file` takes the alias's. `reachable` pings one host; `log`
+/// receives why each entry was taken or skipped.
 pub fn resolve(
     name: &str,
     config: &Config,
@@ -18,13 +19,13 @@ pub fn resolve(
     log: &mut dyn FnMut(String),
 ) -> Result<Option<HostEntry>, String> {
     let (user, alias) = split_user(name);
-    let Some(entries) = config.alias(alias) else {
+    let Some(alias) = config.alias(alias) else {
         return Ok(None);
     };
     if let Some(u) = user {
         log(format!("{name}: logging in as {u}, from the command line"));
     }
-    pick(name, entries, user, reachable, log).map(Some)
+    pick(name, alias, user, reachable, log).map(Some)
 }
 
 /// `user@host` as its login name and host, split at the last `@` as ssh
@@ -38,15 +39,19 @@ pub fn split_user(name: &str) -> (Option<&str>, &str) {
 
 fn pick(
     name: &str,
-    entries: &[HostEntry],
+    alias: &Alias,
     user: Option<&str>,
     reachable: &mut dyn FnMut(&str) -> bool,
     log: &mut dyn FnMut(String),
 ) -> Result<HostEntry, String> {
     let mut tried = Vec::new();
-    for e in entries {
+    for e in &alias.entries {
         let e = HostEntry {
             user: user.map(String::from).or_else(|| e.user.clone()),
+            identity_file: e
+                .identity_file
+                .clone()
+                .or_else(|| alias.identity_file.clone()),
             ..e.clone()
         };
         let dest = e.destination();
@@ -212,6 +217,45 @@ hosts:
             log[1].starts_with("lab: using lab2 (reachability_check is off, "),
             "{log:?}"
         );
+    }
+
+    #[test]
+    fn an_entry_without_a_key_takes_the_aliass() {
+        let c = config(
+            "\
+hosts:
+  devbox:
+    identity_file: ~/.ssh/id_alias
+    hosts:
+      - host: devbox.lan
+        identity_file: ~/.ssh/id_lan
+      - host: devbox.example.com
+  plain:
+    - host: plain.lan
+",
+        );
+        let key = |name: &str, up: &[&str]| {
+            resolve(name, &c, &mut |h| up.contains(&h), &mut |_| {})
+                .unwrap()
+                .unwrap()
+                .identity_file
+                .map(|s| format!("{}:{}", s.value, s.origin.unwrap().line))
+        };
+        // The entry's own key beats the alias's; the fallback has none and
+        // takes the alias's, whoever logs in.
+        assert_eq!(
+            key("devbox", &["devbox.lan"]).as_deref(),
+            Some("~/.ssh/id_lan:6")
+        );
+        assert_eq!(
+            key("devbox", &["devbox.example.com"]).as_deref(),
+            Some("~/.ssh/id_alias:3")
+        );
+        assert_eq!(
+            key("you@devbox", &["devbox.example.com"]).as_deref(),
+            Some("~/.ssh/id_alias:3")
+        );
+        assert_eq!(key("plain", &["plain.lan"]), None);
     }
 
     #[test]

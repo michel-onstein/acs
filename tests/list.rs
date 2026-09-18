@@ -3,11 +3,8 @@
 
 mod common;
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use acs::testutil::TempDir;
 use common::*;
 
 fn list(remote: &Remote) -> (i32, String) {
@@ -89,59 +86,6 @@ fn a_host_silent_after_its_marker_is_given_up_on() {
 }
 
 // ---- acs --list: every alias -----------------------------------------------
-
-/// A fake `ssh` for `--ssh`: runs the remote command on the fake remote its
-/// destination stands for, and refuses any other destination as a dead host
-/// would. It records each call's arguments.
-struct Ssh {
-    dir: TempDir,
-}
-
-impl Ssh {
-    fn new(hosts: &[(&str, &Remote)]) -> Ssh {
-        let s = Ssh {
-            dir: TempDir::new(),
-        };
-        let mut cases = String::new();
-        for (dest, remote) in hosts {
-            cases.push_str(&format!(
-                "    '{dest}') exec '{}' \"$1\" ;;\n",
-                remote.transport()
-            ));
-        }
-        std::fs::write(
-            s.path(),
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
-                 while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
-                 dest=$2\nshift 2\n\
-                 case \"$dest\" in\n{cases}esac\n\
-                 echo \"ssh: connect to host $dest port 22: Connection refused\" >&2\nexit 255\n",
-                log = s.log().display(),
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(s.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        s
-    }
-
-    fn path(&self) -> PathBuf {
-        self.dir.path().join("ssh")
-    }
-
-    fn log(&self) -> PathBuf {
-        self.dir.path().join("calls")
-    }
-
-    /// The arguments of every call so far.
-    fn calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.log())
-            .unwrap_or_default()
-            .lines()
-            .map(String::from)
-            .collect()
-    }
-}
 
 /// `acs [args] --list` with no host, through `ssh` and `net`: exit code,
 /// stdout, stderr.
@@ -291,6 +235,44 @@ fn every_host_answering_exits_0() {
         )
     );
     assert_eq!(err, "");
+}
+
+#[test]
+fn every_host_is_asked_with_its_own_key() {
+    // nas has its own key, pi takes its alias's, and -i on the command
+    // line would replace both (acs-mbd).
+    let nas = Remote::installed();
+    let pi = Remote::installed();
+    let ssh = Ssh::new(&[("nas.lan", &nas), ("pi.lan", &pi)]);
+    let net = Net::new(&["nas.lan", "pi.lan"]);
+    let config = "\
+hosts:
+  nas:
+    - host: nas.lan
+      identity_file: /keys/nas
+  pi:
+    identity_file: /keys/pi
+    hosts:
+      - host: pi.lan
+";
+    let (code, _, err) = list_all(&ssh, &net, config, &[], &[]);
+    assert_eq!(code, 0, "{err}");
+    let mut keys = ssh.keys();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            ("nas.lan".to_string(), vec!["/keys/nas".to_string()]),
+            ("pi.lan".to_string(), vec!["/keys/pi".to_string()])
+        ]
+    );
+    let (code, _, err) = list_all(&ssh, &net, config, &["-i", "/cli/key"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        ssh.keys()[2..].iter().all(|(_, k)| k == &["/cli/key"]),
+        "{:?}",
+        ssh.keys()
+    );
 }
 
 #[test]

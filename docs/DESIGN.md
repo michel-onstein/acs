@@ -560,6 +560,11 @@ reconnects, `--list` and remote install — so a host reachable as
 - `acs` does not interpret these values (a `~` in `-i` is expanded by ssh, as
   usual). `ACS_SSH` or `--ssh <path>` picks the ssh binary; default is `ssh`
   on `PATH`.
+- **A key from the configuration**: an alias or one of its entries may name
+  an `identity_file` (§7.2, §7.3), which `acs` passes as `-i` after the
+  user's options — but only when those name no key, neither `-i` nor
+  `-o IdentityFile` (any case, `=` or space): a key on the command line
+  replaces the configured one rather than being tried alongside it.
 - **Precedence**: ssh keeps the *first* value it sees for an option, so `acs`
   places the options its transport depends on (§3: `-T`, `-e none`,
   `ControlMaster=no`, `ControlPath=none`, `ServerAliveInterval=0`) **before**
@@ -585,11 +590,17 @@ hosts:                         # aliases: acs devbox tries these in order
       reachability_check: true # ping once first (the default)
     - host: devbox.example.com
       user: michel             # otherwise ~/.ssh/config decides
+      identity_file: ~/.ssh/id_outside # this host's ssh key (-i)
+  lab:                         # an alias with settings of its own
+    identity_file: ~/.ssh/id_lab # the key of every host naming none
+    hosts:
+      - host: lab.lan
 ```
 
-- **Merging**: a setting in the local file replaces the global one; mappings
-  (`hosts`) merge key by key; lists (an alias's hosts) concatenate, global
-  entries first. An empty value (`key:`) sets nothing.
+- **Merging**: a setting in the local file replaces the global one — an
+  alias's `identity_file` too; mappings (`hosts`) merge key by key; lists (an
+  alias's hosts) concatenate, global entries first. An empty value (`key:`)
+  sets nothing.
 - **Errors are not defaults**: a malformed file, an unknown key or a value of
   the wrong type stops the client with the file and line
   (`~/.config/acs/config.yaml:3: install_on_remote: expected true or false`).
@@ -597,9 +608,18 @@ hosts:                         # aliases: acs devbox tries these in order
 - **`install_on_remote: false`**: when the prelude reports `ACS-NEED` (§8)
   the client installs nothing; it says which host lacks which version, where
   the setting came from, and exits with the install-failed code (254).
-- `hosts` is parsed and validated: `host` is required, `user` and
-  `reachability_check` (default `true`) are optional, and one entry may be
-  written without the list. How an alias is resolved is §7.3.
+- `hosts` is parsed and validated: `host` is required, `user`,
+  `identity_file` and `reachability_check` (default `true`) are optional,
+  and one entry may be written without the list. How an alias is resolved is
+  §7.3.
+- **An alias's own settings**: an alias is a list of entries (or one entry,
+  a mapping with `host`), or a mapping of its settings — `identity_file` —
+  and its `hosts`, that list. The list form stays the usual one; the mapping
+  is only needed for a setting shared by the entries. A file may give the
+  mapping without `hosts`, to set the key of an alias whose hosts are in the
+  other file, but an alias with no host in either is an error (at its first
+  definition). An `identity_file` is one path, not a list: several keys are
+  a job for `~/.ssh/config`.
 - Only the local client reads the files; `_proxy`, `_master` and `_install`
   never do.
 
@@ -632,17 +652,27 @@ one of the alias's entries instead of `<name>`:
   `@`, as ssh splits it (`a@b@devbox` is user `a@b`); an alias cannot
   contain `@` (§7.2), so the split is never ambiguous. `-v` says the login
   name came from the command line.
+- **The ssh key** is the first of: a key on the command line (`-i` or
+  `-o IdentityFile`, §7.1), the chosen entry's `identity_file`, the alias's
+  `identity_file`. Only that one is passed; with none, ssh chooses as usual
+  (`~/.ssh/config`, the agent). A leading `~/` (or a bare `~`) is expanded
+  with `$HOME` by `acs`, as the shell expands a typed `-i`; `~user/…` and
+  relative paths go to ssh as written (ssh tilde-expands `-i` itself, from
+  the password database rather than `$HOME`). `-v` names the key and where
+  it was set, or says the command line's replaces it. ssh still offers the
+  agent's and its default keys after it unless `IdentitiesOnly` is set.
 - **None answers**: the client names every host it tried and exits with the
   unreachable code (255) without calling ssh.
 - It applies to every ssh call — the session, `--list`, install — since they
-  share one destination. `-v` says which entry was chosen and why.
+  share one destination and key. `-v` says which entry was chosen and why.
 - **Redial**: a reconnect (§5.3) resolves the alias again, so after a network
   change the client reaches the host through whichever address answers now.
   A change of host is always shown (`devbox: now using … (was …)`). The
   session is found only if the new address is the **same machine**: entries
   of one alias should be ways to reach one host; if they are different
   machines, the redial reports that the session has ended. A redial of
-  `user@<alias>` keeps the user.
+  `user@<alias>` keeps the user; the key follows the entry, so a redial onto
+  a fallback host uses that host's key (or the alias's).
 - Messages and the `reattach with: acs <name>` hints use the name as given
   (`devbox`, `me@devbox`), not the resolved host.
 - A name that is not an alias, with or without `user@`, behaves exactly as
@@ -697,9 +727,10 @@ their YAML shape:
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
 | `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`); `set` checks the type |
-| `host list` | every alias and its hosts, in the order they are tried, with where each is defined |
-| `host add <alias> <host> [--user U] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
-| `host remove <alias> [<host>]` | remove one host (the alias goes with its last one), or the alias |
+| `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
+| `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
+| `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
+| `host set <alias> identity_file <K>` / `host unset <alias> identity_file` | the alias's own key (§7.3); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` turns it back into a list |
 | `path` | the two files and whether they exist |
 
 - Edits go to the local file; `--global` edits the global one (and needs
@@ -709,6 +740,9 @@ their YAML shape:
   written as two spaces. The result is parsed and validated again before it
   replaces the file (atomically, keeping its mode), so an edit never saves a
   file the client would refuse — nor overwrites one that is already broken.
+  It is also checked merged with the other file, so the hosts under an
+  alias's key in one file cannot be removed from the other; `host set` on an
+  alias that has no host yet says to add one first.
 - Removing something that lives in the other file fails with a pointer to it
   (`it is set in /etc/acs/config.yaml:1 (use --global)`).
 - `config` is a reserved **first** argument (as is `upgrade`, §7.5). A host

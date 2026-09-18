@@ -198,3 +198,135 @@ fn a_redial_of_user_at_alias_keeps_the_user() {
     c.wait(T);
     c.wait_for("acs you@devbox r", T);
 }
+
+// ---- identity files (acs-mbd) ----------------------------------------------
+
+/// devbox's first host has its own key; the second takes the alias's.
+const KEYED: &str = "\
+hosts:
+  devbox:
+    identity_file: /keys/devbox
+    hosts:
+      - host: devbox.lan
+        identity_file: ~/.ssh/id_lan
+      - host: devbox.example.com
+";
+
+const HOME: &str = "/home/acs-test";
+
+/// A client of `devbox` on a pty through the recording `ssh`, with `HOME`
+/// set and `extra` arguments before the host.
+fn keyed_client(ssh: &Ssh, net: &Net, extra: &[&str], env: &[(&str, &str)]) -> Client {
+    let mut args = vec![
+        "--ssh".to_string(),
+        ssh.path().display().to_string(),
+        "-v".into(),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    args.extend(["devbox", "k", "--", "/bin/sh", "-c", "echo up; sleep 30"].map(String::from));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut owned = net.env(KEYED);
+    owned.push(("HOME".into(), HOME.into()));
+    let mut all = env.to_vec();
+    all.extend(refs(&owned));
+    Client::spawn(&exe(), &args, &all)
+}
+
+fn devbox_ssh(remote: &Remote) -> Ssh {
+    Ssh::new(&[("devbox.lan", remote), ("devbox.example.com", remote)])
+}
+
+fn key(dest: &str, keys: &[&str]) -> (String, Vec<String>) {
+    (dest.into(), keys.iter().map(|k| k.to_string()).collect())
+}
+
+#[test]
+fn the_command_line_key_beats_the_hosts_which_beats_the_aliass() {
+    let remote = Remote::installed();
+    let ssh = devbox_ssh(&remote);
+    let net = Net::new(&["devbox.lan"]);
+
+    // The entry's own key, with ~ expanded as the shell would.
+    let mut c = keyed_client(&ssh, &net, &[], &[]);
+    c.wait_for("devbox: identity_file ~/.ssh/id_lan (", T);
+    c.wait_for("up", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+    assert_eq!(
+        ssh.keys().last().unwrap(),
+        &key("devbox.lan", &["/home/acs-test/.ssh/id_lan"])
+    );
+
+    // The fallback host names none: the alias's.
+    net.set_up(&["devbox.example.com"]);
+    let mut c = keyed_client(&ssh, &net, &[], &[]);
+    c.wait_for("devbox: identity_file /keys/devbox (", T);
+    c.wait_for("up", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+    assert_eq!(
+        ssh.keys().last().unwrap(),
+        &key("devbox.example.com", &["/keys/devbox"])
+    );
+
+    // -i on the command line, or -o IdentityFile, replaces both.
+    net.set_up(&["devbox.lan"]);
+    for (opts, want) in [
+        (["-i", "/cli/key"], &["/cli/key"][..]),
+        (["-o", "IdentityFile=/cli/key"], &[][..]),
+    ] {
+        let mut c = keyed_client(&ssh, &net, &opts, &[]);
+        c.wait_for(
+            "devbox: the key given on the command line replaces identity_file ~/.ssh/id_lan (",
+            T,
+        );
+        c.wait_for("up", T);
+        c.send(&command(b'x'));
+        c.wait(T);
+        assert_eq!(ssh.keys().last().unwrap(), &key("devbox.lan", want));
+    }
+}
+
+#[test]
+fn a_redial_onto_the_fallback_host_switches_to_its_key() {
+    let remote = Remote::installed();
+    let ssh = devbox_ssh(&remote);
+    let net = Net::new(&["devbox.lan"]);
+    let fast = [
+        ("ACS_BACKOFF_MS", "100"),
+        ("ACS_PING_MS", "200"),
+        ("ACS_DEAD_MS", "800"),
+    ];
+    let mut c = keyed_client(&ssh, &net, &[], &fast);
+    c.wait_for("up", T);
+    net.set_up(&["devbox.example.com"]);
+    remote.cut_link();
+    c.wait_for("devbox: now using devbox.example.com (was devbox.lan)", T);
+    remote.wait_connections(2, T);
+    c.send(b"echo back\r");
+    c.wait_for("back", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+    let keys = ssh.keys();
+    assert_eq!(keys[0], key("devbox.lan", &["/home/acs-test/.ssh/id_lan"]));
+    assert_eq!(
+        keys.last().unwrap(),
+        &key("devbox.example.com", &["/keys/devbox"])
+    );
+}
+
+#[test]
+fn list_uses_the_chosen_hosts_key() {
+    let remote = Remote::installed();
+    let ssh = devbox_ssh(&remote);
+    let net = Net::new(&["devbox.example.com"]);
+    let out = output_of(
+        acs_cmd()
+            .envs(net.env(KEYED))
+            .arg("--ssh")
+            .arg(ssh.path())
+            .args(["devbox", "--list"]),
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(ssh.keys(), [key("devbox.example.com", &["/keys/devbox"])]);
+}

@@ -108,6 +108,79 @@ impl Net {
     }
 }
 
+/// A fake `ssh` for `--ssh`: runs the remote command on the fake remote its
+/// destination stands for, and refuses any other destination as a dead host
+/// would. It records each call's arguments.
+pub struct Ssh {
+    dir: TempDir,
+}
+
+impl Ssh {
+    pub fn new(hosts: &[(&str, &Remote)]) -> Ssh {
+        let s = Ssh {
+            dir: TempDir::new(),
+        };
+        let mut cases = String::new();
+        for (dest, remote) in hosts {
+            cases.push_str(&format!(
+                "    '{dest}') exec '{}' \"$1\" ;;\n",
+                remote.transport()
+            ));
+        }
+        std::fs::write(
+            s.path(),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                 while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+                 dest=$2\nshift 2\n\
+                 case \"$dest\" in\n{cases}esac\n\
+                 echo \"ssh: connect to host $dest port 22: Connection refused\" >&2\nexit 255\n",
+                log = s.log().display(),
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(s.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        s
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.dir.path().join("ssh")
+    }
+
+    fn log(&self) -> PathBuf {
+        self.dir.path().join("calls")
+    }
+
+    /// The arguments of every call so far.
+    pub fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.log())
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    /// Every call so far as its destination and the keys (`-i`) it was
+    /// given, in order.
+    pub fn keys(&self) -> Vec<(String, Vec<String>)> {
+        self.calls()
+            .iter()
+            .map(|c| {
+                let (opts, rest) = c.split_once(" -- ").expect("a destination after --");
+                let opts: Vec<&str> = opts.split(' ').collect();
+                let keys = opts
+                    .windows(2)
+                    .filter(|w| w[0] == "-i")
+                    .map(|w| w[1].to_string())
+                    .collect();
+                let dest = rest.split(' ').next().unwrap().to_string();
+                (dest, keys)
+            })
+            .collect()
+    }
+}
+
 /// `cmd.output()`, retried while the program is "busy" (ETXTBSY): on Linux a
 /// binary a test just copied cannot be run while another test thread's
 /// fork still holds the copy's write descriptor.
