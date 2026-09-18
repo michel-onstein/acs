@@ -54,7 +54,7 @@ macro_rules! mlog {
 // ---- starting a master -----------------------------------------------------
 
 /// Start a detached master for `session` in `dir` and wait until its socket
-/// is bound. `exe` is the acs binary to run (normally `current_exe()`).
+/// is bound. `exe` is the acs binary to run (normally `sys::self_exe()`).
 pub fn spawn(exe: &Path, dir: &Path, session: &str) -> io::Result<()> {
     spawn_with_env(exe, dir, session, &[])
 }
@@ -361,6 +361,16 @@ impl Master {
                     return self.finish();
                 }
             }
+
+            // Refill and flush before deciding what to wait for: a flush that
+            // empties the client's buffer must be followed by a refill from
+            // the ring, or with the ring full (no pty POLLIN) and the buffer
+            // empty (no POLLOUT) nothing would ever wake us.
+            self.pump_output();
+            for c in &mut self.conns {
+                c.flush();
+            }
+            self.pump_output();
 
             let active = self.active();
             let mut fds = vec![
