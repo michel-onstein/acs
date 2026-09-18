@@ -318,3 +318,66 @@ fn e2e_10_user_at_alias_logs_in_as_that_user() {
     c.wait(T);
     eprintln!("VERIFIED dev@<alias> logs in as dev over ssh");
 }
+
+#[test]
+fn e2e_11_identity_file_from_the_configuration() {
+    let Some(h) = host() else { return };
+    // The key only under a HOME of our own, reached as ~/.ssh/id_box: acs
+    // expands the ~. `keyed` names it on its host entry, over a missing
+    // alias key; `plain` names it for the whole alias. No -i is given.
+    let home = acs::testutil::TempDir::new();
+    let key = home.path().join(".ssh/id_box");
+    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+    std::fs::copy(&h.key, &key).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let cfg = acs::testutil::TempDir::new();
+    let entry = "{host: 127.0.0.1, user: dev, reachability_check: false";
+    let mut env = config_env(
+        cfg.path(),
+        &format!(
+            "hosts:\n  keyed:\n    identity_file: /nonexistent/acs-key\n    hosts:\n      - {entry}, identity_file: ~/.ssh/id_box}}\n  plain:\n    identity_file: ~/.ssh/id_box\n    hosts: [{entry}}}]\n"
+        ),
+    );
+    env.push(("HOME".into(), home.path().display().to_string()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    for alias in ["keyed", "plain"] {
+        let mut args: Vec<String> = [
+            "-F",
+            "/dev/null",
+            "-p",
+            &h.port,
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+        ]
+        .map(String::from)
+        .to_vec();
+        args.extend(
+            [
+                "-v",
+                alias,
+                "key",
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo key-ok; sleep 60",
+            ]
+            .map(String::from),
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut c = Client::spawn(std::path::Path::new(&h.client), &args, &env);
+        c.wait_for(&format!("{alias}: identity_file ~/.ssh/id_box ("), T);
+        c.wait_for("key-ok", T);
+        c.send(&command(b'x'));
+        c.wait(T);
+    }
+    eprintln!("VERIFIED identity_file (per host over the alias's, and per alias) over ssh");
+}

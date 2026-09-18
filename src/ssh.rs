@@ -57,6 +57,9 @@ pub struct Transport {
     pub user_opts: Vec<OsString>,
     /// `[user@]host`.
     pub destination: String,
+    /// The configuration's key for the destination (DESIGN §7.3), passed as
+    /// `-i` unless the user's options name one: the command line wins.
+    pub identity_file: Option<String>,
     /// Test hook: run this (split on whitespace) with the remote command as
     /// its last argument instead of ssh (DESIGN §9.1).
     pub transport_cmd: Option<String>,
@@ -70,8 +73,23 @@ impl Transport {
                 .unwrap_or_else(|| "ssh".into()),
             user_opts: Vec::new(),
             destination: destination.into(),
+            identity_file: None,
             transport_cmd: None,
         }
+    }
+
+    /// Whether the user's options name a key: `-i`, or `-o IdentityFile`.
+    pub fn user_identity(&self) -> bool {
+        self.user_opts.chunks(2).any(|p| match p {
+            [flag, _] if flag == "-i" => true,
+            [flag, v] if flag == "-o" => v.to_str().is_some_and(|o| {
+                o.trim_start()
+                    .split(|c: char| c == '=' || c.is_whitespace())
+                    .next()
+                    .is_some_and(|k| k.eq_ignore_ascii_case("IdentityFile"))
+            }),
+            _ => false,
+        })
     }
 
     /// Program and arguments for a call running `remote` on the host.
@@ -89,6 +107,14 @@ impl Transport {
         };
         v.extend(fixed.iter().map(OsString::from));
         v.extend(self.user_opts.iter().cloned());
+        if let Some(key) = self
+            .identity_file
+            .as_ref()
+            .filter(|_| !self.user_identity())
+        {
+            v.push("-i".into());
+            v.push(key.into());
+        }
         // `--` keeps a destination starting with `-` from being an option.
         v.push("--".into());
         v.push(self.destination.clone().into());
@@ -176,6 +202,7 @@ mod tests {
             .map(OsString::from)
             .collect(),
             destination: "me@box".into(),
+            identity_file: None,
             transport_cmd: None,
         }
     }
@@ -253,6 +280,57 @@ mod tests {
         );
         // The user's options follow, multiplexing included.
         assert_eq!(v[8..], strs(t().argv(Call::Side, "R"))[4..]);
+    }
+
+    #[test]
+    fn a_configured_key_goes_to_ssh_unless_the_command_line_names_one() {
+        let mut tr = t();
+        tr.identity_file = Some("/keys/devbox".into());
+        // The user's -i wins: ssh would otherwise try both.
+        let v = strs(tr.argv(Call::Session, "R"));
+        assert_eq!(v.iter().filter(|a| *a == "-i").count(), 1, "{v:?}");
+        assert!(!v.iter().any(|a| a == "/keys/devbox"), "{v:?}");
+
+        tr.user_opts = ["-p", "2222", "-o", "IdentitiesOnly=yes"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        for call in [Call::Session, Call::Side, Call::Batch] {
+            let v = strs(tr.argv(call, "R"));
+            let n = v.len();
+            assert_eq!(
+                v[n - 9..],
+                [
+                    "-p",
+                    "2222",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-i",
+                    "/keys/devbox",
+                    "--",
+                    "me@box",
+                    "R"
+                ],
+                "{call:?}"
+            );
+        }
+
+        // -o IdentityFile, in any spelling ssh takes, names a key too.
+        for o in [
+            "IdentityFile=~/.ssh/k",
+            "identityfile ~/.ssh/k",
+            " IDENTITYFILE=k",
+        ] {
+            tr.user_opts = vec!["-o".into(), o.into()];
+            assert!(tr.user_identity(), "{o}");
+            let v = strs(tr.argv(Call::Session, "R"));
+            assert!(!v.iter().any(|a| a == "-i"), "{o}: {v:?}");
+        }
+        tr.user_opts = vec!["-o".into(), "IdentitiesOnly=yes".into()];
+        assert!(!tr.user_identity());
+        // A value that only looks like the flag is not one.
+        tr.user_opts = vec!["-J".into(), "-i".into()];
+        assert!(!tr.user_identity());
     }
 
     #[test]

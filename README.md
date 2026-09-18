@@ -133,7 +133,9 @@ usual. The command key works in every keyboard encoding a terminal may use
 `-o <option=value>` are passed to every ssh call acs makes, with ssh's
 meaning. `-l` is `--list`, not ssh's login option: put a login name in
 `user@host` or `-o User=`. Your `~/.ssh/config`, agent and keys apply as
-usual; nothing needs configuring on either side.
+usual; nothing needs configuring on either side. A key can also be set per
+host alias in the configuration (`identity_file`, below); `-i` on the
+command line wins.
 
 ### When the network drops
 
@@ -176,6 +178,12 @@ hosts:
   nas:
     - host: nas.lan
       reachability_check: false   # it drops pings: use it unchecked
+  lab:                     # an alias with a setting of its own
+    identity_file: ~/.ssh/id_lab  # the key for every host below…
+    hosts:
+      - host: lab.lan
+      - host: lab.example.com
+        identity_file: ~/.ssh/id_lab_outside   # …but this one
 ```
 
 | Setting | Meaning |
@@ -183,7 +191,7 @@ hosts:
 | `install_on_remote` | install acs on a host that lacks it (default `true`); when `false`, acs says what is missing and exits with 254 |
 | `update_check` | look for a newer acs release once a week (default `true`) |
 | `command_bell` | ring the terminal bell when Ctrl-] Ctrl-] arms command mode (default `true`; `ACS_COMMAND_BELL` overrides it) |
-| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user` and `reachability_check` (default `true`) |
+| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file` and `reachability_check` (default `true`) — or to a mapping of the alias's own `identity_file` and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -207,25 +215,21 @@ on whichever host is chosen (instead of `michel` on the fallback), and keeps
 `user@`, is used as given. To reach a machine whose name is also an alias,
 use its full name or address (`acs devbox.example.com`).
 
-### Sessions on every host
+### Which ssh key
 
-`acs --list` without a host lists the sessions on every alias at once:
+`identity_file` picks the key acs passes to ssh as `-i`, for one host entry
+or for a whole alias. The first of these wins, and only that one is passed:
 
-```text
-HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
-devbox  main  attached  michel@mbp    3s    2h   /bin/zsh -l
-devbox  work  detached  (michel@mbp)  4m    1d   htop
-no sessions on nas
-acs: pi: no host for 'pi' is reachable (tried pi.lan)
-```
+1. `-i` (or `-o IdentityFile=`) on the command line;
+2. the chosen host entry's `identity_file`;
+3. the alias's `identity_file`.
 
-Each alias is resolved as above and all are asked in parallel, so a host
-that is down or slow only costs its own line — on stderr, after at most 30 s
-(`ACS_DIAL_TIMEOUT_MS`). The exit status is 0 when every host answered and
-255 when any did not. Several ssh cannot ask for passwords on one terminal,
-so these calls run with ssh's `BatchMode`: list a host that needs a password
-on its own, with `acs <alias> --list`. With no aliases configured, it says so
-and exits with 2.
+With none of them, ssh picks the key as usual (`~/.ssh/config`, the agent).
+A leading `~/` means your home directory. The key follows the entry: a
+reconnect that falls back to another host of the alias uses that host's
+key. ssh still offers its other keys after this one unless you set
+`IdentitiesOnly yes`. Your own file can set just the key of an alias whose
+hosts are in the global file (`lab: {identity_file: ~/.ssh/mine}`).
 
 ### Sessions on every host
 
@@ -253,7 +257,10 @@ and exits with 2.
 acs config host add devbox devbox.lan                 # the first host of devbox
 acs config host add devbox devbox.example.com --user michel
 acs config host add nas nas.lan --no-reachability-check
-acs config host list                                  # aliases and their hosts
+acs config host add lab lab.lan --identity-file ~/.ssh/id_lab_home
+acs config host set lab identity_file ~/.ssh/id_lab   # the alias's key
+acs config host unset lab identity_file
+acs config host list                                  # aliases, hosts and keys
 acs config host remove devbox devbox.lan              # one host, or the alias
 acs config set install_on_remote false
 acs config set update_check false                     # no weekly release check

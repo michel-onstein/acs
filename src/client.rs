@@ -79,8 +79,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
 }
 
 /// If `name` is an alias, or `user@<alias>`, point the transport at the host
-/// it stands for now (DESIGN §7.3); with `-v`, say which entry was chosen
-/// and why. `name` is kept as given, so a redial resolves it the same way.
+/// it stands for now, with that entry's key (DESIGN §7.3); with `-v`, say
+/// which entry was chosen and why. `name` is kept as given, so a redial
+/// resolves it the same way.
 pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
     let verbose = args.verbose > 0;
     let entry = crate::alias::resolve(name, &args.config, &mut crate::alias::ping, &mut |m| {
@@ -91,6 +92,25 @@ pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
     if let Some(e) = entry {
         args.alias = Some(name.to_string());
         args.transport.destination = e.destination();
+        args.transport.identity_file = e
+            .identity_file
+            .as_ref()
+            .map(|s| crate::config::expand_home(&s.value));
+        if let (true, Some(key)) = (verbose, &e.identity_file) {
+            let at = key
+                .origin
+                .as_ref()
+                .map(|o| o.to_string())
+                .unwrap_or_default();
+            if args.transport.user_identity() {
+                note(&format!(
+                    "{name}: the key given on the command line replaces identity_file {} ({at})",
+                    key.value
+                ));
+            } else {
+                note(&format!("{name}: identity_file {} ({at})", key.value));
+            }
+        }
     }
     Ok(())
 }

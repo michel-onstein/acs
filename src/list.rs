@@ -42,7 +42,7 @@ pub fn run(args: &ClientArgs) -> ExitCode {
 /// (DESIGN §7.3) and asked in parallel, so a slow or dead host holds up
 /// only its own line. Exits 0 if every host answered, 255 if any did not.
 pub fn run_all(args: &ClientArgs) -> ExitCode {
-    let aliases: Vec<&str> = args.config.hosts.iter().map(|(a, _)| a.as_str()).collect();
+    let aliases: Vec<&str> = args.config.hosts.iter().map(|a| a.name.as_str()).collect();
     if aliases.is_empty() {
         eprintln!(
             "acs: no host aliases in the configuration: list one host with acs <host> --list, or add an alias with acs config host add <alias> <host>"
