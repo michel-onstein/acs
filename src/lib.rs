@@ -8,6 +8,10 @@ pub mod keys;
 pub mod modes;
 pub mod proto;
 pub mod resume;
+pub mod session;
+pub mod sys;
+#[doc(hidden)]
+pub mod testutil;
 
 /// The crate version, baked into the remote prelude so a client always runs
 /// its own version on the remote (DESIGN §8).
