@@ -150,6 +150,35 @@ fn socket_is_rebound_after_deletion() {
 }
 
 #[test]
+fn socket_directory_is_recreated_after_deletion() {
+    let t = TempDir::new();
+    let dir = t.path().join("s");
+    let (_c, w) = start_env(
+        &dir,
+        "gone",
+        &["/bin/sh", "-c", "sleep 30"],
+        "me",
+        &[("ACS_MASTER_REBIND_MS", "100")],
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    let deadline = Instant::now() + T;
+    while !sock(&dir, "gone").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "socket directory never recreated"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+    let (_c2, m) = attach(&dir, "gone", "me", None);
+    assert!(
+        matches!(m, Msg::Welcome(ref x) if x.instance == w.instance),
+        "{m:?}"
+    );
+}
+
+#[test]
 fn attach_to_a_session_that_is_not_there() {
     let t = TempDir::new();
     acs::master::spawn(&exe(), t.path(), "empty").unwrap();

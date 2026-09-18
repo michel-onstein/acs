@@ -181,7 +181,8 @@ found the same way.
   the fix there is `loginctl enable-linger`, which `acs` should mention in its
   error when it detects a master died that way.)
 - `systemd-tmpfiles` may age files out of `/tmp`; the master re-checks its
-  socket every minute and re-binds it if the path is gone (tmux's `SIGUSR1`
+  socket every minute and re-binds it if the path is gone — recreating the
+  directory, with the same checks, if that went too (tmux's `SIGUSR1`
   recovery, made automatic).
 
 ### 4.2 Master
