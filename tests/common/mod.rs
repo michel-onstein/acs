@@ -38,6 +38,76 @@ pub fn config_env(dir: &Path, yaml: &str) -> Vec<(String, String)> {
     vec![("XDG_CONFIG_HOME".into(), dir.display().to_string())]
 }
 
+/// Borrow an owned environment for [`Client::start_env`].
+pub fn refs(env: &[(String, String)]) -> Vec<(&str, &str)> {
+    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+/// Which hosts answer a ping: a fake `ping` for `ACS_PING` that succeeds for
+/// the hosts listed in a file and records every host it is asked about, so
+/// alias resolution (DESIGN §7.3) needs no ICMP.
+pub struct Net {
+    dir: TempDir,
+}
+
+impl Net {
+    /// A ping answering for `up`.
+    pub fn new(up: &[&str]) -> Net {
+        let n = Net {
+            dir: TempDir::new(),
+        };
+        let ping = n.ping();
+        std::fs::write(
+            &ping,
+            format!(
+                "#!/bin/sh\nfor h; do :; done\necho \"$h\" >> '{log}'\ngrep -qx \"$h\" '{up}'\n",
+                log = n.pinged_file().display(),
+                up = n.up_file().display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ping, std::fs::Permissions::from_mode(0o755)).unwrap();
+        n.set_up(up);
+        n
+    }
+
+    fn ping(&self) -> PathBuf {
+        self.dir.path().join("ping")
+    }
+
+    fn up_file(&self) -> PathBuf {
+        self.dir.path().join("up")
+    }
+
+    fn pinged_file(&self) -> PathBuf {
+        self.dir.path().join("pinged")
+    }
+
+    pub fn set_up(&self, up: &[&str]) {
+        let mut s = up.join("\n");
+        s.push('\n');
+        std::fs::write(self.up_file(), s).unwrap();
+    }
+
+    /// Every host pinged so far, in order.
+    pub fn pinged(&self) -> Vec<String> {
+        std::fs::read_to_string(self.pinged_file())
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    /// The environment for a client with `config` as its configuration and
+    /// this ping.
+    pub fn env(&self, config: &str) -> Vec<(String, String)> {
+        let mut env = config_env(self.dir.path(), config);
+        env.push(("ACS_PING".into(), self.ping().display().to_string()));
+        env
+    }
+}
+
 /// `cmd.output()`, retried while the program is "busy" (ETXTBSY): on Linux a
 /// binary a test just copied cannot be run while another test thread's
 /// fork still holds the copy's write descriptor.

@@ -1,8 +1,10 @@
 //! `acs <host> --list` (DESIGN §4.3): ask the remote proxy for every
-//! session's STATUS and print a table.
+//! session's STATUS and print a table. `acs --list` asks every alias in the
+//! configuration at once (DESIGN §7.3).
 
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use crate::cli::ClientArgs;
 use crate::client::{self, code};
@@ -10,33 +12,122 @@ use crate::proto::{Decoder, Marker, Msg, StatusInfo};
 use crate::ssh::{self, Call};
 use crate::sys;
 
+/// Why a host's sessions could not be listed.
+#[derive(Debug)]
+enum Failure {
+    /// No connection, or no answer in time.
+    Unreachable(String),
+    /// The proxy answered with something that is not a STATUS reply.
+    BadReply(String),
+}
+
 pub fn run(args: &ClientArgs) -> ExitCode {
     let host = args.host_name();
-    let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--list"]);
-    let (link, marker) =
-        match client::dial(args, Call::Side, &remote, client::answer_timeout(false)) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("acs: {e}");
-                return ExitCode::from(code::UNREACHABLE);
+    match query(args, Call::Side, client::answer_timeout(false)) {
+        Ok(Some(sessions)) => print!("{}", render(host, &sessions, sys::unix_now())),
+        Ok(None) => println!("{}", not_installed(host)),
+        Err(Failure::Unreachable(e)) => {
+            eprintln!("acs: {e}");
+            return ExitCode::from(code::UNREACHABLE);
+        }
+        Err(Failure::BadReply(e)) => {
+            eprintln!("acs: bad reply from {host}: {e}");
+            return ExitCode::from(code::ERROR);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `acs --list`: every alias, each resolved as a connection would be
+/// (DESIGN §7.3) and asked in parallel, so a slow or dead host holds up
+/// only its own line. Exits 0 if every host answered, 255 if any did not.
+pub fn run_all(args: &ClientArgs) -> ExitCode {
+    let aliases: Vec<&str> = args.config.hosts.iter().map(|(a, _)| a.as_str()).collect();
+    if aliases.is_empty() {
+        eprintln!(
+            "acs: no host aliases in the configuration: list one host with acs <host> --list, or add an alias with acs config host add <alias> <host>"
+        );
+        return ExitCode::from(code::USAGE);
+    }
+    // Nobody can type a password into several ssh at once (Call::Batch), so
+    // a host gets the redial's limit rather than the first connection's.
+    let timeout = client::answer_timeout(true);
+    let answers: Vec<_> = std::thread::scope(|s| {
+        let asks: Vec<_> = aliases
+            .iter()
+            .map(|&alias| s.spawn(move || ask(args, alias, timeout)))
+            .collect();
+        asks.into_iter()
+            .map(|t| t.join().expect("a list thread panicked"))
+            .collect()
+    });
+
+    let mut listed = Vec::new();
+    let mut quiet = String::new();
+    let mut failed = Vec::new();
+    for (alias, answer) in aliases.into_iter().zip(answers) {
+        match answer {
+            Ok(Some(sessions)) if sessions.is_empty() => {
+                quiet.push_str(&format!("no sessions on {alias}\n"))
             }
-        };
+            Ok(Some(sessions)) => listed.push((alias, sessions)),
+            Ok(None) => quiet.push_str(&format!("{}\n", not_installed(alias))),
+            Err(Failure::Unreachable(e)) => failed.push(format!("acs: {alias}: {e}")),
+            Err(Failure::BadReply(e)) => failed.push(format!("acs: bad reply from {alias}: {e}")),
+        }
+    }
+    print!("{}{quiet}", render_all(&listed, sys::unix_now()));
+    for f in &failed {
+        eprintln!("{f}");
+    }
+    if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(code::UNREACHABLE)
+    }
+}
+
+/// Resolve `alias` and ask the host it stands for now.
+fn ask(
+    base: &ClientArgs,
+    alias: &str,
+    timeout: Duration,
+) -> Result<Option<Vec<StatusInfo>>, Failure> {
+    let mut args = base.clone();
+    client::resolve_alias(&mut args, alias).map_err(Failure::Unreachable)?;
+    query(&args, Call::Batch, timeout)
+}
+
+fn not_installed(host: &str) -> String {
+    format!(
+        "no sessions on {host} (acs {} is not installed there)",
+        crate::VERSION
+    )
+}
+
+/// Ask the host's proxy for every session's STATUS, all within `timeout`;
+/// `Ok(None)` if acs of our version is not installed there.
+fn query(
+    args: &ClientArgs,
+    call: Call,
+    timeout: Duration,
+) -> Result<Option<Vec<StatusInfo>>, Failure> {
+    let deadline = Instant::now() + timeout;
+    let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--list"]);
+    let (link, marker) = client::dial(args, call, &remote, timeout)
+        .map_err(|e| Failure::Unreachable(e.to_string()))?;
     let rest = match marker {
         Marker::Ready { rest, .. } => rest,
         Marker::Need { .. } => {
             link.close();
-            println!(
-                "no sessions on {host} (acs {} is not installed there)",
-                crate::VERSION
-            );
-            return ExitCode::SUCCESS;
+            return Ok(None);
         }
     };
     let mut dec = Decoder::new();
     dec.push(&rest);
     let mut sessions = Vec::new();
     let mut buf = [0u8; 16 * 1024];
-    let from = link.from_fd();
+    let from = link.from_fd().as_raw_fd();
     loop {
         match dec.next_msg() {
             Ok(Some(Msg::StatusReply(s))) => {
@@ -46,19 +137,41 @@ pub fn run(args: &ClientArgs) -> ExitCode {
             Ok(Some(_)) => continue,
             Ok(None) => {}
             Err(e) => {
-                eprintln!("acs: bad reply from {host}: {e}");
                 link.close();
-                return ExitCode::from(code::ERROR);
+                return Err(Failure::BadReply(e.to_string()));
             }
         }
-        match sys::read(from.as_raw_fd(), &mut buf) {
+        // A host that goes quiet after its marker must not hold us forever.
+        let left = deadline.saturating_duration_since(Instant::now());
+        let mut p = [sys::pollfd(from, libc::POLLIN)];
+        let ready = if left.is_zero() {
+            Ok(0)
+        } else {
+            sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32)
+        };
+        match ready {
+            Ok(0) if Instant::now() < deadline => continue, // a signal cut the wait short
+            Ok(0) => {
+                link.close();
+                return Err(Failure::Unreachable(format!(
+                    "no answer from {} within {} s",
+                    args.transport.destination,
+                    timeout.as_secs_f32()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                link.close();
+                return Err(Failure::Unreachable(e.to_string()));
+            }
+        }
+        match sys::read(from, &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => dec.push(&buf[..n]),
         }
     }
     link.close();
-    print!("{}", render(host, &sessions, sys::unix_now()));
-    ExitCode::SUCCESS
+    Ok(Some(sessions))
 }
 
 /// Compact durations in one unit: `42s`, `7m`, `3h`, `12d`.
@@ -71,38 +184,36 @@ pub fn span(secs: u64) -> String {
     }
 }
 
-/// The table `--list` prints.
-pub fn render(host: &str, sessions: &[StatusInfo], now: u64) -> String {
-    if sessions.is_empty() {
-        return format!("no sessions on {host}\n");
-    }
-    let rows: Vec<[String; 6]> = sessions
-        .iter()
-        .map(|s| {
-            [
-                s.name.clone(),
-                if s.attached { "attached" } else { "detached" }.to_string(),
-                if s.identity.is_empty() {
-                    "-".to_string()
-                } else if s.attached {
-                    s.identity.clone()
-                } else {
-                    format!("({})", s.identity)
-                },
-                span(s.idle_secs),
-                span(now.saturating_sub(s.created_at)),
-                s.command.clone(),
-            ]
-        })
-        .collect();
-    let head = ["NAME", "STATE", "WHO", "IDLE", "AGE", "COMMAND"];
-    let mut width = head.map(str::len);
-    for r in &rows {
+const HEAD: [&str; 6] = ["NAME", "STATE", "WHO", "IDLE", "AGE", "COMMAND"];
+
+/// One session's cells, in the order of [`HEAD`].
+fn cells(s: &StatusInfo, now: u64) -> Vec<String> {
+    vec![
+        s.name.clone(),
+        if s.attached { "attached" } else { "detached" }.to_string(),
+        if s.identity.is_empty() {
+            "-".to_string()
+        } else if s.attached {
+            s.identity.clone()
+        } else {
+            format!("({})", s.identity)
+        },
+        span(s.idle_secs),
+        span(now.saturating_sub(s.created_at)),
+        s.command.clone(),
+    ]
+}
+
+/// `rows` under `head`, each column as wide as its widest cell (the last,
+/// the command, is not padded).
+fn table(head: &[&str], rows: &[Vec<String>]) -> String {
+    let mut width: Vec<usize> = head.iter().map(|h| h.len()).collect();
+    for r in rows {
         for (w, c) in width.iter_mut().zip(r.iter()) {
             *w = (*w).max(c.chars().count());
         }
     }
-    let line = |cells: [&str; 6]| -> String {
+    let line = |cells: &[&str]| -> String {
         let mut s = String::new();
         for (i, c) in cells.iter().enumerate() {
             if i == cells.len() - 1 {
@@ -114,10 +225,40 @@ pub fn render(host: &str, sessions: &[StatusInfo], now: u64) -> String {
         s.trim_end().to_string() + "\n"
     };
     let mut out = line(head);
-    for r in &rows {
-        out.push_str(&line([&r[0], &r[1], &r[2], &r[3], &r[4], &r[5]]));
+    for r in rows {
+        out.push_str(&line(&r.iter().map(String::as_str).collect::<Vec<_>>()));
     }
     out
+}
+
+/// The table `acs <host> --list` prints.
+pub fn render(host: &str, sessions: &[StatusInfo], now: u64) -> String {
+    if sessions.is_empty() {
+        return format!("no sessions on {host}\n");
+    }
+    let rows: Vec<Vec<String>> = sessions.iter().map(|s| cells(s, now)).collect();
+    table(&HEAD, &rows)
+}
+
+/// The table `acs --list` prints: the sessions of every host that has any,
+/// under a HOST column; empty if none has.
+pub fn render_all(hosts: &[(&str, Vec<StatusInfo>)], now: u64) -> String {
+    let rows: Vec<Vec<String>> = hosts
+        .iter()
+        .flat_map(|(host, sessions)| {
+            sessions.iter().map(move |s| {
+                let mut row = vec![host.to_string()];
+                row.extend(cells(s, now));
+                row
+            })
+        })
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut head = vec!["HOST"];
+    head.extend(HEAD);
+    table(&head, &rows)
 }
 
 #[cfg(test)]
@@ -156,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn table() {
+    fn table_of_one_host() {
         let now = 1_000_000;
         let t = render(
             "devbox",
@@ -175,5 +316,33 @@ mod tests {
              x     detached  -               0s    0s   sh\n"
         );
         assert_eq!(render("h", &[], now), "no sessions on h\n");
+    }
+
+    #[test]
+    fn table_of_every_host() {
+        let now = 1_000_000;
+        let t = render_all(
+            &[
+                (
+                    "devbox",
+                    vec![
+                        info("main", true, "michel@mbp", 3, now - 7200, "/bin/zsh -l"),
+                        info("work", false, "michel@mbp", 60, now - 60, "htop"),
+                    ],
+                ),
+                ("nas", vec![]),
+                ("lab-server", vec![info("1", false, "", 0, now, "sh")]),
+            ],
+            now,
+        );
+        assert_eq!(
+            t,
+            "HOST        NAME  STATE     WHO           IDLE  AGE  COMMAND\n\
+             devbox      main  attached  michel@mbp    3s    2h   /bin/zsh -l\n\
+             devbox      work  detached  (michel@mbp)  1m    1m   htop\n\
+             lab-server  1     detached  -             0s    0s   sh\n"
+        );
+        assert_eq!(render_all(&[("nas", vec![])], now), "");
+        assert_eq!(render_all(&[], now), "");
     }
 }

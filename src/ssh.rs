@@ -26,11 +26,25 @@ pub const TRANSPORT_OPTS: &[&str] = &[
 /// but the user's connection multiplexing is kept.
 pub const SIDE_OPTS: &[&str] = &["-T", "-e", "none"];
 
+/// Side calls made to several hosts at once (`acs --list`, DESIGN §7.3): no
+/// ssh may ask for a password or a host key on the shared terminal, and a
+/// dead host must fail within the time the others take to answer.
+pub const BATCH_OPTS: &[&str] = &[
+    "-T",
+    "-e",
+    "none",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+];
+
 /// Which kind of ssh call to build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Call {
     Session,
     Side,
+    Batch,
 }
 
 /// Everything needed to reach a host.
@@ -71,6 +85,7 @@ impl Transport {
         let fixed = match call {
             Call::Session => TRANSPORT_OPTS,
             Call::Side => SIDE_OPTS,
+            Call::Batch => BATCH_OPTS,
         };
         v.extend(fixed.iter().map(OsString::from));
         v.extend(self.user_opts.iter().cloned());
@@ -218,6 +233,26 @@ mod tests {
                 "R"
             ]
         );
+    }
+
+    #[test]
+    fn batch_call_never_prompts_and_gives_up_on_a_dead_host() {
+        let v = strs(t().argv(Call::Batch, "R"));
+        assert_eq!(
+            v[..8],
+            [
+                "ssh",
+                "-T",
+                "-e",
+                "none",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10"
+            ]
+        );
+        // The user's options follow, multiplexing included.
+        assert_eq!(v[8..], strs(t().argv(Call::Side, "R"))[4..]);
     }
 
     #[test]

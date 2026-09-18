@@ -139,7 +139,8 @@ lives in the master and the client.
   makes it explicit).
 - `ControlMaster=no`, `ControlPath=none`: the session gets its own TCP
   connection, so a reconnect never waits on a dead multiplexer. Side commands
-  (`--list`, install) keep using the user's multiplexing.
+  (`--list`, install) keep using the user's multiplexing; `acs --list` on
+  every alias adds `BatchMode=yes` and `ConnectTimeout=10` (§7.3).
 - `ServerAliveInterval=0`: liveness is ours (§5.3), much faster than ssh's.
 - `ConnectTimeout=10`: a redial into a dead network fails fast and the
   client returns to its backoff wait, where `d` still detaches (§6.1).
@@ -254,6 +255,7 @@ know anything:
 | `acs <host> <name>` | `<name>` — attach, or create it if absent |
 | `acs <host> --new` | a new session named with the lowest free number: `1`, `2`, … (picked under the directory lock, so two `--new`s never collide) |
 | `acs <host> --list` | list sessions: name, attached/detached, idle time, command |
+| `acs --list` | the same for every host alias at once, with a HOST column (§7.3) |
 
 So the unnamed case is covered two ways: plain `acs <host>` always means
 `main`, which you never have to remember, and `--new` gives short numeric
@@ -273,7 +275,8 @@ terminal is restored:
 - Inside the session `ACS_SESSION=<name>` is set, so the shell prompt or
   `echo $ACS_SESSION` can show it.
 
-If you still lose track, `acs <host> --list` tells you. With exactly one
+If you still lose track, `acs <host> --list` tells you, and `acs --list`
+does for every host in the configuration. With exactly one
 session, `acs <host>` is still `main`, not "whatever is there" — the default
 never depends on what else happens to exist.
 
@@ -523,7 +526,8 @@ nothing, because the terminal state is still correct.
 
 - Argument parsing matches `dsh`: `acs [ssh options] [user@]<host> [session]
   [-l|--list] [--new] [--no-reconnect] [-- command…]` (§4.4, §7.1). `-r` is
-  accepted and ignored, since reconnecting is the default.
+  accepted and ignored, since reconnecting is the default. `--list` is the
+  one form without a host: it then lists every alias (§7.3).
 - `cfmakeraw`-equivalent `termios` (dtach's flags), restored on every exit
   path: normal, signal (`SIGHUP`, `SIGTERM`, `SIGINT` before raw mode), and
   panic (`panic = "abort"` plus a restore in a drop guard and a signal handler).
@@ -636,6 +640,42 @@ build 490 → 507 KB).
   resolved host.
 - A name that is not an alias behaves exactly as before; so does
   `user@<alias>`, which is a way to reach a host whose name is also an alias.
+
+**Every alias at once.** `acs [ssh options] --list` without a host lists the
+sessions on every alias of the configuration (`list.rs`):
+
+```text
+HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
+devbox  main  attached  michel@mbp    3s    2h   /bin/zsh -l
+devbox  work  detached  (michel@mbp)  4m    1d   htop
+no sessions on nas
+no sessions on pi (acs 0.4.0 is not installed there)
+acs: lab: no host for 'lab' is reachable (tried lab.lan)
+```
+
+- Each alias is resolved as above, pings and fallbacks included, and asked
+  with the same `_proxy --list` side call as `acs <alias> --list`. The
+  aliases are asked **in parallel**, a thread each, so a slow or dead host
+  holds up only its own line; each has the redial's answer limit (§5.3:
+  30 s, `ACS_DIAL_TIMEOUT_MS`) for the whole exchange, not only for the
+  marker. (`acs <host> --list` bounds its whole exchange the same way, with
+  the first connection's 120 s.)
+- **No prompts**: several ssh cannot share the terminal for a password or a
+  host key, so these calls put `-o BatchMode=yes -o ConnectTimeout=10`
+  before the user's options (`ssh::BATCH_OPTS`). A host that needs a
+  password fails here and is listed on its own with `acs <alias> --list`.
+- **Output**: one table with the alias in a HOST column, in configuration
+  order, then a line for each alias with no sessions or without acs of this
+  version, on stdout. An alias that could not be asked gets an
+  `acs: <alias>: <why>` line on stderr, not a failed command.
+- **Exit status**: 0 when every host answered — one without acs answered,
+  as it does for `acs <host> --list` — and the unreachable code (255) when
+  any did not. With no aliases configured there is nothing to list: it says
+  how to add one and exits with the usage code (2).
+- **Spawns are serialized** (`sys::spawn`): without `pipe2` (macOS) the
+  standard library marks a child's pipes close-on-exec only after creating
+  them, and a child another thread forks in between would hold one host's
+  pipe open, so that host's list would not end until the other child did.
 
 ### 7.4 `acs config`
 
@@ -885,7 +925,7 @@ src/
   session.rs    session names, per-uid socket directory, locks
   proxy.rs      acs _proxy: connect-or-spawn, relay, --list
   master.rs     acs _master: pty, child, ring, protocol
-  list.rs       --list table
+  list.rs       --list table, for one host or every alias in parallel
   config.rs     configuration files: locations, merging, validation
   config_cmd.rs acs config: show, get/set/unset, host list/add/remove
   release.rs    published releases: SHA256SUMS, versions, curl downloads
