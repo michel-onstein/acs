@@ -1,6 +1,7 @@
 # Versioning
 
-**Status:** Built — `scripts/version-bump.sh` (`cargo xtask bump`).
+**Status:** Built — `scripts/version-bump.sh` (`cargo xtask bump`) and
+`scripts/release-binaries.sh` (`cargo xtask package`).
 
 acs follows semantic versioning, and the version moves **automatically** after
 every merge to `main`. The version lives in `Cargo.toml` (and so in
@@ -62,6 +63,27 @@ scripts/version-bump.sh --major     # a new major version (manual only)
 - The `ship` workflow runs it after every merge, then pulls again.
 - The first run on a repository without tags releases the current
   `Cargo.toml` version as it is.
+
+## Binaries
+
+Every release is published on
+[GitHub Releases](https://github.com/michel-onstein/acs/releases) with:
+
+- `acs-<version>-<target>.tar.gz` for `aarch64-apple-darwin`,
+  `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl` — the complete builds, each holding
+  `acs-<version>-<target>/acs` and the README;
+- `SHA256SUMS` over the archives;
+- notes with install instructions and the changes since the previous release.
+
+`scripts/version-bump.sh` publishes them right after it tags a release;
+`scripts/release-binaries.sh [vX.Y.Z]` does it on its own (for example to
+publish an existing tag again: it replaces the assets). It builds from the
+exact tag in a throwaway worktree, needs `gh` with access to the repository
+(`GH_TOKEN` works), `cargo-zigbuild` and `zig`, and `--dry-run` builds and
+packages without uploading. `ACS_NO_PUBLISH=1` makes the bump skip it.
+
+## Options
 
 Options: `--minor` / `--patch` force a level; `--large-lines N`;
 `--no-labels` skips the pull request lookup (which uses `gh`); `--remote`,

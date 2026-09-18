@@ -12,6 +12,18 @@ It replaces the `dsh` shell function (`ssh` + `dtach`). The design is in
 
 ## Install
 
+Download the archive for your machine from
+[Releases](https://github.com/michel-onstein/acs/releases) (macOS Apple
+silicon and Intel, Linux x86_64 and aarch64):
+
+```sh
+v=0.1.0 t=aarch64-apple-darwin      # see the release page for the latest
+curl -LO https://github.com/michel-onstein/acs/releases/download/v$v/acs-$v-$t.tar.gz
+tar xzf acs-$v-$t.tar.gz && install -m 755 acs-$v-$t/acs ~/.local/bin/acs
+```
+
+Or build it yourself:
+
 ```sh
 cargo xtask dist                                  # every target, see below
 cp dist/aarch64-apple-darwin/acs ~/.local/bin/    # or the build for your machine
@@ -95,7 +107,8 @@ own default instead of `main`.
 scripts/verify.sh       # fmt, clippy (macOS and Linux targets), tests, markdownlint
 scripts/test_linux.sh   # the suite on Linux in a container, plus multi-user isolation
 scripts/e2e_ssh.sh      # end to end over real ssh against a container host
-scripts/version-bump.sh # release the next version (see docs/VERSIONING.md)
+scripts/version-bump.sh # release the next version and publish its binaries
+scripts/release-binaries.sh  # (re)publish a tag's binaries to GitHub Releases
 ```
 
 Results of the checks that need a real terminal are in
