@@ -113,10 +113,3 @@ scripts/release-binaries.sh  # (re)publish a tag's binaries to GitHub Releases
 
 Results of the checks that need a real terminal are in
 [docs/VERIFICATION.md](docs/VERIFICATION.md).
-
-## Migrating from dsh
-
-`acs` keeps its own socket directory and does not touch `/tmp/*.dtach`, so
-both run side by side. `dsh` arguments work unchanged (`-r` is accepted and
-ignored — reconnecting is the default). Once you are happy, replace the `dsh`
-function in `~/.zshrc` with `alias dsh=acs` and drop dtach.
