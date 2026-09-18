@@ -147,6 +147,9 @@ pub fn unix_now() -> u64 {
 }
 
 /// `HH:MM` in local time for Unix seconds `t`.
+// libc marks musl's `time_t` deprecated ahead of its 64-bit change; the
+// cast is right either way.
+#[allow(deprecated)]
 pub fn local_hhmm(t: u64) -> String {
     let secs = t as libc::time_t;
     // SAFETY: zeroed tm is a valid out-parameter for localtime_r.

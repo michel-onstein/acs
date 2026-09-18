@@ -413,9 +413,9 @@ lossless resume will not repaint it. So:
    back afterwards.
 3. After a successful resume that followed a printed status line, force one
    redraw to clean up the line: the client sends two RESIZE frames (one row
-   fewer, then the real size), since an unchanged size raises no `SIGWINCH`. Full-screen programs
-   repaint; a plain shell prompt may leave the line in scrollback, which is
-   acceptable.
+   fewer, then the real size), since an unchanged size raises no `SIGWINCH`.
+   Full-screen programs repaint; a plain shell prompt may leave the line in
+   scrollback, which is acceptable.
 
 ## 6. Command mode
 
@@ -632,8 +632,16 @@ final atomic rename puts identical content in place either way. A version's
 binary is never replaced by different content, so running masters are never
 affected by someone else's install.
 
-**Size** (estimates, to be measured in phase 1): slim ≈ 0.7 MB, gzip'd
-≈ 0.35 MB, so a complete binary with two Linux payloads ≈ 1.4 MB.
+**Size** (measured with `cargo xtask dist`, release profile):
+
+| Target | Slim | Complete |
+| --- | --- | --- |
+| `x86_64-unknown-linux-musl` | 602 KB | 1.21 MB |
+| `aarch64-unknown-linux-musl` | 553 KB | 1.16 MB |
+| `aarch64-apple-darwin` | 473 KB | 1.10 MB |
+| `x86_64-apple-darwin` | 494 KB | 1.13 MB |
+
+The payload set (both Linux builds, gzip'd) is 609 KB.
 
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
