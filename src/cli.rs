@@ -15,6 +15,7 @@ pub const USAGE: &str = "\
 usage: acs [ssh options] [user@]<host> [session]   attach, or create (default session: main)
        acs [ssh options] [user@]<host> --new       create a new numbered session
        acs [ssh options] [user@]<host> --list      list sessions on <host>
+       acs config ...                            read and edit the configuration (acs config --help)
 
 options:
   -l, --list          list sessions on the host
