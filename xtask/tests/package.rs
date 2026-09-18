@@ -25,6 +25,8 @@ fn packages_every_target_with_checksums_and_notes() {
         .arg(&out)
         .arg("--readme")
         .arg(&readme)
+        .arg("--installer")
+        .arg(readme.parent().unwrap().join("scripts/install.sh"))
         .arg("--changes")
         .arg(root.join("changes.md"))
         .status()
@@ -43,7 +45,8 @@ fn packages_every_target_with_checksums_and_notes() {
             "NOTES.md",
             "SHA256SUMS",
             "acs-0.9.1-aarch64-apple-darwin.tar.gz",
-            "acs-0.9.1-x86_64-unknown-linux-musl.tar.gz"
+            "acs-0.9.1-x86_64-unknown-linux-musl.tar.gz",
+            "install.sh"
         ]
     );
 
@@ -75,6 +78,14 @@ fn packages_every_target_with_checksums_and_notes() {
         "{}",
         String::from_utf8_lossy(&check.stdout)
     );
+
+    // The installer ships as is, executable.
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(out.join("install.sh")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+    assert!(std::fs::read_to_string(out.join("install.sh"))
+        .unwrap()
+        .starts_with("#!/bin/sh\n"));
 
     let notes = std::fs::read_to_string(out.join("NOTES.md")).unwrap();
     assert!(notes.contains("acs 0.9.1"));
