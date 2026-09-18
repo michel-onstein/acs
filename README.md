@@ -92,6 +92,7 @@ and links `~/.local/bin/acs` to it.
 acs [ssh options] [user@]host [session]   attach, or create (default session: main)
 acs [ssh options] [user@]host --new       create a new numbered session (1, 2, …)
 acs [ssh options] [user@]host --list      list sessions on host
+acs [ssh options] --list                  list sessions on every host alias
 acs host session -- command args…         run a command instead of the login shell
 ```
 
@@ -179,6 +180,26 @@ reaching **one** machine under an alias: the session lives on that machine,
 so a fallback to a different one finds no session to resume.
 `me@devbox`, or any name that is not an alias, is used as given.
 
+### Sessions on every host
+
+`acs --list` without a host lists the sessions on every alias at once:
+
+```text
+HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
+devbox  main  attached  michel@mbp    3s    2h   /bin/zsh -l
+devbox  work  detached  (michel@mbp)  4m    1d   htop
+no sessions on nas
+acs: pi: no host for 'pi' is reachable (tried pi.lan)
+```
+
+Each alias is resolved as above and all are asked in parallel, so a host
+that is down or slow only costs its own line — on stderr, after at most 30 s
+(`ACS_DIAL_TIMEOUT_MS`). The exit status is 0 when every host answered and
+255 when any did not. Several ssh cannot ask for passwords on one terminal,
+so these calls run with ssh's `BatchMode`: list a host that needs a password
+on its own, with `acs <alias> --list`. With no aliases configured, it says so
+and exits with 2.
+
 ### Editing it from the command line
 
 ```sh
@@ -211,7 +232,7 @@ reached as `user@config`.
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
-| `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial) |
+| `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial and for each host of `acs --list`) |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |
