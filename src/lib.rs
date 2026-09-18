@@ -20,6 +20,7 @@ pub mod proto;
 pub mod proxy;
 pub mod prune;
 pub mod reconnect;
+pub mod release;
 pub mod resume;
 pub mod session;
 pub mod sha256;
@@ -28,6 +29,7 @@ pub mod sys;
 #[doc(hidden)]
 pub mod testutil;
 pub mod tty;
+pub mod upgrade;
 pub mod yaml;
 
 /// The crate version, baked into the remote prelude so a client always runs
@@ -49,6 +51,8 @@ pub enum Role {
     Version,
     /// `acs config …`: read and edit the configuration files.
     Config,
+    /// `acs upgrade`: replace this binary with a newer release.
+    Upgrade,
 }
 
 impl Role {
@@ -61,9 +65,10 @@ impl Role {
             Some("_install") => Role::Install,
             Some("_version") | Some("--version") | Some("-V") => Role::Version,
             // Reserved words, only as the very first argument: a host
-            // called `config` is still reachable as `user@config`, or with
-            // any option before it.
+            // called `config` or `upgrade` is still reachable as
+            // `user@config`, or with any option before it.
             Some("config") => Role::Config,
+            Some("upgrade") => Role::Upgrade,
             _ => Role::Client,
         }
     }
@@ -110,6 +115,7 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         Role::Client => client::main(&args[1..]),
         Role::Install => install::finish_main(&args[2..]),
         Role::Config => config_cmd::main(&args[2..]),
+        Role::Upgrade => upgrade::main(&args[2..]),
     }
 }
 
@@ -139,8 +145,9 @@ mod tests {
     }
 
     #[test]
-    fn config_is_reserved_as_the_first_argument() {
+    fn commands_are_reserved_as_the_first_argument() {
         assert_eq!(role("config"), Role::Config);
+        assert_eq!(role("upgrade"), Role::Upgrade);
         assert_eq!(Role::from_first_arg(None), Role::Client);
     }
 }

@@ -16,6 +16,7 @@ usage: acs [ssh options] [user@]<host> [session]   attach, or create (default se
        acs [ssh options] [user@]<host> --new       create a new numbered session
        acs [ssh options] [user@]<host> --list      list sessions on <host>
        acs config ...                            read and edit the configuration (acs config --help)
+       acs upgrade [--version X.Y.Z] [--check]   replace this acs with the latest release
 
 options:
   -l, --list          list sessions on the host

@@ -58,6 +58,19 @@ Linux builds for x86_64 and aarch64, so any of them can install acs on any
 Linux host. A plain `cargo build` binary is **slim**: it can only install a
 copy of itself (same OS and CPU).
 
+### Upgrade
+
+```sh
+acs upgrade            # the latest release, checked against its SHA256SUMS
+acs upgrade --check    # only say whether there is a newer one
+acs upgrade --version 0.2.0   # that release, even an older one
+```
+
+acs replaces itself in place (a link like `~/.local/bin/acs` is pointed at
+the new version); if its directory is not yours, it says to use
+`sudo acs upgrade`. It uses `curl` (or `wget`). Remote hosts need nothing:
+the next connection installs the new version there.
+
 Nothing is needed on the remote beyond ssh, a POSIX `sh` and `gzip`: on first
 contact acs installs its own version under `~/.local/share/acs/<version>/`
 and links `~/.local/bin/acs` to it.
@@ -187,6 +200,7 @@ reached as `user@config`.
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |
+| `ACS_RELEASES_URL` | where `acs upgrade` looks for releases (default GitHub) |
 
 ## Development
 
