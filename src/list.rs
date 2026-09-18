@@ -13,13 +13,14 @@ use crate::sys;
 pub fn run(args: &ClientArgs) -> ExitCode {
     let host = args.host_name();
     let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--list"]);
-    let (link, marker) = match client::dial(args, Call::Side, &remote) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("acs: {e}");
-            return ExitCode::from(code::UNREACHABLE);
-        }
-    };
+    let (link, marker) =
+        match client::dial(args, Call::Side, &remote, client::answer_timeout(false)) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("acs: {e}");
+                return ExitCode::from(code::UNREACHABLE);
+            }
+        };
     let rest = match marker {
         Marker::Ready { rest, .. } => rest,
         Marker::Need { .. } => {

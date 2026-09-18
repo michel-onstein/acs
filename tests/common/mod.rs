@@ -115,8 +115,9 @@ impl Remote {
         let script = self.root.path().join("transport.sh");
         if !script.exists() {
             let body = format!(
-                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\nexec /bin/sh -c \"$1\"\n",
+                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\nexec /bin/sh -c \"$1\"\n",
                 pids = self.pid_file().display(),
+                silent = self.silent_file().display(),
                 noise = self.noise_file().display(),
                 home = self.home().display(),
                 sock = self.sockets().display(),
@@ -135,6 +136,22 @@ impl Remote {
 
     fn noise_file(&self) -> PathBuf {
         self.root.path().join("login-noise")
+    }
+
+    fn silent_file(&self) -> PathBuf {
+        self.root.path().join("silent")
+    }
+
+    /// Make new connections go quiet once accepted, as a half-alive host
+    /// does: they print `said` (nothing, or a marker) and then nothing more.
+    /// `None` makes them normal again.
+    pub fn silence(&self, said: Option<&str>) {
+        match said {
+            Some(s) => std::fs::write(self.silent_file(), s).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(self.silent_file());
+            }
+        }
     }
 
     /// Make every connection print `text` on stdout before the remote

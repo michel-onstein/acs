@@ -228,15 +228,10 @@ fn offline(
     }
 }
 
+/// The command key while offline: the same configuration as online, window
+/// included (acs-wxa).
 fn client_escape() -> crate::keys::Config {
-    let mut cfg = crate::keys::Config::default();
-    if let Some(k) = std::env::var("ACS_ESCAPE_KEY")
-        .ok()
-        .and_then(|v| crate::keys::Config::parse_key(&v))
-    {
-        cfg.byte = k;
-    }
-    cfg
+    client::escape_config()
 }
 
 /// One line on the bottom row (cursor saved and restored) and the window
@@ -255,10 +250,14 @@ fn show_status(state: &mut State, msg: &str) {
     state.status_shown = true;
 }
 
-/// Take the title back (pop the stack) if we pushed one.
-fn clear_status(state: &mut State) {
+/// Take the title back (pop the stack) and blank the status row, if we
+/// drew them. Every way out of the client passes here (`client::leave`),
+/// so a session that ends during an outage leaves no trace (acs-qrn).
+pub fn clear_status(state: &mut State) {
     if state.status_shown {
-        let _ = sys::write_all(1, b"\x1b[23;0t");
+        let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
+        let out = format!("\x1b[23;0t\x1b7\x1b[{rows};1H\x1b[2K\x1b8");
+        let _ = sys::write_all(1, out.as_bytes());
         state.status_shown = false;
     }
 }
