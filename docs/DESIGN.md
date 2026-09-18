@@ -140,7 +140,9 @@ lives in the master and the client.
   (`--list`, install) keep using the user's multiplexing.
 - `ServerAliveInterval=0`: liveness is ours (§5.3), much faster than ssh's.
 - Everything else — keys, agent, `ProxyJump`, host aliases — comes from the
-  user's ssh config unchanged. `acs` opens no ports and has no auth of its own.
+  user's ssh config unchanged, plus any ssh options given on the `acs`
+  command line (`-i`, `-p`, `-J`, `-F`, `-o`; §7.1). `acs` opens no ports
+  and has no auth of its own.
 
 **No ssh-side configuration.** The client runs the system `ssh` binary as a
 child process; the `-o` options above are per-invocation overrides and never
@@ -443,9 +445,9 @@ nothing, because the terminal state is still correct.
 
 ## 7. Client
 
-- Argument parsing matches `dsh`: `acs <host> [session] [-l|--list]
-  [--new] [--no-reconnect] [-- command…]` (§4.4). `-r` is accepted and
-  ignored, since reconnecting is the default.
+- Argument parsing matches `dsh`: `acs [ssh options] [user@]<host> [session]
+  [-l|--list] [--new] [--no-reconnect] [-- command…]` (§4.4, §7.1). `-r` is
+  accepted and ignored, since reconnecting is the default.
 - `cfmakeraw`-equivalent `termios` (dtach's flags), restored on every exit
   path: normal, signal (`SIGHUP`, `SIGTERM`, `SIGINT` before raw mode), and
   panic (`panic = "abort"` plus a restore in a drop guard and a signal handler).
@@ -455,6 +457,34 @@ nothing, because the terminal state is still correct.
 - Exit status: the child's status after `EXIT` (128+n for signals), 0 on detach,
   and distinct codes for "host unreachable", "remote install failed" and
   "taken over".
+
+### 7.1 ssh options
+
+A handful of ssh's own options are accepted with ssh's spelling and meaning,
+and passed **verbatim** to every ssh call `acs` makes — the session transport,
+reconnects, `--list` and remote install — so a host reachable as
+`ssh -i ~/.ssh/id_work -p 2222 me@box` is reachable as
+`acs -i ~/.ssh/id_work -p 2222 me@box`:
+
+| Option | Meaning (as in ssh) |
+| --- | --- |
+| `-i <identity_file>` | private key to use; repeatable, ssh tries them in order |
+| `-p <port>` | port |
+| `-J <destination>` | jump host(s) |
+| `-F <configfile>` | alternative ssh config file |
+| `-o <option=value>` | any ssh config option; repeatable (e.g. `-o IdentitiesOnly=yes` to use **only** the `-i` key rather than the agent's keys first) |
+| `[user@]host` | login name in the destination, as with ssh |
+
+- **`-l` stays `--list`**, as in `dsh`; ssh's `-l <login>` is not accepted.
+  The login name goes in `user@host` or `-o User=<login>`.
+- `acs` does not interpret these values (a `~` in `-i` is expanded by ssh, as
+  usual). `ACS_SSH` or `--ssh <path>` picks the ssh binary; default is `ssh`
+  on `PATH`.
+- **Precedence**: ssh keeps the *first* value it sees for an option, so `acs`
+  places the options its transport depends on (§3: `-T`, `-e none`,
+  `ControlMaster=no`, `ControlPath=none`, `ServerAliveInterval=0`) **before**
+  the user's. A stray `-o ControlMaster=auto` cannot break reconnects; every
+  other option, including all `-i` keys, applies as given.
 
 ## 8. Installing the remote binary
 
@@ -568,7 +598,10 @@ xtask/           cargo xtask dist: slim builds, payload set, complete builds, si
   wrap-around; the command-key detector as a table of `(bytes, timings) →
   (forwarded bytes, action)` over an injected clock, covering all three
   encodings, split reads, key release events and bracketed paste; the mode
-  observer on sequences split at every byte boundary.
+  observer on sequences split at every byte boundary; the ssh argv builder
+  (session calls put the transport options first; the user's
+  `-i`/`-p`/`-J`/`-F`/`-o` follow in order and are identical for session,
+  `--list` and install calls).
 - **Integration** (no ssh): `--transport-cmd` makes the client exec
   `acs _proxy …` locally instead of `ssh host acs _proxy …`. Tests start a
   session running a deterministic producer, kill the transport mid-stream,
