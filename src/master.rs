@@ -56,6 +56,17 @@ macro_rules! mlog {
 /// Start a detached master for `session` in `dir` and wait until its socket
 /// is bound. `exe` is the acs binary to run (normally `current_exe()`).
 pub fn spawn(exe: &Path, dir: &Path, session: &str) -> io::Result<()> {
+    spawn_with_env(exe, dir, session, &[])
+}
+
+/// [`spawn`] with extra environment for the master (tests: `ACS_RING`,
+/// `ACS_MASTER_REBIND_MS`, `ACS_MASTER_LOG`).
+pub fn spawn_with_env(
+    exe: &Path,
+    dir: &Path,
+    session: &str,
+    env: &[(&str, &str)],
+) -> io::Result<()> {
     let (r, w) = sys::pipe()?;
     let wfd = w.as_raw_fd();
     let mut cmd = Command::new(exe);
@@ -69,6 +80,9 @@ pub fn spawn(exe: &Path, dir: &Path, session: &str) -> io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
@@ -490,12 +504,14 @@ impl Master {
     fn read_conn(&mut self, i: usize, buf: &mut [u8]) {
         let n = match sys::read(self.conns[i].stream.as_raw_fd(), buf) {
             Ok(0) => {
+                mlog!("client closed the connection");
                 self.conns[i].dead = true;
                 return;
             }
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-            Err(_) => {
+            Err(e) => {
+                mlog!("client connection failed: {e}");
                 self.conns[i].dead = true;
                 return;
             }
