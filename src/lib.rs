@@ -9,6 +9,7 @@ pub mod keys;
 pub mod master;
 pub mod modes;
 pub mod proto;
+pub mod proxy;
 pub mod resume;
 pub mod session;
 pub mod ssh;
@@ -59,6 +60,7 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Role::Master => master::main(&args[2..]),
+        Role::Proxy => proxy::main(&args[2..]),
         other => {
             eprintln!("acs: role {other:?} is not implemented yet");
             ExitCode::from(70)

@@ -365,7 +365,9 @@ fn backpressure_engages_for_a_stalled_client() {
     );
     // Do not read for a while: the master must stop reading the pty rather
     // than overwrite what we have not received.
+    a.set_paused(true);
     std::thread::sleep(Duration::from_secs(1));
+    a.set_paused(false);
     a.wait_output("END", Duration::from_secs(30));
     let xs = a.output.iter().filter(|&&b| b == b'x').count();
     assert_eq!(xs, total, "output lost despite backpressure");
