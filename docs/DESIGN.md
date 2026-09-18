@@ -1,6 +1,6 @@
 # acs — design
 
-**Status:** Proposed — design only, nothing built.
+**Status:** In progress — implementation tracked under the beads epic "acs v1".
 
 `acs` replaces the `dsh` shell function (`ssh` + `dtach`) with **one Rust
 binary** that is both the local client and the remote session holder. It keeps
