@@ -31,7 +31,7 @@ usage: acs config show                 the merged configuration and where each v
 
   --global  edit /etc/acs/config.yaml instead of ~/.config/acs/config.yaml
 
-settings: install_on_remote, update_check (true|false)
+settings: install_on_remote, update_check, command_bell (true|false)
 precedence of the ssh key: -i, then the host's identity_file, then the alias's";
 
 /// Settings `get`/`set`/`unset` know: all true or false.

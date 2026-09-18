@@ -317,6 +317,27 @@ fn a_session_ending_during_an_outage_leaves_no_status_behind() {
     assert!(c.echo_on());
 }
 
+#[test]
+fn the_bell_rings_while_the_link_is_down_too() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "ob",
+        "echo up; sleep 30",
+        &[("ACS_BACKOFF_MS", "20000")],
+    );
+    c.wait_for("up", T);
+    remote.cut_link();
+    // The end of the status line (its title has a BEL of its own).
+    c.wait_for("d to detach)\x1b[0m\x1b8", T);
+    c.send(&[0x1d]);
+    std::thread::sleep(Duration::from_millis(50));
+    c.send(&[0x1d]);
+    c.wait_for("\x07", T);
+    c.send(b"d");
+    assert_eq!(c.wait(T), 0);
+}
+
 /// Regression (acs-wxa): the command-key window set with
 /// `ACS_ESCAPE_TIMEOUT_MS` also applies while the link is down.
 #[test]

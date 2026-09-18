@@ -138,6 +138,12 @@ impl Detector {
         }
     }
 
+    /// True while command mode waits for its command key (after the double
+    /// tap, before the key or the timeout).
+    pub fn armed(&self) -> bool {
+        matches!(self.state, State::Command { .. })
+    }
+
     /// The earliest time [`Detector::tick`] must be called.
     pub fn deadline(&self) -> Option<u64> {
         let s = match &self.state {
@@ -528,6 +534,28 @@ mod tests {
             run(&[(0, &[CB, CB, b'D'])], 0),
             (vec![], Some(Action::Detach))
         );
+    }
+
+    #[test]
+    fn armed_from_the_double_tap_until_the_key_or_the_timeout() {
+        let mut d = Detector::new(Config::default());
+        d.feed(&[CB], 0);
+        assert!(!d.armed(), "one press is not command mode");
+        d.feed(&[CB], 100);
+        assert!(d.armed());
+        d.tick(2100);
+        assert!(!d.armed(), "timed out");
+
+        let mut d = Detector::new(Config::default());
+        d.feed(&[CB, CB], 0);
+        assert!(d.armed());
+        d.feed(b"q", 10);
+        assert!(!d.armed(), "an unknown key ends it");
+
+        // Never inside a paste.
+        let mut d = Detector::new(Config::default());
+        d.feed(b"\x1b[200~\x1d\x1d", 0);
+        assert!(!d.armed());
     }
 
     #[test]

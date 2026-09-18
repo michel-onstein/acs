@@ -36,9 +36,10 @@ ssh options (passed to every ssh call):
 
 in a session: Ctrl-] Ctrl-] then  d  detach (session keeps running)
                                   x  exit (ends the session)
+              a bell says it waits for the key (off: command_bell: false)
 
 environment: ACS_DEFAULT_SESSION ACS_IDENTITY ACS_ESCAPE_KEY ACS_ESCAPE_TIMEOUT_MS
-             ACS_SSH ACS_SOCKET_DIR
+             ACS_COMMAND_BELL ACS_SSH ACS_SOCKET_DIR
 
 configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml;
                the <host> of [user@]<host> may be an alias defined there (hosts:)";

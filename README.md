@@ -103,6 +103,12 @@ In a session, press **Ctrl-] Ctrl-]** quickly, then:
 | `d` | detach — the session keeps running; reattach with `acs host session` |
 | `x` | exit — end the session on the remote |
 
+The terminal bell rings when Ctrl-] Ctrl-] has armed command mode, so you
+know the next key is a command (command mode waits 2 seconds for it). acs
+writes the bell to your terminal only, never to the program, and never in
+the middle of a sequence the program is sending. Turn it off with
+`command_bell: false` in the configuration or `ACS_COMMAND_BELL=0`.
+
 A single Ctrl-], or Ctrl-] followed by any other key, goes to the program as
 usual. The command key works in every keyboard encoding a terminal may use
 (including the kitty keyboard protocol) and never triggers inside a paste.
@@ -148,6 +154,7 @@ merge key by key and lists add up, global entries first.
 # ~/.config/acs/config.yaml
 install_on_remote: false   # never install acs on a host (default: true)
 update_check: false        # never look for a newer release (default: true)
+command_bell: false        # no bell when Ctrl-] Ctrl-] arms (default: true)
 hosts:
   devbox:                  # acs devbox
     - host: devbox.lan     # at home: used if it answers a ping
@@ -168,6 +175,7 @@ hosts:
 | --- | --- |
 | `install_on_remote` | install acs on a host that lacks it (default `true`); when `false`, acs says what is missing and exits with 254 |
 | `update_check` | look for a newer acs release once a week (default `true`) |
+| `command_bell` | ring the terminal bell when Ctrl-] Ctrl-] arms command mode (default `true`; `ACS_COMMAND_BELL` overrides it) |
 | `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file` and `reachability_check` (default `true`) — or to a mapping of the alias's own `identity_file` and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
@@ -241,6 +249,7 @@ acs config host list                                  # aliases, hosts and keys
 acs config host remove devbox devbox.lan              # one host, or the alias
 acs config set install_on_remote false
 acs config set update_check false                     # no weekly release check
+acs config set command_bell false                     # no bell for command mode
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default
 acs config show                                       # everything, and where it is from
@@ -260,6 +269,7 @@ reached as `user@config`.
 | `ACS_IDENTITY` | identity shown to others on a shared account |
 | `ACS_ESCAPE_KEY` | command key in `^X` notation (default `^]`) |
 | `ACS_ESCAPE_TIMEOUT_MS` | window for the double press (default 400) |
+| `ACS_COMMAND_BELL` | `0`: no bell when command mode arms; `1`: a bell even if the configuration turns it off |
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |

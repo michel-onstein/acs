@@ -143,6 +143,23 @@ pub(crate) fn escape_config() -> keys::Config {
     cfg
 }
 
+/// Whether arming command mode rings the bell (DESIGN §6.1).
+pub(crate) fn command_bell(config: &crate::config::Config) -> bool {
+    bell_setting(
+        std::env::var("ACS_COMMAND_BELL").ok().as_deref(),
+        config.command_bell.value,
+    )
+}
+
+/// `ACS_COMMAND_BELL` over the configuration: `0` is off, anything else
+/// non-empty on.
+fn bell_setting(env: Option<&str>, config: bool) -> bool {
+    match env {
+        Some(v) if !v.is_empty() => v != "0",
+        _ => config,
+    }
+}
+
 /// Print a message on the terminal outside the session's byte stream.
 /// Works in raw mode too (explicit `\r\n`).
 pub fn note(msg: &str) {
@@ -275,6 +292,10 @@ pub struct State {
     pub attached_once: bool,
     /// A reconnect status line / title is on the terminal (DESIGN §5.4).
     pub status_shown: bool,
+    /// Ring the bell when command mode arms (DESIGN §6.1).
+    pub command_bell: bool,
+    /// A bell waits for the output to reach a boundary.
+    pub bell_pending: bool,
 }
 
 /// How serving a link ended.
@@ -377,6 +398,8 @@ pub fn run(args: ClientArgs) -> u8 {
         identity: identity(),
         attached_once: false,
         status_shown: false,
+        command_bell: command_bell(&args.config),
+        bell_pending: false,
     };
     let mut raw: Option<RawMode> = None;
     let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals);
@@ -466,6 +489,44 @@ fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+/// After feeding or ticking the command detector: ring the bell when
+/// command mode has just armed, and drop a bell still waiting once it is
+/// over (DESIGN §6.1).
+pub fn follow_detector(state: &mut State, was_armed: bool, detector: &Detector) {
+    if !detector.armed() {
+        state.bell_pending = false;
+    } else if !was_armed && state.command_bell {
+        // Only between sequences: a BEL inside the program's OSC would end
+        // it early. Otherwise it goes with the output that gets there.
+        if state.observer.at_boundary() {
+            let _ = sys::write_all(STDOUT, b"\x07");
+        } else {
+            state.bell_pending = true;
+        }
+    }
+}
+
+/// Write session output to the terminal, with a waiting bell at the first
+/// boundary in it.
+fn write_output(state: &mut State, bytes: &[u8]) -> io::Result<()> {
+    if !state.bell_pending {
+        sys::write_all(STDOUT, bytes)?;
+        state.observer.observe(bytes);
+        return Ok(());
+    }
+    let Some(n) = state.observer.observe_to_boundary(bytes) else {
+        return sys::write_all(STDOUT, bytes);
+    };
+    state.bell_pending = false;
+    let mut buf = Vec::with_capacity(bytes.len() + 1);
+    buf.extend_from_slice(&bytes[..n]);
+    buf.push(0x07);
+    buf.extend_from_slice(&bytes[n..]);
+    sys::write_all(STDOUT, &buf)?;
+    state.observer.observe(&bytes[n..]);
+    Ok(())
+}
+
 /// Send INPUT for bytes the user typed.
 fn queue_input(state: &mut State, out: &mut Vec<u8>, bytes: &[u8]) {
     for chunk in bytes.chunks(proto::MAX_CHUNK) {
@@ -500,6 +561,8 @@ fn serve(
     let mut out = Msg::Hello(hello(args, state, args.force)).to_bytes();
     let mut buf = vec![0u8; 64 * 1024];
     let mut detector = Detector::new(escape_config());
+    // A bell waiting from an earlier link's command mode is moot.
+    state.bell_pending = false;
     let mut welcomed = false;
     let mut exiting = false;
     let mut liveness = crate::reconnect::Liveness::new();
@@ -603,12 +666,10 @@ fn serve(
                     // Skip anything we already wrote (never expected).
                     let skip = state.offset.saturating_sub(offset) as usize;
                     if skip < bytes.len() {
-                        let new = &bytes[skip..];
-                        if sys::write_all(STDOUT, new).is_err() {
+                        if write_output(state, &bytes[skip..]).is_err() {
                             link.close();
                             return Outcome::Exit(code::ERROR);
                         }
-                        state.observer.observe(new);
                         state.offset = offset + bytes.len() as u64;
                     }
                 }
@@ -694,13 +755,17 @@ fn serve(
                     return Outcome::Exit(code::DETACHED);
                 }
                 Ok(n) => {
+                    let was = detector.armed();
                     let o = detector.feed(&buf[..n], sys::now_ms());
+                    follow_detector(state, was, &detector);
                     queue_input(state, &mut out, &o.forward);
                     action = o.action;
                 }
             }
         } else if detector.deadline().is_some_and(|d| sys::now_ms() >= d) {
+            let was = detector.armed();
             let o = detector.tick(sys::now_ms());
+            follow_detector(state, was, &detector);
             queue_input(state, &mut out, &o.forward);
         }
         match action {
@@ -758,5 +823,19 @@ fn serve(
             ));
             return Outcome::Exit(code::UNREACHABLE);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_environment_decides_the_bell_over_the_configuration() {
+        assert!(bell_setting(None, true));
+        assert!(!bell_setting(None, false));
+        assert!(bell_setting(Some(""), true), "empty is unset");
+        assert!(!bell_setting(Some("0"), true));
+        assert!(bell_setting(Some("1"), false));
     }
 }
