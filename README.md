@@ -7,8 +7,7 @@ reporting, OSC 52 copy, hyperlinks and keyboard protocols work exactly as over
 plain `ssh -t`. One binary is both the local client and the remote session
 holder; it installs itself on the remote the first time you connect.
 
-It replaces the `dsh` shell function (`ssh` + `dtach`). The design is in
-[docs/DESIGN.md](docs/DESIGN.md).
+The design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Install
 
@@ -35,8 +34,20 @@ not on it, and running it again upgrades in place. It needs `curl` or
 | `ACS_VERSION=0.2.0` | install that release instead of the latest |
 | `ACS_INSTALL_DIR=~/bin` | put the binary itself in that directory |
 
-for example `curl -fsSL …/install.sh | ACS_VERSION=0.2.0 sh`. By hand, the
-archives are on [Releases](https://github.com/michel-onstein/acs/releases):
+for example `curl -fsSL …/install.sh | ACS_VERSION=0.2.0 sh`.
+
+With [Homebrew](https://brew.sh) (macOS, or Homebrew on Linux):
+
+```sh
+brew install michel-onstein/acs/acs
+```
+
+installs the same build from the tap
+[michel-onstein/homebrew-acs](https://github.com/michel-onstein/homebrew-acs),
+which every release updates; upgrade it with `brew upgrade acs`.
+
+By hand, the archives are on
+[Releases](https://github.com/michel-onstein/acs/releases):
 
 ```sh
 v=0.2.0 t=aarch64-apple-darwin      # see the release page for the latest
@@ -69,7 +80,9 @@ acs upgrade --version 0.2.0   # that release, even an older one
 acs replaces itself in place (a link like `~/.local/bin/acs` is pointed at
 the new version); if its directory is not yours, it says to use
 `sudo acs upgrade`. It uses `curl` (or `wget`). Remote hosts need nothing:
-the next connection installs the new version there.
+the next connection installs the new version there. An acs installed with
+Homebrew is brew's to replace: `acs upgrade` says to run
+`brew upgrade acs` instead.
 
 Once a week acs looks for a newer release in the background (it never
 delays connecting) and, if there is one, says so once when you next start
@@ -79,8 +92,9 @@ it:
 acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
 ```
 
-Offline, it says nothing. Turn it off with `ACS_NO_UPDATE_CHECK=1` or
-`update_check: false` in the configuration.
+(with Homebrew, `run: brew upgrade acs`). Offline, it says nothing. Turn it
+off with `ACS_NO_UPDATE_CHECK=1` or `update_check: false` in the
+configuration.
 
 Nothing is needed on the remote beyond ssh, a POSIX `sh` and `gzip`: on first
 contact acs installs its own version under `~/.local/share/acs/<version>/`
@@ -92,6 +106,7 @@ and links `~/.local/bin/acs` to it.
 acs [ssh options] [user@]host [session]   attach, or create (default session: main)
 acs [ssh options] [user@]host --new       create a new numbered session (1, 2, …)
 acs [ssh options] [user@]host --list      list sessions on host
+acs [ssh options] --list                  list sessions on every host alias
 acs host session -- command args…         run a command instead of the login shell
 ```
 
@@ -102,6 +117,12 @@ In a session, press **Ctrl-] Ctrl-]** quickly, then:
 | `d` | detach — the session keeps running; reattach with `acs host session` |
 | `x` | exit — end the session on the remote |
 
+The terminal bell rings when Ctrl-] Ctrl-] has armed command mode, so you
+know the next key is a command (command mode waits 2 seconds for it). acs
+writes the bell to your terminal only, never to the program, and never in
+the middle of a sequence the program is sending. Turn it off with
+`command_bell: false` in the configuration or `ACS_COMMAND_BELL=0`.
+
 A single Ctrl-], or Ctrl-] followed by any other key, goes to the program as
 usual. The command key works in every keyboard encoding a terminal may use
 (including the kitty keyboard protocol) and never triggers inside a paste.
@@ -110,9 +131,11 @@ usual. The command key works in every keyboard encoding a terminal may use
 
 `-i <identity_file>`, `-p <port>`, `-J <jump>`, `-F <config>` and
 `-o <option=value>` are passed to every ssh call acs makes, with ssh's
-meaning. `-l` is `--list` (as in `dsh`); put a login name in `user@host` or
-`-o User=`. Your `~/.ssh/config`, agent and keys apply as usual; nothing
-needs configuring on either side.
+meaning. `-l` is `--list`, not ssh's login option: put a login name in
+`user@host` or `-o User=`. Your `~/.ssh/config`, agent and keys apply as
+usual; nothing needs configuring on either side. A key can also be set per
+host alias in the configuration (`identity_file`, below); `-i` on the
+command line wins.
 
 ### When the network drops
 
@@ -146,6 +169,7 @@ merge key by key and lists add up, global entries first.
 # ~/.config/acs/config.yaml
 install_on_remote: false   # never install acs on a host (default: true)
 update_check: false        # never look for a newer release (default: true)
+command_bell: false        # no bell when Ctrl-] Ctrl-] arms (default: true)
 hosts:
   devbox:                  # acs devbox
     - host: devbox.lan     # at home: used if it answers a ping
@@ -154,13 +178,20 @@ hosts:
   nas:
     - host: nas.lan
       reachability_check: false   # it drops pings: use it unchecked
+  lab:                     # an alias with a setting of its own
+    identity_file: ~/.ssh/id_lab  # the key for every host below…
+    hosts:
+      - host: lab.lan
+      - host: lab.example.com
+        identity_file: ~/.ssh/id_lab_outside   # …but this one
 ```
 
 | Setting | Meaning |
 | --- | --- |
 | `install_on_remote` | install acs on a host that lacks it (default `true`); when `false`, acs says what is missing and exits with 254 |
 | `update_check` | look for a newer acs release once a week (default `true`) |
-| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user` and `reachability_check` (default `true`) |
+| `command_bell` | ring the terminal bell when Ctrl-] Ctrl-] arms command mode (default `true`; `ACS_COMMAND_BELL` overrides it) |
+| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file` and `reachability_check` (default `true`) — or to a mapping of the alias's own `identity_file` and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -177,7 +208,48 @@ The alias is resolved again on every reconnect, so when you move from home
 to outside, the redial goes to whichever address answers. List ways of
 reaching **one** machine under an alias: the session lives on that machine,
 so a fallback to a different one finds no session to resume.
-`me@devbox`, or any name that is not an alias, is used as given.
+
+`acs root@devbox` goes through the alias the same way, logging in as `root`
+on whichever host is chosen (instead of `michel` on the fallback), and keeps
+`root` on every redial. Any name that is not an alias, with or without a
+`user@`, is used as given. To reach a machine whose name is also an alias,
+use its full name or address (`acs devbox.example.com`).
+
+### Which ssh key
+
+`identity_file` picks the key acs passes to ssh as `-i`, for one host entry
+or for a whole alias. The first of these wins, and only that one is passed:
+
+1. `-i` (or `-o IdentityFile=`) on the command line;
+2. the chosen host entry's `identity_file`;
+3. the alias's `identity_file`.
+
+With none of them, ssh picks the key as usual (`~/.ssh/config`, the agent).
+A leading `~/` means your home directory. The key follows the entry: a
+reconnect that falls back to another host of the alias uses that host's
+key. ssh still offers its other keys after this one unless you set
+`IdentitiesOnly yes`. Your own file can set just the key of an alias whose
+hosts are in the global file (`lab: {identity_file: ~/.ssh/mine}`).
+
+### Sessions on every host
+
+`acs --list` without a host lists the sessions on every alias at once:
+
+```text
+HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
+devbox  main  attached  michel@mbp    3s    2h   /bin/zsh -l
+devbox  work  detached  (michel@mbp)  4m    1d   htop
+no sessions on nas
+acs: pi: no host for 'pi' is reachable (tried pi.lan)
+```
+
+Each alias is resolved as above and all are asked in parallel, so a host
+that is down or slow only costs its own line — on stderr, after at most 30 s
+(`ACS_DIAL_TIMEOUT_MS`). The exit status is 0 when every host answered and
+255 when any did not. Several ssh cannot ask for passwords on one terminal,
+so these calls run with ssh's `BatchMode`: list a host that needs a password
+on its own, with `acs <alias> --list`. With no aliases configured, it says so
+and exits with 2.
 
 ### Editing it from the command line
 
@@ -185,10 +257,14 @@ so a fallback to a different one finds no session to resume.
 acs config host add devbox devbox.lan                 # the first host of devbox
 acs config host add devbox devbox.example.com --user michel
 acs config host add nas nas.lan --no-reachability-check
-acs config host list                                  # aliases and their hosts
+acs config host add lab lab.lan --identity-file ~/.ssh/id_lab_home
+acs config host set lab identity_file ~/.ssh/id_lab   # the alias's key
+acs config host unset lab identity_file
+acs config host list                                  # aliases, hosts and keys
 acs config host remove devbox devbox.lan              # one host, or the alias
 acs config set install_on_remote false
 acs config set update_check false                     # no weekly release check
+acs config set command_bell false                     # no bell for command mode
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default
 acs config show                                       # everything, and where it is from
@@ -208,10 +284,11 @@ reached as `user@config`.
 | `ACS_IDENTITY` | identity shown to others on a shared account |
 | `ACS_ESCAPE_KEY` | command key in `^X` notation (default `^]`) |
 | `ACS_ESCAPE_TIMEOUT_MS` | window for the double press (default 400) |
+| `ACS_COMMAND_BELL` | `0`: no bell when command mode arms; `1`: a bell even if the configuration turns it off |
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
-| `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial) |
+| `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial and for each host of `acs --list`) |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |
@@ -228,6 +305,7 @@ scripts/e2e_ssh.sh      # end to end over real ssh against a container host
 scripts/test_install.sh # install.sh against the real releases, here and in containers
 scripts/version-bump.sh # release the next version and publish its binaries
 scripts/release-binaries.sh  # (re)publish a tag's binaries to GitHub Releases
+scripts/update-tap.sh vX.Y.Z # point the Homebrew tap at a release
 ```
 
 Results of the checks that need a real terminal are in

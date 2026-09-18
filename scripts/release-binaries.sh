@@ -3,13 +3,15 @@
 # builds `cargo xtask dist` from the exact tag in a throwaway worktree,
 # packages one archive per target with SHA256SUMS, the one-line installer
 # (scripts/install.sh) and notes, and creates the release (or replaces its
-# assets if it exists).
+# assets if it exists). Then points the Homebrew tap at it
+# (scripts/update-tap.sh; ACS_NO_TAP=1 skips that).
 #
 #   scripts/release-binaries.sh [vX.Y.Z] [--dry-run]
 #
 # The tag defaults to the newest vX.Y.Z on origin. Needs gh with access to the
-# repository (GH_TOKEN works), cargo-zigbuild and zig. --dry-run builds and
-# packages but uploads nothing, and prints where the assets are.
+# repository and the tap (GH_TOKEN works), cargo-zigbuild and zig. --dry-run
+# builds and packages but uploads nothing, prints where the assets are and
+# shows what the tap would get.
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
@@ -57,10 +59,12 @@ echo "== packaging"
 cargo xtask package --dist "$work/dist" --version "$version" --out "$work/assets" \
     --readme "$work/src/README.md" --installer "$work/src/scripts/install.sh" \
     --changes "$work/changes.md" >/dev/null
+cargo xtask formula --version "$version" --sums "$work/assets/SHA256SUMS" --out "$work/acs.rb"
 
 if [ "$dry" = 1 ]; then
     echo "dry run: assets in $work/assets"
     ls -l "$work/assets"
+    [ -n "${ACS_NO_TAP:-}" ] || scripts/update-tap.sh "$work/acs.rb" --dry-run
     exit 0
 fi
 
@@ -74,3 +78,10 @@ else
         --verify-tag --title "acs $version" --notes-file "$work/assets/NOTES.md"
 fi
 gh release view "$tag" --json url -q .url
+
+[ -z "${ACS_NO_TAP:-}" ] || exit 0
+echo "== updating the Homebrew tap"
+scripts/update-tap.sh "$work/acs.rb" || {
+    echo "the release is published but the tap is not: retry with scripts/update-tap.sh $tag" >&2
+    exit 1
+}

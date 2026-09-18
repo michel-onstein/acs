@@ -139,7 +139,8 @@ lives in the master and the client.
   makes it explicit).
 - `ControlMaster=no`, `ControlPath=none`: the session gets its own TCP
   connection, so a reconnect never waits on a dead multiplexer. Side commands
-  (`--list`, install) keep using the user's multiplexing.
+  (`--list`, install) keep using the user's multiplexing; `acs --list` on
+  every alias adds `BatchMode=yes` and `ConnectTimeout=10` (§7.3).
 - `ServerAliveInterval=0`: liveness is ours (§5.3), much faster than ssh's.
 - `ConnectTimeout=10`: a redial into a dead network fails fast and the
   client returns to its backoff wait, where `d` still detaches (§6.1).
@@ -254,6 +255,7 @@ know anything:
 | `acs <host> <name>` | `<name>` — attach, or create it if absent |
 | `acs <host> --new` | a new session named with the lowest free number: `1`, `2`, … (picked under the directory lock, so two `--new`s never collide) |
 | `acs <host> --list` | list sessions: name, attached/detached, idle time, command |
+| `acs --list` | the same for every host alias at once, with a HOST column (§7.3) |
 
 So the unnamed case is covered two ways: plain `acs <host>` always means
 `main`, which you never have to remember, and `--new` gives short numeric
@@ -273,7 +275,8 @@ terminal is restored:
 - Inside the session `ACS_SESSION=<name>` is set, so the shell prompt or
   `echo $ACS_SESSION` can show it.
 
-If you still lose track, `acs <host> --list` tells you. With exactly one
+If you still lose track, `acs <host> --list` tells you, and `acs --list`
+does for every host in the configuration. With exactly one
 session, `acs <host>` is still `main`, not "whatever is there" — the default
 never depends on what else happens to exist.
 
@@ -442,7 +445,7 @@ lossless resume will not repaint it. So:
 | --- | --- |
 | Ctrl-] | Held for up to **400 ms**. If nothing else arrives, it is sent to the remote. |
 | Ctrl-] then any other key within 400 ms | Both keys sent to the remote, in order, immediately. |
-| Ctrl-] Ctrl-] within 400 ms | Enter command mode: the next key is a command. |
+| Ctrl-] Ctrl-] within 400 ms | Enter command mode: the next key is a command. The terminal bell rings. |
 | … then `d` | **Detach.** `DETACH` to the master, restore the local terminal, exit 0. The session keeps running. Works even while the link is down (it is purely local then). |
 | … then `x` | **Exit.** `KILL` to the master, wait for `EXIT`, restore the terminal, exit with the child's status. Needs the link; if it is down the client says so and stays in the session. |
 | … then any other key, or nothing for 2 s | All the held keys are sent to the remote as typed. |
@@ -450,10 +453,35 @@ lossless resume will not repaint it. So:
 The only cost is that a lone Ctrl-] reaches the remote up to 400 ms late. The
 window is a setting (`ACS_ESCAPE_TIMEOUT_MS`), and so is the key.
 
-Command mode prints nothing on the screen: the local terminal shows only what
-the remote sent. The table is intended to grow — `r` (force redraw) and `?`
-(help, followed by a redraw) are obvious next entries — but only `d` and `x`
-are in scope.
+Command mode prints nothing on the screen — it only rings the bell (below):
+the local terminal shows only what the remote sent. The table is intended to
+grow — `r` (force redraw) and `?` (help, followed by a redraw) are obvious
+next entries — but only `d` and `x` are in scope.
+
+**The bell.** Entering command mode rings the terminal bell (`BEL`, `0x07`),
+so the user knows the next key is a command. It is on by default;
+`command_bell: false` (§7.2) turns it off, and `ACS_COMMAND_BELL` overrides
+the file (`0` off, `1` on). The bell does not break the transparent stream:
+
+- The client writes it to the **local terminal**, as it writes the status
+  line (§5.4). Nothing is added to the program's input, and the output bytes
+  are unchanged — the bell goes between them.
+- It goes only at a **boundary** of the output: not inside an escape
+  sequence, not inside a UTF-8 character, and above all not inside an
+  OSC/DCS/APC/PM/SOS string, which a `BEL` would end early (an unfinished
+  title or OSC 52 copy would be cut short). The mode observer (§6.4) already
+  lexes the output and knows where it is. If the output is inside such a
+  sequence, the bell waits and is written as soon as the output reaches a
+  boundary — right after the ST or `BEL` that ends the string. It is dropped
+  if command mode ends first (a key, or the 2 s timeout), so a late bell never
+  announces a command mode that is over.
+- It rings only when command mode arms and then waits: Ctrl-] Ctrl-] and the
+  command key arriving in one read (a paste without bracketed paste, or
+  typed faster than the terminal is read) need no announcement. Inside a
+  bracketed paste the escape key is never recognised (§6.3), so it never
+  rings there.
+- The same holds while the link is down (§5.4), where the offline wait arms
+  command mode with the same detector.
 
 ### 6.2 Is Ctrl-] a good choice?
 
@@ -523,7 +551,8 @@ nothing, because the terminal state is still correct.
 
 - Argument parsing matches `dsh`: `acs [ssh options] [user@]<host> [session]
   [-l|--list] [--new] [--no-reconnect] [-- command…]` (§4.4, §7.1). `-r` is
-  accepted and ignored, since reconnecting is the default.
+  accepted and ignored, since reconnecting is the default. `--list` is the
+  one form without a host: it then lists every alias (§7.3).
 - `cfmakeraw`-equivalent `termios` (dtach's flags), restored on every exit
   path: normal, signal (`SIGHUP`, `SIGTERM`, `SIGINT` before raw mode), and
   panic (`panic = "abort"` plus a restore in a drop guard and a signal handler).
@@ -556,6 +585,11 @@ reconnects, `--list` and remote install — so a host reachable as
 - `acs` does not interpret these values (a `~` in `-i` is expanded by ssh, as
   usual). `ACS_SSH` or `--ssh <path>` picks the ssh binary; default is `ssh`
   on `PATH`.
+- **A key from the configuration**: an alias or one of its entries may name
+  an `identity_file` (§7.2, §7.3), which `acs` passes as `-i` after the
+  user's options — but only when those name no key, neither `-i` nor
+  `-o IdentityFile` (any case, `=` or space): a key on the command line
+  replaces the configured one rather than being tried alongside it.
 - **Precedence**: ssh keeps the *first* value it sees for an option, so `acs`
   places the options its transport depends on (§3: `-T`, `-e none`,
   `ControlMaster=no`, `ControlPath=none`, `ServerAliveInterval=0`) **before**
@@ -575,17 +609,24 @@ Directory spec; either may be missing:
 ```yaml
 install_on_remote: true        # install acs on a host that lacks it (§8)
 update_check: true             # look for a newer release once a week (§7.6)
+command_bell: true             # ring the bell when command mode arms (§6.1)
 hosts:                         # aliases: acs devbox tries these in order
   devbox:
     - host: devbox.lan
       reachability_check: true # ping once first (the default)
     - host: devbox.example.com
       user: michel             # otherwise ~/.ssh/config decides
+      identity_file: ~/.ssh/id_outside # this host's ssh key (-i)
+  lab:                         # an alias with settings of its own
+    identity_file: ~/.ssh/id_lab # the key of every host naming none
+    hosts:
+      - host: lab.lan
 ```
 
-- **Merging**: a setting in the local file replaces the global one; mappings
-  (`hosts`) merge key by key; lists (an alias's hosts) concatenate, global
-  entries first. An empty value (`key:`) sets nothing.
+- **Merging**: a setting in the local file replaces the global one — an
+  alias's `identity_file` too; mappings (`hosts`) merge key by key; lists (an
+  alias's hosts) concatenate, global entries first. An empty value (`key:`)
+  sets nothing.
 - **Errors are not defaults**: a malformed file, an unknown key or a value of
   the wrong type stops the client with the file and line
   (`~/.config/acs/config.yaml:3: install_on_remote: expected true or false`).
@@ -593,9 +634,18 @@ hosts:                         # aliases: acs devbox tries these in order
 - **`install_on_remote: false`**: when the prelude reports `ACS-NEED` (§8)
   the client installs nothing; it says which host lacks which version, where
   the setting came from, and exits with the install-failed code (254).
-- `hosts` is parsed and validated: `host` is required, `user` and
-  `reachability_check` (default `true`) are optional, and one entry may be
-  written without the list. How an alias is resolved is §7.3.
+- `hosts` is parsed and validated: `host` is required, `user`,
+  `identity_file` and `reachability_check` (default `true`) are optional,
+  and one entry may be written without the list. How an alias is resolved is
+  §7.3.
+- **An alias's own settings**: an alias is a list of entries (or one entry,
+  a mapping with `host`), or a mapping of its settings — `identity_file` —
+  and its `hosts`, that list. The list form stays the usual one; the mapping
+  is only needed for a setting shared by the entries. A file may give the
+  mapping without `hosts`, to set the key of an alias whose hosts are in the
+  other file, but an alias with no host in either is an error (at its first
+  definition). An `identity_file` is one path, not a list: several keys are
+  a job for `~/.ssh/config`.
 - Only the local client reads the files; `_proxy`, `_master` and `_install`
   never do.
 
@@ -611,8 +661,8 @@ build 490 → 507 KB).
 
 ### 7.3 Host aliases
 
-`acs <name>`, where `<name>` has no `user@` part and is a key of `hosts`
-(§7.2), connects to one of the alias's entries instead of `<name>`:
+`acs [user@]<name>`, where `<name>` is a key of `hosts` (§7.2), connects to
+one of the alias's entries instead of `<name>`:
 
 - Entries are tried **in order**. One with `reachability_check: true` (the
   default) is pinged once — `ping -c 1` with a 2 s deadline, spelled `-t` on
@@ -622,20 +672,77 @@ build 490 → 507 KB).
   ICMP.
 - The chosen entry becomes the ssh destination: `user@host` if it has a
   `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
+- **`user@<alias>`** goes through the alias the same way — same order, same
+  pings, same fallback — and logs in as `user` on whichever entry is chosen,
+  replacing the entry's own `user`. The destination is split at its **last**
+  `@`, as ssh splits it (`a@b@devbox` is user `a@b`); an alias cannot
+  contain `@` (§7.2), so the split is never ambiguous. `-v` says the login
+  name came from the command line.
+- **The ssh key** is the first of: a key on the command line (`-i` or
+  `-o IdentityFile`, §7.1), the chosen entry's `identity_file`, the alias's
+  `identity_file`. Only that one is passed; with none, ssh chooses as usual
+  (`~/.ssh/config`, the agent). A leading `~/` (or a bare `~`) is expanded
+  with `$HOME` by `acs`, as the shell expands a typed `-i`; `~user/…` and
+  relative paths go to ssh as written (ssh tilde-expands `-i` itself, from
+  the password database rather than `$HOME`). `-v` names the key and where
+  it was set, or says the command line's replaces it. ssh still offers the
+  agent's and its default keys after it unless `IdentitiesOnly` is set.
 - **None answers**: the client names every host it tried and exits with the
   unreachable code (255) without calling ssh.
 - It applies to every ssh call — the session, `--list`, install — since they
-  share one destination. `-v` says which entry was chosen and why.
+  share one destination and key. `-v` says which entry was chosen and why.
 - **Redial**: a reconnect (§5.3) resolves the alias again, so after a network
   change the client reaches the host through whichever address answers now.
   A change of host is always shown (`devbox: now using … (was …)`). The
   session is found only if the new address is the **same machine**: entries
   of one alias should be ways to reach one host; if they are different
-  machines, the redial reports that the session has ended.
-- Messages and the `reattach with: acs <name>` hints use the alias, not the
-  resolved host.
-- A name that is not an alias behaves exactly as before; so does
-  `user@<alias>`, which is a way to reach a host whose name is also an alias.
+  machines, the redial reports that the session has ended. A redial of
+  `user@<alias>` keeps the user; the key follows the entry, so a redial onto
+  a fallback host uses that host's key (or the alias's).
+- Messages and the `reattach with: acs <name>` hints use the name as given
+  (`devbox`, `me@devbox`), not the resolved host.
+- A name that is not an alias, with or without `user@`, behaves exactly as
+  before.
+- **A host whose name is also an alias** is reached by another name for it —
+  its FQDN or address (`acs devbox.example.com`). To keep a `~/.ssh/config`
+  `Host devbox` in play, list it in the alias (`- host: devbox`): an entry's
+  `host` goes to ssh as is and is never itself resolved as an alias.
+
+**Every alias at once.** `acs [ssh options] --list` without a host lists the
+sessions on every alias of the configuration (`list.rs`):
+
+```text
+HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
+devbox  main  attached  michel@mbp    3s    2h   /bin/zsh -l
+devbox  work  detached  (michel@mbp)  4m    1d   htop
+no sessions on nas
+no sessions on pi (acs 0.4.0 is not installed there)
+acs: lab: no host for 'lab' is reachable (tried lab.lan)
+```
+
+- Each alias is resolved as above, pings and fallbacks included, and asked
+  with the same `_proxy --list` side call as `acs <alias> --list`. The
+  aliases are asked **in parallel**, a thread each, so a slow or dead host
+  holds up only its own line; each has the redial's answer limit (§5.3:
+  30 s, `ACS_DIAL_TIMEOUT_MS`) for the whole exchange, not only for the
+  marker. (`acs <host> --list` bounds its whole exchange the same way, with
+  the first connection's 120 s.)
+- **No prompts**: several ssh cannot share the terminal for a password or a
+  host key, so these calls put `-o BatchMode=yes -o ConnectTimeout=10`
+  before the user's options (`ssh::BATCH_OPTS`). A host that needs a
+  password fails here and is listed on its own with `acs <alias> --list`.
+- **Output**: one table with the alias in a HOST column, in configuration
+  order, then a line for each alias with no sessions or without acs of this
+  version, on stdout. An alias that could not be asked gets an
+  `acs: <alias>: <why>` line on stderr, not a failed command.
+- **Exit status**: 0 when every host answered — one without acs answered,
+  as it does for `acs <host> --list` — and the unreachable code (255) when
+  any did not. With no aliases configured there is nothing to list: it says
+  how to add one and exits with the usage code (2).
+- **Spawns are serialized** (`sys::spawn`): without `pipe2` (macOS) the
+  standard library marks a child's pipes close-on-exec only after creating
+  them, and a child another thread forks in between would hold one host's
+  pipe open, so that host's list would not end until the other child did.
 
 ### 7.4 `acs config`
 
@@ -645,10 +752,11 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`); `set` checks the type |
-| `host list` | every alias and its hosts, in the order they are tried, with where each is defined |
-| `host add <alias> <host> [--user U] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
-| `host remove <alias> [<host>]` | remove one host (the alias goes with its last one), or the alias |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`); `set` checks the type |
+| `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
+| `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
+| `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
+| `host set <alias> identity_file <K>` / `host unset <alias> identity_file` | the alias's own key (§7.3); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` turns it back into a list |
 | `path` | the two files and whether they exist |
 
 - Edits go to the local file; `--global` edits the global one (and needs
@@ -658,6 +766,9 @@ their YAML shape:
   written as two spaces. The result is parsed and validated again before it
   replaces the file (atomically, keeping its mode), so an edit never saves a
   file the client would refuse — nor overwrites one that is already broken.
+  It is also checked merged with the other file, so the hosts under an
+  alias's key in one file cannot be removed from the other; `host set` on an
+  alias that has no host yet says to add one first.
 - Removing something that lives in the other file fails with a pointer to it
   (`it is set in /etc/acs/config.yaml:1 (use --global)`).
 - `config` is a reserved **first** argument (as is `upgrade`, §7.5). A host
@@ -695,6 +806,12 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   `~/.local/bin/acs`, `/usr/local/bin/acs`, `acs` on `PATH`) are repointed.
   The old version stays: clients of that version may still use it on this
   host, and `prune.rs` removes it once unused.
+- **Homebrew**: a binary whose real path is in a keg —
+  `<prefix>/Cellar/acs/<version>/bin/acs`, for `/opt/homebrew`, `/usr/local`
+  or `/home/linuxbrew/.linuxbrew` — is brew's to replace, and replacing it
+  behind brew's back would leave brew's records wrong. `acs upgrade` refuses
+  before any download (exit 1) with `upgrade it with: brew upgrade acs`;
+  `--check` still reports, naming that command (`upgrade::brewed`).
 - **macOS**: a curl download carries no quarantine attribute, and the
   ad-hoc signature is part of the file, so it still verifies after the
   rename (VERIFICATION.md).
@@ -719,6 +836,7 @@ acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
   `SHA256SUMS` the way `acs upgrade` does (§7.5), with curl's 3 s limit, and
   writes the version it found. A later start shows the message on stderr,
   before raw mode and outside the session stream, **once per new version**.
+  For a Homebrew install (§7.5) it ends `run: brew upgrade acs`.
 - **State** is `$XDG_STATE_HOME/acs/update-check` (default
   `~/.local/state/acs/update-check`): `checked=<unix time>`,
   `latest=<version>`, `shown=<version>`. It is a cache — unreadable or
@@ -736,7 +854,10 @@ The one-line installer (`scripts/install.sh`, published with every release;
 README "Install") uses the same layout — `~/.local/share/acs/<version>/acs`,
 or `/usr/local/lib/acs/<version>/acs` as root — so a host set up with it
 serves clients of that version without an upload. It is also what the client
-suggests when `install_on_remote` is off (§7.2).
+suggests when `install_on_remote` is off (§7.2). Homebrew
+(`brew install michel-onstein/acs/acs`, docs/VERSIONING.md) installs the same
+complete release binary into its own keg, which the prelude below does not
+look in: a client reaching a brewed host installs its version as usual.
 
 Remote binaries are installed **per version**:
 `~/.local/share/acs/<version>/acs`. A client always runs exactly its own
@@ -885,7 +1006,7 @@ src/
   session.rs    session names, per-uid socket directory, locks
   proxy.rs      acs _proxy: connect-or-spawn, relay, --list
   master.rs     acs _master: pty, child, ring, protocol
-  list.rs       --list table
+  list.rs       --list table, for one host or every alias in parallel
   config.rs     configuration files: locations, merging, validation
   config_cmd.rs acs config: show, get/set/unset, host list/add/remove
   release.rs    published releases: SHA256SUMS, versions, curl downloads

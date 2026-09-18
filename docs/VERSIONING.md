@@ -1,7 +1,8 @@
 # Versioning
 
-**Status:** Built — `scripts/version-bump.sh` (`cargo xtask bump`) and
-`scripts/release-binaries.sh` (`cargo xtask package`).
+**Status:** Built — `scripts/version-bump.sh` (`cargo xtask bump`),
+`scripts/release-binaries.sh` (`cargo xtask package`) and
+`scripts/update-tap.sh` (`cargo xtask formula`).
 
 acs follows semantic versioning, and the version moves **automatically** after
 every merge to `main`. The version lives in `Cargo.toml` (and so in
@@ -84,6 +85,38 @@ publish an existing tag again: it replaces the assets). It builds from the
 exact tag in a throwaway worktree, needs `gh` with access to the repository
 (`GH_TOKEN` works), `cargo-zigbuild` and `zig`, and `--dry-run` builds and
 packages without uploading. `ACS_NO_PUBLISH=1` makes the bump skip it.
+
+## Homebrew
+
+The tap [michel-onstein/homebrew-acs](https://github.com/michel-onstein/homebrew-acs)
+holds one formula, `Formula/acs.rb`, so `brew install michel-onstein/acs/acs`
+installs acs on macOS and on Homebrew for Linux. It installs the **release
+archive** for the machine (`on_macos` / `on_linux`, `on_arm` / `on_intel`,
+each with its SHA-256 from `SHA256SUMS`) rather than building from source: the
+release binaries are the complete builds, which install acs on any Linux
+remote (DESIGN §8.1); a `cargo build` from source would be slim. Its test runs
+`acs --version` and checks the version and that the Linux payloads are there.
+
+The release keeps it current. After publishing, `scripts/release-binaries.sh`
+renders the formula from the release's `SHA256SUMS`
+(`cargo xtask formula --version X.Y.Z --sums SHA256SUMS --out acs.rb`) and
+`scripts/update-tap.sh` commits it to the tap as `acs X.Y.Z` and pushes:
+
+- it clones the tap into a temporary directory and pushes with `gh`'s token
+  (`GH_TOKEN` works), set as the credential helper of that clone only;
+- a formula that is already there does nothing, and one older than the tap's
+  (an old tag published again) is left out, so the tap never moves back;
+- `--dry-run` shows the change without committing; the release's own
+  `--dry-run` runs it that way, and `ACS_NO_TAP=1` skips the tap altogether;
+- `scripts/update-tap.sh vX.Y.Z` renders and pushes that release's formula
+  from its published `SHA256SUMS` — the way to retry if the push failed
+  after the release was published. `ACS_TAP_REPO` points it at another
+  repository (the tests use a local one).
+
+The formula is generated: change `xtask/src/formula.rs`, not the tap. A
+Homebrew install is brew's to replace — its real path is in a `Cellar` —
+so `acs upgrade` refuses and says `brew upgrade acs`, and so does the weekly
+update message (DESIGN §7.5, §7.6).
 
 ## Options
 

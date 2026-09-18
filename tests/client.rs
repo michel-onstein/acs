@@ -12,10 +12,14 @@ fn sh(cmd: &str) -> Vec<String> {
 }
 
 fn start(remote: &Remote, session: &str, cmd: &str) -> Client {
+    start_env(remote, session, cmd, &[])
+}
+
+fn start_env(remote: &Remote, session: &str, cmd: &str, env: &[(&str, &str)]) -> Client {
     let mut args = vec!["devbox".to_string(), session.to_string()];
     args.extend(sh(cmd));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    Client::start(remote, &args)
+    Client::start_env(remote, &args, env)
 }
 
 #[test]
@@ -187,4 +191,74 @@ fn failing_transport_is_unreachable() {
     let mut c = Client::start_env(&remote, &["--transport-cmd", "false", "devbox"], &[]);
     assert_eq!(c.wait(T), 255);
     c.wait_for("closed before acs started", T);
+}
+
+/// Ctrl-] Ctrl-] typed as a person does: two presses, apart.
+fn double_tap(c: &Client) {
+    c.send(&[0x1d]);
+    std::thread::sleep(Duration::from_millis(50));
+    c.send(&[0x1d]);
+}
+
+#[test]
+fn arming_command_mode_rings_the_bell() {
+    let remote = Remote::installed();
+    let mut c = start(&remote, "bell", "echo started; sleep 30");
+    c.wait_for("started", T);
+    assert!(!c.output().contains(&0x07));
+    double_tap(&c);
+    c.wait_for("\x07", T);
+    c.send(b"d");
+    assert_eq!(c.wait(T), 0);
+    c.wait_for("detached from devbox/bell", T);
+}
+
+#[test]
+fn the_bell_setting_and_its_environment_override() {
+    let cfg = acs::testutil::TempDir::new();
+    let off = config_env(cfg.path(), "command_bell: false\n");
+    let off: Vec<(&str, &str)> = off.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let cases: [(Vec<(&str, &str)>, bool); 3] = [
+        (off.clone(), false),
+        (vec![("ACS_COMMAND_BELL", "0")], false),
+        // The environment wins over the configuration.
+        ([&off[..], &[("ACS_COMMAND_BELL", "1")]].concat(), true),
+    ];
+    for (env, bell) in cases {
+        let remote = Remote::installed();
+        let mut c = start_env(&remote, "nb", "echo started; sleep 30", &env);
+        c.wait_for("started", T);
+        double_tap(&c);
+        std::thread::sleep(Duration::from_millis(300));
+        c.send(b"d");
+        assert_eq!(c.wait(T), 0);
+        c.wait_for("detached from devbox/nb", T);
+        assert_eq!(c.output().contains(&0x07), bell, "{env:?}");
+    }
+}
+
+#[test]
+fn the_bell_waits_for_the_programs_osc_to_end() {
+    let remote = Remote::installed();
+    // A title the program takes a second to finish, ended by ST.
+    let mut c = start(
+        &remote,
+        "osc",
+        "printf 'A\\033]2;ti'; sleep 1; printf 'tle\\033\\\\B'; sleep 30",
+    );
+    c.wait_for("A\x1b]2;ti", T);
+    double_tap(&c);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !c.output().contains(&0x07),
+        "a BEL now would end the title: {:?}",
+        c.text()
+    );
+    c.wait_for("B", T);
+    // Rung as soon as the title ended, not inside it.
+    assert!(
+        c.text().contains("A\x1b]2;title\x1b\\\x07B"),
+        "{:?}",
+        c.text()
+    );
 }

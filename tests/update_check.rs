@@ -39,7 +39,12 @@ impl Setup {
 
     /// `acs devbox --list` with the check turned on; returns stderr.
     fn start(&self, extra: &[(&str, &str)]) -> String {
-        let mut c = acs_cmd();
+        self.start_as(&exe(), extra)
+    }
+
+    /// [`Setup::start`] running the copy of acs at `acs`.
+    fn start_as(&self, acs: &Path, extra: &[(&str, &str)]) -> String {
+        let mut c = acs_cmd_as(acs);
         c.args([
             "--transport-cmd",
             &self.remote.transport(),
@@ -52,7 +57,7 @@ impl Setup {
         for (k, v) in extra {
             c.env(k, v);
         }
-        let out = c.output().unwrap();
+        let out = output_of(&mut c);
         assert!(out.status.success(), "{out:?}");
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
@@ -90,6 +95,20 @@ fn a_newer_release_is_shown_once() {
     assert_eq!(s.start(&[]), "");
     // Checked just now: nothing was asked.
     assert!(s.server.hits().is_empty(), "{:?}", s.server.hits());
+}
+
+#[test]
+fn a_brewed_acs_says_to_upgrade_with_brew() {
+    let s = Setup::new();
+    let d = TempDir::new();
+    s.write_state(&format!("checked={}\nlatest=9.9.9\n", now()));
+    assert_eq!(
+        s.start_as(&brewed_copy(d.path()), &[]),
+        format!(
+            "acs: acs 9.9.9 is available (you have {}) — run: brew upgrade acs\n",
+            acs::VERSION
+        )
+    );
 }
 
 #[test]

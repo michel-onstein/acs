@@ -43,7 +43,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(code::USAGE);
         }
     };
-    let mut args = match parsed {
+    let (mut args, every_alias) = match parsed {
         Parsed::Help => {
             println!("{}", cli::USAGE);
             return ExitCode::SUCCESS;
@@ -52,7 +52,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             crate::print_version();
             return ExitCode::SUCCESS;
         }
-        Parsed::Run(a) => *a,
+        Parsed::Run(a) => (*a, false),
+        Parsed::ListAll(a) => (*a, true),
     };
     args.config = match crate::config::Config::load() {
         Ok(c) => c,
@@ -63,6 +64,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     // Before connecting: a newer release found by an earlier check.
     crate::update_check::on_client_start(&args.config);
+    if every_alias {
+        return crate::list::run_all(&args);
+    }
     let name = args.transport.destination.clone();
     if let Err(e) = resolve_alias(&mut args, &name) {
         eprintln!("acs: {e}");
@@ -74,18 +78,39 @@ pub fn main(args: &[OsString]) -> ExitCode {
     ExitCode::from(run(args))
 }
 
-/// If `name` is an alias, point the transport at the host it stands for
-/// now (DESIGN §7.3); with `-v`, say which entry was chosen and why.
+/// If `name` is an alias, or `user@<alias>`, point the transport at the host
+/// it stands for now, with that entry's key (DESIGN §7.3); with `-v`, say
+/// which entry was chosen and why. `name` is kept as given, so a redial
+/// resolves it the same way.
 pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
     let verbose = args.verbose > 0;
-    let dest = crate::alias::resolve(name, &args.config, &mut crate::alias::ping, &mut |m| {
+    let entry = crate::alias::resolve(name, &args.config, &mut crate::alias::ping, &mut |m| {
         if verbose {
             note(&m)
         }
     })?;
-    if let Some(d) = dest {
+    if let Some(e) = entry {
         args.alias = Some(name.to_string());
-        args.transport.destination = d;
+        args.transport.destination = e.destination();
+        args.transport.identity_file = e
+            .identity_file
+            .as_ref()
+            .map(|s| crate::config::expand_home(&s.value));
+        if let (true, Some(key)) = (verbose, &e.identity_file) {
+            let at = key
+                .origin
+                .as_ref()
+                .map(|o| o.to_string())
+                .unwrap_or_default();
+            if args.transport.user_identity() {
+                note(&format!(
+                    "{name}: the key given on the command line replaces identity_file {} ({at})",
+                    key.value
+                ));
+            } else {
+                note(&format!("{name}: identity_file {} ({at})", key.value));
+            }
+        }
     }
     Ok(())
 }
@@ -116,6 +141,23 @@ pub(crate) fn escape_config() -> keys::Config {
         cfg.window_ms = ms;
     }
     cfg
+}
+
+/// Whether arming command mode rings the bell (DESIGN §6.1).
+pub(crate) fn command_bell(config: &crate::config::Config) -> bool {
+    bell_setting(
+        std::env::var("ACS_COMMAND_BELL").ok().as_deref(),
+        config.command_bell.value,
+    )
+}
+
+/// `ACS_COMMAND_BELL` over the configuration: `0` is off, anything else
+/// non-empty on.
+fn bell_setting(env: Option<&str>, config: bool) -> bool {
+    match env {
+        Some(v) if !v.is_empty() => v != "0",
+        _ => config,
+    }
 }
 
 /// Print a message on the terminal outside the session's byte stream.
@@ -182,7 +224,7 @@ pub fn dial(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = sys::spawn(&mut cmd).map_err(|e| {
         let argv = args.transport.argv(call, remote);
         io::Error::new(
             e.kind(),
@@ -250,6 +292,10 @@ pub struct State {
     pub attached_once: bool,
     /// A reconnect status line / title is on the terminal (DESIGN §5.4).
     pub status_shown: bool,
+    /// Ring the bell when command mode arms (DESIGN §6.1).
+    pub command_bell: bool,
+    /// A bell waits for the output to reach a boundary.
+    pub bell_pending: bool,
 }
 
 /// How serving a link ended.
@@ -352,6 +398,8 @@ pub fn run(args: ClientArgs) -> u8 {
         identity: identity(),
         attached_once: false,
         status_shown: false,
+        command_bell: command_bell(&args.config),
+        bell_pending: false,
     };
     let mut raw: Option<RawMode> = None;
     let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals);
@@ -441,6 +489,44 @@ fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+/// After feeding or ticking the command detector: ring the bell when
+/// command mode has just armed, and drop a bell still waiting once it is
+/// over (DESIGN §6.1).
+pub fn follow_detector(state: &mut State, was_armed: bool, detector: &Detector) {
+    if !detector.armed() {
+        state.bell_pending = false;
+    } else if !was_armed && state.command_bell {
+        // Only between sequences: a BEL inside the program's OSC would end
+        // it early. Otherwise it goes with the output that gets there.
+        if state.observer.at_boundary() {
+            let _ = sys::write_all(STDOUT, b"\x07");
+        } else {
+            state.bell_pending = true;
+        }
+    }
+}
+
+/// Write session output to the terminal, with a waiting bell at the first
+/// boundary in it.
+fn write_output(state: &mut State, bytes: &[u8]) -> io::Result<()> {
+    if !state.bell_pending {
+        sys::write_all(STDOUT, bytes)?;
+        state.observer.observe(bytes);
+        return Ok(());
+    }
+    let Some(n) = state.observer.observe_to_boundary(bytes) else {
+        return sys::write_all(STDOUT, bytes);
+    };
+    state.bell_pending = false;
+    let mut buf = Vec::with_capacity(bytes.len() + 1);
+    buf.extend_from_slice(&bytes[..n]);
+    buf.push(0x07);
+    buf.extend_from_slice(&bytes[n..]);
+    sys::write_all(STDOUT, &buf)?;
+    state.observer.observe(&bytes[n..]);
+    Ok(())
+}
+
 /// Send INPUT for bytes the user typed.
 fn queue_input(state: &mut State, out: &mut Vec<u8>, bytes: &[u8]) {
     for chunk in bytes.chunks(proto::MAX_CHUNK) {
@@ -475,6 +561,8 @@ fn serve(
     let mut out = Msg::Hello(hello(args, state, args.force)).to_bytes();
     let mut buf = vec![0u8; 64 * 1024];
     let mut detector = Detector::new(escape_config());
+    // A bell waiting from an earlier link's command mode is moot.
+    state.bell_pending = false;
     let mut welcomed = false;
     let mut exiting = false;
     let mut liveness = crate::reconnect::Liveness::new();
@@ -578,12 +666,10 @@ fn serve(
                     // Skip anything we already wrote (never expected).
                     let skip = state.offset.saturating_sub(offset) as usize;
                     if skip < bytes.len() {
-                        let new = &bytes[skip..];
-                        if sys::write_all(STDOUT, new).is_err() {
+                        if write_output(state, &bytes[skip..]).is_err() {
                             link.close();
                             return Outcome::Exit(code::ERROR);
                         }
-                        state.observer.observe(new);
                         state.offset = offset + bytes.len() as u64;
                     }
                 }
@@ -669,13 +755,17 @@ fn serve(
                     return Outcome::Exit(code::DETACHED);
                 }
                 Ok(n) => {
+                    let was = detector.armed();
                     let o = detector.feed(&buf[..n], sys::now_ms());
+                    follow_detector(state, was, &detector);
                     queue_input(state, &mut out, &o.forward);
                     action = o.action;
                 }
             }
         } else if detector.deadline().is_some_and(|d| sys::now_ms() >= d) {
+            let was = detector.armed();
             let o = detector.tick(sys::now_ms());
+            follow_detector(state, was, &detector);
             queue_input(state, &mut out, &o.forward);
         }
         match action {
@@ -733,5 +823,19 @@ fn serve(
             ));
             return Outcome::Exit(code::UNREACHABLE);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_environment_decides_the_bell_over_the_configuration() {
+        assert!(bell_setting(None, true));
+        assert!(!bell_setting(None, false));
+        assert!(bell_setting(Some(""), true), "empty is unset");
+        assert!(!bell_setting(Some("0"), true));
+        assert!(bell_setting(Some("1"), false));
     }
 }

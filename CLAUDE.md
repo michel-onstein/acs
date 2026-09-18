@@ -28,7 +28,8 @@ MINOR for a feature or a larger fix, MAJOR only with `--major`. **Title pull
 requests in Conventional Commits form** (`fix: …`, `feat: …`, `docs: …`) —
 the squash commit takes the title — and add a `Semver: minor` trailer or a
 `semver:minor` label to a fix that deserves a minor release. Each release's
-binaries are published to GitHub Releases by the same script. Rules in
+binaries are published to GitHub Releases by the same script, which then
+updates the Homebrew tap (`michel-onstein/homebrew-acs`). Rules in
 [docs/VERSIONING.md](docs/VERSIONING.md).
 
 ## Document index
@@ -37,5 +38,5 @@ binaries are published to GitHub Releases by the same script. Rules in
 | --- | --- | --- |
 | [README.md](README.md) | Install, usage, command keys, environment | Current |
 | [DESIGN.md](docs/DESIGN.md) | Architecture, protocol, command mode, remote install | Built |
-| [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning and release binaries on GitHub | Built |
+| [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning, release binaries on GitHub, the Homebrew tap | Built |
 | [VERIFICATION.md](docs/VERIFICATION.md) | End-to-end results over real ssh; checks still to do by hand | Automated checks pass |

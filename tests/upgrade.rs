@@ -181,6 +181,39 @@ fn check_only_reports() {
 }
 
 #[test]
+fn a_brewed_acs_defers_to_brew() {
+    let d = TempDir::new();
+    let server = ReleaseServer::start();
+    server.release(NEW, &ReleaseServer::fake_acs(NEW), true, false);
+    let acs = brewed_copy(d.path());
+    let keg = std::fs::canonicalize(&acs).unwrap();
+    let (code, out, err) = upgrade(&acs, d.path(), &server, &[]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(
+        err,
+        format!(
+            "acs: this acs was installed with Homebrew ({}) — upgrade it with: brew upgrade acs\n",
+            keg.display()
+        )
+    );
+    // Refused before asking: nothing downloaded, nothing replaced.
+    assert!(server.hits().is_empty(), "{:?}", server.hits());
+    assert_eq!(std::fs::read(&keg).unwrap(), std::fs::read(exe()).unwrap());
+    assert!(!d.path().join("homebrew/Cellar/acs").join(NEW).exists());
+
+    // --check still reports, pointing at brew.
+    let (code, out, _) = upgrade(&acs, d.path(), &server, &["--check"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        format!(
+            "acs {NEW} is available (you have {}) — run: brew upgrade acs\n",
+            acs::VERSION
+        )
+    );
+}
+
+#[test]
 fn an_unwritable_directory_says_to_use_sudo_before_downloading() {
     if acs::sys::getuid() == 0 {
         return; // root writes anywhere

@@ -3,6 +3,7 @@
 //! ```text
 //! acs [ssh options] [user@]<host> [session] [-l|--list] [--new]
 //!     [--no-reconnect] [--force] [-v] [-- command...]
+//! acs [ssh options] -l|--list [-v]
 //! ```
 
 use std::ffi::OsString;
@@ -15,11 +16,12 @@ pub const USAGE: &str = "\
 usage: acs [ssh options] [user@]<host> [session]   attach, or create (default session: main)
        acs [ssh options] [user@]<host> --new       create a new numbered session
        acs [ssh options] [user@]<host> --list      list sessions on <host>
+       acs [ssh options] --list                    list sessions on every host alias (hosts:)
        acs config ...                            read and edit the configuration (acs config --help)
        acs upgrade [--version X.Y.Z] [--check]   replace this acs with the latest release
 
 options:
-  -l, --list          list sessions on the host
+  -l, --list          list sessions on the host, or without one on every alias
       --new           create a session named with the lowest free number
       --no-reconnect  exit when the connection drops instead of redialling
       --force         take over a session attached by someone else
@@ -34,12 +36,13 @@ ssh options (passed to every ssh call):
 
 in a session: Ctrl-] Ctrl-] then  d  detach (session keeps running)
                                   x  exit (ends the session)
+              a bell says it waits for the key (off: command_bell: false)
 
 environment: ACS_DEFAULT_SESSION ACS_IDENTITY ACS_ESCAPE_KEY ACS_ESCAPE_TIMEOUT_MS
-             ACS_SSH ACS_SOCKET_DIR
+             ACS_COMMAND_BELL ACS_SSH ACS_SOCKET_DIR
 
 configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml;
-               <host> may be an alias defined there (hosts:)";
+               the <host> of [user@]<host> may be an alias defined there (hosts:)";
 
 /// Which session the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +65,8 @@ pub struct ClientArgs {
     /// The configuration file's settings (DESIGN §7.2); defaults until the
     /// client loads them.
     pub config: Config,
-    /// The alias the destination was resolved from, if any (DESIGN §7.3).
+    /// The alias the destination was resolved from, as given (`[user@]<alias>`),
+    /// if any (DESIGN §7.3).
     pub alias: Option<String>,
 }
 
@@ -76,6 +80,9 @@ impl ClientArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
     Run(Box<ClientArgs>),
+    /// `--list` without a host: every alias in the configuration (DESIGN
+    /// §7.3). The transport has no destination; each alias supplies one.
+    ListAll(Box<ClientArgs>),
     Help,
     Version,
 }
@@ -148,11 +155,12 @@ where
     }
 
     let mut positionals = positionals.into_iter();
-    let host = positionals
-        .next()
-        .ok_or_else(|| "need a host (see acs --help)".to_string())?;
-    if host.starts_with('-') {
-        return Err(format!("bad host '{host}'"));
+    // Only `--list` goes without a host: it then lists every alias.
+    let host = positionals.next();
+    match &host {
+        None if !list => return Err("need a host (see acs --help)".into()),
+        Some(h) if h.starts_with('-') => return Err(format!("bad host '{h}'")),
+        _ => {}
     }
     let session = positionals.next();
     if let Some(extra) = positionals.next() {
@@ -183,14 +191,14 @@ where
         Target::Named(name)
     };
 
-    let mut transport = Transport::new(host);
+    let mut transport = Transport::new(host.clone().unwrap_or_default());
     if let Some(s) = ssh {
         transport.ssh = s;
     }
     transport.user_opts = user_opts;
     transport.transport_cmd = transport_cmd;
 
-    Ok(Parsed::Run(Box::new(ClientArgs {
+    let args = Box::new(ClientArgs {
         transport,
         target,
         list,
@@ -200,7 +208,11 @@ where
         command,
         config: Config::default(),
         alias: None,
-    })))
+    });
+    Ok(match host {
+        Some(_) => Parsed::Run(args),
+        None => Parsed::ListAll(args),
+    })
 }
 
 #[cfg(test)]
@@ -244,6 +256,25 @@ mod tests {
         let a = run(&["devbox", "--list"]).unwrap();
         assert!(a.list);
         assert!(run(&["-l", "devbox"]).unwrap().list);
+    }
+
+    #[test]
+    fn list_without_a_host_lists_every_alias() {
+        for args in [&["--list"][..], &["-l"], &["-p", "2222", "-v", "--list"]] {
+            match parse(args.iter().map(OsString::from), None).unwrap() {
+                Parsed::ListAll(a) => {
+                    assert!(a.list);
+                    assert_eq!(a.transport.destination, "");
+                    if args.len() > 1 {
+                        assert_eq!(opts(&a), ["-p", "2222"]);
+                        assert_eq!(a.verbose, 1);
+                    }
+                }
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+        // With a host it is that host only.
+        assert!(run(&["--list", "devbox"]).unwrap().list);
     }
 
     #[test]
@@ -308,6 +339,9 @@ mod tests {
     fn errors() {
         let cases: &[(&[&str], &str)] = &[
             (&[], "need a host"),
+            (&["--new"], "need a host"),
+            (&["--list", "--new"], "--list takes no session"),
+            (&["--list", "--", "ls"], "no command"),
             (&["h", "a", "b"], "too many arguments"),
             (&["h", "bad name"], "bad session name"),
             (&["h", "x", "--list"], "--list takes no session"),

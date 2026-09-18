@@ -2,9 +2,10 @@
 //! `/etc/acs/config.yaml` (global), then `$XDG_CONFIG_HOME/acs/config.yaml`
 //! (local, default `~/.config/acs/config.yaml`). Either may be missing.
 //!
-//! Merging: a setting in the local file replaces the global one; mappings
-//! (`hosts`) merge key by key; lists (an alias's hosts) concatenate, global
-//! entries first. An empty value (`key:`) sets nothing.
+//! Merging: a setting in the local file replaces the global one (an alias's
+//! `identity_file` too); mappings (`hosts`) merge key by key; lists (an
+//! alias's hosts) concatenate, global entries first. An empty value (`key:`)
+//! sets nothing.
 //!
 //! Only the local client reads it; the remote roles never do.
 
@@ -50,6 +51,8 @@ pub struct HostEntry {
     pub user: Option<String>,
     /// Ping the host once before using it (default true).
     pub reachability_check: bool,
+    /// The ssh key for this host (`-i`); `None` leaves it to the alias.
+    pub identity_file: Option<Setting<String>>,
     pub origin: Origin,
 }
 
@@ -63,14 +66,28 @@ impl HostEntry {
     }
 }
 
+/// An alias (DESIGN §7.3): its entries in the order they are tried, and
+/// what they share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Alias {
+    pub name: String,
+    pub entries: Vec<HostEntry>,
+    /// The ssh key of every entry that names none itself.
+    pub identity_file: Option<Setting<String>>,
+    /// Where the alias is first defined.
+    pub origin: Origin,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Install acs on a remote that lacks it (default true).
     pub install_on_remote: Setting<bool>,
     /// Check GitHub once a week for a newer release (default true).
     pub update_check: Setting<bool>,
+    /// Ring the terminal bell when command mode arms (default true).
+    pub command_bell: Setting<bool>,
     /// Aliases in the order first defined, each with its hosts in order.
-    pub hosts: Vec<(String, Vec<HostEntry>)>,
+    pub hosts: Vec<Alias>,
     /// The files that were read, global first.
     pub files: Vec<PathBuf>,
 }
@@ -80,6 +97,7 @@ impl Default for Config {
         Config {
             install_on_remote: Setting::default(true),
             update_check: Setting::default(true),
+            command_bell: Setting::default(true),
             hosts: Vec::new(),
             files: Vec::new(),
         }
@@ -87,13 +105,17 @@ impl Default for Config {
 }
 
 /// Every top-level setting, for error messages and `acs config`.
-pub const KEYS: &[&str] = &["install_on_remote", "update_check", "hosts"];
+pub const KEYS: &[&str] = &["install_on_remote", "update_check", "command_bell", "hosts"];
 
 /// The settings that are true or false.
-pub const BOOLS: &[&str] = &["install_on_remote", "update_check"];
+pub const BOOLS: &[&str] = &["install_on_remote", "update_check", "command_bell"];
 
 /// Every key of a host entry.
-pub const HOST_KEYS: &[&str] = &["host", "user", "reachability_check"];
+pub const HOST_KEYS: &[&str] = &["host", "user", "reachability_check", "identity_file"];
+
+/// Every key of an alias written as a mapping (`devbox: {identity_file: …,
+/// hosts: […]}`) rather than as its list of hosts.
+pub const ALIAS_KEYS: &[&str] = &["identity_file", "hosts"];
 
 /// The global file: `/etc/acs/config.yaml` (`ACS_GLOBAL_CONFIG` overrides it,
 /// for packagers and tests).
@@ -145,7 +167,18 @@ impl Config {
                 c.files.push(f.clone());
             }
         }
+        c.check()?;
         Ok(c)
+    }
+
+    /// What only the merged files can get wrong: one file may set an
+    /// alias's identity_file over another's hosts, but together they must
+    /// name a host.
+    pub fn check(&self) -> Result<(), String> {
+        match self.hosts.iter().find(|a| a.entries.is_empty()) {
+            Some(a) => Err(format!("{}: hosts.{}: no hosts listed", a.origin, a.name)),
+            None => Ok(()),
+        }
     }
 
     /// Merge one file's settings over what is there.
@@ -190,34 +223,25 @@ impl Config {
                             ),
                         )
                     })?;
-                    for (alias, list) in aliases {
-                        validate_alias(alias).map_err(|e| fail(list, e))?;
-                        let items: Vec<&Node> = match &list.value {
-                            Value::Seq(v) => v.iter().collect(),
-                            Value::Map(_) => vec![list],
-                            _ => {
-                                return Err(fail(
-                                    list,
-                                    format!(
-                                        "hosts.{alias}: expected a list of hosts ('- host: name'), found {}",
-                                        list.value.kind()
-                                    ),
-                                ))
+                    for (name, n) in aliases {
+                        validate_alias(name).map_err(|e| fail(n, e))?;
+                        let (entries, identity) = alias_parts(name, n, &at)?;
+                        let i = match self.hosts.iter().position(|a| a.name == *name) {
+                            Some(i) => i,
+                            None => {
+                                self.hosts.push(Alias {
+                                    name: name.clone(),
+                                    entries: Vec::new(),
+                                    identity_file: None,
+                                    origin: at(n),
+                                });
+                                self.hosts.len() - 1
                             }
                         };
-                        let mut new = Vec::new();
-                        for item in items {
-                            new.push(
-                                host_entry(item, &at)
-                                    .map_err(|e| fail(item, format!("hosts.{alias}: {e}")))?,
-                            );
-                        }
-                        if new.is_empty() {
-                            return Err(fail(list, format!("hosts.{alias}: no hosts listed")));
-                        }
-                        match self.hosts.iter_mut().find(|(a, _)| a == alias) {
-                            Some((_, have)) => have.extend(new),
-                            None => self.hosts.push((alias.clone(), new)),
+                        let alias = &mut self.hosts[i];
+                        alias.entries.extend(entries);
+                        if identity.is_some() {
+                            alias.identity_file = identity;
                         }
                     }
                 }
@@ -237,6 +261,7 @@ impl Config {
         match key {
             "install_on_remote" => Some(&self.install_on_remote),
             "update_check" => Some(&self.update_check),
+            "command_bell" => Some(&self.command_bell),
             _ => None,
         }
     }
@@ -245,16 +270,14 @@ impl Config {
         match key {
             "install_on_remote" => Some(&mut self.install_on_remote),
             "update_check" => Some(&mut self.update_check),
+            "command_bell" => Some(&mut self.command_bell),
             _ => None,
         }
     }
 
-    /// The hosts of `alias`, if it is one.
-    pub fn alias(&self, name: &str) -> Option<&[HostEntry]> {
-        self.hosts
-            .iter()
-            .find(|(a, _)| a == name)
-            .map(|(_, v)| v.as_slice())
+    /// The alias called `name`, if there is one.
+    pub fn alias(&self, name: &str) -> Option<&Alias> {
+        self.hosts.iter().find(|a| a.name == name)
     }
 }
 
@@ -298,6 +321,97 @@ fn string_value(n: &Node) -> Result<String, String> {
     }
 }
 
+/// `~` or `~/…` with `$HOME`, as the shell expands a `-i` typed on the
+/// command line; anything else (`~user/…` too) as is, for ssh to expand.
+pub fn expand_home(path: &str) -> String {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
+    match (home, path.strip_prefix('~')) {
+        (Some(h), Some(rest)) if rest.is_empty() || rest.starts_with('/') => format!("{h}{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// An `identity_file` value: a path, kept as written (`~` is expanded where
+/// it is used); `None` for an empty value.
+fn identity_file(
+    n: &Node,
+    at: &dyn Fn(&Node) -> Origin,
+) -> Result<Option<Setting<String>>, String> {
+    match &n.value {
+        Value::Null => Ok(None),
+        Value::Scalar(s) if !s.text.is_empty() && !s.text.chars().any(char::is_control) => {
+            Ok(Some(Setting {
+                value: s.text.clone(),
+                origin: Some(at(n)),
+            }))
+        }
+        Value::Scalar(_) => Err("expected a file path, found an empty string".into()),
+        other => Err(format!("expected a file path, found {}", other.kind())),
+    }
+}
+
+/// One file's entries and `identity_file` for `hosts.<name>`: a list of
+/// entries, one entry without the list, or a mapping of the alias's
+/// settings and its `hosts` (which another file may supply instead).
+#[allow(clippy::type_complexity)]
+fn alias_parts(
+    name: &str,
+    node: &Node,
+    at: &dyn Fn(&Node) -> Origin,
+) -> Result<(Vec<HostEntry>, Option<Setting<String>>), String> {
+    let fail = |n: &Node, msg: String| format!("{}: hosts.{name}: {msg}", at(n));
+    let mut identity = None;
+    let list = match &node.value {
+        Value::Map(m) if !m.iter().any(|(k, _)| k == "host") => {
+            let mut list = None;
+            for (k, v) in m {
+                match k.as_str() {
+                    "hosts" => list = Some(v).filter(|v| v.value != Value::Null),
+                    "identity_file" => {
+                        identity = identity_file(v, at)
+                            .map_err(|e| fail(v, format!("identity_file: {e}")))?
+                    }
+                    other => {
+                        return Err(fail(
+                            v,
+                            format!(
+                                "unknown key '{other}' (an alias takes {}; a single host entry needs 'host: <name>')",
+                                ALIAS_KEYS.join(", ")
+                            ),
+                        ))
+                    }
+                }
+            }
+            match list {
+                Some(l) => l,
+                None => return Ok((Vec::new(), identity)),
+            }
+        }
+        _ => node,
+    };
+    let items: Vec<&Node> = match &list.value {
+        Value::Seq(v) => v.iter().collect(),
+        Value::Map(_) => vec![list],
+        _ => {
+            return Err(fail(
+                list,
+                format!(
+                    "expected a list of hosts ('- host: name'), found {}",
+                    list.value.kind()
+                ),
+            ))
+        }
+    };
+    let mut entries = Vec::new();
+    for item in items {
+        entries.push(host_entry(item, at).map_err(|e| fail(item, e))?);
+    }
+    if entries.is_empty() {
+        return Err(fail(list, "no hosts listed".into()));
+    }
+    Ok((entries, identity))
+}
+
 /// Name the field (and its line) in an error about its value.
 fn field<T>(key: &str, n: &Node, r: Result<T, String>) -> Result<T, String> {
     r.map_err(|e| format!("{key}: {e} (line {})", n.line))
@@ -306,13 +420,14 @@ fn field<T>(key: &str, n: &Node, r: Result<T, String>) -> Result<T, String> {
 fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, String> {
     let fields = item.value.map().ok_or_else(|| {
         format!(
-            "expected a host entry ('host: name', optional 'user' and 'reachability_check'), found {}",
+            "expected a host entry ('host: name', optional 'user', 'reachability_check' and 'identity_file'), found {}",
             item.value.kind()
         )
     })?;
     let mut host = None;
     let mut user = None;
     let mut check = true;
+    let mut identity = None;
     for (k, v) in fields {
         match k.as_str() {
             "host" => {
@@ -338,6 +453,7 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
                     check = field(k, v, bool_value(v))?;
                 }
             }
+            "identity_file" => identity = field(k, v, identity_file(v, at))?,
             other => {
                 return Err(format!(
                     "unknown key '{other}' in a host entry (known: {})",
@@ -351,6 +467,7 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
         host,
         user,
         reachability_check: check,
+        identity_file: identity,
         origin: at(item),
     })
 }
@@ -376,6 +493,7 @@ mod tests {
     fn hosts(c: &Config, alias: &str) -> Vec<String> {
         c.alias(alias)
             .unwrap()
+            .entries
             .iter()
             .map(|e| format!("{}/{}", e.destination(), e.reachability_check))
             .collect()
@@ -387,6 +505,7 @@ mod tests {
         let c = Config::load_files(&[dir.path().join("none.yaml")]).unwrap();
         assert!(c.install_on_remote.value);
         assert_eq!(c.install_on_remote.origin, None);
+        assert!(c.command_bell.value);
         assert!(c.hosts.is_empty());
         assert!(c.files.is_empty());
         assert_eq!(c, Config::default());
@@ -425,9 +544,9 @@ mod tests {
         assert_eq!(hosts(&c, "nas"), ["nas.lan/false"]);
         // A single entry needs no list.
         assert_eq!(hosts(&c, "pi"), ["pi.lan/true"]);
-        let order: Vec<&str> = c.hosts.iter().map(|(a, _)| a.as_str()).collect();
+        let order: Vec<&str> = c.hosts.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(order, ["devbox", "nas", "pi"]);
-        let second = &c.alias("devbox").unwrap()[1];
+        let second = &c.alias("devbox").unwrap().entries[1];
         assert!(second.origin.file.ends_with("local.yaml"));
         assert_eq!(second.origin.line, 3);
     }
@@ -445,7 +564,7 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, hosts)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, hosts)",
             ),
             ("hosts: [a]\n", ":1: hosts: expected a mapping"),
             (
@@ -479,6 +598,144 @@ mod tests {
         for (src, want) in cases {
             let e = load("", src).unwrap_err();
             assert!(e.contains("local.yaml") && e.contains(want), "{src:?}: {e}");
+        }
+    }
+
+    fn identity(s: &Option<Setting<String>>) -> Option<String> {
+        s.as_ref().map(|s| {
+            let o = s.origin.as_ref().unwrap();
+            let f = o.file.file_name().unwrap().to_string_lossy();
+            format!("{}@{f}:{}", s.value, o.line)
+        })
+    }
+
+    #[test]
+    fn identity_files_at_the_alias_and_the_entry() {
+        let l = "\
+hosts:
+  devbox:
+    identity_file: ~/.ssh/id_devbox
+    hosts:
+      - host: devbox.lan
+        identity_file: ~/.ssh/id_lan
+      - host: devbox.example.com
+  nas: {identity_file: /keys/nas, hosts: [{host: nas.lan}]}
+  pi:
+    host: pi.lan
+    identity_file: ~/.ssh/id_pi
+";
+        let c = load("", l).unwrap();
+        let d = c.alias("devbox").unwrap();
+        assert_eq!(
+            identity(&d.identity_file).as_deref(),
+            Some("~/.ssh/id_devbox@local.yaml:3")
+        );
+        assert_eq!(
+            identity(&d.entries[0].identity_file).as_deref(),
+            Some("~/.ssh/id_lan@local.yaml:6")
+        );
+        assert_eq!(d.entries[1].identity_file, None);
+        assert_eq!(hosts(&c, "devbox").len(), 2);
+        let nas = c.alias("nas").unwrap();
+        assert_eq!(nas.identity_file.as_ref().unwrap().value, "/keys/nas");
+        assert_eq!(hosts(&c, "nas"), ["nas.lan/true"]);
+        // One entry without a list keeps its own key: it is not the alias's.
+        let pi = c.alias("pi").unwrap();
+        assert_eq!(pi.identity_file, None);
+        assert_eq!(
+            pi.entries[0].identity_file.as_ref().unwrap().value,
+            "~/.ssh/id_pi"
+        );
+    }
+
+    #[test]
+    fn the_local_alias_identity_replaces_the_global_one() {
+        let g = "hosts:\n  devbox:\n    identity_file: /etc/key\n    hosts:\n      - host: devbox.lan\n";
+        // A file may set only the alias's key, over another file's hosts.
+        let l = "hosts:\n  devbox:\n    identity_file: ~/.ssh/mine\n";
+        let c = load(g, l).unwrap();
+        let d = c.alias("devbox").unwrap();
+        assert_eq!(
+            identity(&d.identity_file).as_deref(),
+            Some("~/.ssh/mine@local.yaml:3")
+        );
+        assert_eq!(hosts(&c, "devbox"), ["devbox.lan/true"]);
+        assert!(d.origin.file.ends_with("global.yaml"));
+
+        // An empty value sets nothing; a list adds hosts and keeps the key.
+        let c = load(g, "hosts:\n  devbox:\n    identity_file:\n").unwrap();
+        assert_eq!(
+            identity(&c.alias("devbox").unwrap().identity_file).as_deref(),
+            Some("/etc/key@global.yaml:3")
+        );
+        let c = load(g, "hosts:\n  devbox:\n    - host: devbox.example.com\n").unwrap();
+        assert_eq!(
+            c.alias("devbox")
+                .unwrap()
+                .identity_file
+                .as_ref()
+                .unwrap()
+                .value,
+            "/etc/key"
+        );
+        assert_eq!(hosts(&c, "devbox").len(), 2);
+    }
+
+    #[test]
+    fn an_alias_needs_a_host_in_some_file() {
+        let e = load("", "hosts:\n  devbox:\n    identity_file: ~/.ssh/k\n").unwrap_err();
+        assert!(
+            e.contains("local.yaml:2: hosts.devbox: no hosts listed"),
+            "{e}"
+        );
+        let e = load(
+            "",
+            "hosts:\n  devbox:\n    identity_file: k\n    hosts: []\n",
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("local.yaml:4: hosts.devbox: no hosts listed"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn identity_file_errors_name_the_file_and_line() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "hosts:\n  d:\n    identity_file: [a, b]\n    hosts:\n      - host: a\n",
+                ":3: hosts.d: identity_file: expected a file path, found a list",
+            ),
+            (
+                "hosts:\n  d:\n    identity_file: \"\"\n",
+                ":3: hosts.d: identity_file: expected a file path, found an empty string",
+            ),
+            (
+                "hosts:\n  d:\n    user: me\n",
+                ":3: hosts.d: unknown key 'user' (an alias takes identity_file, hosts; a single host entry needs 'host: <name>')",
+            ),
+            (
+                "hosts:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
+                ":3: hosts.d: identity_file: expected a file path, found a mapping (line 4)",
+            ),
+            (
+                "hosts:\n  d:\n    hosts: x\n",
+                ":3: hosts.d: expected a list of hosts",
+            ),
+        ];
+        for (src, want) in cases {
+            let e = load("", src).unwrap_err();
+            assert!(e.contains("local.yaml") && e.contains(want), "{src:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn home_is_expanded_like_the_shell_would() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_home("~/.ssh/id"), format!("{home}/.ssh/id"));
+        assert_eq!(expand_home("~"), home);
+        for p in ["~bob/.ssh/id", "/abs/~/x", "rel/key", "~x"] {
+            assert_eq!(expand_home(p), p);
         }
     }
 

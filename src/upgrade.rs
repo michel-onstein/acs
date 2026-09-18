@@ -13,6 +13,9 @@
 //!   the one on `PATH`) are repointed; the old version stays for clients that
 //!   still use it on this host, and is pruned like any other.
 //!
+//! A Homebrew install (the binary is in a `Cellar`) is brew's to replace:
+//! `acs upgrade` says to run `brew upgrade acs` instead.
+//!
 //! Remote hosts need nothing: the next connection finds no binary of the new
 //! version there and installs it (DESIGN §8).
 
@@ -151,6 +154,24 @@ impl Layout {
     }
 }
 
+/// Whether `exe`, a real path, is in a Homebrew keg:
+/// `<prefix>/Cellar/acs/<version>/bin/acs` for any prefix (`/opt/homebrew`,
+/// `/usr/local`, `/home/linuxbrew/.linuxbrew`).
+pub fn brewed(exe: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = exe.components().map(|c| c.as_os_str()).collect();
+    parts.windows(2).any(|w| w[0] == "Cellar" && w[1] == "acs")
+}
+
+/// The command that upgrades the running acs.
+pub fn command() -> &'static str {
+    let exe = crate::sys::self_exe().and_then(std::fs::canonicalize);
+    if exe.is_ok_and(|e| brewed(&e)) {
+        "brew upgrade acs"
+    } else {
+        "acs upgrade"
+    }
+}
+
 /// Paths that may be links to the running binary: what it was run as, the
 /// usual bin directories, and `acs` on `PATH`.
 fn link_candidates() -> Vec<PathBuf> {
@@ -233,6 +254,16 @@ impl Drop for Scratch {
 
 pub fn run(opts: &Opts) -> Result<String, Error> {
     let current = crate::VERSION;
+    let exe = crate::sys::self_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|e| format!("cannot find this acs binary: {e}"));
+    let brew = exe.as_deref().is_ok_and(brewed);
+    if let (true, false, Ok(e)) = (brew, opts.check, &exe) {
+        return Err(Error::Failed(format!(
+            "this acs was installed with Homebrew ({}) — upgrade it with: brew upgrade acs",
+            e.display()
+        )));
+    }
     let target = release::archive_target(crate::payload::OWN_TARGET);
     let base = release::releases_url();
     let tmp = Scratch::new()?;
@@ -252,20 +283,17 @@ pub fn run(opts: &Opts) -> Result<String, Error> {
             ))
         }
         Decision::Install if opts.check => {
-            return Ok(format!(
-                "acs {v} is available (you have {current}) — run: acs upgrade{}",
-                opts.version
-                    .as_ref()
-                    .map(|_| format!(" --version {v}"))
-                    .unwrap_or_default()
-            ))
+            let how = match opts.version {
+                _ if brew => "brew upgrade acs".to_string(),
+                Some(_) => format!("acs upgrade --version {v}"),
+                None => "acs upgrade".to_string(),
+            };
+            return Ok(format!("acs {v} is available (you have {current}) — run: {how}"));
         }
         Decision::Install => {}
     }
 
-    let exe = crate::sys::self_exe()
-        .and_then(std::fs::canonicalize)
-        .map_err(|e| format!("cannot find this acs binary: {e}"))?;
+    let exe = exe?;
     let layout = Layout::detect(&exe, current, &link_candidates());
     for dir in layout.dirs(&v) {
         check_writable(&dir)?;
@@ -471,6 +499,44 @@ mod tests {
         relink(&l.destination("0.3.0"), &link).unwrap();
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+    }
+
+    #[test]
+    fn a_homebrew_keg_is_brewed_under_any_prefix() {
+        for p in [
+            "/opt/homebrew/Cellar/acs/0.3.0/bin/acs",
+            "/usr/local/Cellar/acs/0.3.0/bin/acs",
+            "/home/linuxbrew/.linuxbrew/Cellar/acs/0.3.0/bin/acs",
+            "/Users/me/homebrew/Cellar/acs/0.3.0_1/bin/acs",
+        ] {
+            assert!(brewed(Path::new(p)), "{p}");
+        }
+        for p in [
+            "/Users/me/.local/share/acs/0.3.0/acs",
+            "/usr/local/lib/acs/0.3.0/acs",
+            "/usr/local/bin/acs",
+            "/opt/homebrew/bin/acs",
+            // Another formula's keg, or a directory merely named like one.
+            "/opt/homebrew/Cellar/other/1.0/bin/acs",
+            "/home/me/Cellars/acs/0.3.0/bin/acs",
+            "/home/me/my-Cellar/acs/acs",
+        ] {
+            assert!(!brewed(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_brewed_acs_is_found_through_the_brew_link() {
+        let d = TempDir::new();
+        let exe = d.path().join("homebrew/Cellar/acs/0.3.0/bin/acs");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "acs").unwrap();
+        let bin = d.path().join("homebrew/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("../Cellar/acs/0.3.0/bin/acs", bin.join("acs")).unwrap();
+        // `bin/acs` is a link; its real path is the keg's.
+        assert!(!brewed(&bin.join("acs")));
+        assert!(brewed(&std::fs::canonicalize(bin.join("acs")).unwrap()));
     }
 
     #[test]

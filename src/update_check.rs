@@ -5,8 +5,8 @@
 //! background (curl with a 3 s limit, `release.rs`) and goes on; that process
 //! records the latest version in the state file, and a later start shows
 //! `acs X is available (you have Y) — run: acs upgrade` on stderr before
-//! connecting — once per new version. Offline or rate-limited, nothing is
-//! said.
+//! connecting — once per new version; `brew upgrade acs` for a Homebrew
+//! install (`upgrade::brewed`). Offline or rate-limited, nothing is said.
 //!
 //! State: `$XDG_STATE_HOME/acs/update-check` (default
 //! `~/.local/state/acs/update-check`), `key=value` lines. Turned off with
@@ -73,8 +73,9 @@ impl State {
     }
 
     /// The message to show for `current`, if a newer release is known and
-    /// was not shown yet; records it as shown.
-    pub fn take_message(&mut self, current: &str) -> Option<String> {
+    /// was not shown yet; records it as shown. `upgrade` is the command that
+    /// upgrades this acs (`upgrade::command`).
+    pub fn take_message(&mut self, current: &str, upgrade: &str) -> Option<String> {
         let latest = self.latest.clone()?;
         let newer = release::compare(&latest, current) == Some(std::cmp::Ordering::Greater);
         if !newer || self.shown.as_deref() == Some(latest.as_str()) {
@@ -82,7 +83,7 @@ impl State {
         }
         self.shown = Some(latest.clone());
         Some(format!(
-            "acs {latest} is available (you have {current}) — run: acs upgrade"
+            "acs {latest} is available (you have {current}) — run: {upgrade}"
         ))
     }
 }
@@ -133,7 +134,7 @@ pub fn on_client_start(config: &Config) {
     let Some(path) = state_path() else { return };
     let mut state = read(&path);
     let before = state.clone();
-    if let Some(msg) = state.take_message(crate::VERSION) {
+    if let Some(msg) = state.take_message(crate::VERSION, crate::upgrade::command()) {
         eprintln!("acs: {msg}");
     }
     let now = crate::sys::unix_now();
@@ -244,14 +245,17 @@ mod tests {
             ..State::default()
         };
         assert_eq!(
-            s.take_message("0.2.0").as_deref(),
+            s.take_message("0.2.0", "acs upgrade").as_deref(),
             Some("acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade")
         );
         assert_eq!(s.shown.as_deref(), Some("0.3.0"));
-        assert_eq!(s.take_message("0.2.0"), None);
-        // A newer one again is news again.
+        assert_eq!(s.take_message("0.2.0", "acs upgrade"), None);
+        // A newer one again is news again; a brewed acs says to use brew.
         s.latest = Some("0.4.0".into());
-        assert!(s.take_message("0.2.0").unwrap().starts_with("acs 0.4.0 "));
+        assert_eq!(
+            s.take_message("0.2.0", "brew upgrade acs").as_deref(),
+            Some("acs 0.4.0 is available (you have 0.2.0) — run: brew upgrade acs")
+        );
     }
 
     #[test]
@@ -261,9 +265,9 @@ mod tests {
                 latest: Some("0.3.0".into()),
                 ..State::default()
             };
-            assert_eq!(s.take_message(current), None, "{current}");
+            assert_eq!(s.take_message(current, "acs upgrade"), None, "{current}");
             assert_eq!(s.shown, None);
         }
-        assert_eq!(State::default().take_message("0.1.0"), None);
+        assert_eq!(State::default().take_message("0.1.0", "acs upgrade"), None);
     }
 }

@@ -22,7 +22,12 @@ pub const NO_CONFIG: &str = "/nonexistent/acs-test-config";
 /// `acs` as a plain command (no pty), isolated from the developer's own
 /// configuration.
 pub fn acs_cmd() -> Command {
-    let mut c = Command::new(exe());
+    acs_cmd_as(&exe())
+}
+
+/// [`acs_cmd`] running the copy of acs at `path`.
+pub fn acs_cmd_as(path: &Path) -> Command {
+    let mut c = Command::new(path);
     c.env("ACS_NO_UPDATE_CHECK", "1")
         .env("XDG_CONFIG_HOME", NO_CONFIG)
         .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"));
@@ -36,6 +41,149 @@ pub fn config_env(dir: &Path, yaml: &str) -> Vec<(String, String)> {
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(&file, yaml).unwrap();
     vec![("XDG_CONFIG_HOME".into(), dir.display().to_string())]
+}
+
+/// Borrow an owned environment for [`Client::start_env`].
+pub fn refs(env: &[(String, String)]) -> Vec<(&str, &str)> {
+    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+/// Which hosts answer a ping: a fake `ping` for `ACS_PING` that succeeds for
+/// the hosts listed in a file and records every host it is asked about, so
+/// alias resolution (DESIGN §7.3) needs no ICMP.
+pub struct Net {
+    dir: TempDir,
+}
+
+impl Net {
+    /// A ping answering for `up`.
+    pub fn new(up: &[&str]) -> Net {
+        let n = Net {
+            dir: TempDir::new(),
+        };
+        let ping = n.ping();
+        std::fs::write(
+            &ping,
+            format!(
+                "#!/bin/sh\nfor h; do :; done\necho \"$h\" >> '{log}'\ngrep -qx \"$h\" '{up}'\n",
+                log = n.pinged_file().display(),
+                up = n.up_file().display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ping, std::fs::Permissions::from_mode(0o755)).unwrap();
+        n.set_up(up);
+        n
+    }
+
+    fn ping(&self) -> PathBuf {
+        self.dir.path().join("ping")
+    }
+
+    fn up_file(&self) -> PathBuf {
+        self.dir.path().join("up")
+    }
+
+    fn pinged_file(&self) -> PathBuf {
+        self.dir.path().join("pinged")
+    }
+
+    pub fn set_up(&self, up: &[&str]) {
+        let mut s = up.join("\n");
+        s.push('\n');
+        std::fs::write(self.up_file(), s).unwrap();
+    }
+
+    /// Every host pinged so far, in order.
+    pub fn pinged(&self) -> Vec<String> {
+        std::fs::read_to_string(self.pinged_file())
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    /// The environment for a client with `config` as its configuration and
+    /// this ping.
+    pub fn env(&self, config: &str) -> Vec<(String, String)> {
+        let mut env = config_env(self.dir.path(), config);
+        env.push(("ACS_PING".into(), self.ping().display().to_string()));
+        env
+    }
+}
+
+/// A fake `ssh` for `--ssh`: runs the remote command on the fake remote its
+/// destination stands for, and refuses any other destination as a dead host
+/// would. It records each call's arguments.
+pub struct Ssh {
+    dir: TempDir,
+}
+
+impl Ssh {
+    pub fn new(hosts: &[(&str, &Remote)]) -> Ssh {
+        let s = Ssh {
+            dir: TempDir::new(),
+        };
+        let mut cases = String::new();
+        for (dest, remote) in hosts {
+            cases.push_str(&format!(
+                "    '{dest}') exec '{}' \"$1\" ;;\n",
+                remote.transport()
+            ));
+        }
+        std::fs::write(
+            s.path(),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                 while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+                 dest=$2\nshift 2\n\
+                 case \"$dest\" in\n{cases}esac\n\
+                 echo \"ssh: connect to host $dest port 22: Connection refused\" >&2\nexit 255\n",
+                log = s.log().display(),
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(s.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        s
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.dir.path().join("ssh")
+    }
+
+    fn log(&self) -> PathBuf {
+        self.dir.path().join("calls")
+    }
+
+    /// The arguments of every call so far.
+    pub fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.log())
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    /// Every call so far as its destination and the keys (`-i`) it was
+    /// given, in order.
+    pub fn keys(&self) -> Vec<(String, Vec<String>)> {
+        self.calls()
+            .iter()
+            .map(|c| {
+                let (opts, rest) = c.split_once(" -- ").expect("a destination after --");
+                let opts: Vec<&str> = opts.split(' ').collect();
+                let keys = opts
+                    .windows(2)
+                    .filter(|w| w[0] == "-i")
+                    .map(|w| w[1].to_string())
+                    .collect();
+                let dest = rest.split(' ').next().unwrap().to_string();
+                (dest, keys)
+            })
+            .collect()
+    }
 }
 
 /// `cmd.output()`, retried while the program is "busy" (ETXTBSY): on Linux a
@@ -55,6 +203,20 @@ pub fn output_of(cmd: &mut Command) -> std::process::Output {
 
 pub fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_acs"))
+}
+
+/// A copy of this acs installed the way Homebrew does under `dir`: the
+/// binary in `homebrew/Cellar/acs/<version>/bin/`, linked from
+/// `homebrew/bin/acs`, which is returned.
+pub fn brewed_copy(dir: &Path) -> PathBuf {
+    let keg = dir.join(format!("homebrew/Cellar/acs/{}/bin", acs::VERSION));
+    std::fs::create_dir_all(&keg).unwrap();
+    std::fs::copy(exe(), keg.join("acs")).unwrap();
+    let bin = dir.join("homebrew/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let link = bin.join("acs");
+    std::os::unix::fs::symlink(format!("../Cellar/acs/{}/bin/acs", acs::VERSION), &link).unwrap();
+    link
 }
 
 /// A "remote host": its own HOME (with acs installed at the versioned path

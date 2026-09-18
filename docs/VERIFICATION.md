@@ -14,7 +14,8 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
   `cargo xtask dist`), macOS on Apple silicon.
 - Host: Alpine Linux container (`scripts/e2e/Dockerfile`) running OpenSSH
   `sshd`, user `dev` accepting only a freshly generated ed25519 key, reached
-  as `acs -F /dev/null -i <key> -p 2222 … dev@127.0.0.1`.
+  as `acs -F /dev/null -i <key> -p <port> … dev@127.0.0.1` (a free port docker
+  picks, or `ACS_E2E_PORT`).
 - Linux suite: `rust:alpine` container, musl, run as root with users `alice`
   and `bob`.
 
@@ -31,6 +32,9 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 | Killed connection | the host's `sshd-session` for the connection is killed mid-stream | Pass — reconnect, numbered output consecutive, nothing lost or repeated |
 | Frozen host | `docker pause` for 4 s beyond the dead-link timeout | Pass — dead link detected in 3.0 s (`ACS_DEAD_MS=3000`), resumed with no loss |
 | `--list` | over ssh after the sessions above | Pass — sessions listed |
+| `--list` on every alias | no host; aliases `box` (the container) and `gone` (192.0.2.1, answers no ping); ssh in `BatchMode` | Pass — `box` sessions under a HOST column, one stderr line for `gone`, exit 255 |
+| `user@<alias>` | `acs dev@box` where alias `box`'s only entry says `user: nobody` | Pass — logs in as `dev` (2026-09-18) |
+| `identity_file` | no `-i`; the key only at `~/.ssh/id_box` under a HOME of the test's own, named by a host entry over a missing alias key, then by an alias | Pass — both log in; acs expands the `~` (2026-09-18) |
 | Full test suite on Linux | `scripts/test_linux.sh` | Pass — found and fixed two Linux-only bugs first (a master stall under backpressure; a replaced binary breaking master start) |
 | Multi-user isolation | squatted and symlinked socket directories, foreign peer uid, per-user `main` | Pass |
 | Static Linux binaries run | `dist/*-linux-musl/acs --version` in Alpine (aarch64 native, x86_64 emulated) | Pass |
@@ -38,6 +42,8 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 | One-line installer | `scripts/test_install.sh` against the real v0.1.0 and v0.2.0 releases: macOS arm64 (curl), Alpine x86_64 (busybox wget) and Ubuntu aarch64 (curl), each as root and as a user | Pass — default layout, pinned version and in-place upgrade, `ACS_INSTALL_DIR`, checksum mismatch, missing version, unsupported platform |
 | `acs upgrade` from GitHub, macOS | this code built as 0.1.0 (plain file), `acs upgrade --check`, then `acs upgrade` (2026-09-18) | Pass — replaced by the real 0.2.0 release; `codesign -v`: valid on disk, satisfies its Designated Requirement; no quarantine attribute |
 | `acs upgrade` from GitHub, Linux | the same as a static aarch64 build in Alpine, which has no curl | Pass — downloaded with the wget fallback and replaced by 0.2.0 |
+| Homebrew, macOS | `brew install michel-onstein/acs/acs` (the v0.3.0 formula from the tap), `brew test acs`, `brew audit --strict --online`, `brew style`, on macOS arm64 (2026-09-18) | Pass — installed from the release archive into the Cellar, `codesign -v` valid, `acs --version` 0.3.0 with both Linux remotes; audit and style clean |
+| Homebrew, Linux | the same in the `homebrew/brew` container, aarch64 and x86_64 (emulated) | Pass — the static build installs and its test passes; the appended payloads survive brew's install |
 
 ## Still to check by hand
 
@@ -49,6 +55,9 @@ claimed as verified:
   output, so this should hold; it has not been looked at.
 - **Claude Code** as the remote program (mouse selection, auto copy). Not
   installable in the throwaway host.
+- **The command-mode bell** in a real terminal (heard, or flashed, as the
+  terminal is set up). Tests show the BEL byte arrives, and never inside an
+  OSC the program is sending.
 - **htop and less** interactively. Covered only indirectly (vim, raw mouse and
   key paths).
 - **A real Wi-Fi switch and laptop sleep/wake.** Simulated by killing and

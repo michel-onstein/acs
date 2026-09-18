@@ -1,8 +1,8 @@
 #!/bin/sh
 # End-to-end checks over real ssh against a container host (DESIGN §9.1):
 # first-contact install from the macOS complete build, TUI escape sequences,
-# the kitty keyboard protocol, mouse reports, OSC 52, -i key selection, and
-# drops (a killed connection, a frozen host).
+# the kitty keyboard protocol, mouse reports, OSC 52, key selection by -i and
+# by identity_file, and drops (a killed connection, a frozen host).
 #
 #   scripts/e2e_ssh.sh [--no-build]
 #
@@ -10,8 +10,9 @@
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
-name=acs-e2e-host
-port=${ACS_E2E_PORT:-2222}
+# Per checkout, so worktrees running this at once keep their own host.
+name=acs-e2e-host-$(printf %s "$root" | cksum | cut -d' ' -f1)
+port=${ACS_E2E_PORT:-}
 work=$(mktemp -d /tmp/acs-e2e.XXXXXX)
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
 
@@ -29,8 +30,10 @@ esac
 ssh-keygen -q -t ed25519 -N '' -f "$work/key"
 docker build -q -t acs-e2e-host scripts/e2e >/dev/null
 docker rm -f "$name" >/dev/null 2>&1 || true
+# Without ACS_E2E_PORT docker picks a free port.
 docker run -d --name "$name" -p "127.0.0.1:$port:22" \
     -e AUTHORIZED_KEY="$(cat "$work/key.pub")" acs-e2e-host >/dev/null
+port=$(docker port "$name" 22/tcp | head -n 1 | sed 's/.*://')
 # Wait for sshd.
 i=0
 until ssh -F /dev/null -i "$work/key" -p "$port" -o StrictHostKeyChecking=no \

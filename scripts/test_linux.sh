@@ -5,10 +5,13 @@
 #   scripts/test_linux.sh [--platform linux/amd64]
 #
 # Needs docker (or podman as docker). Cargo's registry and the target
-# directory live in named volumes so later runs are fast.
+# directory live in named volumes so later runs are fast. The target volume
+# is per checkout: every checkout mounts at /src, so in a shared one cargo
+# cannot tell one worktree's sources from another's and runs a stale build.
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
+id=$(printf %s "$root" | cksum | cut -d' ' -f1)
 platform=
 if [ "${1:-}" = "--platform" ]; then
     platform="--platform $2"
@@ -18,7 +21,7 @@ fi
 exec docker run --rm $platform \
     -v "$root:/src:ro" \
     -v acs-cargo-registry:/usr/local/cargo/registry \
-    -v acs-linux-target:/target \
+    -v "acs-linux-target-$id:/target" \
     -e CARGO_TARGET_DIR=/target \
     -w /src \
     rust:alpine sh -euc '
