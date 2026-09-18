@@ -4,6 +4,8 @@
 use std::ffi::OsString;
 use std::process::ExitCode;
 
+pub mod proto;
+
 /// The crate version, baked into the remote prelude so a client always runs
 /// its own version on the remote (DESIGN §8).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
