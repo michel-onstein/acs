@@ -22,7 +22,12 @@ pub const NO_CONFIG: &str = "/nonexistent/acs-test-config";
 /// `acs` as a plain command (no pty), isolated from the developer's own
 /// configuration.
 pub fn acs_cmd() -> Command {
-    let mut c = Command::new(exe());
+    acs_cmd_as(&exe())
+}
+
+/// [`acs_cmd`] running the copy of acs at `path`.
+pub fn acs_cmd_as(path: &Path) -> Command {
+    let mut c = Command::new(path);
     c.env("ACS_NO_UPDATE_CHECK", "1")
         .env("XDG_CONFIG_HOME", NO_CONFIG)
         .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"));
@@ -125,6 +130,20 @@ pub fn output_of(cmd: &mut Command) -> std::process::Output {
 
 pub fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_acs"))
+}
+
+/// A copy of this acs installed the way Homebrew does under `dir`: the
+/// binary in `homebrew/Cellar/acs/<version>/bin/`, linked from
+/// `homebrew/bin/acs`, which is returned.
+pub fn brewed_copy(dir: &Path) -> PathBuf {
+    let keg = dir.join(format!("homebrew/Cellar/acs/{}/bin", acs::VERSION));
+    std::fs::create_dir_all(&keg).unwrap();
+    std::fs::copy(exe(), keg.join("acs")).unwrap();
+    let bin = dir.join("homebrew/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let link = bin.join("acs");
+    std::os::unix::fs::symlink(format!("../Cellar/acs/{}/bin/acs", acs::VERSION), &link).unwrap();
+    link
 }
 
 /// A "remote host": its own HOME (with acs installed at the versioned path

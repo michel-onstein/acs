@@ -32,6 +32,7 @@ pub fn notes(version: &str, archives: &[(String, String)], changes: &str) -> Str
     n.push_str(&format!(
         "installs the latest release for your machine into `~/.local/bin` (as root, `/usr/local/bin`), checked against `SHA256SUMS`. `curl … | ACS_VERSION={version} sh` installs this one.\n\n"
     ));
+    n.push_str("With Homebrew: `brew install michel-onstein/acs/acs` (the tap is updated with each release).\n\n");
     n.push_str("Or pick the archive for your machine by hand; every build can install acs on Linux hosts (x86_64 and aarch64) by itself on first contact.\n\n");
     n.push_str("| Platform | Archive |\n| --- | --- |\n");
     for (target, file) in archives {
@@ -209,6 +210,7 @@ mod tests {
         let install = n.find("releases/latest/download/install.sh | sh").unwrap();
         assert!(install < n.find("| Platform |").unwrap());
         assert!(n.contains("ACS_VERSION=1.2.3 sh"));
+        assert!(n.contains("`brew install michel-onstein/acs/acs`"));
         assert!(!notes("1.2.3", &a, "  ").contains("## Changes"));
     }
 }

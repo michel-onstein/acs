@@ -34,8 +34,20 @@ not on it, and running it again upgrades in place. It needs `curl` or
 | `ACS_VERSION=0.2.0` | install that release instead of the latest |
 | `ACS_INSTALL_DIR=~/bin` | put the binary itself in that directory |
 
-for example `curl -fsSL …/install.sh | ACS_VERSION=0.2.0 sh`. By hand, the
-archives are on [Releases](https://github.com/michel-onstein/acs/releases):
+for example `curl -fsSL …/install.sh | ACS_VERSION=0.2.0 sh`.
+
+With [Homebrew](https://brew.sh) (macOS, or Homebrew on Linux):
+
+```sh
+brew install michel-onstein/acs/acs
+```
+
+installs the same build from the tap
+[michel-onstein/homebrew-acs](https://github.com/michel-onstein/homebrew-acs),
+which every release updates; upgrade it with `brew upgrade acs`.
+
+By hand, the archives are on
+[Releases](https://github.com/michel-onstein/acs/releases):
 
 ```sh
 v=0.2.0 t=aarch64-apple-darwin      # see the release page for the latest
@@ -68,7 +80,9 @@ acs upgrade --version 0.2.0   # that release, even an older one
 acs replaces itself in place (a link like `~/.local/bin/acs` is pointed at
 the new version); if its directory is not yours, it says to use
 `sudo acs upgrade`. It uses `curl` (or `wget`). Remote hosts need nothing:
-the next connection installs the new version there.
+the next connection installs the new version there. An acs installed with
+Homebrew is brew's to replace: `acs upgrade` says to run
+`brew upgrade acs` instead.
 
 Once a week acs looks for a newer release in the background (it never
 delays connecting) and, if there is one, says so once when you next start
@@ -78,8 +92,9 @@ it:
 acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
 ```
 
-Offline, it says nothing. Turn it off with `ACS_NO_UPDATE_CHECK=1` or
-`update_check: false` in the configuration.
+(with Homebrew, `run: brew upgrade acs`). Offline, it says nothing. Turn it
+off with `ACS_NO_UPDATE_CHECK=1` or `update_check: false` in the
+configuration.
 
 Nothing is needed on the remote beyond ssh, a POSIX `sh` and `gzip`: on first
 contact acs installs its own version under `~/.local/share/acs/<version>/`
@@ -283,6 +298,7 @@ scripts/e2e_ssh.sh      # end to end over real ssh against a container host
 scripts/test_install.sh # install.sh against the real releases, here and in containers
 scripts/version-bump.sh # release the next version and publish its binaries
 scripts/release-binaries.sh  # (re)publish a tag's binaries to GitHub Releases
+scripts/update-tap.sh vX.Y.Z # point the Homebrew tap at a release
 ```
 
 Results of the checks that need a real terminal are in

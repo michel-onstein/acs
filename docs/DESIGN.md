@@ -808,6 +808,12 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   `~/.local/bin/acs`, `/usr/local/bin/acs`, `acs` on `PATH`) are repointed.
   The old version stays: clients of that version may still use it on this
   host, and `prune.rs` removes it once unused.
+- **Homebrew**: a binary whose real path is in a keg —
+  `<prefix>/Cellar/acs/<version>/bin/acs`, for `/opt/homebrew`, `/usr/local`
+  or `/home/linuxbrew/.linuxbrew` — is brew's to replace, and replacing it
+  behind brew's back would leave brew's records wrong. `acs upgrade` refuses
+  before any download (exit 1) with `upgrade it with: brew upgrade acs`;
+  `--check` still reports, naming that command (`upgrade::brewed`).
 - **macOS**: a curl download carries no quarantine attribute, and the
   ad-hoc signature is part of the file, so it still verifies after the
   rename (VERIFICATION.md).
@@ -832,6 +838,7 @@ acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
   `SHA256SUMS` the way `acs upgrade` does (§7.5), with curl's 3 s limit, and
   writes the version it found. A later start shows the message on stderr,
   before raw mode and outside the session stream, **once per new version**.
+  For a Homebrew install (§7.5) it ends `run: brew upgrade acs`.
 - **State** is `$XDG_STATE_HOME/acs/update-check` (default
   `~/.local/state/acs/update-check`): `checked=<unix time>`,
   `latest=<version>`, `shown=<version>`. It is a cache — unreadable or
@@ -849,7 +856,10 @@ The one-line installer (`scripts/install.sh`, published with every release;
 README "Install") uses the same layout — `~/.local/share/acs/<version>/acs`,
 or `/usr/local/lib/acs/<version>/acs` as root — so a host set up with it
 serves clients of that version without an upload. It is also what the client
-suggests when `install_on_remote` is off (§7.2).
+suggests when `install_on_remote` is off (§7.2). Homebrew
+(`brew install michel-onstein/acs/acs`, docs/VERSIONING.md) installs the same
+complete release binary into its own keg, which the prelude below does not
+look in: a client reaching a brewed host installs its version as usual.
 
 Remote binaries are installed **per version**:
 `~/.local/share/acs/<version>/acs`. A client always runs exactly its own

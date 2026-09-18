@@ -11,13 +11,15 @@
 //!    ad-hoc signed;
 //! 5. a size report, failing over budget (slim 1 MB, complete 2 MB).
 //!
-//! `cargo xtask bump` releases the next version (see `bump.rs` and
-//! docs/VERSIONING.md).
+//! `cargo xtask bump` releases the next version, `cargo xtask package` makes
+//! the release assets and `cargo xtask formula` the Homebrew formula (see
+//! `bump.rs`, `package.rs`, `formula.rs` and docs/VERSIONING.md).
 
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
 mod bump;
+mod formula;
 mod package;
 
 const LINUX: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
@@ -35,6 +37,12 @@ fn main() {
                 exit(1);
             }
         }
+        Some("formula") => {
+            if let Err(e) = formula::main(&args[1..]) {
+                eprintln!("xtask formula: {e}");
+                exit(1);
+            }
+        }
         Some("package") => {
             if let Err(e) = package::main(&args[1..]) {
                 eprintln!("xtask package: {e}");
@@ -43,7 +51,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask dist [--targets t1,t2] [--out dir]\n       cargo xtask bump [--dry-run] [--major|--minor|--patch] (see docs/VERSIONING.md)\n       cargo xtask package --dist DIR --version X.Y.Z --out DIR"
+                "usage: cargo xtask dist [--targets t1,t2] [--out dir]\n       cargo xtask bump [--dry-run] [--major|--minor|--patch] (see docs/VERSIONING.md)\n       cargo xtask package --dist DIR --version X.Y.Z --out DIR\n       cargo xtask formula --version X.Y.Z --sums SHA256SUMS [--out FILE]"
             );
             exit(2);
         }

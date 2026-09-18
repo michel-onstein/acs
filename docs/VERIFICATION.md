@@ -41,6 +41,8 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 | One-line installer | `scripts/test_install.sh` against the real v0.1.0 and v0.2.0 releases: macOS arm64 (curl), Alpine x86_64 (busybox wget) and Ubuntu aarch64 (curl), each as root and as a user | Pass — default layout, pinned version and in-place upgrade, `ACS_INSTALL_DIR`, checksum mismatch, missing version, unsupported platform |
 | `acs upgrade` from GitHub, macOS | this code built as 0.1.0 (plain file), `acs upgrade --check`, then `acs upgrade` (2026-09-18) | Pass — replaced by the real 0.2.0 release; `codesign -v`: valid on disk, satisfies its Designated Requirement; no quarantine attribute |
 | `acs upgrade` from GitHub, Linux | the same as a static aarch64 build in Alpine, which has no curl | Pass — downloaded with the wget fallback and replaced by 0.2.0 |
+| Homebrew, macOS | `brew install michel-onstein/acs/acs` (the v0.3.0 formula from the tap), `brew test acs`, `brew audit --strict --online`, `brew style`, on macOS arm64 (2026-09-18) | Pass — installed from the release archive into the Cellar, `codesign -v` valid, `acs --version` 0.3.0 with both Linux remotes; audit and style clean |
+| Homebrew, Linux | the same in the `homebrew/brew` container, aarch64 and x86_64 (emulated) | Pass — the static build installs and its test passes; the appended payloads survive brew's install |
 
 ## Still to check by hand
 
