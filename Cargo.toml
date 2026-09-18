@@ -1,0 +1,34 @@
+[package]
+name = "acs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Persistent, reconnecting remote shells over ssh with an unfiltered terminal stream"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "acs"
+path = "src/main.rs"
+
+[lib]
+name = "acs"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+lexopt = "0.3"
+
+[features]
+# Link the Linux payload set into the binary (macOS complete builds, DESIGN §8.1).
+embed-payloads = []
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]
+members = ["xtask"]

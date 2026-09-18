@@ -1,0 +1,191 @@
+//! The proxy, `acs _proxy` (DESIGN §3, §4.3), driven through its stdio as
+//! sshd would.
+
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use acs::proto::{err, Marker, Mode, Msg, PROTO_VERSION};
+use acs::testutil::{hello, FrameConn, TempDir};
+
+const T: Duration = Duration::from_secs(10);
+
+struct Proxy {
+    conn: FrameConn,
+    child: Child,
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn proxy(dir: &Path, args: &[&str]) -> Proxy {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_acs"))
+        .arg("_proxy")
+        .args(args)
+        .env("ACS_SOCKET_DIR", dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut conn = FrameConn::from_io(child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    match conn.expect_marker(T) {
+        Some(Marker::Ready { proto, .. }) => assert_eq!(proto, PROTO_VERSION),
+        other => panic!("expected ACS-READY, got {other:?}"),
+    }
+    Proxy { conn, child }
+}
+
+fn session(dir: &Path, name: &str) -> Proxy {
+    proxy(dir, &["--session", name, "--mode", "attach-or-create"])
+}
+
+fn hello_cmd(name: &str, identity: &str, cmd: &str) -> Msg {
+    let mut h = hello(name, Mode::AttachOrCreate, identity);
+    h.command = vec!["/bin/sh".into(), "-c".into(), cmd.into()];
+    Msg::Hello(h)
+}
+
+fn welcome(p: &mut Proxy) -> acs::proto::Welcome {
+    match p.conn.recv_control(T) {
+        Some(Msg::Welcome(w)) => w,
+        other => panic!("expected WELCOME, got {other:?}"),
+    }
+}
+
+#[test]
+fn creates_a_session_and_relays_both_ways() {
+    let t = TempDir::new();
+    let mut p = session(t.path(), "s");
+    p.conn
+        .send(&hello_cmd("s", "me", "read l; echo got:$l; exit 4"));
+    let w = welcome(&mut p);
+    assert!(w.created);
+    p.conn.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"hi\r".to_vec(),
+    });
+    p.conn.wait_output("got:hi", T);
+    match p.conn.recv_control(T) {
+        Some(Msg::Exit { status }) => assert_eq!(acs::sys::exit_code(status), 4),
+        other => panic!("{other:?}"),
+    }
+    // The master closed: the proxy follows.
+    assert!(p.conn.closed(T));
+    assert!(p.child.wait().unwrap().success());
+}
+
+#[test]
+fn stale_socket_is_replaced() {
+    let t = TempDir::new();
+    let path = t.path().join("st.sock");
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    assert!(path.exists(), "a socket file with nobody listening");
+    let mut p = session(t.path(), "st");
+    p.conn.send(&hello_cmd("st", "me", "echo alive; sleep 30"));
+    assert!(welcome(&mut p).created);
+    p.conn.wait_output("alive", T);
+}
+
+#[test]
+fn racing_proxies_converge_on_one_master() {
+    let t = TempDir::new();
+    let dir = t.path().to_path_buf();
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let mut p = session(&dir, "race");
+                p.conn
+                    .send(&hello_cmd("race", &format!("me{i}"), "sleep 30"));
+                // Different identities: later ones may get BUSY; retry forced.
+                let w = match p.conn.recv_control(T) {
+                    Some(Msg::Welcome(w)) => w,
+                    Some(Msg::Busy { .. }) => {
+                        let mut h = hello("race", Mode::AttachOrCreate, &format!("me{i}"));
+                        h.force = true;
+                        p.conn.send(&Msg::Hello(h));
+                        welcome(&mut p)
+                    }
+                    other => panic!("{other:?}"),
+                };
+                (w, p)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let instances: std::collections::HashSet<u64> =
+        results.iter().map(|(w, _)| w.instance).collect();
+    assert_eq!(instances.len(), 1, "more than one master");
+    assert_eq!(results.iter().filter(|(w, _)| w.created).count(), 1);
+}
+
+#[test]
+fn mismatched_protocol_is_refused_by_the_proxy() {
+    let t = TempDir::new();
+    let mut p = session(t.path(), "pm");
+    let mut h = hello("pm", Mode::AttachOrCreate, "me");
+    h.proto = PROTO_VERSION + 1;
+    p.conn.send(&Msg::Hello(h));
+    match p.conn.recv_control(T) {
+        Some(Msg::Error { code, .. }) => assert_eq!(code, err::PROTO_MISMATCH),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn attaching_to_a_missing_session_is_an_error() {
+    let t = TempDir::new();
+    let mut p = proxy(t.path(), &["--session", "nope", "--mode", "attach"]);
+    p.conn.send(&Msg::Hello(hello("nope", Mode::Attach, "me")));
+    match p.conn.recv_control(T) {
+        Some(Msg::Error { code, message }) => {
+            assert_eq!(code, err::NO_SESSION);
+            assert!(message.contains("nope"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!t.path().join("nope.sock").exists());
+}
+
+#[test]
+fn new_sessions_get_increasing_numbers() {
+    let t = TempDir::new();
+    let mut names = Vec::new();
+    let mut keep = Vec::new();
+    for _ in 0..3 {
+        let mut p = proxy(t.path(), &["--new"]);
+        // The client does not know the name; the proxy fills it in.
+        let mut h = hello("", Mode::Create, "me");
+        h.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        p.conn.send(&Msg::Hello(h));
+        let w = welcome(&mut p);
+        assert!(w.created);
+        names.push(w.session.clone());
+        keep.push(p);
+    }
+    assert_eq!(names, ["1", "2", "3"]);
+}
+
+#[test]
+fn a_dropped_client_leaves_the_session_detached() {
+    let t = TempDir::new();
+    let mut p = session(t.path(), "dd");
+    p.conn
+        .send(&hello_cmd("dd", "alice@one", "echo up; sleep 30"));
+    welcome(&mut p);
+    p.conn.wait_output("up", T);
+    // The ssh connection ends: the proxy's stdin closes.
+    p.conn.close_write();
+    assert!(p.conn.closed(T));
+    // Someone else can attach without a BUSY: nobody is attached any more.
+    let mut q = session(t.path(), "dd");
+    q.conn
+        .send(&Msg::Hello(hello("dd", Mode::Attach, "bob@two")));
+    let w = welcome(&mut q);
+    assert!(!w.created);
+}

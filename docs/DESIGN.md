@@ -1,6 +1,7 @@
 # acs — design
 
-**Status:** Proposed — design only, nothing built.
+**Status:** Built — acs v1 implemented and verified (see
+[VERIFICATION.md](VERIFICATION.md)).
 
 `acs` (*Ad-hoc Connectivity Shell*) replaces the `dsh` shell function (`ssh` +
 `dtach`) with **one Rust binary** that is both the local client and the remote
@@ -130,7 +131,7 @@ the connection ends. The proxy is a dumb relay — ~100 lines — so all state
 lives in the master and the client.
 
 **Transport** is `ssh -T -e none -o ControlMaster=no -o ControlPath=none
--o ServerAliveInterval=0 <host> <remote command>`:
+-o ServerAliveInterval=0 -o ConnectTimeout=10 <host> <remote command>`:
 
 - `-T`: no remote pty. The ssh channel is an 8-bit clean pipe carrying frames;
   the only pty is the master's. One pty instead of two.
@@ -140,6 +141,8 @@ lives in the master and the client.
   connection, so a reconnect never waits on a dead multiplexer. Side commands
   (`--list`, install) keep using the user's multiplexing.
 - `ServerAliveInterval=0`: liveness is ours (§5.3), much faster than ssh's.
+- `ConnectTimeout=10`: a redial into a dead network fails fast and the
+  client returns to its backoff wait, where `d` still detaches (§6.1).
 - Everything else — keys, agent, `ProxyJump`, host aliases — comes from the
   user's ssh config unchanged, plus any ssh options given on the `acs`
   command line (`-i`, `-p`, `-J`, `-F`, `-o`; §7.1). `acs` opens no ports
@@ -334,7 +337,7 @@ Length-prefixed, same format on the ssh leg and the unix-socket leg:
 | --- | --- | --- |
 | `HELLO` | c→m | proto version, session, mode (`attach`/`create`/`attach-or-create`), client identity, `force` flag, `TERM`, `COLORTERM`, cols, rows, xpixel, ypixel, optional `resume{instance, output_offset}` |
 | `BUSY` | m→c | identity attached and since when; the client may retry `HELLO` with `force` (§4.5) |
-| `WELCOME` | m→c | proto version, instance id, current output offset, `created` flag, `resumed` / `gap` / `fresh` |
+| `WELCOME` | m→c | proto version, instance id, current output offset, `created` flag, `resumed` / `gap` / `fresh`, input sequence (bytes written to the pty so far — input sequence numbers count in the master's stream, so clients taking turns never collide) |
 | `DATA` | m→c | `u64` offset of first byte, then raw pty bytes |
 | `INPUT` | c→m | `u64` sequence of first byte, then raw bytes for the pty |
 | `ACK` | m→c | highest input sequence written to the pty |
@@ -412,10 +415,11 @@ lossless resume will not repaint it. So:
    save-cursor / restore-cursor, and set the window title with the xterm title
    stack (push `CSI 22;0 t`, pop `CSI 23;0 t`) so the remote's title comes
    back afterwards.
-3. After a successful resume that followed a printed status line, send one
-   forced redraw (`SIGWINCH`) to clean up the line. Full-screen programs
-   repaint; a plain shell prompt may leave the line in scrollback, which is
-   acceptable.
+3. After a successful resume that followed a printed status line, force one
+   redraw to clean up the line: the client sends two RESIZE frames (one row
+   fewer, then the real size), since an unchanged size raises no `SIGWINCH`.
+   Full-screen programs repaint; a plain shell prompt may leave the line in
+   scrollback, which is acceptable.
 
 ## 6. Command mode
 
@@ -480,7 +484,13 @@ Rules:
 - **Bracketed paste** (`CSI 200 ~` … `CSI 201 ~`) is forwarded untouched: a
   pasted `0x1D 0x1D d` must not detach you.
 - Terminal replies to remote queries (DA, OSC 11, `CSI ? u`, XTVERSION) start
-  with `ESC`, never with a held key, so they are never delayed.
+  with `ESC`, never with a held key, so they are never delayed. They, mouse
+  reports and focus events are forwarded at once and do not break a pending
+  double tap.
+- One exception to reassembly: a read that ends in a **lone `ESC`** is the Esc
+  key and is sent at once — vim users press it constantly, and delaying it is
+  worse than missing the rare escape-key sequence split right after its first
+  byte. An incomplete `CSI` at the end of a read is held for at most 100 ms.
 
 ### 6.4 Restoring the local terminal on detach
 
@@ -626,8 +636,16 @@ final atomic rename puts identical content in place either way. A version's
 binary is never replaced by different content, so running masters are never
 affected by someone else's install.
 
-**Size** (estimates, to be measured in phase 1): slim ≈ 0.7 MB, gzip'd
-≈ 0.35 MB, so a complete binary with two Linux payloads ≈ 1.4 MB.
+**Size** (measured with `cargo xtask dist`, release profile):
+
+| Target | Slim | Complete |
+| --- | --- | --- |
+| `x86_64-unknown-linux-musl` | 602 KB | 1.21 MB |
+| `aarch64-unknown-linux-musl` | 553 KB | 1.16 MB |
+| `aarch64-apple-darwin` | 473 KB | 1.10 MB |
+| `x86_64-apple-darwin` | 494 KB | 1.13 MB |
+
+The payload set (both Linux builds, gzip'd) is 609 KB.
 
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
@@ -638,11 +656,12 @@ for anything else.
 
 ## 9. Implementation
 
-- **Crates, chosen for size**: `rustix` (termios, pty, poll, signals, `flock`)
-  or `nix`; `lexopt` for arguments (clap adds hundreds of KB); hand-written
-  frame codec; no compression crate (the remote's `gzip` unpacks payloads,
-  §8.1); `sha2` for the install digest. **No async runtime**: two
-  single-threaded poll loops do not need tokio.
+- **Crates, chosen for size**: only `libc` (termios, pty, poll, signals,
+  `flock`, peer credentials — wrapped in `sys.rs`) and `lexopt` for arguments
+  (clap adds hundreds of KB); hand-written frame codec; no compression crate
+  (the remote's `gzip` unpacks payloads, §8.1); an in-crate SHA-256 for the
+  install digest. **No async runtime**: the single-threaded poll loops do not
+  need tokio.
 - **Profile**: `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
   `panic = "abort"`, `strip = true`.
 - **Targets**: `aarch64-apple-darwin` (local, installed), `x86_64-apple-darwin`,
@@ -650,17 +669,33 @@ for anything else.
   `cargo-zigbuild` (not installed yet; the installed
   `aarch64-unknown-linux-gnu` target would produce a glibc-linked binary, which
   is not what a copy-anywhere remote needs).
-- **Layout** (single crate):
+- **Layout** (single crate plus `xtask`):
 
 ```text
 src/
-  main.rs        role dispatch: client | _proxy | _master | _version-check
-  proto.rs       frame codec, HELLO/WELCOME types
-  client/        tty, command-key detector, mode observer, reconnect loop, ssh spawn
-  master/        pty, ring buffer, child lifecycle, socket/lock handling
-  proxy.rs       connect-or-spawn, splice, --list
-  install.rs     ACS-NEED handling, target mapping, payload trailer / embed, _install --finish
-xtask/           cargo xtask dist: slim builds, payload set, complete builds, signing
+  lib.rs        role dispatch (client | _proxy | _master | _install), --version
+  cli.rs        dsh-compatible arguments, ssh option passthrough
+  client.rs     dial, handshake, session loop, detach/exit, messages
+  reconnect.rs  liveness, backoff, offline status line, takeover prompt
+  keys.rs       Ctrl-] Ctrl-] command-key detector
+  modes.rs      passive terminal-mode observer and resets
+  netwatch.rs   network-change watcher (PF_ROUTE / NETLINK_ROUTE)
+  tty.rs        raw mode and emergency restore
+  proto.rs      frames, messages, ACS-READY / ACS-NEED markers
+  resume.rs     output ring, input ack tracking
+  ssh.rs        ssh argv builder, remote prelude, quoting
+  session.rs    session names, per-uid socket directory, locks
+  proxy.rs      acs _proxy: connect-or-spawn, relay, --list
+  master.rs     acs _master: pty, child, ring, protocol
+  list.rs       --list table
+  install.rs    remote self-install and _install --finish
+  payload.rs    payload set format, ELF trailer, Mach-O embed
+  prune.rs      pruning of unused remote versions
+  sha256.rs     SHA-256 for install checks
+  sys.rs        libc wrappers
+xtask/          cargo xtask dist
+tests/          integration tests (tests/common: fake remote, pty runner)
+scripts/        verify.sh, test_linux.sh, e2e_ssh.sh
 ```
 
 ### 9.1 Testing

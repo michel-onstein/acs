@@ -1,0 +1,319 @@
+//! Passive observer of terminal modes (DESIGN §6.4).
+//!
+//! Scans the output stream for the few sequences that switch terminal modes a
+//! remote program should not leave behind — mouse reporting, bracketed paste,
+//! the alternate screen, a hidden cursor, keyboard protocols, synchronized
+//! output — and produces the resets for when the client leaves without the
+//! program having cleaned up (detach, exit, abandoned reconnect).
+//!
+//! It never modifies, delays or reorders the stream: the caller writes the
+//! bytes to the terminal and hands the same bytes to [`ModeObserver::observe`].
+
+use std::collections::BTreeMap;
+
+/// DEC private modes worth resetting, with their power-on default.
+const TRACKED: &[(u16, bool)] = &[
+    (1, false),    // application cursor keys
+    (25, true),    // cursor visible
+    (47, false),   // alternate screen (old)
+    (1047, false), // alternate screen
+    (1049, false), // alternate screen + saved cursor
+    (1000, false), // mouse: press/release
+    (1002, false), // mouse: button motion
+    (1003, false), // mouse: any motion
+    (1004, false), // focus events
+    (1005, false), // mouse: UTF-8 coordinates
+    (1006, false), // mouse: SGR coordinates
+    (1015, false), // mouse: urxvt coordinates
+    (1016, false), // mouse: SGR pixel coordinates
+    (2004, false), // bracketed paste
+    (2026, false), // synchronized output
+];
+
+const ALT_SCREEN: &[u16] = &[1049, 1047, 47];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lex {
+    Ground,
+    Esc,
+    Csi,
+    /// OSC/DCS/APC/PM/SOS body; `esc` = previous byte was ESC.
+    Str {
+        esc: bool,
+    },
+}
+
+#[derive(Default)]
+pub struct ModeObserver {
+    lex: Option<Lex>,
+    seq: Vec<u8>,
+    /// DEC modes currently different from their default: mode → value.
+    dec: BTreeMap<u16, bool>,
+    /// Kitty keyboard flags pushed with `CSI > flags u` and not popped.
+    kitty_depth: u32,
+    /// Kitty flags set in place with `CSI = flags ; mode u`.
+    kitty_set: bool,
+    /// xterm modifyOtherKeys level, if non-zero.
+    modify_other_keys: bool,
+    /// Keypad application mode (`ESC =`).
+    keypad_app: bool,
+    /// A scroll region was set.
+    scroll_region: bool,
+}
+
+impl ModeObserver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget everything, e.g. after a fresh attach where the local terminal
+    /// was cleared.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// True when the terminal is believed to be in its default state.
+    pub fn is_clean(&self) -> bool {
+        self.dec.is_empty()
+            && self.kitty_depth == 0
+            && !self.kitty_set
+            && !self.modify_other_keys
+            && !self.keypad_app
+            && !self.scroll_region
+    }
+
+    pub fn observe(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            let lex = self.lex.unwrap_or(Lex::Ground);
+            self.lex = Some(match lex {
+                Lex::Ground => {
+                    if b == 0x1b {
+                        self.seq.clear();
+                        Lex::Esc
+                    } else {
+                        Lex::Ground
+                    }
+                }
+                Lex::Esc => match b {
+                    b'[' => Lex::Csi,
+                    b']' | b'P' | b'_' | b'^' | b'X' => Lex::Str { esc: false },
+                    b'=' => {
+                        self.keypad_app = true;
+                        Lex::Ground
+                    }
+                    b'>' => {
+                        self.keypad_app = false;
+                        Lex::Ground
+                    }
+                    b'c' => {
+                        // RIS: full reset.
+                        self.clear();
+                        Lex::Ground
+                    }
+                    0x1b => Lex::Esc,
+                    _ => Lex::Ground,
+                },
+                Lex::Csi => {
+                    if (0x20..=0x3f).contains(&b) {
+                        if self.seq.len() < 64 {
+                            self.seq.push(b);
+                        }
+                        Lex::Csi
+                    } else if (0x40..=0x7e).contains(&b) {
+                        let body = std::mem::take(&mut self.seq);
+                        self.csi(&body, b);
+                        Lex::Ground
+                    } else if b == 0x1b {
+                        self.seq.clear();
+                        Lex::Esc
+                    } else {
+                        // C0 controls inside CSI are executed; keep lexing.
+                        Lex::Csi
+                    }
+                }
+                Lex::Str { esc } => match (esc, b) {
+                    (_, 0x07) | (true, b'\\') => Lex::Ground,
+                    (_, 0x1b) => Lex::Str { esc: true },
+                    _ => Lex::Str { esc: false },
+                },
+            });
+        }
+    }
+
+    fn csi(&mut self, body: &[u8], fin: u8) {
+        let Ok(body) = std::str::from_utf8(body) else {
+            return;
+        };
+        let nums = |s: &str| -> Vec<u32> { s.split(';').map(|n| n.parse().unwrap_or(0)).collect() };
+        match (body.as_bytes().first(), fin) {
+            (Some(b'?'), b'h' | b'l') => {
+                let on = fin == b'h';
+                for m in nums(&body[1..]) {
+                    let Ok(m) = u16::try_from(m) else { continue };
+                    if let Some(&(_, default)) = TRACKED.iter().find(|(t, _)| *t == m) {
+                        if on == default {
+                            self.dec.remove(&m);
+                        } else {
+                            self.dec.insert(m, on);
+                        }
+                    }
+                }
+            }
+            (Some(b'>'), b'u') => self.kitty_depth += 1,
+            (Some(b'<'), b'u') => {
+                let n = body[1..].parse().unwrap_or(1).max(1);
+                self.kitty_depth = self.kitty_depth.saturating_sub(n);
+            }
+            (Some(b'='), b'u') => {
+                let p = nums(&body[1..]);
+                if self.kitty_depth == 0 {
+                    self.kitty_set = p.first().copied().unwrap_or(0) != 0;
+                }
+            }
+            (Some(b'>'), b'm') => {
+                let p = nums(&body[1..]);
+                if p.first() == Some(&4) {
+                    self.modify_other_keys = p.get(1).copied().unwrap_or(0) != 0;
+                }
+            }
+            (None | Some(b'0'..=b'9' | b';'), b'r') => {
+                let p = nums(body);
+                self.scroll_region = !(body.is_empty() || p.iter().all(|&n| n == 0));
+            }
+            _ => {}
+        }
+    }
+
+    /// Bytes that return the terminal to its defaults for every mode seen.
+    /// Empty when nothing needs resetting.
+    pub fn reset_sequence(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.is_clean() {
+            return out;
+        }
+        if self.kitty_depth > 0 {
+            out.extend_from_slice(format!("\x1b[<{}u", self.kitty_depth).as_bytes());
+        }
+        if self.kitty_set {
+            out.extend_from_slice(b"\x1b[=0;1u");
+        }
+        if self.modify_other_keys {
+            out.extend_from_slice(b"\x1b[>4;0m");
+        }
+        if self.keypad_app {
+            out.extend_from_slice(b"\x1b>");
+        }
+        if self.scroll_region {
+            out.extend_from_slice(b"\x1b[r");
+        }
+        let restore = |out: &mut Vec<u8>, m: u16| {
+            let default = TRACKED
+                .iter()
+                .find(|(t, _)| *t == m)
+                .map(|t| t.1)
+                .unwrap_or(false);
+            out.extend_from_slice(
+                format!("\x1b[?{}{}", m, if default { 'h' } else { 'l' }).as_bytes(),
+            );
+        };
+        for &m in self.dec.keys() {
+            if !ALT_SCREEN.contains(&m) && m != 25 {
+                restore(&mut out, m);
+            }
+        }
+        // Leave the alternate screen last but one, so the resets above apply
+        // to the screen the user returns to, then show the cursor.
+        for &m in ALT_SCREEN {
+            if self.dec.contains_key(&m) {
+                restore(&mut out, m);
+            }
+        }
+        if self.dec.contains_key(&25) {
+            restore(&mut out, 25);
+        }
+        out.extend_from_slice(b"\x1b[0m");
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observe_split(stream: &[u8]) -> Vec<Vec<u8>> {
+        let mut resets = Vec::new();
+        for split in 0..=stream.len() {
+            let mut o = ModeObserver::new();
+            o.observe(&stream[..split]);
+            o.observe(&stream[split..]);
+            resets.push(o.reset_sequence());
+        }
+        resets
+    }
+
+    #[test]
+    fn clean_stream_needs_no_reset() {
+        let mut o = ModeObserver::new();
+        o.observe(b"hello \x1b[1;31mred\x1b[0m \x1b]0;title\x07 \x1b[?1049h\x1b[?1049l");
+        assert!(o.is_clean());
+        assert!(o.reset_sequence().is_empty());
+    }
+
+    #[test]
+    fn full_screen_tui_is_reset_in_order() {
+        // What a vim/htop-like program turns on.
+        let stream: &[u8] =
+            b"\x1b[?1049h\x1b[?1h\x1b=\x1b[?25l\x1b[?1000;1002;1006h\x1b[?2004h\x1b[>1u\x1b[>4;2m\x1b[?1004h\x1b[5;20r";
+        for (split, reset) in observe_split(stream).into_iter().enumerate() {
+            assert_eq!(
+                reset,
+                b"\x1b[<1u\x1b[>4;0m\x1b>\x1b[r\x1b[?1l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m",
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn modes_turned_off_again_are_forgotten() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[?1000h\x1b[?25l\x1b[>1u\x1b[>1u\x1b[<u\x1b[?25h\x1b[?1000l");
+        assert_eq!(o.reset_sequence(), b"\x1b[<1u\x1b[0m");
+        o.observe(b"\x1b[<5u");
+        assert!(o.is_clean());
+    }
+
+    #[test]
+    fn sequences_inside_strings_are_ignored() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b]2;\x1b[?1000h\x07\x1bP\x1b[?2004h\x1b\\");
+        // The OSC ends at BEL; the DCS body swallows its sequence until ST.
+        assert!(
+            o.is_clean(),
+            "{:?}",
+            String::from_utf8_lossy(&o.reset_sequence())
+        );
+    }
+
+    #[test]
+    fn full_reset_clears_state() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[?1049h\x1b[?1000h\x1bc");
+        assert!(o.is_clean());
+    }
+
+    #[test]
+    fn kitty_set_in_place_and_modify_other_keys_off() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[=5;1u\x1b[>4;1m");
+        assert_eq!(o.reset_sequence(), b"\x1b[=0;1u\x1b[>4;0m\x1b[0m");
+        o.observe(b"\x1b[=0;1u\x1b[>4m");
+        assert!(o.is_clean());
+    }
+
+    #[test]
+    fn untracked_modes_are_ignored() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[?7l\x1b[?12h\x1b[4h\x1b[?99999h");
+        assert!(o.is_clean());
+    }
+}
