@@ -167,7 +167,13 @@ mod tests {
         let held = Flock::lock(&p).unwrap();
         assert!(Flock::try_lock(&p).unwrap().is_none());
         drop(held);
-        assert!(Flock::try_lock(&p).unwrap().is_some());
+        // Another test may fork while we hold the lock; its child shares the
+        // descriptor until exec closes it (close-on-exec), so allow a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while Flock::try_lock(&p).unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "lock never freed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = std::fs::remove_file(&p);
     }
 
