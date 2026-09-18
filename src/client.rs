@@ -43,7 +43,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(code::USAGE);
         }
     };
-    let mut args = match parsed {
+    let (mut args, every_alias) = match parsed {
         Parsed::Help => {
             println!("{}", cli::USAGE);
             return ExitCode::SUCCESS;
@@ -52,7 +52,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             crate::print_version();
             return ExitCode::SUCCESS;
         }
-        Parsed::Run(a) => *a,
+        Parsed::Run(a) => (*a, false),
+        Parsed::ListAll(a) => (*a, true),
     };
     args.config = match crate::config::Config::load() {
         Ok(c) => c,
@@ -63,6 +64,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     // Before connecting: a newer release found by an earlier check.
     crate::update_check::on_client_start(&args.config);
+    if every_alias {
+        return crate::list::run_all(&args);
+    }
     let name = args.transport.destination.clone();
     if let Err(e) = resolve_alias(&mut args, &name) {
         eprintln!("acs: {e}");
@@ -183,7 +187,7 @@ pub fn dial(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = sys::spawn(&mut cmd).map_err(|e| {
         let argv = args.transport.argv(call, remote);
         io::Error::new(
             e.kind(),

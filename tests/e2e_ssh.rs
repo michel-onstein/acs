@@ -263,6 +263,41 @@ fn e2e_09_list_shows_the_sessions() {
 }
 
 #[test]
+fn e2e_09b_list_without_a_host_asks_every_alias() {
+    let Some(h) = host() else { return };
+    // `box` is the container; `gone` is a documentation address no ping
+    // reaches.
+    let dir = acs::testutil::TempDir::new();
+    let env = config_env(
+        dir.path(),
+        "hosts:\n  box:\n    - host: 127.0.0.1\n      user: dev\n  gone:\n    - host: 192.0.2.1\n",
+    );
+    let mut args = h.ssh_args();
+    args.push("--list".into());
+    let out = Command::new(&h.client)
+        .args(&args)
+        .envs(env)
+        .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+        .env("ACS_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "{text}{err}");
+    // Tests run in name order: e2e_01 left its session there.
+    let row = text
+        .lines()
+        .find(|l| l.contains(" first "))
+        .unwrap_or_else(|| panic!("no session listed:\n{text}{err}"));
+    assert!(row.starts_with("box "), "{text}");
+    assert!(
+        err.contains("acs: gone: no host for 'gone' is reachable"),
+        "{err}"
+    );
+    eprintln!("VERIFIED acs --list over ssh (BatchMode):\n{text}{err}");
+}
+
+#[test]
 fn e2e_10_user_at_alias_logs_in_as_that_user() {
     let Some(h) = host() else { return };
     // The entry's own user has no key on the host: only the override works.

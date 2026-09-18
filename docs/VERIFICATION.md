@@ -31,6 +31,7 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 | Killed connection | the host's `sshd-session` for the connection is killed mid-stream | Pass — reconnect, numbered output consecutive, nothing lost or repeated |
 | Frozen host | `docker pause` for 4 s beyond the dead-link timeout | Pass — dead link detected in 3.0 s (`ACS_DEAD_MS=3000`), resumed with no loss |
 | `--list` | over ssh after the sessions above | Pass — sessions listed |
+| `--list` on every alias | no host; aliases `box` (the container) and `gone` (192.0.2.1, answers no ping); ssh in `BatchMode` | Pass — `box` sessions under a HOST column, one stderr line for `gone`, exit 255 |
 | `user@<alias>` | `acs dev@box` where alias `box`'s only entry says `user: nobody` | Pass — logs in as `dev` (2026-09-18) |
 | Full test suite on Linux | `scripts/test_linux.sh` | Pass — found and fixed two Linux-only bugs first (a master stall under backpressure; a replaced binary breaking master start) |
 | Multi-user isolation | squatted and symlinked socket directories, foreign peer uid, per-user `main` | Pass |

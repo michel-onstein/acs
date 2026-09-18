@@ -87,7 +87,11 @@ pub fn ping(host: &str) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    c.status().map(|s| s.success()).unwrap_or(false)
+    // Spawned apart from waited for: `acs --list` pings from several threads.
+    crate::sys::spawn(&mut c)
+        .and_then(|mut child| child.wait())
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
