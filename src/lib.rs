@@ -29,6 +29,7 @@ pub mod sys;
 #[doc(hidden)]
 pub mod testutil;
 pub mod tty;
+pub mod update_check;
 pub mod upgrade;
 pub mod yaml;
 
@@ -53,6 +54,8 @@ pub enum Role {
     Config,
     /// `acs upgrade`: replace this binary with a newer release.
     Upgrade,
+    /// Background check for a newer release, started by the client.
+    UpdateCheck,
 }
 
 impl Role {
@@ -63,6 +66,7 @@ impl Role {
             Some("_proxy") => Role::Proxy,
             Some("_master") => Role::Master,
             Some("_install") => Role::Install,
+            Some("_update-check") => Role::UpdateCheck,
             Some("_version") | Some("--version") | Some("-V") => Role::Version,
             // Reserved words, only as the very first argument: a host
             // called `config` or `upgrade` is still reachable as
@@ -116,6 +120,7 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         Role::Install => install::finish_main(&args[2..]),
         Role::Config => config_cmd::main(&args[2..]),
         Role::Upgrade => upgrade::main(&args[2..]),
+        Role::UpdateCheck => update_check::check_main(),
     }
 }
 
@@ -132,6 +137,7 @@ mod tests {
         assert_eq!(role("_proxy"), Role::Proxy);
         assert_eq!(role("_master"), Role::Master);
         assert_eq!(role("_install"), Role::Install);
+        assert_eq!(role("_update-check"), Role::UpdateCheck);
         assert_eq!(role("_version"), Role::Version);
         assert_eq!(role("--version"), Role::Version);
     }

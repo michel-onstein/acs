@@ -67,6 +67,8 @@ impl HostEntry {
 pub struct Config {
     /// Install acs on a remote that lacks it (default true).
     pub install_on_remote: Setting<bool>,
+    /// Check GitHub once a week for a newer release (default true).
+    pub update_check: Setting<bool>,
     /// Aliases in the order first defined, each with its hosts in order.
     pub hosts: Vec<(String, Vec<HostEntry>)>,
     /// The files that were read, global first.
@@ -77,6 +79,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             install_on_remote: Setting::default(true),
+            update_check: Setting::default(true),
             hosts: Vec::new(),
             files: Vec::new(),
         }
@@ -84,7 +87,10 @@ impl Default for Config {
 }
 
 /// Every top-level setting, for error messages and `acs config`.
-pub const KEYS: &[&str] = &["install_on_remote", "hosts"];
+pub const KEYS: &[&str] = &["install_on_remote", "update_check", "hosts"];
+
+/// The settings that are true or false.
+pub const BOOLS: &[&str] = &["install_on_remote", "update_check"];
 
 /// Every key of a host entry.
 pub const HOST_KEYS: &[&str] = &["host", "user", "reachability_check"];
@@ -167,9 +173,10 @@ impl Config {
                 continue;
             }
             match key.as_str() {
-                "install_on_remote" => {
-                    self.install_on_remote = Setting {
-                        value: bool_value(node).map_err(|e| fail(node, format!("{key}: {e}")))?,
+                k if BOOLS.contains(&k) => {
+                    let value = bool_value(node).map_err(|e| fail(node, format!("{key}: {e}")))?;
+                    *self.bool_mut(k).expect("a bool setting") = Setting {
+                        value,
                         origin: Some(at(node)),
                     }
                 }
@@ -223,6 +230,23 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// A true-or-false setting by name.
+    pub fn bool_setting(&self, key: &str) -> Option<&Setting<bool>> {
+        match key {
+            "install_on_remote" => Some(&self.install_on_remote),
+            "update_check" => Some(&self.update_check),
+            _ => None,
+        }
+    }
+
+    fn bool_mut(&mut self, key: &str) -> Option<&mut Setting<bool>> {
+        match key {
+            "install_on_remote" => Some(&mut self.install_on_remote),
+            "update_check" => Some(&mut self.update_check),
+            _ => None,
+        }
     }
 
     /// The hosts of `alias`, if it is one.
@@ -421,7 +445,7 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, hosts)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, hosts)",
             ),
             ("hosts: [a]\n", ":1: hosts: expected a mapping"),
             (
