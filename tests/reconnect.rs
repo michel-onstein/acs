@@ -207,3 +207,30 @@ fn output_lost_to_a_small_ring_is_a_gap_and_redraw() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn a_network_change_redials_at_once() {
+    let remote = Remote::installed();
+    let fifo = remote.root.path().join("netchange");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let fifo_s = fifo.to_str().unwrap().to_string();
+    let mut c = start(
+        &remote,
+        "net",
+        TICKER,
+        &[("ACS_BACKOFF_MS", "20000"), ("ACS_NETWATCH_FIFO", &fifo_s)],
+    );
+    c.wait_for("#10#", T);
+    remote.cut_link();
+    c.wait_for("reconnecting in 20s", T);
+    let t0 = Instant::now();
+    // Wi-Fi came back: the watcher fires, the client redials now.
+    let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+    std::io::Write::write_all(&mut w, b"up").unwrap();
+    remote.wait_connections(2, Duration::from_secs(5));
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    let target = last_number(&c) + 20;
+    c.wait_for(&format!("#{target}#"), T);
+    assert_consecutive(&c.text());
+}

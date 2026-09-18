@@ -63,6 +63,8 @@ pub fn run(
     signals: &OwnedFd,
 ) -> u8 {
     let mut backoff = Backoff::new(env_ms("ACS_BACKOFF_MS", 1000));
+    let netwatch = crate::netwatch::NetWatch::new();
+    let mut last_early: Option<Instant> = None;
     let mut resuming = false;
     loop {
         let started = Instant::now();
@@ -83,8 +85,20 @@ pub fn run(
             backoff.reset();
         }
         let wait = backoff.step();
-        match offline(state, raw, signals, wait) {
+        match offline(
+            state,
+            raw,
+            signals,
+            wait,
+            netwatch.as_ref(),
+            &mut last_early,
+        ) {
             Offline::Retry => resuming = true,
+            Offline::NetworkChanged => {
+                // A new network is a fresh start.
+                backoff.reset();
+                resuming = true;
+            }
             Offline::Detach => {
                 clear_status(state);
                 client::leave(state, raw);
@@ -100,8 +114,12 @@ pub fn run(
 
 enum Offline {
     Retry,
+    NetworkChanged,
     Detach,
 }
+
+/// At most one early redial per this interval, however chatty the network.
+const EARLY_EVERY: Duration = Duration::from_secs(2);
 
 /// Wait `wait` before the next redial with the link down: show the status,
 /// drop typed keys, but honour the command keys.
@@ -110,6 +128,8 @@ fn offline(
     raw: &mut Option<RawMode>,
     signals: &OwnedFd,
     wait: Duration,
+    netwatch: Option<&crate::netwatch::NetWatch>,
+    last_early: &mut Option<Instant>,
 ) -> Offline {
     if let Some(r) = raw.as_mut() {
         let _ = r.resume();
@@ -136,10 +156,18 @@ fn offline(
         let mut fds = [
             sys::pollfd(0, libc::POLLIN),
             sys::pollfd(signals.as_raw_fd(), libc::POLLIN),
+            sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
         ];
         let _ = sys::poll(&mut fds, timeout.as_millis() as i32);
         if fds[1].revents != 0 {
             sys::signals::drain(signals.as_raw_fd());
+        }
+        if fds[2].revents != 0 && netwatch.is_some_and(|w| w.changed()) {
+            let quiet = last_early.map_or(true, |t| t.elapsed() >= EARLY_EVERY);
+            if quiet {
+                *last_early = Some(Instant::now());
+                return Offline::NetworkChanged;
+            }
         }
         let out = if fds[0].revents != 0 {
             match sys::read(0, &mut buf) {

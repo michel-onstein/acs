@@ -11,6 +11,7 @@ pub mod keys;
 pub mod list;
 pub mod master;
 pub mod modes;
+pub mod netwatch;
 pub mod payload;
 pub mod proto;
 pub mod proxy;
