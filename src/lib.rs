@@ -8,6 +8,7 @@ pub mod alias;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod config_cmd;
 pub mod install;
 pub mod keys;
 pub mod list;
@@ -46,6 +47,8 @@ pub enum Role {
     Install,
     /// Print the version and protocol version.
     Version,
+    /// `acs config …`: read and edit the configuration files.
+    Config,
 }
 
 impl Role {
@@ -57,6 +60,10 @@ impl Role {
             Some("_master") => Role::Master,
             Some("_install") => Role::Install,
             Some("_version") | Some("--version") | Some("-V") => Role::Version,
+            // Reserved words, only as the very first argument: a host
+            // called `config` is still reachable as `user@config`, or with
+            // any option before it.
+            Some("config") => Role::Config,
             _ => Role::Client,
         }
     }
@@ -97,6 +104,7 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         Role::Proxy => proxy::main(&args[2..]),
         Role::Client => client::main(&args[1..]),
         Role::Install => install::finish_main(&args[2..]),
+        Role::Config => config_cmd::main(&args[2..]),
     }
 }
 
@@ -121,6 +129,13 @@ mod tests {
     fn anything_else_is_the_client() {
         assert_eq!(role("devbox"), Role::Client);
         assert_eq!(role("proxy"), Role::Client);
+        assert_eq!(role("me@config"), Role::Client);
+        assert_eq!(role("-v"), Role::Client);
+    }
+
+    #[test]
+    fn config_is_reserved_as_the_first_argument() {
+        assert_eq!(role("config"), Role::Config);
         assert_eq!(Role::from_first_arg(None), Role::Client);
     }
 }

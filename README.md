@@ -131,6 +131,26 @@ so a fallback to a different one finds no session to resume.
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
 
+### Editing it from the command line
+
+```sh
+acs config host add devbox devbox.lan                 # the first host of devbox
+acs config host add devbox devbox.example.com --user michel
+acs config host add nas nas.lan --no-reachability-check
+acs config host list                                  # aliases and their hosts
+acs config host remove devbox devbox.lan              # one host, or the alias
+acs config set install_on_remote false
+acs config get install_on_remote
+acs config unset install_on_remote                    # back to the default
+acs config show                                       # everything, and where it is from
+acs config path                                       # the files acs reads
+```
+
+These edit `~/.config/acs/config.yaml`; add `--global` for
+`/etc/acs/config.yaml` (with sudo). Comments and the order of the rest of the
+file are kept. Because `config` is a command, a host named `config` is
+reached as `user@config`.
+
 ## Environment
 
 | Variable | Meaning |

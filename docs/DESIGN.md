@@ -624,6 +624,33 @@ build 490 → 507 KB).
 - A name that is not an alias behaves exactly as before; so does
   `user@<alias>`, which is a way to reach a host whose name is also an alias.
 
+### 7.4 `acs config`
+
+`acs config …` reads and edits the files of §7.2, so nobody has to remember
+their YAML shape:
+
+| Command | Effect |
+| --- | --- |
+| `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`); `set` checks the type |
+| `host list` | every alias and its hosts, in the order they are tried, with where each is defined |
+| `host add <alias> <host> [--user U] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
+| `host remove <alias> [<host>]` | remove one host (the alias goes with its last one), or the alias |
+| `path` | the two files and whether they exist |
+
+- Edits go to the local file; `--global` edits the global one (and needs
+  write access to it — the error says to use sudo).
+- An edit changes the YAML tree (`yaml.rs`), not the text, so comments,
+  blank lines and the order of everything else survive; indentation is
+  written as two spaces. The result is parsed and validated again before it
+  replaces the file (atomically, keeping its mode), so an edit never saves a
+  file the client would refuse — nor overwrites one that is already broken.
+- Removing something that lives in the other file fails with a pointer to it
+  (`it is set in /etc/acs/config.yaml:1 (use --global)`).
+- `config` is a reserved **first** argument. A host literally called
+  `config` is reached as `user@config`, or with any option before it
+  (`acs -p 22 config`).
+
 ## 8. Installing the remote binary
 
 Remote binaries are installed **per version**:
@@ -765,6 +792,7 @@ src/
   master.rs     acs _master: pty, child, ring, protocol
   list.rs       --list table
   config.rs     configuration files: locations, merging, validation
+  config_cmd.rs acs config: show, get/set/unset, host list/add/remove
   alias.rs      host aliases: ping check and fallback hosts
   yaml.rs       the YAML subset those files use, parsed and written back
   install.rs    remote self-install and _install --finish
