@@ -88,7 +88,7 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
     }
     let target = payload::target_for_uname(os, arch)
         .ok_or_else(|| format!("{host} runs {os} {arch}, which acs does not support"))?;
-    let own = std::env::current_exe()
+    let own = crate::sys::self_exe()
         .and_then(std::fs::read)
         .map_err(|e| format!("cannot read this acs binary: {e}"))?;
     let carried = Payloads::from_self();

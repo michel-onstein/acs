@@ -129,7 +129,7 @@ impl Payloads {
         if !EMBEDDED.is_empty() {
             return Payloads::parse(EMBEDDED);
         }
-        let exe = std::env::current_exe().ok()?;
+        let exe = crate::sys::self_exe().ok()?;
         Payloads::from_file(&exe).ok().flatten().map(|(_, p)| p)
     }
 
@@ -181,7 +181,7 @@ fn footer(b: &[u8]) -> Option<(u64, u64)> {
 
 /// This binary without any appended payloads: `(bytes, was_complete)`.
 pub fn own_slim_bytes() -> io::Result<(Vec<u8>, bool)> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::sys::self_exe()?;
     let all = std::fs::read(&exe)?;
     match Payloads::from_file(&exe)? {
         Some((slim_len, _)) => Ok((all[..slim_len as usize].to_vec(), true)),

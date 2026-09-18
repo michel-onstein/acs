@@ -134,6 +134,12 @@ impl FrameConn {
         self.send_raw(&m.to_bytes());
     }
 
+    /// Send without panicking when the peer has already closed.
+    pub fn try_send(&mut self, m: &Msg) -> std::io::Result<()> {
+        self.writer.write_all(&m.to_bytes())?;
+        self.writer.flush()
+    }
+
     pub fn send_raw(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).expect("send");
         self.writer.flush().expect("flush");

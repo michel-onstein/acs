@@ -53,6 +53,46 @@ pub fn user_name(uid: u32) -> Option<String> {
     )
 }
 
+/// `(uid, gid, home)` of a login name, if the password database knows it.
+pub fn user_by_name(name: &str) -> Option<(u32, u32, std::path::PathBuf)> {
+    let c = std::ffi::CString::new(name).ok()?;
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: zeroed passwd is a valid out-parameter; buf outlives the call.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let r = unsafe {
+        libc::getpwnam_r(
+            c.as_ptr(),
+            &mut pw,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if r != 0 || result.is_null() {
+        return None;
+    }
+    // SAFETY: pw_dir points into buf and is NUL-terminated.
+    let home = unsafe { CStr::from_ptr(pw.pw_dir) }
+        .to_string_lossy()
+        .into_owned();
+    Some((pw.pw_uid, pw.pw_gid, home.into()))
+}
+
+/// A path that runs this very binary. On Linux `/proc/self/exe` keeps
+/// working after the file was replaced (an install renamed a new build over
+/// it), when `current_exe()` would name a path that no longer exists.
+pub fn self_exe() -> io::Result<std::path::PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let p = std::path::Path::new("/proc/self/exe");
+        if p.exists() {
+            return Ok(p.to_path_buf());
+        }
+    }
+    std::env::current_exe()
+}
+
 pub fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: buf is writable for its length.

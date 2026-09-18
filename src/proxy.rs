@@ -128,7 +128,7 @@ fn connect_or_start(
         if tried_spawn {
             std::thread::sleep(Duration::from_millis(20));
         }
-        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let exe = crate::sys::self_exe().map_err(|e| format!("current_exe: {e}"))?;
         match master::spawn(&exe, dir.path(), name) {
             Ok(()) => {}
             // Another proxy's master won the race: just connect to it.
