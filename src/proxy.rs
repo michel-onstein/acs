@@ -89,6 +89,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         Ok(d) => d,
         Err(e) => return fail(e),
     };
+    crate::prune::on_proxy_start(|| live_versions(&dir));
     match what {
         What::List => list(&dir),
         What::Session { name, mode } => match session(&dir, name, mode) {
@@ -326,6 +327,17 @@ fn list(dir: &SocketDir) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Versions the running masters report (kept by the pruner).
+fn live_versions(dir: &SocketDir) -> std::collections::HashSet<String> {
+    dir.sessions()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|n| dir.socket_path(n).ok())
+        .filter_map(|p| status_of(&p).ok())
+        .map(|s| s.version)
+        .collect()
 }
 
 fn status_of(path: &std::path::Path) -> io::Result<proto::StatusInfo> {

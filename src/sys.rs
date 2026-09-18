@@ -160,6 +160,25 @@ pub fn local_hhmm(t: u64) -> String {
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
+/// Set a path's access and modification time to now.
+pub fn touch(path: &std::path::Path) -> io::Result<()> {
+    set_mtime(path, unix_now())
+}
+
+/// Set a path's access and modification time to Unix seconds `t`.
+pub fn set_mtime(path: &std::path::Path, t: u64) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let tv = libc::timeval {
+        tv_sec: t as _,
+        tv_usec: 0,
+    };
+    let times = [tv, tv];
+    cvt(unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) })?;
+    Ok(())
+}
+
 /// Milliseconds on a monotonic clock (the command-key detector's clock).
 pub fn now_ms() -> u64 {
     use std::sync::OnceLock;

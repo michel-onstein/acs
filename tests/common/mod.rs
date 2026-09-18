@@ -56,6 +56,15 @@ impl Remote {
         std::os::unix::fs::symlink(exe(), dir.join("acs")).unwrap();
     }
 
+    /// Install a real copy (not a symlink): `current_exe()` must then be
+    /// the versioned path, as on a real host.
+    pub fn install_copy(&self, version: &str) {
+        let dir = self.home().join(format!(".local/share/acs/{version}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("acs"));
+        std::fs::copy(exe(), dir.join("acs")).unwrap();
+    }
+
     /// File where the transport wrapper records the pid of every
     /// connection, so a test can cut one.
     pub fn pid_file(&self) -> PathBuf {

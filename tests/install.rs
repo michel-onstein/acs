@@ -124,3 +124,29 @@ fn finisher_rejects_a_corrupt_upload() {
     assert!(!tmp.exists(), "corrupt upload must be removed");
     assert!(!dir.join("acs").exists());
 }
+
+#[test]
+fn old_unused_versions_are_pruned_at_proxy_start() {
+    let remote = Remote::new();
+    remote.install_copy(acs::VERSION);
+    let root = remote.home().join(".local/share/acs");
+    let old = root.join("0.0.1-old");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("acs"), b"old").unwrap();
+    let ninety_days_ago = acs::sys::unix_now() - 90 * 86_400;
+    acs::sys::set_mtime(&old, ninety_days_ago).unwrap();
+    acs::sys::set_mtime(&root.join(acs::VERSION), ninety_days_ago).unwrap();
+
+    let mut c = Client::start_env(&remote, &args("pr"), &[("ACS_PRUNE_EVERY_SECS", "0")]);
+    c.wait_for("up", T);
+    assert!(!old.exists(), "an old unused version must be pruned");
+    // Our own version was marked as used just now.
+    let age = std::fs::metadata(root.join(acs::VERSION))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .elapsed()
+        .unwrap();
+    assert!(age.as_secs() < 3600, "{age:?}");
+    assert!(root.join(".pruned").exists());
+}
