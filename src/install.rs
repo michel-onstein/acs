@@ -78,6 +78,10 @@ pub fn plan(
     ))
 }
 
+/// The one-line installer: it puts a release where the prelude looks for it.
+pub const INSTALLER: &str =
+    "https://github.com/michel-onstein/acs/releases/latest/download/install.sh";
+
 /// What to say when the remote lacks acs and `install_on_remote` is off.
 pub fn not_installing(args: &ClientArgs, os: &str, arch: &str) -> String {
     let v = crate::VERSION;
@@ -87,7 +91,7 @@ pub fn not_installing(args: &ClientArgs, os: &str, arch: &str) -> String {
     };
     format!(
         "acs {v} is not installed on {host} ({os} {arch}), and install_on_remote is false{why}; \
-         put acs {v} at ~/.local/share/acs/{v}/acs on the host, or set install_on_remote: true",
+         install it there with `curl -fsSL {INSTALLER} | ACS_VERSION={v} sh`, or set install_on_remote: true",
         host = args.transport.destination
     )
 }

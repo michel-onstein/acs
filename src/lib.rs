@@ -72,7 +72,12 @@ impl Role {
 /// `acs --version`: version, protocol, build target, and the remote
 /// targets this binary can install (DESIGN §8.1).
 pub fn print_version() {
-    println!(
+    // write!, not println!: a reader that stops early (`acs --version |
+    // grep -q`) closes the pipe, and println! would panic on EPIPE.
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(
+        out,
         "acs {VERSION} (protocol {}, {})",
         proto::PROTO_VERSION,
         payload::OWN_TARGET
@@ -89,7 +94,7 @@ pub fn print_version() {
     } else {
         ""
     };
-    println!("installs remotes: {}{slim}", targets.join(", "));
+    let _ = writeln!(out, "installs remotes: {}{slim}", targets.join(", "));
 }
 
 /// Entry point shared by `main` and the integration tests.

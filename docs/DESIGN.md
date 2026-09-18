@@ -653,6 +653,12 @@ their YAML shape:
 
 ## 8. Installing the remote binary
 
+The one-line installer (`scripts/install.sh`, published with every release;
+README "Install") uses the same layout — `~/.local/share/acs/<version>/acs`,
+or `/usr/local/lib/acs/<version>/acs` as root — so a host set up with it
+serves clients of that version without an upload. It is also what the client
+suggests when `install_on_remote` is off (§7.2).
+
 Remote binaries are installed **per version**:
 `~/.local/share/acs/<version>/acs`. A client always runs exactly its own
 version on the remote, so different users of one account, or one user with

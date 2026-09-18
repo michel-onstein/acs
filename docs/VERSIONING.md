@@ -74,6 +74,8 @@ Every release is published on
   `aarch64-unknown-linux-musl` — the complete builds, each holding
   `acs-<version>-<target>/acs` and the README;
 - `SHA256SUMS` over the archives;
+- `install.sh`, the one-line installer (`scripts/install.sh` at the tag), so
+  `…/releases/latest/download/install.sh` always names the newest one;
 - notes with install instructions and the changes since the previous release.
 
 `scripts/version-bump.sh` publishes them right after it tags a release;

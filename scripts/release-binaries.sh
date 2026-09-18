@@ -1,8 +1,9 @@
 #!/bin/sh
 # Publish the binaries of a release to GitHub Releases (docs/VERSIONING.md):
 # builds `cargo xtask dist` from the exact tag in a throwaway worktree,
-# packages one archive per target with SHA256SUMS and notes, and creates the
-# release (or replaces its assets if it exists).
+# packages one archive per target with SHA256SUMS, the one-line installer
+# (scripts/install.sh) and notes, and creates the release (or replaces its
+# assets if it exists).
 #
 #   scripts/release-binaries.sh [vX.Y.Z] [--dry-run]
 #
@@ -54,7 +55,8 @@ fi
 
 echo "== packaging"
 cargo xtask package --dist "$work/dist" --version "$version" --out "$work/assets" \
-    --readme "$work/src/README.md" --changes "$work/changes.md" >/dev/null
+    --readme "$work/src/README.md" --installer "$work/src/scripts/install.sh" \
+    --changes "$work/changes.md" >/dev/null
 
 if [ "$dry" = 1 ]; then
     echo "dry run: assets in $work/assets"
@@ -64,10 +66,11 @@ fi
 
 echo "== publishing $tag"
 if gh release view "$tag" >/dev/null 2>&1; then
-    gh release upload "$tag" "$work"/assets/*.tar.gz "$work/assets/SHA256SUMS" --clobber
+    gh release upload "$tag" "$work"/assets/*.tar.gz "$work/assets/SHA256SUMS" \
+        "$work/assets/install.sh" --clobber
     gh release edit "$tag" --notes-file "$work/assets/NOTES.md"
 else
-    gh release create "$tag" "$work"/assets/*.tar.gz "$work/assets/SHA256SUMS" \
+    gh release create "$tag" "$work"/assets/*.tar.gz "$work/assets/SHA256SUMS" "$work/assets/install.sh" \
         --verify-tag --title "acs $version" --notes-file "$work/assets/NOTES.md"
 fi
 gh release view "$tag" --json url -q .url

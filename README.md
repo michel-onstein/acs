@@ -12,12 +12,34 @@ It replaces the `dsh` shell function (`ssh` + `dtach`). The design is in
 
 ## Install
 
-Download the archive for your machine from
-[Releases](https://github.com/michel-onstein/acs/releases) (macOS Apple
-silicon and Intel, Linux x86_64 and aarch64):
+```sh
+curl -fsSL https://github.com/michel-onstein/acs/releases/latest/download/install.sh | sh
+```
+
+The installer picks the build for your machine (macOS Apple silicon and
+Intel, Linux x86_64 and aarch64), checks it against the release's
+`SHA256SUMS`, and installs it the way acs installs itself on a remote:
+
+| Run as | Binary | On `PATH` as |
+| --- | --- | --- |
+| you | `~/.local/share/acs/<version>/acs` | `~/.local/bin/acs` (a link) |
+| root | `/usr/local/lib/acs/<version>/acs` | `/usr/local/bin/acs` (a link) |
+
+so a client of the same version finds acs already there when it connects
+to this machine. It says how to add the directory to your `PATH` if it is
+not on it, and running it again upgrades in place. It needs `curl` or
+`wget`, and `sha256sum`, `shasum` or `openssl`.
+
+| Variable | Meaning |
+| --- | --- |
+| `ACS_VERSION=0.2.0` | install that release instead of the latest |
+| `ACS_INSTALL_DIR=~/bin` | put the binary itself in that directory |
+
+for example `curl -fsSL …/install.sh | ACS_VERSION=0.2.0 sh`. By hand, the
+archives are on [Releases](https://github.com/michel-onstein/acs/releases):
 
 ```sh
-v=0.1.0 t=aarch64-apple-darwin      # see the release page for the latest
+v=0.2.0 t=aarch64-apple-darwin      # see the release page for the latest
 curl -LO https://github.com/michel-onstein/acs/releases/download/v$v/acs-$v-$t.tar.gz
 tar xzf acs-$v-$t.tar.gz && install -m 755 acs-$v-$t/acs ~/.local/bin/acs
 ```
@@ -114,6 +136,9 @@ hosts:
 | `install_on_remote` | install acs on a host that lacks it (default `true`); when `false`, acs says what is missing and exits with 254 |
 | `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user` and `reachability_check` (default `true`) |
 
+A mistake in a file stops acs with the file and line, for example
+`~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
+
 ### Host aliases
 
 `acs devbox` with the file above pings `devbox.lan` once; if it answers, acs
@@ -127,9 +152,6 @@ to outside, the redial goes to whichever address answers. List ways of
 reaching **one** machine under an alias: the session lives on that machine,
 so a fallback to a different one finds no session to resume.
 `me@devbox`, or any name that is not an alias, is used as given.
-
-A mistake in a file stops acs with the file and line, for example
-`~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
 
 ### Editing it from the command line
 
@@ -172,6 +194,7 @@ reached as `user@config`.
 scripts/verify.sh       # fmt, clippy (macOS and Linux targets), tests, markdownlint
 scripts/test_linux.sh   # the suite on Linux in a container, plus multi-user isolation
 scripts/e2e_ssh.sh      # end to end over real ssh against a container host
+scripts/test_install.sh # install.sh against the real releases, here and in containers
 scripts/version-bump.sh # release the next version and publish its binaries
 scripts/release-binaries.sh  # (re)publish a tag's binaries to GitHub Releases
 ```

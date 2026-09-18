@@ -11,6 +11,12 @@ echo '== cargo clippy (linux)'
 cargo clippy -p acs --all-targets --target x86_64-unknown-linux-musl -- -D warnings
 echo '== cargo test'
 cargo test --workspace
+echo '== shellcheck'
+if command -v shellcheck >/dev/null; then
+    shellcheck scripts/*.sh scripts/e2e/*.sh
+else
+    echo 'shellcheck is not installed: skipped'
+fi
 echo '== markdownlint'
 npx -y markdownlint-cli2 '**/*.md' '#target' '#.claude'
 echo '== ok'

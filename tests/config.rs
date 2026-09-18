@@ -30,6 +30,7 @@ fn install_on_remote_false_stops_a_remote_install() {
     );
     c.wait_for("install_on_remote is false (", T);
     c.wait_for("acs/config.yaml:2)", T);
+    c.wait_for(&format!("install.sh | ACS_VERSION={} sh`", acs::VERSION), T);
     assert!(!c.text().contains("installing acs"), "{}", c.text());
     assert!(!remote.installed_binary(acs::VERSION).exists());
 }
