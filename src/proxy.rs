@@ -79,6 +79,7 @@ fn fail(msg: impl std::fmt::Display) -> ExitCode {
 
 /// Entry point of `acs _proxy` (arguments after the role).
 pub fn main(args: &[OsString]) -> ExitCode {
+    sys::close_inherited(&[]);
     let _ = sys::signals::ignore(libc::SIGPIPE);
     let what = match parse_args(args) {
         Ok(w) => w,

@@ -411,8 +411,9 @@ lossless resume will not repaint it. So:
    save-cursor / restore-cursor, and set the window title with the xterm title
    stack (push `CSI 22;0 t`, pop `CSI 23;0 t`) so the remote's title comes
    back afterwards.
-3. After a successful resume that followed a printed status line, send one
-   forced redraw (`SIGWINCH`) to clean up the line. Full-screen programs
+3. After a successful resume that followed a printed status line, force one
+   redraw to clean up the line: the client sends two RESIZE frames (one row
+   fewer, then the real size), since an unchanged size raises no `SIGWINCH`. Full-screen programs
    repaint; a plain shell prompt may leave the line in scrollback, which is
    acceptable.
 

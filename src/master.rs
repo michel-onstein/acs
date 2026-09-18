@@ -179,6 +179,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    sys::close_inherited(&args.ready_fd.into_iter().collect::<Vec<_>>());
     // Detach: the proxy waits for this process, the grandchild is the master.
     // SAFETY: single-threaded at this point; the parent only calls _exit.
     match unsafe { libc::fork() } {

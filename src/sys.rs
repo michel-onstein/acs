@@ -376,6 +376,26 @@ pub fn peer_uid(fd: RawFd) -> io::Result<u32> {
     }
 }
 
+/// Close every inherited descriptor from 3 up except `keep`. Daemons do
+/// this so a descriptor leaked into them by a racing fork elsewhere (a
+/// pipe's write end, say) cannot keep someone else's pipe open for the
+/// daemon's whole life.
+pub fn close_inherited(keep: &[RawFd]) {
+    let Ok(dir) = std::fs::read_dir("/dev/fd") else {
+        return;
+    };
+    let fds: Vec<RawFd> = dir
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    for fd in fds {
+        if fd > 2 && !keep.contains(&fd) {
+            // SAFETY: closing a descriptor number; EBADF (the listing's own
+            // descriptor, already closed) is harmless.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
 // ---- processes and signals -------------------------------------------------
 
 pub fn kill(pid: i32, sig: libc::c_int) -> io::Result<()> {

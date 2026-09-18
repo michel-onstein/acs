@@ -176,6 +176,8 @@ pub struct State {
     pub identity: String,
     /// Set once the terminal has seen session output (for resets).
     pub attached_once: bool,
+    /// A reconnect status line / title is on the terminal (DESIGN §5.4).
+    pub status_shown: bool,
 }
 
 /// How serving a link ended.
@@ -274,6 +276,7 @@ pub fn run(args: ClientArgs) -> u8 {
         observer: ModeObserver::new(),
         identity: identity(),
         attached_once: false,
+        status_shown: false,
     };
     let mut raw: Option<RawMode> = None;
     let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals);
@@ -457,7 +460,7 @@ fn serve(
                             .encode(&mut out);
                         }
                     }
-                    crate::reconnect::on_welcome(state);
+                    crate::reconnect::on_welcome(state, w.kind, &mut out);
                 }
                 Msg::Busy { identity, since } if !welcomed => {
                     match crate::reconnect::ask_takeover(state, &identity, since) {
