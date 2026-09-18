@@ -77,6 +77,68 @@ fn a_complete_build_installs_another_platform_from_its_payloads() {
     assert!(leftovers(&remote).is_empty(), "{:?}", leftovers(&remote));
 }
 
+/// Regression (acs-q9t): login-shell noise on stdout must not fail the
+/// payload upload step, which prints nothing of its own.
+#[test]
+fn a_chatty_login_shell_does_not_break_either_install() {
+    let remote = Remote::new();
+    remote.login_noise("Welcome to devbox!\nYou have mail.\n");
+    remote.fake_uname("Linux", "x86_64");
+    let (client, _, _) = complete_client(remote.root.path(), "x86_64-unknown-linux-musl");
+    let mut c = Client::start_exe(&client, &remote, &args("p"), &[]);
+    c.wait_for("(Linux x86_64)", T);
+    c.wait_for("up", T);
+    assert!(!c.text().contains("unexpected reply"), "{}", c.text());
+    assert!(leftovers(&remote).is_empty(), "{:?}", leftovers(&remote));
+
+    let remote = Remote::new();
+    remote.login_noise("motd\n");
+    let mut c = Client::start(&remote, &args("s"));
+    c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
+    c.wait_for("up", T);
+}
+
+/// Regression (acs-14k): a startup file that prints without a trailing
+/// newline must not hide the ACS-NEED or ACS-READY marker.
+#[test]
+fn noise_without_a_newline_does_not_hide_the_markers() {
+    let remote = Remote::new();
+    remote.login_noise("printf without newline");
+    // ACS-NEED, then the install, then ACS-READY.
+    let mut c = Client::start(&remote, &args("n"));
+    c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
+    c.wait_for("up", T);
+}
+
+/// Regression (acs-tb1): installing does not replace a hand-installed
+/// `~/.local/bin/acs`, nor move a link to a newer version backwards.
+#[test]
+fn the_bin_link_is_left_alone_unless_it_moves_forward() {
+    let remote = Remote::new();
+    let link = remote.home().join(".local/bin/acs");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::fs::write(&link, "#!/bin/sh\necho mine\n").unwrap();
+    let mut c = Client::start(&remote, &args("f"));
+    c.wait_for("up", T);
+    assert!(remote.installed_binary(acs::VERSION).exists());
+    assert_eq!(
+        std::fs::read_to_string(&link).unwrap(),
+        "#!/bin/sh\necho mine\n"
+    );
+
+    let remote = Remote::new();
+    let newer = remote.home().join(".local/share/acs/99.0.0/acs");
+    std::fs::create_dir_all(newer.parent().unwrap()).unwrap();
+    std::fs::write(&newer, "newer").unwrap();
+    let link = remote.home().join(".local/bin/acs");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&newer, &link).unwrap();
+    let mut c = Client::start(&remote, &args("g"));
+    c.wait_for("up", T);
+    assert!(remote.installed_binary(acs::VERSION).exists());
+    assert_eq!(std::fs::read_link(&link).unwrap(), newer);
+}
+
 #[test]
 fn concurrent_installs_converge() {
     let remote = Remote::new();

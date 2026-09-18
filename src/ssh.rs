@@ -117,7 +117,7 @@ pub fn prelude(version: &str, args: &[&str]) -> String {
         "for b in \"{home}\" \"{system}\"; do \
          if [ -x \"$b\" ]; then exec \"$b\" {args}; fi; \
          done; \
-         printf 'ACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"",
+         printf '\\nACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"",
         args = args.join(" ")
     )
 }
@@ -259,7 +259,7 @@ mod tests {
             String::from_utf8(Command::new("uname").arg("-m").output().unwrap().stdout).unwrap();
         assert_eq!(
             out,
-            format!("ACS-NEED {} {}\n", uname_s.trim(), uname_m.trim())
+            format!("\nACS-NEED {} {}\n", uname_s.trim(), uname_m.trim())
         );
     }
 

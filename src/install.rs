@@ -125,26 +125,28 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
             let script = format!(
                 "set -e; mkdir -p {dir}; cat > {tmp}; chmod 755 {tmp}; exec {tmp} _install --finish --token {token} --sha256 {digest}"
             );
-            side_call(args, &script, &data)?;
+            side_call(args, &script, &data, true)?;
         }
         Plan::Payload { gz, blob, digest } => {
             let slim_digest = sha256::hex(&digest);
             let script = format!(
                 "set -e; command -v gzip >/dev/null || {{ echo 'acs: the remote has no gzip' >&2; exit 3; }}; mkdir -p {dir}; gzip -dc > {tmp}; chmod 755 {tmp}"
             );
-            side_call(args, &script, &gz)?;
+            side_call(args, &script, &gz, false)?;
             let script = format!(
                 "exec {tmp} _install --finish --token {token} --slim-sha256 {slim_digest} --payloads"
             );
-            side_call(args, &script, &blob)?;
+            side_call(args, &script, &blob, true)?;
         }
     }
     note(&format!("installed acs {v} on {host}"));
     Ok(())
 }
 
-/// Run `script` on the host with `input` on stdin; succeed on "ok".
-fn side_call(args: &ClientArgs, script: &str, input: &[u8]) -> Result<(), String> {
+/// Run `script` on the host with `input` on stdin. With `expect_ok` the
+/// finisher must print its `ok` line; without, the exit status alone
+/// decides — stdout may hold login-shell noise either way (DESIGN §3).
+fn side_call(args: &ClientArgs, script: &str, input: &[u8], expect_ok: bool) -> Result<(), String> {
     let remote = crate::ssh::remote_command(script);
     let mut cmd = args.transport.command(Call::Side, &remote);
     cmd.stdin(Stdio::piped())
@@ -165,9 +167,11 @@ fn side_call(args: &ClientArgs, script: &str, input: &[u8]) -> Result<(), String
     if !status.success() {
         return Err(format!("installing acs failed ({status})"));
     }
-    // Only the finisher prints ("ok"); the upload step prints nothing.
-    if !out.trim().is_empty() && !out.lines().any(|l| l.trim() == "ok") {
-        return Err(format!("unexpected reply while installing: {}", out.trim()));
+    if expect_ok && !out.lines().any(|l| l.trim() == "ok") {
+        return Err(format!(
+            "unexpected reply while installing: {:?}",
+            out.trim()
+        ));
     }
     Ok(())
 }
@@ -215,7 +219,8 @@ fn parse_finish(args: &[OsString]) -> Result<Finish, String> {
 pub fn finish_main(args: &[OsString]) -> ExitCode {
     match parse_finish(args).and_then(|f| finish(&f)) {
         Ok(()) => {
-            println!("ok");
+            // On a line of its own even after unterminated login noise.
+            print!("\nok\n");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -295,13 +300,60 @@ fn rename(from: &Path, to: &Path) -> Result<(), String> {
 /// Point `~/.local/bin/acs` at the newest install: a temporary symlink
 /// renamed over the old one, so it is never missing.
 fn link_bin(target: &Path, token: &str) -> Result<(), String> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    let bin = PathBuf::from(home).join(".local/bin");
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
+    let bin = home.join(".local/bin");
+    let link = bin.join("acs");
+    if !should_link(&link, target, &home.join(".local/share/acs")) {
+        return Ok(());
+    }
     std::fs::create_dir_all(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
     let tmp = bin.join(format!(".acs.{token}"));
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(target, &tmp).map_err(|e| e.to_string())?;
-    rename(&tmp, &bin.join("acs"))
+    rename(&tmp, &link)
+}
+
+/// Whether `~/.local/bin/acs` (`link`) should point at `target`, the
+/// version just installed under `share`: when it is missing, or a link of
+/// ours (into `share`) to an older or vanished version. A file or link the
+/// user put there is left alone, and a newer version keeps the link.
+fn should_link(link: &Path, target: &Path, share: &Path) -> bool {
+    let meta = match std::fs::symlink_metadata(link) {
+        Err(e) => return e.kind() == io::ErrorKind::NotFound,
+        Ok(m) => m,
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(current) = std::fs::read_link(link) else {
+        return false;
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let share_c = canon(share);
+    // A dangling link cannot be canonicalised: judge it by its parent.
+    let current_c = match std::fs::canonicalize(&current) {
+        Ok(c) => c,
+        Err(_) => current
+            .parent()
+            .map(|d| canon(d).join(current.file_name().unwrap_or_default()))
+            .unwrap_or_else(|| current.clone()),
+    };
+    if !(current.starts_with(share) || current_c.starts_with(&share_c)) {
+        return false;
+    }
+    if !current_c.exists() {
+        return true;
+    }
+    let version = |p: &Path| {
+        p.parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    };
+    match (version(&current_c), version(target)) {
+        (Some(have), Some(new)) => crate::release::compare(&new, &have).map_or(true, |o| o.is_ge()),
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +412,43 @@ mod tests {
         assert!(e.contains("cargo xtask dist"), "{e}");
         let e = plan("x86_64-apple-darwin", "aarch64-apple-darwin", b"me", None).unwrap_err();
         assert!(e.contains("by hand"), "{e}");
+    }
+
+    /// Regression (acs-tb1): `~/.local/bin/acs` is only ever pointed at a
+    /// newer version of ours, never over the user's own file or link.
+    #[test]
+    fn the_bin_link_is_only_moved_forward() {
+        let d = crate::testutil::TempDir::new();
+        let share = d.path().join("share/acs");
+        let bin = d.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let version = |v: &str| {
+            let p = share.join(v).join("acs");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, v).unwrap();
+            p
+        };
+        let new = version("0.2.0");
+        let link = bin.join("acs");
+        let set = |to: &Path| {
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(to, &link).unwrap();
+        };
+
+        assert!(should_link(&link, &new, &share), "missing");
+        set(&version("0.1.9"));
+        assert!(should_link(&link, &new, &share), "older");
+        set(&new);
+        assert!(should_link(&link, &new, &share), "same");
+        set(&version("0.10.0"));
+        assert!(!should_link(&link, &new, &share), "newer stays");
+        set(&share.join("0.0.1/acs"));
+        assert!(should_link(&link, &new, &share), "dangling, pruned");
+        set(Path::new("/bin/sh"));
+        assert!(!should_link(&link, &new, &share), "someone else's link");
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, "hand-installed").unwrap();
+        assert!(!should_link(&link, &new, &share), "a regular file");
     }
 
     #[test]

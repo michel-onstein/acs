@@ -176,11 +176,8 @@ pub fn dial(args: &ClientArgs, call: Call, remote: &str) -> io::Result<(Link, Ma
     let marker = loop {
         let n = sys::read(from.as_raw_fd(), &mut buf)?;
         if n == 0 {
-            if args.verbose > 0 && !scanner.noise.is_empty() {
-                note(&format!(
-                    "remote said: {}",
-                    String::from_utf8_lossy(&scanner.noise)
-                ));
+            if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
+                note(&format!("remote said: {noise}"));
             }
             let _ = child.wait();
             return Err(io::Error::new(
@@ -192,11 +189,8 @@ pub fn dial(args: &ClientArgs, call: Call, remote: &str) -> io::Result<(Link, Ma
             break m;
         }
     };
-    if args.verbose > 0 && !scanner.noise.is_empty() {
-        note(&format!(
-            "skipped remote login output: {:?}",
-            String::from_utf8_lossy(&scanner.noise)
-        ));
+    if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
+        note(&format!("skipped remote login output: {noise:?}"));
     }
     Ok((Link { child, to, from }, marker))
 }
