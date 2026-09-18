@@ -4,6 +4,7 @@
 use std::ffi::OsString;
 use std::process::ExitCode;
 
+pub mod alias;
 pub mod cli;
 pub mod client;
 pub mod config;

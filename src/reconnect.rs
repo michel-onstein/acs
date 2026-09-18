@@ -66,9 +66,18 @@ pub fn run(
     let netwatch = crate::netwatch::NetWatch::new();
     let mut last_early: Option<Instant> = None;
     let mut resuming = false;
+    let mut args = args.clone();
     loop {
         let started = Instant::now();
-        match client::connect_and_serve(args, state, raw, signals, resuming) {
+        // An alias is resolved again for every redial, so a fallback host is
+        // picked up after a network change (DESIGN §7.3).
+        let reachable = !resuming || redial_alias(&mut args, state);
+        let outcome = if reachable {
+            client::connect_and_serve(&args, state, raw, signals, resuming)
+        } else {
+            Outcome::LinkLost
+        };
+        match outcome {
             Outcome::Exit(c) => return c,
             Outcome::LinkLost => {}
         }
@@ -108,6 +117,34 @@ pub fn run(
                 ));
                 return code::DETACHED;
             }
+        }
+    }
+}
+
+/// Re-resolve the alias before a redial; false if no host answers now. A
+/// change of host is always told: the session is only there if the new host
+/// is the same machine.
+fn redial_alias(args: &mut crate::cli::ClientArgs, state: &mut State) -> bool {
+    let Some(name) = args.alias.clone() else {
+        return true;
+    };
+    let before = args.transport.destination.clone();
+    match client::resolve_alias(args, &name) {
+        Ok(()) => {
+            if args.transport.destination != before {
+                clear_status(state);
+                note(&format!(
+                    "{name}: now using {} (was {before})",
+                    args.transport.destination
+                ));
+            }
+            true
+        }
+        Err(e) => {
+            if args.verbose > 0 {
+                note(&e);
+            }
+            false
         }
     }
 }

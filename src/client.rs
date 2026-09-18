@@ -61,10 +61,31 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(code::USAGE);
         }
     };
+    let name = args.transport.destination.clone();
+    if let Err(e) = resolve_alias(&mut args, &name) {
+        eprintln!("acs: {e}");
+        return ExitCode::from(code::UNREACHABLE);
+    }
     if args.list {
         return crate::list::run(&args);
     }
     ExitCode::from(run(args))
+}
+
+/// If `name` is an alias, point the transport at the host it stands for
+/// now (DESIGN §7.3); with `-v`, say which entry was chosen and why.
+pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
+    let verbose = args.verbose > 0;
+    let dest = crate::alias::resolve(name, &args.config, &mut crate::alias::ping, &mut |m| {
+        if verbose {
+            note(&m)
+        }
+    })?;
+    if let Some(d) = dest {
+        args.alias = Some(name.to_string());
+        args.transport.destination = d;
+    }
+    Ok(())
 }
 
 /// Who we are, for the master's takeover decisions (DESIGN §4.5).
@@ -285,7 +306,7 @@ pub fn run(args: ClientArgs) -> u8 {
     };
     let _ = sys::signals::ignore(libc::SIGPIPE);
     let mut state = State {
-        host: args.transport.destination.clone(),
+        host: args.host_name().to_string(),
         session: match &args.target {
             Target::Named(n) => Some(n.clone()),
             Target::New => None,

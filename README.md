@@ -99,11 +99,34 @@ merge key by key and lists add up, global entries first.
 ```yaml
 # ~/.config/acs/config.yaml
 install_on_remote: false   # never install acs on a host (default: true)
+hosts:
+  devbox:                  # acs devbox
+    - host: devbox.lan     # at home: used if it answers a ping
+    - host: devbox.example.com
+      user: michel         # from outside, as michel
+  nas:
+    - host: nas.lan
+      reachability_check: false   # it drops pings: use it unchecked
 ```
 
 | Setting | Meaning |
 | --- | --- |
 | `install_on_remote` | install acs on a host that lacks it (default `true`); when `false`, acs says what is missing and exits with 254 |
+| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user` and `reachability_check` (default `true`) |
+
+### Host aliases
+
+`acs devbox` with the file above pings `devbox.lan` once; if it answers, acs
+connects there, otherwise it tries `michel@devbox.example.com`. An entry
+with `reachability_check: false` is used without a ping. Without a `user`,
+your `~/.ssh/config` picks the login name. If no entry answers, acs lists the
+hosts it tried and exits with 255. `-v` shows which entry was chosen and why.
+
+The alias is resolved again on every reconnect, so when you move from home
+to outside, the redial goes to whichever address answers. List ways of
+reaching **one** machine under an alias: the session lives on that machine,
+so a fallback to a different one finds no session to resume.
+`me@devbox`, or any name that is not an alias, is used as given.
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -121,6 +144,7 @@ A mistake in a file stops acs with the file and line, for example
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
+| `ACS_PING` | ping program for alias reachability checks (default `ping`) |
 
 ## Development
 
