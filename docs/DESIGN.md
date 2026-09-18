@@ -90,7 +90,9 @@ flowchart LR
    No terminal emulation, no screen model, no rewriting — so local scrollback,
    mouse reporting, OSC 52 clipboard, hyperlinks, kitty graphics and keyboard
    protocols, and terminal queries/replies all work as if you had run `ssh -t`.
-2. **One binary** for both sides, statically linked on Linux, ideally < 1 MB.
+2. **One binary** for both sides and for both client platforms (macOS and
+   Linux), statically linked on Linux, that can install itself on a remote
+   (§8). Slim build < 1 MB; with the embedded Linux payloads < 2 MB.
 3. **Survive network interruption** with no lost output, and detect a dead link
    in seconds rather than a minute.
 4. **Command mode** on a double-tap of Ctrl-] (§6): `d` detach, `x` exit.
@@ -147,7 +149,7 @@ lives in the master and the client.
 - Directory: `${TMPDIR:-/tmp}/acs-$UID/`, created `0700`; the master refuses to
   start if it exists and is not owned by the user or is group/other writable.
 - Socket: `<dir>/<session>.sock`. Names keep `dsh`'s `[A-Za-z0-9._-]` rule;
-  default `main`.
+  every session has one (§4.4).
 - **Not `$XDG_RUNTIME_DIR`**: `systemd-logind` deletes it when the user's last
   login session ends, which would orphan every master. (On hosts with
   `KillUserProcesses=yes` the master itself is killed too — as dtach is today;
@@ -202,6 +204,49 @@ parse frames beyond checking the protocol version in the HELLO. `acs _proxy
 --list` enumerates `<dir>/*.sock`, sends each master `STATUS`, and prints name,
 attached/detached, created-at, idle time, child command, and size. Sockets that
 refuse connections are reported stale and removed — no `ps` parsing.
+
+### 4.4 Session names and getting back in
+
+"Reconnect" covers two different situations, and only one of them needs you to
+know anything:
+
+- **Resume** — the link dropped but the local `acs` process is still running.
+  That process already holds the host, the session name, the master's
+  instance id and the output offset, so it redials and resumes by itself
+  (§5.2, §5.3). You never type a name. This is what "reconnect on by default"
+  means.
+- **Re-attach** — the local client is gone: you pressed `d`, closed the
+  terminal window, rebooted the laptop, or the client was taken over. A new
+  client has to name the session, so every session always has a name.
+
+| Command | Session |
+| --- | --- |
+| `acs <host>` | `main` — attach, or create it if absent (as `dsh`) |
+| `acs <host> <name>` | `<name>` — attach, or create it if absent |
+| `acs <host> --new` | a new session named with the lowest free number: `1`, `2`, … (picked under the directory lock, so two `--new`s never collide) |
+| `acs <host> --list` | list sessions: name, attached/detached, idle time, command |
+
+So the unnamed case is covered two ways: plain `acs <host>` always means
+`main`, which you never have to remember, and `--new` gives short numeric
+names (as tmux does) for when you want a second session without inventing a
+name.
+
+To keep a session findable, the client says what it did **outside** the
+session's byte stream — on stderr, before raw mode starts or after the
+terminal is restored:
+
+- When it **creates** a session (by `--new` or because the name did not exist):
+  `acs: new session 'mian' on devbox`. A typo in a name therefore shows up
+  immediately instead of as a mystery session in a later `--list`.
+- When it **ends without the session ending** (detach, takeover, reconnect
+  abandoned with `d`):
+  `acs: detached from devbox/2 — reattach with: acs devbox 2`.
+- Inside the session `ACS_SESSION=<name>` is set, so the shell prompt or
+  `echo $ACS_SESSION` can show it.
+
+If you still lose track, `acs <host> --list` tells you. With exactly one
+session, `acs <host>` is still `main`, not "whatever is there" — the default
+never depends on what else happens to exist.
 
 ## 5. Protocol
 
@@ -383,8 +428,8 @@ nothing, because the terminal state is still correct.
 ## 7. Client
 
 - Argument parsing matches `dsh`: `acs <host> [session] [-l|--list]
-  [--no-reconnect] [-- command…]`. `-r` is accepted and ignored, since
-  reconnecting is the default.
+  [--new] [--no-reconnect] [-- command…]` (§4.4). `-r` is accepted and
+  ignored, since reconnecting is the default.
 - `cfmakeraw`-equivalent `termios` (dtach's flags), restored on every exit
   path: normal, signal (`SIGHUP`, `SIGTERM`, `SIGINT` before raw mode), and
   panic (`panic = "abort"` plus a restore in a drop guard and a signal handler).
@@ -392,8 +437,8 @@ nothing, because the terminal state is still correct.
 - Single-threaded `poll` loop over stdin, the ssh child's pipes, a self-pipe for
   signals, and a timer (escape timeout, pings) — the same shape as dtach.
 - Exit status: the child's status after `EXIT` (128+n for signals), 0 on detach,
-  and distinct codes for "host unreachable", "session not found" (`--attach`
-  only) and "taken over".
+  and distinct codes for "host unreachable", "remote install failed" and
+  "taken over".
 
 ## 8. Installing the remote binary
 
@@ -406,29 +451,81 @@ b="$HOME/.local/bin/acs"
 printf 'ACS-NEED %s %s\n' "$(uname -s)" "$(uname -m)"
 ```
 
-When the client reads `ACS-NEED`, it maps `Linux x86_64` / `Linux aarch64` /
-`Darwin arm64` to a target, pipes the matching binary to
-`cat > ~/.local/bin/acs.new && chmod 755 … && mv -f … acs` (an atomic rename, so
-running masters keep their already-mapped old binary), and redials. Protocol
-versions are checked in `HELLO`; a new proxy that finds an older master tells
-the user to finish or kill the session rather than guess across versions.
+When the client reads `ACS-NEED`, it maps the `uname` pair to a target,
+installs a binary for it (below), and redials. Protocol versions are checked in
+`HELLO`; a new proxy that finds an older master tells the user to finish or
+kill the session rather than guess across versions.
 
-Where the client gets the remote binary — **decision needed**, see §11:
+### 8.1 Every copy can install every remote
 
-- **(a) Embedded**: the macOS build carries zstd-compressed static musl builds
-  for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`
-  (`include_bytes!`, roughly +1 MB). One file to copy around; always matching
-  versions.
-- **(b) Side-by-side**: `~/.local/share/acs/<version>/<target>/acs`, populated
-  by `acs install-targets` or the release tarball.
-- **(c) Manual**: the user installs on each host; `acs` only reports mismatches.
+The rule: **any complete `acs` binary — whether it runs on macOS or Linux —
+can install a complete `acs` on any supported Linux remote, with no network
+access on either end and no second file.** Linux is a client platform as much
+as macOS, and a host reached with `acs` can itself be the client for the next
+hop.
+
+Two kinds of build:
+
+- **slim** — just the program. What `cargo build` produces.
+- **complete** — a slim binary plus a **payload set** `P`: the slim builds for
+  the remote targets, each gzip-compressed. Default remote targets are
+  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (statically
+  linked, so they run on any distribution); `armv7-unknown-linux-musleabihf`
+  can be added at build time.
+
+How `P` is attached depends on the executable format:
+
+| Format | Attachment | Why |
+| --- | --- | --- |
+| ELF (Linux) | appended trailer: `[slim][P entries][index][magic + index offset]`, read back through `current_exe()` | The loader ignores bytes past the last segment, and a trailer lets an installed copy be **reassembled** on the remote from parts (below) |
+| Mach-O (macOS) | linked in with `include_bytes!` in a second build stage, before signing | `codesign` refuses a file whose `__LINKEDIT` does not reach the end, so appending is not an option |
+
+Installing on a remote whose target is `r`:
+
+1. **`r` is my own target and I am ELF** — send my own file. It is already the
+   complete binary for `r`. (Linux → Linux, same architecture.)
+2. **`r` is a Linux target in `P`** — send `slim_r` from `P`, then `P` itself.
+   The remote ends up with `slim_r` + `P`, byte-identical to the released
+   complete binary for `r`, so it can install onward. (macOS → Linux,
+   Linux x86_64 → Linux aarch64.)
+3. **`r` is macOS** — macOS remotes are only installed by a macOS client of
+   the same architecture copying itself; anything else gets a message to
+   install by hand. macOS as a remote is rare, and carrying Mach-O payloads
+   would add ~0.4 MB to every binary.
+
+On the wire, with no decompressor needed inside `acs` (gzip is on every
+Linux, busybox included), in two ssh calls that may use the user's
+multiplexed connection:
+
+```sh
+# 1: unpack the slim binary; stdin is gz(slim_r) from P
+mkdir -p ~/.local/bin && gzip -dc > ~/.local/bin/acs.new && chmod 755 ~/.local/bin/acs.new
+# 2: stdin is P; append it as a trailer, check the SHA-256 the client
+#    computed, then rename over ~/.local/bin/acs
+~/.local/bin/acs.new _install --finish --sha256 <digest>
+```
+
+Step 2 is skipped in case 1 (the file sent is already complete, and step 1
+then uses `cat` rather than `gzip -dc`). The final `mv` is an atomic rename,
+so running masters keep the old binary they already have mapped.
+
+**Size** (estimates, to be measured in phase 1): slim ≈ 0.7 MB, gzip'd
+≈ 0.35 MB, so a complete binary with two Linux payloads ≈ 1.4 MB.
+
+**Build** is `cargo xtask dist`: (1) build slim for every target with
+`cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
+appending the trailer and the macOS builds by rebuilding with
+`--features embed-payloads`, then signing. A plain `cargo build` binary is
+slim: it can still self-copy (case 1) and says `cargo xtask dist` is needed
+for anything else.
 
 ## 9. Implementation
 
 - **Crates, chosen for size**: `rustix` (termios, pty, poll, signals, `flock`)
   or `nix`; `lexopt` for arguments (clap adds hundreds of KB); hand-written
-  frame codec; `zstd` decoder only if option (a) is chosen. **No async
-  runtime**: two single-threaded poll loops do not need tokio.
+  frame codec; no compression crate (the remote's `gzip` unpacks payloads,
+  §8.1); `sha2` for the install digest. **No async runtime**: two
+  single-threaded poll loops do not need tokio.
 - **Profile**: `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
   `panic = "abort"`, `strip = true`.
 - **Targets**: `aarch64-apple-darwin` (local, installed), `x86_64-apple-darwin`,
@@ -445,7 +542,8 @@ src/
   client/        tty, command-key detector, mode observer, reconnect loop, ssh spawn
   master/        pty, ring buffer, child lifecycle, socket/lock handling
   proxy.rs       connect-or-spawn, splice, --list
-  install.rs     ACS-NEED handling, target mapping
+  install.rs     ACS-NEED handling, target mapping, payload trailer / embed, _install --finish
+xtask/           cargo xtask dist: slim builds, payload set, complete builds, signing
 ```
 
 ### 9.1 Testing
@@ -473,13 +571,12 @@ src/
 run side by side. Once it has been in use for a while, `dsh` becomes
 `alias dsh=acs` and the function and the dtach dependency are deleted.
 
-## 11. Open decisions
+## 11. Decisions
 
-1. **Name.** This doc assumes `acs`, after the repository.
-2. **Remote binary provisioning** (§8): embedded (recommended — it is the
-   only option that keeps "one binary" true for the user), side-by-side, or
-   manual.
-3. **Reconnect on by default** (§5.3) — recommended, since drops and clean ends
-   can now be told apart.
-4. **Takeover vs. mirrored clients** (§4.2) — recommended: takeover.
-5. **Escape key**: Ctrl-] Ctrl-] with a 400 ms window (§6.2) — recommended as is.
+| # | Question | Decision |
+| --- | --- | --- |
+| 1 | Name | `acs`, after the repository |
+| 2 | Remote binary provisioning | Every complete binary, macOS or Linux, carries slim Linux payloads and can install a complete copy on any Linux remote; ELF self-copies (§8.1) |
+| 3 | Reconnect on by default | Yes. Resume after a drop is automatic because the running client knows the session; re-attaching from a new client uses the session name, which always exists — `main` by default, numbered with `--new` (§4.4) |
+| 4 | Takeover vs. mirrored clients | Takeover (§4.2) |
+| 5 | Escape key | Ctrl-] Ctrl-] with a 400 ms window, configurable (§6.2) |
