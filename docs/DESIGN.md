@@ -479,7 +479,13 @@ Rules:
 - **Bracketed paste** (`CSI 200 ~` … `CSI 201 ~`) is forwarded untouched: a
   pasted `0x1D 0x1D d` must not detach you.
 - Terminal replies to remote queries (DA, OSC 11, `CSI ? u`, XTVERSION) start
-  with `ESC`, never with a held key, so they are never delayed.
+  with `ESC`, never with a held key, so they are never delayed. They, mouse
+  reports and focus events are forwarded at once and do not break a pending
+  double tap.
+- One exception to reassembly: a read that ends in a **lone `ESC`** is the Esc
+  key and is sent at once — vim users press it constantly, and delaying it is
+  worse than missing the rare escape-key sequence split right after its first
+  byte. An incomplete `CSI` at the end of a read is held for at most 100 ms.
 
 ### 6.4 Restoring the local terminal on detach
 

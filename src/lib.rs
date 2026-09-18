@@ -4,6 +4,7 @@
 use std::ffi::OsString;
 use std::process::ExitCode;
 
+pub mod keys;
 pub mod proto;
 pub mod resume;
 
