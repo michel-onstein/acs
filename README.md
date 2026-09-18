@@ -1,7 +1,8 @@
 # acs
 
-Persistent remote shells over ssh that survive network drops — with an
-**unfiltered** terminal stream, so the local terminal's scrollback, mouse
+**acs** — *Ad-hoc Connectivity Shell*. Persistent remote shells over ssh that
+survive network drops — with an **unfiltered** terminal stream, so the local
+terminal's scrollback, mouse
 reporting, OSC 52 copy, hyperlinks and keyboard protocols work exactly as over
 plain `ssh -t`. One binary is both the local client and the remote session
 holder; it installs itself on the remote the first time you connect.
