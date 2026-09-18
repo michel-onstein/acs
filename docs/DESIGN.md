@@ -738,17 +738,27 @@ v=0.3.1
 for b in "$HOME/.local/share/acs/$v/acs" "/usr/local/lib/acs/$v/acs"; do
   [ -x "$b" ] && exec "$b" _proxy main --create
 done
-printf 'ACS-NEED %s %s\n' "$(uname -s)" "$(uname -m)"
+printf '\nACS-NEED %s %s\n' "$(uname -s)" "$(uname -m)"
 ```
+
+The marker — `ACS-NEED` here, `ACS-READY` from the proxy, and the
+finisher's `ok` — is printed after a newline of its own, so a startup file
+that printed without one (`printf foo`) cannot put it mid-line, where it
+would not be recognised.
 
 - `/usr/local/lib/acs/<version>/` is an optional system-wide location an
   administrator can populate once for all users; `acs` never writes there.
-- After an install, `~/.local/bin/acs` is repointed (symlink created under a
-  temporary name, then renamed over) at the newest installed version, so the
-  remote can be used as a client for the next hop. Nothing in the protocol
-  depends on that link.
+- After an install, `~/.local/bin/acs` is pointed (symlink created under a
+  temporary name, then renamed over) at the installed version, so the remote
+  can be used as a client for the next hop — but only when it is missing, or
+  a link into `~/.local/share/acs/` to an **older or pruned** version. A file
+  or link the user put there is left alone, and an older client never moves
+  the link back from a newer version. Nothing in the protocol depends on
+  that link.
 - `acs _proxy` touches its version directory on start; versions untouched for
-  30 days whose sessions have all ended are removed by the next proxy start.
+  30 days whose sessions have all ended are removed by the next proxy start —
+  only under the user's own `~/.local/share/acs`, never in the system-wide
+  `/usr/local/lib/acs`, which holds other users' versions.
 
 When the client reads `ACS-NEED`, it maps the `uname` pair to a target,
 installs a binary for it (below), and redials. Protocol versions are checked in

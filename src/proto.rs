@@ -570,9 +570,11 @@ impl Decoder {
     }
 }
 
-/// The `ACS-READY <proto>` line.
+/// The `ACS-READY <proto>` line. It starts with a newline: a startup file
+/// that printed without one (`printf foo`) would otherwise put the marker in
+/// the middle of its line, where it is not recognised.
 pub fn ready_line() -> String {
-    format!("{READY_MARKER} {PROTO_VERSION}\n")
+    format!("\n{READY_MARKER} {PROTO_VERSION}\n")
 }
 
 /// What the stream said before its first frame.
@@ -597,6 +599,13 @@ pub struct MarkerScanner {
 impl MarkerScanner {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// What came before the marker, for `-v`, if it is more than blank
+    /// lines (the marker's own leading newline is always there).
+    pub fn noise_text(&self) -> Option<String> {
+        let t = String::from_utf8_lossy(&self.noise);
+        (!t.trim().is_empty()).then(|| t.into_owned())
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Option<Marker> {
@@ -886,6 +895,28 @@ mod tests {
                 arch: "aarch64".into()
             })
         );
+    }
+
+    /// Regression: a startup file that prints without a newline must not
+    /// swallow the marker (acs-14k).
+    #[test]
+    fn noise_without_a_newline_does_not_hide_the_marker() {
+        let mut s = MarkerScanner::new();
+        let mut stream = b"motd without newline".to_vec();
+        stream.extend_from_slice(ready_line().as_bytes());
+        assert_eq!(
+            s.push(&stream),
+            Some(Marker::Ready {
+                proto: PROTO_VERSION,
+                rest: vec![]
+            })
+        );
+        assert_eq!(s.noise_text().as_deref(), Some("motd without newline\n"));
+
+        // Without noise, the leading newline is not worth showing.
+        let mut s = MarkerScanner::new();
+        assert!(s.push(ready_line().as_bytes()).is_some());
+        assert_eq!(s.noise_text(), None);
     }
 
     #[test]

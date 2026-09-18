@@ -30,11 +30,26 @@ fn every() -> Duration {
 /// `~/.local/share/acs`, if this binary runs from a version directory in it.
 pub fn versions_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    root_for(&exe, crate::VERSION, Path::new(&home))
+}
+
+/// The versions directory `exe` runs from, only if it is the user's own
+/// `home/.local/share/acs`: a system-wide install (`/usr/local/lib/acs`)
+/// holds other users' versions and is never touched (DESIGN §8).
+fn root_for(exe: &Path, version: &str, home: &Path) -> Option<PathBuf> {
     let version_dir = exe.parent()?;
-    if version_dir.file_name()?.to_str()? != crate::VERSION {
+    if version_dir.file_name()?.to_str()? != version {
         return None;
     }
-    Some(version_dir.parent()?.to_path_buf())
+    let root = version_dir.parent()?;
+    let own = home.join(".local/share/acs");
+    let same = root == own
+        || matches!(
+            (std::fs::canonicalize(root), std::fs::canonicalize(&own)),
+            (Ok(a), Ok(b)) if a == b
+        );
+    same.then(|| root.to_path_buf())
 }
 
 fn age(path: &Path, now: SystemTime) -> Option<Duration> {
@@ -93,6 +108,28 @@ pub fn on_proxy_start(live_versions: impl FnOnce() -> HashSet<String>) {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    /// Regression (acs-rxw): a binary run from the system-wide
+    /// `/usr/local/lib/acs/<v>/acs` prunes nothing.
+    #[test]
+    fn only_the_users_own_versions_directory_is_pruned() {
+        let home = TempDir::new();
+        let own = home.path().join(".local/share/acs/1.2.3/acs");
+        assert_eq!(
+            root_for(&own, "1.2.3", home.path()),
+            Some(home.path().join(".local/share/acs"))
+        );
+        let system = Path::new("/usr/local/lib/acs/1.2.3/acs");
+        assert_eq!(root_for(system, "1.2.3", home.path()), None);
+        // Another user's HOME is not ours either.
+        let other = Path::new("/home/someone/.local/share/acs/1.2.3/acs");
+        assert_eq!(root_for(other, "1.2.3", home.path()), None);
+        // Not from a version directory at all.
+        assert_eq!(
+            root_for(&home.path().join("acs"), "1.2.3", home.path()),
+            None
+        );
+    }
 
     #[test]
     fn prunes_only_old_unused_other_versions() {

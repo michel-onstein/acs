@@ -100,8 +100,9 @@ impl Remote {
         let script = self.root.path().join("transport.sh");
         if !script.exists() {
             let body = format!(
-                "#!/bin/sh\necho $$ >> '{pids}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\nexec /bin/sh -c \"$1\"\n",
+                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\nexec /bin/sh -c \"$1\"\n",
                 pids = self.pid_file().display(),
+                noise = self.noise_file().display(),
                 home = self.home().display(),
                 sock = self.sockets().display(),
                 fake = self.fake_bin().display(),
@@ -115,6 +116,16 @@ impl Remote {
 
     fn fake_bin(&self) -> PathBuf {
         self.root.path().join("fakebin")
+    }
+
+    fn noise_file(&self) -> PathBuf {
+        self.root.path().join("login-noise")
+    }
+
+    /// Make every connection print `text` on stdout before the remote
+    /// command runs, as a chatty `.bashrc` or motd script would.
+    pub fn login_noise(&self, text: &str) {
+        std::fs::write(self.noise_file(), text).unwrap();
     }
 
     /// Make the remote's `uname -s` / `uname -m` report another platform.
