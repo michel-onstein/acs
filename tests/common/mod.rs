@@ -1,0 +1,301 @@
+//! Integration harness (DESIGN §9.1): a fake remote in a temp HOME, a
+//! transport that replaces ssh, and a pty runner for the real client.
+#![allow(dead_code)]
+
+use std::io::Read;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use acs::sys;
+use acs::testutil::TempDir;
+
+pub const T: Duration = Duration::from_secs(15);
+
+pub fn exe() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_acs"))
+}
+
+/// A "remote host": its own HOME (with acs installed at the versioned path
+/// the prelude looks for) and its own socket directory.
+pub struct Remote {
+    pub root: TempDir,
+}
+
+impl Remote {
+    pub fn new() -> Remote {
+        let root = TempDir::new();
+        let r = Remote { root };
+        std::fs::create_dir_all(r.home()).unwrap();
+        std::fs::create_dir_all(r.sockets()).unwrap();
+        r
+    }
+
+    /// A remote with acs installed for the client's own version.
+    pub fn installed() -> Remote {
+        let r = Remote::new();
+        r.install(acs::VERSION);
+        r
+    }
+
+    pub fn home(&self) -> PathBuf {
+        self.root.path().join("h")
+    }
+
+    pub fn sockets(&self) -> PathBuf {
+        self.root.path().join("s")
+    }
+
+    pub fn install(&self, version: &str) {
+        let dir = self.home().join(format!(".local/share/acs/{version}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("acs"));
+        std::os::unix::fs::symlink(exe(), dir.join("acs")).unwrap();
+    }
+
+    /// File where the transport wrapper records the pid of every
+    /// connection, so a test can cut one.
+    pub fn pid_file(&self) -> PathBuf {
+        self.root.path().join("transport.pids")
+    }
+
+    /// The `--transport-cmd` stand-in for ssh: a script that records its pid
+    /// and runs the remote command in a shell with the remote's environment.
+    pub fn transport(&self) -> String {
+        let script = self.root.path().join("transport.sh");
+        if !script.exists() {
+            let body = format!(
+                "#!/bin/sh\necho $$ >> '{pids}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}'\nexec /bin/sh -c \"$1\"\n",
+                pids = self.pid_file().display(),
+                home = self.home().display(),
+                sock = self.sockets().display(),
+            );
+            std::fs::write(&script, body).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script.display().to_string()
+    }
+
+    /// Pids of transport connections made so far.
+    pub fn transport_pids(&self) -> Vec<i32> {
+        std::fs::read_to_string(self.pid_file())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    /// Cut the most recent connection, as a network drop would.
+    pub fn cut_link(&self) {
+        let pid = *self.transport_pids().last().expect("no connection to cut");
+        let _ = sys::kill(pid, libc::SIGKILL);
+    }
+
+    /// Wait until `n` connections have been made.
+    pub fn wait_connections(&self, n: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.transport_pids().len() < n {
+            assert!(
+                Instant::now() < deadline,
+                "only {} connections",
+                self.transport_pids().len()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Run the remote command a real ssh would run (the prelude), with the
+    /// remote's environment, over pipes.
+    pub fn run_remote(&self, args: &[&str]) -> Child {
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(acs::ssh::remote_acs(acs::VERSION, args))
+            .env("HOME", self.home())
+            .env("ACS_SOCKET_DIR", self.sockets())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap()
+    }
+
+    pub fn session_exists(&self, name: &str) -> bool {
+        std::os::unix::net::UnixStream::connect(self.sockets().join(format!("{name}.sock"))).is_ok()
+    }
+}
+
+/// The acs client running on a pty, as a user would run it.
+pub struct Client {
+    pub child: Child,
+    pty: OwnedFd,
+    output: Arc<Mutex<Vec<u8>>>,
+    searched: usize,
+}
+
+impl Client {
+    /// `acs --transport-cmd <remote transport> <args...>` on an 80x24 pty.
+    pub fn start(remote: &Remote, args: &[&str]) -> Client {
+        Client::start_env(remote, args, &[])
+    }
+
+    pub fn start_env(remote: &Remote, args: &[&str], env: &[(&str, &str)]) -> Client {
+        let (master, slave) = sys::openpty().unwrap();
+        sys::set_winsize(
+            slave.as_raw_fd(),
+            &acs::proto::WinSize {
+                cols: 80,
+                rows: 24,
+                xpixel: 0,
+                ypixel: 0,
+            },
+        )
+        .unwrap();
+        let mut cmd = Command::new(exe());
+        cmd.arg("--transport-cmd")
+            .arg(remote.transport())
+            .args(args);
+        cmd.env("TERM", "xterm-256color")
+            .env_remove("ACS_DEFAULT_SESSION")
+            .env_remove("ACS_SOCKET_DIR")
+            .env("ACS_IDENTITY", "tester@local");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let s = |fd: &OwnedFd| Stdio::from(fd.try_clone().unwrap());
+        cmd.stdin(s(&slave)).stdout(s(&slave)).stderr(s(&slave));
+        // SAFETY: async-signal-safe calls only.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        drop(slave);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let out = output.clone();
+        let mut reader = std::fs::File::from(master.try_clone().unwrap());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => out.lock().unwrap().extend_from_slice(&buf[..n]),
+                }
+            }
+        });
+        Client {
+            child,
+            pty: master,
+            output,
+            searched: 0,
+        }
+    }
+
+    /// Type bytes.
+    pub fn send(&self, bytes: &[u8]) {
+        sys::write_all(self.pty.as_raw_fd(), bytes).unwrap();
+    }
+
+    /// Everything the client wrote to its terminal so far.
+    pub fn output(&self) -> Vec<u8> {
+        self.output.lock().unwrap().clone()
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.output()).into_owned()
+    }
+
+    /// Wait until the output (after anything already waited for) contains
+    /// `needle`.
+    pub fn wait_for(&mut self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let n = needle.as_bytes();
+        loop {
+            {
+                let out = self.output.lock().unwrap();
+                let start = self.searched.saturating_sub(n.len());
+                if let Some(p) = out[start..].windows(n.len()).position(|w| w == n) {
+                    self.searched = start + p + n.len();
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {needle:?}; output so far:\n{}",
+                    self.text()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Change the terminal size (the client gets SIGWINCH).
+    pub fn resize(&self, cols: u16, rows: u16) {
+        sys::set_winsize(
+            self.pty.as_raw_fd(),
+            &acs::proto::WinSize {
+                cols,
+                rows,
+                xpixel: 0,
+                ypixel: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Terminal settings of the client's pty (raw or cooked).
+    pub fn echo_on(&self) -> bool {
+        let t = sys::tcgetattr(self.pty.as_raw_fd()).unwrap();
+        t.c_lflag & libc::ECHO != 0
+    }
+
+    /// Wait for the client to exit; returns its exit code.
+    pub fn wait(&mut self, timeout: Duration) -> i32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(st) = self.child.try_wait().unwrap() {
+                use std::os::unix::process::ExitStatusExt;
+                return st.code().unwrap_or(128 + st.signal().unwrap_or(0));
+            }
+            if Instant::now() >= deadline {
+                panic!("client did not exit; output:\n{}", self.text());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Ctrl-] Ctrl-] then `key`.
+pub fn command(key: u8) -> Vec<u8> {
+    vec![0x1d, 0x1d, key]
+}
+
+/// A data file with every byte value except `\n` (a pty turns `\n` into
+/// `\r\n`), so output can be compared byte for byte.
+pub fn binary_pattern(path: &Path, len: usize) -> Vec<u8> {
+    let data: Vec<u8> = (0..len)
+        .map(|i| {
+            let b = (i * 7 + i / 251) as u8;
+            if b == b'\n' {
+                b'N'
+            } else {
+                b
+            }
+        })
+        .collect();
+    std::fs::write(path, &data).unwrap();
+    data
+}
