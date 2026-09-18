@@ -582,8 +582,7 @@ hosts:                         # aliases: acs devbox tries these in order
   the setting came from, and exits with the install-failed code (254).
 - `hosts` is parsed and validated: `host` is required, `user` and
   `reachability_check` (default `true`) are optional, and one entry may be
-  written without the list. **Not built yet:** resolving `acs <alias>`
-  through these entries.
+  written without the list. How an alias is resolved is §7.3.
 - Only the local client reads the files; `_proxy`, `_master` and `_install`
   never do.
 
@@ -596,6 +595,34 @@ and order. Measured on the release profile, a minimal load-and-dump binary
 grows by about 100 KB with `yaml-rust2` and 150 KB with `serde_yaml`, and
 neither keeps comments; the hand-written parser adds 17 KB to `acs` (slim
 build 490 → 507 KB).
+
+### 7.3 Host aliases
+
+`acs <name>`, where `<name>` has no `user@` part and is a key of `hosts`
+(§7.2), connects to one of the alias's entries instead of `<name>`:
+
+- Entries are tried **in order**. One with `reachability_check: true` (the
+  default) is pinged once — `ping -c 1` with a 2 s deadline, spelled `-t` on
+  macOS and `-W` on Linux (`ACS_PING` names another program, which is how the
+  tests avoid ICMP). The first that answers is used. One with
+  `reachability_check: false` is used without a ping, for hosts that drop
+  ICMP.
+- The chosen entry becomes the ssh destination: `user@host` if it has a
+  `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
+- **None answers**: the client names every host it tried and exits with the
+  unreachable code (255) without calling ssh.
+- It applies to every ssh call — the session, `--list`, install — since they
+  share one destination. `-v` says which entry was chosen and why.
+- **Redial**: a reconnect (§5.3) resolves the alias again, so after a network
+  change the client reaches the host through whichever address answers now.
+  A change of host is always shown (`devbox: now using … (was …)`). The
+  session is found only if the new address is the **same machine**: entries
+  of one alias should be ways to reach one host; if they are different
+  machines, the redial reports that the session has ended.
+- Messages and the `reattach with: acs <name>` hints use the alias, not the
+  resolved host.
+- A name that is not an alias behaves exactly as before; so does
+  `user@<alias>`, which is a way to reach a host whose name is also an alias.
 
 ## 8. Installing the remote binary
 
@@ -738,6 +765,7 @@ src/
   master.rs     acs _master: pty, child, ring, protocol
   list.rs       --list table
   config.rs     configuration files: locations, merging, validation
+  alias.rs      host aliases: ping check and fallback hosts
   yaml.rs       the YAML subset those files use, parsed and written back
   install.rs    remote self-install and _install --finish
   payload.rs    payload set format, ELF trailer, Mach-O embed

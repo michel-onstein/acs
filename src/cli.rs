@@ -36,7 +36,8 @@ in a session: Ctrl-] Ctrl-] then  d  detach (session keeps running)
 environment: ACS_DEFAULT_SESSION ACS_IDENTITY ACS_ESCAPE_KEY ACS_ESCAPE_TIMEOUT_MS
              ACS_SSH ACS_SOCKET_DIR
 
-configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml";
+configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml;
+               <host> may be an alias defined there (hosts:)";
 
 /// Which session the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +60,15 @@ pub struct ClientArgs {
     /// The configuration file's settings (DESIGN §7.2); defaults until the
     /// client loads them.
     pub config: Config,
+    /// The alias the destination was resolved from, if any (DESIGN §7.3).
+    pub alias: Option<String>,
+}
+
+impl ClientArgs {
+    /// The host as the user named it: the alias, or the destination.
+    pub fn host_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.transport.destination)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +197,7 @@ where
         verbose,
         command,
         config: Config::default(),
+        alias: None,
     })))
 }
 
