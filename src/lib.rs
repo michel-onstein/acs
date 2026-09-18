@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 pub mod keys;
+pub mod modes;
 pub mod proto;
 pub mod resume;
 
