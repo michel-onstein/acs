@@ -142,6 +142,22 @@ lives in the master and the client.
 - Everything else — keys, agent, `ProxyJump`, host aliases — comes from the
   user's ssh config unchanged. `acs` opens no ports and has no auth of its own.
 
+**No ssh-side configuration.** The client runs the system `ssh` binary as a
+child process; the `-o` options above are per-invocation overrides and never
+touch `~/.ssh/config` or `sshd_config`. The remote needs only what `dsh`
+needs today — `sshd` allowing a command, and a POSIX `sh` — plus `gzip` and a
+writable `~/.local/bin` for self-install (§8). Hosts that pin what ssh may run
+(`ForceCommand`, `command=` in `authorized_keys`, restricted shells) cannot
+work, as they cannot with `dsh`.
+
+**Noise before the protocol.** Shell startup files sometimes print to stdout
+even for non-interactive sessions (an `echo` in `.bashrc`, a `motd` script),
+and those bytes would arrive ahead of the first frame. The remote side
+therefore writes a marker line, `ACS-READY <proto version>\n`, immediately
+before its first frame; the client discards everything before the marker (and
+shows it on stderr under `-v`), then switches to frames. `ACS-NEED` (§8) is
+found the same way.
+
 ## 4. Remote side
 
 ### 4.1 Session directory and naming
