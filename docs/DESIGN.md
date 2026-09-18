@@ -405,6 +405,14 @@ sequenceDiagram
   passed through, because ssh gets the controlling tty for prompts even with
   `-T`; the client restores cooked mode while ssh is authenticating. With
   keys in an agent, reconnect is silent.
+- **Before the first WELCOME there is a deadline too**: liveness only starts
+  with WELCOME, and `ConnectTimeout` only covers the TCP connect, so a host
+  that accepts and then says nothing would otherwise hold the client forever.
+  A connection has 30 s on a redial — then it is dropped and the client goes
+  back to its backoff wait, where the command keys work — and 120 s on the
+  first connection (time for a password), then the client exits 255, for the
+  marker and again for the handshake (`ACS_DIAL_TIMEOUT_MS` sets both). A
+  takeover question restarts the handshake's clock.
 
 ### 5.4 Status while disconnected
 
@@ -421,6 +429,10 @@ lossless resume will not repaint it. So:
    fewer, then the real size), since an unchanged size raises no `SIGWINCH`.
    Full-screen programs repaint; a plain shell prompt may leave the line in
    scrollback, which is acceptable.
+4. Whatever ends the client — resume, detach, or the session ending while
+   the link was down — pops the title and blanks the status row on the way
+   out, so the terminal is left as it was. While offline, the command key
+   uses the same key and window (`ACS_ESCAPE_TIMEOUT_MS`) as online.
 
 ## 6. Command mode
 

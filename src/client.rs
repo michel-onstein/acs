@@ -101,7 +101,7 @@ pub fn identity() -> String {
         })
 }
 
-fn escape_config() -> keys::Config {
+pub(crate) fn escape_config() -> keys::Config {
     let mut cfg = keys::Config::default();
     if let Some(k) = std::env::var("ACS_ESCAPE_KEY")
         .ok()
@@ -150,8 +150,28 @@ impl Link {
     }
 }
 
-/// Start the transport running `remote` and wait for the marker line.
-pub fn dial(args: &ClientArgs, call: Call, remote: &str) -> io::Result<(Link, Marker)> {
+/// How long a connection may take to answer: to print its marker, and then
+/// to WELCOME us (DESIGN §5.3). A first connection may wait on a password
+/// or a key touch, so it gets longer than a redial, which must return to
+/// the backoff wait (where the command keys work) if the host accepted the
+/// connection and then went quiet. `ACS_DIAL_TIMEOUT_MS` sets both.
+pub fn answer_timeout(redial: bool) -> Duration {
+    let ms = std::env::var("ACS_DIAL_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if redial { 30_000 } else { 120_000 });
+    Duration::from_millis(ms)
+}
+
+/// Start the transport running `remote` and wait, at most `timeout`, for
+/// the marker line.
+pub fn dial(
+    args: &ClientArgs,
+    call: Call,
+    remote: &str,
+    timeout: Duration,
+) -> io::Result<(Link, Marker)> {
+    let deadline = Instant::now() + timeout;
     let mut cmd = args.transport.command(call, remote);
     if args.verbose > 0 {
         note(&format!(
@@ -174,6 +194,24 @@ pub fn dial(args: &ClientArgs, call: Call, remote: &str) -> io::Result<(Link, Ma
     let mut scanner = MarkerScanner::new();
     let mut buf = [0u8; 4096];
     let marker = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let mut p = [sys::pollfd(from.as_raw_fd(), libc::POLLIN)];
+        if left.is_zero() || sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32)? == 0
+        {
+            if Instant::now() < deadline {
+                continue; // a signal cut the wait short
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "no answer from {} within {} s",
+                    args.transport.destination,
+                    timeout.as_secs_f32()
+                ),
+            ));
+        }
         let n = sys::read(from.as_raw_fd(), &mut buf)?;
         if n == 0 {
             if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
@@ -323,6 +361,7 @@ pub fn run(args: ClientArgs) -> u8 {
 
 /// Put the local terminal back the way we found it.
 pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
+    crate::reconnect::clear_status(state);
     let reset = state.observer.reset_sequence();
     if !reset.is_empty() {
         let _ = sys::write_all(STDOUT, &reset);
@@ -347,7 +386,8 @@ pub fn connect_and_serve(
     if let Some(r) = raw.as_mut() {
         let _ = r.suspend();
     }
-    let (link, marker) = match dial(args, Call::Session, &remote) {
+    let timeout = answer_timeout(resuming);
+    let (link, marker) = match dial(args, Call::Session, &remote, timeout) {
         Ok(x) => x,
         Err(e) => {
             if resuming {
@@ -384,7 +424,7 @@ pub fn connect_and_serve(
             };
         }
     };
-    serve(args, state, raw, signals, link, rest)
+    serve(args, state, raw, signals, link, rest, timeout)
 }
 
 fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -421,7 +461,11 @@ fn serve(
     signals: &OwnedFd,
     link: Link,
     early: Vec<u8>,
+    handshake: Duration,
 ) -> Outcome {
+    // The host has until then to WELCOME us (acs-znr): liveness only starts
+    // with the WELCOME.
+    let mut handshake_until = sys::now_ms() + handshake.as_millis() as u64;
     let to = link.to.as_raw_fd();
     let from = link.from.as_raw_fd();
     let _ = sys::set_nonblocking(to, true);
@@ -505,7 +549,11 @@ fn serve(
                 }
                 Msg::Busy { identity, since } if !welcomed => {
                     match crate::reconnect::ask_takeover(state, &identity, since) {
-                        true => Msg::Hello(hello(args, state, true)).encode(&mut out),
+                        true => {
+                            // The question took the user's time, not the host's.
+                            handshake_until = sys::now_ms() + handshake.as_millis() as u64;
+                            Msg::Hello(hello(args, state, true)).encode(&mut out)
+                        }
                         false => {
                             link.close();
                             return Outcome::Exit(code::TAKEN_OVER);
@@ -578,6 +626,8 @@ fn serve(
         }
         if welcomed {
             consider(liveness.next_deadline_ms());
+        } else {
+            consider(handshake_until);
         }
 
         let mut fds = [
@@ -669,6 +719,19 @@ fn serve(
                 crate::reconnect::Health::Ok => {}
                 crate::reconnect::Health::Dead => return lost(link),
             }
+        } else if sys::now_ms() >= handshake_until {
+            // Accepted, then silent: a redial goes back to its backoff; a
+            // first connection gives up.
+            if state.instance.is_some() {
+                return lost(link);
+            }
+            link.close();
+            note(&format!(
+                "no answer from {} within {} s",
+                args.transport.destination,
+                handshake.as_secs_f32()
+            ));
+            return Outcome::Exit(code::UNREACHABLE);
         }
     }
 }

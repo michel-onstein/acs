@@ -234,3 +234,110 @@ fn a_network_change_redials_at_once() {
     c.wait_for(&format!("#{target}#"), T);
     assert_consecutive(&c.text());
 }
+
+// ---- bug hunt 2026-09-18 -----------------------------------------------------
+
+/// Regression (acs-znr): a host that accepts the connection and then says
+/// nothing — before its marker, or after it, instead of WELCOME — is given
+/// up on in time rather than waited for forever.
+#[test]
+fn a_silent_host_is_given_up_on() {
+    let ready = acs::proto::ready_line();
+    for said in ["", ready.as_str()] {
+        let remote = Remote::installed();
+        remote.silence(Some(said));
+        let mut c = start(
+            &remote,
+            "sl",
+            "echo up; sleep 30",
+            &[("ACS_DIAL_TIMEOUT_MS", "500")],
+        );
+        let t0 = Instant::now();
+        assert_eq!(c.wait(T), 255, "{said:?}: {}", c.text());
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        c.wait_for("no answer from devbox within 0.5 s", T);
+    }
+}
+
+/// Regression (acs-znr): a redial into a host that has gone quiet times out
+/// and returns to the backoff wait — and reconnects once the host answers.
+#[test]
+fn a_redial_into_a_silent_host_returns_to_the_backoff() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    // Enough for the first connection on a loaded test machine.
+    env.push(("ACS_DIAL_TIMEOUT_MS", "1500"));
+    let mut c = start(&remote, "rs", "echo up; cat", &env);
+    c.wait_for("up", T);
+    remote.silence(Some(""));
+    remote.cut_link();
+    // Redials time out one after another instead of one hanging.
+    remote.wait_connections(4, Duration::from_secs(20));
+    remote.silence(None);
+    // Resumed: the status line's title is popped, and keys go through.
+    c.wait_for("\x1b[23;0t", T);
+    c.send(b"hello\r");
+    c.wait_for("hello", T);
+}
+
+/// Regression (acs-qrn): when the session ends while the link is down, the
+/// status line and the title pushed for it are taken back.
+#[test]
+fn a_session_ending_during_an_outage_leaves_no_status_behind() {
+    let remote = Remote::installed();
+    let flag = remote.root.path().join("end");
+    let cmd = format!(
+        "echo up; while [ ! -f '{}' ]; do sleep 0.05; done; exit 3",
+        flag.display()
+    );
+    let mut c = start(
+        &remote,
+        "se",
+        &cmd,
+        &[
+            ("ACS_BACKOFF_MS", "1500"),
+            ("ACS_PING_MS", "200"),
+            ("ACS_DEAD_MS", "800"),
+        ],
+    );
+    c.wait_for("up", T);
+    remote.cut_link();
+    c.wait_for("reconnecting in", T);
+    // The program ends while nobody is attached.
+    std::fs::write(&flag, "").unwrap();
+    assert_eq!(c.wait(T), 4, "{}", c.text());
+    c.wait_for("the session has ended", T);
+    let text = c.text();
+    let pushed = text.rfind("\x1b[22;0t").expect("a title was pushed");
+    assert!(
+        text[pushed..].contains("\x1b[23;0t"),
+        "the title was not popped: {:?}",
+        &text[pushed..]
+    );
+    assert!(c.echo_on());
+}
+
+/// Regression (acs-wxa): the command-key window set with
+/// `ACS_ESCAPE_TIMEOUT_MS` also applies while the link is down.
+#[test]
+fn the_escape_window_is_the_same_offline() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "ew",
+        "echo up; sleep 30",
+        &[
+            ("ACS_BACKOFF_MS", "20000"),
+            ("ACS_ESCAPE_TIMEOUT_MS", "3000"),
+        ],
+    );
+    c.wait_for("up", T);
+    remote.cut_link();
+    c.wait_for("reconnecting in 20s", T);
+    // Well past the default 400 ms window, inside the configured one.
+    c.send(&[0x1d]);
+    std::thread::sleep(Duration::from_millis(1000));
+    c.send(&[0x1d, b'd']);
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/ew", T);
+}

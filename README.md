@@ -211,6 +211,7 @@ reached as `user@config`.
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
+| `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial) |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |
