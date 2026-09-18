@@ -7,8 +7,7 @@ reporting, OSC 52 copy, hyperlinks and keyboard protocols work exactly as over
 plain `ssh -t`. One binary is both the local client and the remote session
 holder; it installs itself on the remote the first time you connect.
 
-It replaces the `dsh` shell function (`ssh` + `dtach`). The design is in
-[docs/DESIGN.md](docs/DESIGN.md).
+The design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Install
 
@@ -110,9 +109,9 @@ usual. The command key works in every keyboard encoding a terminal may use
 
 `-i <identity_file>`, `-p <port>`, `-J <jump>`, `-F <config>` and
 `-o <option=value>` are passed to every ssh call acs makes, with ssh's
-meaning. `-l` is `--list` (as in `dsh`); put a login name in `user@host` or
-`-o User=`. Your `~/.ssh/config`, agent and keys apply as usual; nothing
-needs configuring on either side.
+meaning. `-l` is `--list`, not ssh's login option: put a login name in
+`user@host` or `-o User=`. Your `~/.ssh/config`, agent and keys apply as
+usual; nothing needs configuring on either side.
 
 ### When the network drops
 
