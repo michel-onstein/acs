@@ -415,6 +415,41 @@ pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
     }
 }
 
+/// `poll(2)` that sits out signals: an interrupted call is resumed for the
+/// time left, so `Ok(0)` really means the timeout expired with nothing
+/// ready.
+pub fn poll_retry(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let n = unsafe {
+            libc::poll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                left.as_millis() as i32,
+            )
+        };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// A process group to signal from `tcgetpgrp`: never 0 or negative (a pty
+/// with no foreground group reports 0, and `kill(-0, …)` would hit our own
+/// group) and never `own`.
+pub fn valid_pgrp(p: i32, own: i32) -> Option<i32> {
+    (p > 0 && p != own).then_some(p)
+}
+
+pub fn getpgrp() -> i32 {
+    unsafe { libc::getpgrp() }
+}
+
 pub fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
     libc::pollfd {
         fd,
@@ -576,6 +611,25 @@ mod tests {
     #[test]
     fn current_user_has_a_name() {
         assert!(user_name(getuid()).is_some_and(|n| !n.is_empty()));
+    }
+
+    /// Regression (acs-ov1): a pty with no foreground group reports 0, and
+    /// `kill(-0, SIGKILL)` would kill the master's own group.
+    #[test]
+    fn only_real_foreign_process_groups_are_signalled() {
+        assert_eq!(valid_pgrp(0, 100), None);
+        assert_eq!(valid_pgrp(-1, 100), None);
+        assert_eq!(valid_pgrp(100, 100), None);
+        assert_eq!(valid_pgrp(4321, 100), Some(4321));
+    }
+
+    #[test]
+    fn poll_retry_waits_out_the_full_timeout() {
+        let (r, _w) = pipe().unwrap();
+        let mut fds = [pollfd(r.as_raw_fd(), libc::POLLIN)];
+        let t = std::time::Instant::now();
+        assert_eq!(poll_retry(&mut fds, 30).unwrap(), 0);
+        assert!(t.elapsed() >= std::time::Duration::from_millis(29));
     }
 
     #[test]

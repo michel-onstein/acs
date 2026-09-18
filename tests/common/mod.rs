@@ -38,6 +38,21 @@ pub fn config_env(dir: &Path, yaml: &str) -> Vec<(String, String)> {
     vec![("XDG_CONFIG_HOME".into(), dir.display().to_string())]
 }
 
+/// `cmd.output()`, retried while the program is "busy" (ETXTBSY): on Linux a
+/// binary a test just copied cannot be run while another test thread's
+/// fork still holds the copy's write descriptor.
+pub fn output_of(cmd: &mut Command) -> std::process::Output {
+    for _ in 0..50 {
+        match cmd.output() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            r => return r.unwrap(),
+        }
+    }
+    cmd.output().unwrap()
+}
+
 pub fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_acs"))
 }
