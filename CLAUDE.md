@@ -33,7 +33,7 @@ binaries are published to GitHub Releases by the same script. Rules in
 
 | Doc | Description | Status |
 | --- | --- | --- |
-| [README.md](README.md) | Install, usage, command keys, environment, migration from dsh | Current |
+| [README.md](README.md) | Install, usage, command keys, environment | Current |
 | [DESIGN.md](docs/DESIGN.md) | Architecture, protocol, command mode, remote install | Built |
 | [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning and release binaries on GitHub | Built |
 | [VERIFICATION.md](docs/VERIFICATION.md) | End-to-end results over real ssh; checks still to do by hand | Automated checks pass |
