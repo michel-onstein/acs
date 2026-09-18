@@ -32,7 +32,56 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        // A session's master outlives its test otherwise: end every session
+        // whose socket lives here before the directory goes.
+        end_sessions_under(&self.path);
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// SIGTERM the master of every session socket at most two levels below
+/// `root`; a master ends its session on SIGTERM (SIGHUP, then SIGKILL).
+pub fn end_sessions_under(root: &Path) {
+    let mut socks = Vec::new();
+    let mut dirs = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() && !ft.is_symlink() && depth < 2 {
+                dirs.push((p, depth + 1));
+            } else if p.extension().is_some_and(|x| x == "sock") {
+                socks.push(p);
+            }
+        }
+    }
+    for s in socks {
+        if let Ok(pid) = session_pid(&s) {
+            let _ = crate::sys::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+}
+
+/// The pid of the master behind a session socket, asked via STATUS.
+pub fn session_pid(sock: &Path) -> std::io::Result<u32> {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(sock)?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+    s.write_all(&crate::proto::Msg::Status.to_bytes())?;
+    let mut dec = crate::proto::Decoder::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        if let Ok(Some(crate::proto::Msg::StatusReply(info))) = dec.next_msg() {
+            return Ok(info.pid);
+        }
+        let n = s.read(&mut buf)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        dec.push(&buf[..n]);
     }
 }
 

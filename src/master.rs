@@ -896,14 +896,25 @@ impl Master {
         match std::fs::metadata(&self.sock_path) {
             Ok(m) if (m.dev(), m.ino()) == self.sock_ino => {}
             Ok(_) => mlog!("socket path now belongs to something else; leaving it"),
-            Err(_) => match bind(&self.sock_path) {
-                Ok((l, ino)) => {
-                    mlog!("socket was removed; re-bound");
-                    self.listener = l;
-                    self.sock_ino = ino;
+            Err(_) => {
+                // A cleaner may have removed the whole directory: recreate
+                // it (with the usual ownership checks) so the session stays
+                // reachable instead of lingering unreachable forever.
+                if let Some(dir) = self.sock_path.parent() {
+                    if let Err(e) = SocketDir::open_at(dir.to_path_buf()) {
+                        mlog!("cannot recreate {}: {e}", dir.display());
+                        return;
+                    }
                 }
-                Err(e) => mlog!("re-bind failed: {e}"),
-            },
+                match bind(&self.sock_path) {
+                    Ok((l, ino)) => {
+                        mlog!("socket was removed; re-bound");
+                        self.listener = l;
+                        self.sock_ino = ino;
+                    }
+                    Err(e) => mlog!("re-bind failed: {e}"),
+                }
+            }
         }
     }
 

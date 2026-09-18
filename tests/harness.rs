@@ -63,3 +63,32 @@ fn missing_binary_reports_need() {
     }
     let _ = child.wait();
 }
+
+#[test]
+fn dropping_a_remote_ends_its_sessions() {
+    // Regression: test sessions used to outlive their tests forever.
+    let remote = Remote::installed();
+    let mut c = Client::start(
+        &remote,
+        &[
+            "devbox",
+            "keep",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap '' HUP; echo spinning; while :; do sleep 0.1; done",
+        ],
+    );
+    c.wait_for("spinning", T);
+    let pid = acs::testutil::session_pid(&remote.sockets().join("keep.sock")).unwrap();
+    drop(c);
+    drop(remote);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while acs::sys::kill(pid as i32, 0).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "master {pid} still running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
