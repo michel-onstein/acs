@@ -26,7 +26,7 @@ usage: acs config show                 the merged configuration and where each v
 
   --global  edit /etc/acs/config.yaml instead of ~/.config/acs/config.yaml
 
-settings: install_on_remote, update_check (true|false)";
+settings: install_on_remote, update_check, command_bell (true|false)";
 
 /// Settings `get`/`set`/`unset` know: all true or false.
 const SCALARS: &[&str] = config::BOOLS;

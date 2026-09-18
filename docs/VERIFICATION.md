@@ -49,6 +49,9 @@ claimed as verified:
   output, so this should hold; it has not been looked at.
 - **Claude Code** as the remote program (mouse selection, auto copy). Not
   installable in the throwaway host.
+- **The command-mode bell** in a real terminal (heard, or flashed, as the
+  terminal is set up). Tests show the BEL byte arrives, and never inside an
+  OSC the program is sending.
 - **htop and less** interactively. Covered only indirectly (vim, raw mouse and
   key paths).
 - **A real Wi-Fi switch and laptop sleep/wake.** Simulated by killing and

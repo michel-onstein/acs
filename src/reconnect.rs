@@ -206,6 +206,7 @@ fn offline(
                 return Offline::NetworkChanged;
             }
         }
+        let was = detector.armed();
         let out = if fds[0].revents != 0 {
             match sys::read(0, &mut buf) {
                 Ok(n) if n > 0 => detector.feed(&buf[..n], sys::now_ms()),
@@ -214,6 +215,7 @@ fn offline(
         } else {
             detector.tick(sys::now_ms())
         };
+        client::follow_detector(state, was, &detector);
         // Keys typed into a dead link are dropped, not queued (DESIGN §5.2).
         match out.action {
             Some(Action::Detach) => return Offline::Detach,
