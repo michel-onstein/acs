@@ -14,7 +14,8 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
   `cargo xtask dist`), macOS on Apple silicon.
 - Host: Alpine Linux container (`scripts/e2e/Dockerfile`) running OpenSSH
   `sshd`, user `dev` accepting only a freshly generated ed25519 key, reached
-  as `acs -F /dev/null -i <key> -p 2222 … dev@127.0.0.1`.
+  as `acs -F /dev/null -i <key> -p <port> … dev@127.0.0.1` (a free port docker
+  picks, or `ACS_E2E_PORT`).
 - Linux suite: `rust:alpine` container, musl, run as root with users `alice`
   and `bob`.
 
