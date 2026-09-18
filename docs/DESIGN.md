@@ -695,7 +695,46 @@ xtask/           cargo xtask dist: slim builds, payload set, complete builds, si
 run side by side. Once it has been in use for a while, `dsh` becomes
 `alias dsh=acs` and the function and the dtach dependency are deleted.
 
-## 11. Decisions
+## 11. Implementation plan
+
+Tracked as beads (`br`) under the epic **"acs v1: single-binary persistent ssh
+sessions"** — `br show` on it, or `bv --robot-plan`, gives the live state.
+Every bead carries its DESIGN section references and acceptance tests.
+Blocking order:
+
+```mermaid
+flowchart TD
+    S1[Scaffold crate] --> P1[Frame codec]
+    S1 --> P2[Resume buffers]
+    S1 --> P3[Command-key detector]
+    S1 --> P4[Mode observer]
+    S1 --> P5[Names + socket dir]
+    S1 --> P6[ssh builder + prelude]
+    S1 --> P7[CLI parsing]
+    S1 --> C1[Client tty]
+    S1 --> I1[Payload set]
+    P1 & P5 --> M1[Master lifecycle]
+    M1 & P1 & P2 --> M2[Master protocol]
+    P1 & P5 & M1 --> X1[Proxy]
+    M2 & X1 --> X2["--list"]
+    X1 & M2 & P6 --> T1[Test harness]
+    T1 & C1 & P3 & P4 & P6 & P7 --> C2[Client session]
+    C2 & P2 --> C3[Reconnect + resume]
+    C3 --> C4[Redial on network change]
+    C2 & M2 --> U1[Shared-account identity]
+    U1 & P5 --> U2[Multi-user container tests]
+    I1 & C2 & X1 --> I2[Remote self-install]
+    I2 & X2 --> I3[Prune old versions]
+    I1 --> I4[xtask dist]
+    C3 & U1 & I2 & I4 & X2 --> V1[Manual verification]
+    V1 --> D1[Docs + dsh migration]
+```
+
+The first usable milestone is **Client session**: attach, detach and exit
+over ssh to a host where `acs` was installed by hand. **Reconnect + resume**
+and **Remote self-install** make it a `dsh` replacement.
+
+## 12. Decisions
 
 | # | Question | Decision |
 | --- | --- | --- |
