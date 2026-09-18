@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 pub mod cli;
 pub mod keys;
+pub mod master;
 pub mod modes;
 pub mod proto;
 pub mod resume;
@@ -54,9 +55,10 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
     let role = Role::from_first_arg(args.get(1));
     match role {
         Role::Version => {
-            println!("acs {VERSION}");
+            println!("acs {VERSION} (protocol {})", proto::PROTO_VERSION);
             ExitCode::SUCCESS
         }
+        Role::Master => master::main(&args[2..]),
         other => {
             eprintln!("acs: role {other:?} is not implemented yet");
             ExitCode::from(70)
