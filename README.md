@@ -177,7 +177,12 @@ The alias is resolved again on every reconnect, so when you move from home
 to outside, the redial goes to whichever address answers. List ways of
 reaching **one** machine under an alias: the session lives on that machine,
 so a fallback to a different one finds no session to resume.
-`me@devbox`, or any name that is not an alias, is used as given.
+
+`acs root@devbox` goes through the alias the same way, logging in as `root`
+on whichever host is chosen (instead of `michel` on the fallback), and keeps
+`root` on every redial. Any name that is not an alias, with or without a
+`user@`, is used as given. To reach a machine whose name is also an alias,
+use its full name or address (`acs devbox.example.com`).
 
 ### Editing it from the command line
 

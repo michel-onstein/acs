@@ -611,8 +611,8 @@ build 490 → 507 KB).
 
 ### 7.3 Host aliases
 
-`acs <name>`, where `<name>` has no `user@` part and is a key of `hosts`
-(§7.2), connects to one of the alias's entries instead of `<name>`:
+`acs [user@]<name>`, where `<name>` is a key of `hosts` (§7.2), connects to
+one of the alias's entries instead of `<name>`:
 
 - Entries are tried **in order**. One with `reachability_check: true` (the
   default) is pinged once — `ping -c 1` with a 2 s deadline, spelled `-t` on
@@ -622,6 +622,12 @@ build 490 → 507 KB).
   ICMP.
 - The chosen entry becomes the ssh destination: `user@host` if it has a
   `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
+- **`user@<alias>`** goes through the alias the same way — same order, same
+  pings, same fallback — and logs in as `user` on whichever entry is chosen,
+  replacing the entry's own `user`. The destination is split at its **last**
+  `@`, as ssh splits it (`a@b@devbox` is user `a@b`); an alias cannot
+  contain `@` (§7.2), so the split is never ambiguous. `-v` says the login
+  name came from the command line.
 - **None answers**: the client names every host it tried and exits with the
   unreachable code (255) without calling ssh.
 - It applies to every ssh call — the session, `--list`, install — since they
@@ -631,11 +637,16 @@ build 490 → 507 KB).
   A change of host is always shown (`devbox: now using … (was …)`). The
   session is found only if the new address is the **same machine**: entries
   of one alias should be ways to reach one host; if they are different
-  machines, the redial reports that the session has ended.
-- Messages and the `reattach with: acs <name>` hints use the alias, not the
-  resolved host.
-- A name that is not an alias behaves exactly as before; so does
-  `user@<alias>`, which is a way to reach a host whose name is also an alias.
+  machines, the redial reports that the session has ended. A redial of
+  `user@<alias>` keeps the user.
+- Messages and the `reattach with: acs <name>` hints use the name as given
+  (`devbox`, `me@devbox`), not the resolved host.
+- A name that is not an alias, with or without `user@`, behaves exactly as
+  before.
+- **A host whose name is also an alias** is reached by another name for it —
+  its FQDN or address (`acs devbox.example.com`). To keep a `~/.ssh/config`
+  `Host devbox` in play, list it in the alias (`- host: devbox`): an entry's
+  `host` goes to ssh as is and is never itself resolved as an alias.
 
 ### 7.4 `acs config`
 
