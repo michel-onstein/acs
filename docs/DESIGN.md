@@ -615,8 +615,8 @@ build 490 → 507 KB).
 
 ### 7.3 Host aliases
 
-`acs <name>`, where `<name>` has no `user@` part and is a key of `hosts`
-(§7.2), connects to one of the alias's entries instead of `<name>`:
+`acs [user@]<name>`, where `<name>` is a key of `hosts` (§7.2), connects to
+one of the alias's entries instead of `<name>`:
 
 - Entries are tried **in order**. One with `reachability_check: true` (the
   default) is pinged once — `ping -c 1` with a 2 s deadline, spelled `-t` on
@@ -626,6 +626,12 @@ build 490 → 507 KB).
   ICMP.
 - The chosen entry becomes the ssh destination: `user@host` if it has a
   `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
+- **`user@<alias>`** goes through the alias the same way — same order, same
+  pings, same fallback — and logs in as `user` on whichever entry is chosen,
+  replacing the entry's own `user`. The destination is split at its **last**
+  `@`, as ssh splits it (`a@b@devbox` is user `a@b`); an alias cannot
+  contain `@` (§7.2), so the split is never ambiguous. `-v` says the login
+  name came from the command line.
 - **None answers**: the client names every host it tried and exits with the
   unreachable code (255) without calling ssh.
 - It applies to every ssh call — the session, `--list`, install — since they
@@ -635,11 +641,52 @@ build 490 → 507 KB).
   A change of host is always shown (`devbox: now using … (was …)`). The
   session is found only if the new address is the **same machine**: entries
   of one alias should be ways to reach one host; if they are different
-  machines, the redial reports that the session has ended.
-- Messages and the `reattach with: acs <name>` hints use the alias, not the
-  resolved host.
-- A name that is not an alias behaves exactly as before; so does
-  `user@<alias>`, which is a way to reach a host whose name is also an alias.
+  machines, the redial reports that the session has ended. A redial of
+  `user@<alias>` keeps the user.
+- Messages and the `reattach with: acs <name>` hints use the name as given
+  (`devbox`, `me@devbox`), not the resolved host.
+- A name that is not an alias, with or without `user@`, behaves exactly as
+  before.
+- **A host whose name is also an alias** is reached by another name for it —
+  its FQDN or address (`acs devbox.example.com`). To keep a `~/.ssh/config`
+  `Host devbox` in play, list it in the alias (`- host: devbox`): an entry's
+  `host` goes to ssh as is and is never itself resolved as an alias.
+
+**Every alias at once.** `acs [ssh options] --list` without a host lists the
+sessions on every alias of the configuration (`list.rs`):
+
+```text
+HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
+devbox  main  attached  michel@mbp    3s    2h   /bin/zsh -l
+devbox  work  detached  (michel@mbp)  4m    1d   htop
+no sessions on nas
+no sessions on pi (acs 0.4.0 is not installed there)
+acs: lab: no host for 'lab' is reachable (tried lab.lan)
+```
+
+- Each alias is resolved as above, pings and fallbacks included, and asked
+  with the same `_proxy --list` side call as `acs <alias> --list`. The
+  aliases are asked **in parallel**, a thread each, so a slow or dead host
+  holds up only its own line; each has the redial's answer limit (§5.3:
+  30 s, `ACS_DIAL_TIMEOUT_MS`) for the whole exchange, not only for the
+  marker. (`acs <host> --list` bounds its whole exchange the same way, with
+  the first connection's 120 s.)
+- **No prompts**: several ssh cannot share the terminal for a password or a
+  host key, so these calls put `-o BatchMode=yes -o ConnectTimeout=10`
+  before the user's options (`ssh::BATCH_OPTS`). A host that needs a
+  password fails here and is listed on its own with `acs <alias> --list`.
+- **Output**: one table with the alias in a HOST column, in configuration
+  order, then a line for each alias with no sessions or without acs of this
+  version, on stdout. An alias that could not be asked gets an
+  `acs: <alias>: <why>` line on stderr, not a failed command.
+- **Exit status**: 0 when every host answered — one without acs answered,
+  as it does for `acs <host> --list` — and the unreachable code (255) when
+  any did not. With no aliases configured there is nothing to list: it says
+  how to add one and exits with the usage code (2).
+- **Spawns are serialized** (`sys::spawn`): without `pipe2` (macOS) the
+  standard library marks a child's pipes close-on-exec only after creating
+  them, and a child another thread forks in between would hold one host's
+  pipe open, so that host's list would not end until the other child did.
 
 **Every alias at once.** `acs [ssh options] --list` without a host lists the
 sessions on every alias of the configuration (`list.rs`):

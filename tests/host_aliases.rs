@@ -74,11 +74,38 @@ fn no_reachable_host_is_an_error_with_exit_255() {
 }
 
 #[test]
-fn other_names_and_user_at_alias_are_not_resolved() {
+fn user_at_alias_logs_in_as_that_user_on_every_host() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.lan"]);
+    let env = net.env(CONFIG);
+    let mut c = Client::start_env(&remote, &session("you@devbox"), &refs(&env));
+    c.wait_for("you@devbox: logging in as you, from the command line", T);
+    c.wait_for(
+        "you@devbox: devbox.lan answers ping, using you@devbox.lan",
+        T,
+    );
+    c.wait_for("up", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+
+    // The fallback host's own `user: me` gives way to the given one.
+    net.set_up(&["devbox.example.com"]);
+    let mut c = Client::start_env(&remote, &session("you@devbox"), &refs(&env));
+    c.wait_for(
+        "you@devbox: devbox.example.com answers ping, using you@devbox.example.com",
+        T,
+    );
+    c.wait_for("up", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+}
+
+#[test]
+fn other_names_are_not_resolved() {
     let remote = Remote::installed();
     let net = Net::new(&[]);
     let env = net.env(CONFIG);
-    for host in ["other", "me@devbox"] {
+    for host in ["other", "me@other"] {
         let mut c = Client::start_env(&remote, &session(host), &refs(&env));
         c.wait_for("up", T);
         c.send(&command(b'x'));
@@ -113,10 +140,8 @@ fn list_resolves_the_alias_too() {
     );
 }
 
-#[test]
-fn a_redial_resolves_the_alias_again() {
-    let remote = Remote::installed();
-    let net = Net::new(&["devbox.lan"]);
+/// A client of `name` connected through devbox.lan, with fast redials.
+fn redialling(remote: &Remote, net: &Net, name: &str) -> Client {
     let mut env = net.env(CONFIG);
     for (k, v) in [
         ("ACS_BACKOFF_MS", "100"),
@@ -126,11 +151,19 @@ fn a_redial_resolves_the_alias_again() {
         env.push((k.into(), v.into()));
     }
     let mut c = Client::start_env(
-        &remote,
-        &["devbox", "r", "--", "/bin/sh", "-c", "echo up; sleep 30"],
+        remote,
+        &[name, "r", "--", "/bin/sh", "-c", "echo up; sleep 30"],
         &refs(&env),
     );
     c.wait_for("up", T);
+    c
+}
+
+#[test]
+fn a_redial_resolves_the_alias_again() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.lan"]);
+    let mut c = redialling(&remote, &net, "devbox");
     // The network changes: only the outside address answers now.
     net.set_up(&["devbox.example.com"]);
     remote.cut_link();
@@ -144,4 +177,24 @@ fn a_redial_resolves_the_alias_again() {
     c.wait_for("back", T);
     c.send(&command(b'x'));
     c.wait(T);
+}
+
+#[test]
+fn a_redial_of_user_at_alias_keeps_the_user() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.lan"]);
+    let mut c = redialling(&remote, &net, "you@devbox");
+    net.set_up(&["devbox.example.com"]);
+    remote.cut_link();
+    c.wait_for(
+        "you@devbox: now using you@devbox.example.com (was you@devbox.lan)",
+        T,
+    );
+    remote.wait_connections(2, T);
+    c.send(b"echo back\r");
+    c.wait_for("back", T);
+    // The hints name the host as given, user and all.
+    c.send(&command(b'd'));
+    c.wait(T);
+    c.wait_for("acs you@devbox r", T);
 }

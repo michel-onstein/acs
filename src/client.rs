@@ -78,18 +78,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
     ExitCode::from(run(args))
 }
 
-/// If `name` is an alias, point the transport at the host it stands for
-/// now (DESIGN §7.3); with `-v`, say which entry was chosen and why.
+/// If `name` is an alias, or `user@<alias>`, point the transport at the host
+/// it stands for now (DESIGN §7.3); with `-v`, say which entry was chosen
+/// and why. `name` is kept as given, so a redial resolves it the same way.
 pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
     let verbose = args.verbose > 0;
-    let dest = crate::alias::resolve(name, &args.config, &mut crate::alias::ping, &mut |m| {
+    let entry = crate::alias::resolve(name, &args.config, &mut crate::alias::ping, &mut |m| {
         if verbose {
             note(&m)
         }
     })?;
-    if let Some(d) = dest {
+    if let Some(e) = entry {
         args.alias = Some(name.to_string());
-        args.transport.destination = d;
+        args.transport.destination = e.destination();
     }
     Ok(())
 }

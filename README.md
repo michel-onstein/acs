@@ -178,7 +178,32 @@ The alias is resolved again on every reconnect, so when you move from home
 to outside, the redial goes to whichever address answers. List ways of
 reaching **one** machine under an alias: the session lives on that machine,
 so a fallback to a different one finds no session to resume.
-`me@devbox`, or any name that is not an alias, is used as given.
+
+`acs root@devbox` goes through the alias the same way, logging in as `root`
+on whichever host is chosen (instead of `michel` on the fallback), and keeps
+`root` on every redial. Any name that is not an alias, with or without a
+`user@`, is used as given. To reach a machine whose name is also an alias,
+use its full name or address (`acs devbox.example.com`).
+
+### Sessions on every host
+
+`acs --list` without a host lists the sessions on every alias at once:
+
+```text
+HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
+devbox  main  attached  michel@mbp    3s    2h   /bin/zsh -l
+devbox  work  detached  (michel@mbp)  4m    1d   htop
+no sessions on nas
+acs: pi: no host for 'pi' is reachable (tried pi.lan)
+```
+
+Each alias is resolved as above and all are asked in parallel, so a host
+that is down or slow only costs its own line — on stderr, after at most 30 s
+(`ACS_DIAL_TIMEOUT_MS`). The exit status is 0 when every host answered and
+255 when any did not. Several ssh cannot ask for passwords on one terminal,
+so these calls run with ssh's `BatchMode`: list a host that needs a password
+on its own, with `acs <alias> --list`. With no aliases configured, it says so
+and exits with 2.
 
 ### Sessions on every host
 

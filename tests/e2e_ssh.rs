@@ -1,6 +1,10 @@
 //! End-to-end over real ssh against a container host (acs-5v9.24). Run by
 //! `scripts/e2e_ssh.sh`, which starts the host and sets `ACS_E2E_*`;
 //! skipped otherwise.
+//!
+//! The tests run one at a time in name order, and `e2e_01` must be first
+//! (it checks the first-contact install), so numbers are zero-padded:
+//! `e2e_10` would otherwise sort before `e2e_1`.
 
 mod common;
 
@@ -92,7 +96,7 @@ fn assert_consecutive(text: &str) {
 }
 
 #[test]
-fn e2e_1_first_contact_installs_and_attaches() {
+fn e2e_01_first_contact_installs_and_attaches() {
     let Some(h) = host() else { return };
     let mut c = h.client("first", "echo up-and-running; sleep 60", &[]);
     c.wait_for("installing acs", T);
@@ -106,7 +110,7 @@ fn e2e_1_first_contact_installs_and_attaches() {
 }
 
 #[test]
-fn e2e_2_identity_file_is_required() {
+fn e2e_02_identity_file_is_required() {
     let Some(h) = host() else { return };
     // Same options but no -i: this host only accepts the generated key.
     let args = [
@@ -131,7 +135,7 @@ fn e2e_2_identity_file_is_required() {
 }
 
 #[test]
-fn e2e_3_vim_uses_the_alternate_screen_and_exits_cleanly() {
+fn e2e_03_vim_uses_the_alternate_screen_and_exits_cleanly() {
     let Some(h) = host() else { return };
     let mut c = h.client("vim", "vim -u NONE -N", &[]);
     c.wait_for("\x1b[?1049h", T);
@@ -144,7 +148,7 @@ fn e2e_3_vim_uses_the_alternate_screen_and_exits_cleanly() {
 }
 
 #[test]
-fn e2e_4_osc52_and_hyperlinks_pass_through_verbatim() {
+fn e2e_04_osc52_and_hyperlinks_pass_through_verbatim() {
     let Some(h) = host() else { return };
     let mut c = h.client(
         "osc",
@@ -162,7 +166,7 @@ fn e2e_4_osc52_and_hyperlinks_pass_through_verbatim() {
 }
 
 #[test]
-fn e2e_5_kitty_keyboard_protocol_command_key() {
+fn e2e_05_kitty_keyboard_protocol_command_key() {
     let Some(h) = host() else { return };
     let mut c = h.client("kitty", "printf '\\033[>1u'; echo kitty-on; sleep 60", &[]);
     c.wait_for("kitty-on", T);
@@ -173,7 +177,7 @@ fn e2e_5_kitty_keyboard_protocol_command_key() {
 }
 
 #[test]
-fn e2e_6_mouse_reports_reach_the_program() {
+fn e2e_06_mouse_reports_reach_the_program() {
     let Some(h) = host() else { return };
     let mut c = h.client(
         "mouse",
@@ -197,7 +201,7 @@ fn e2e_6_mouse_reports_reach_the_program() {
 }
 
 #[test]
-fn e2e_7_killed_connection_resumes_without_loss() {
+fn e2e_07_killed_connection_resumes_without_loss() {
     let Some(h) = host() else { return };
     let mut c = h.client("drop", TICKER, &[("ACS_BACKOFF_MS", "300")]);
     c.wait_for("#30#", T);
@@ -220,7 +224,7 @@ fn e2e_7_killed_connection_resumes_without_loss() {
 }
 
 #[test]
-fn e2e_8_frozen_host_is_detected_and_resumed() {
+fn e2e_08_frozen_host_is_detected_and_resumed() {
     let Some(h) = host() else { return };
     let mut c = h.client(
         "freeze",
@@ -247,7 +251,7 @@ fn e2e_8_frozen_host_is_detected_and_resumed() {
 }
 
 #[test]
-fn e2e_9_list_shows_the_sessions() {
+fn e2e_09_list_shows_the_sessions() {
     let Some(h) = host() else { return };
     let mut args = h.ssh_args();
     args.extend(["dev@127.0.0.1".into(), "--list".into()]);
@@ -259,7 +263,7 @@ fn e2e_9_list_shows_the_sessions() {
 }
 
 #[test]
-fn e2e_9b_list_without_a_host_asks_every_alias() {
+fn e2e_09b_list_without_a_host_asks_every_alias() {
     let Some(h) = host() else { return };
     // `box` is the container; `gone` is a documentation address no ping
     // reaches.
@@ -280,7 +284,7 @@ fn e2e_9b_list_without_a_host_asks_every_alias() {
     let text = String::from_utf8_lossy(&out.stdout);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(255), "{text}{err}");
-    // Tests run in name order: e2e_1 left its session there.
+    // Tests run in name order: e2e_01 left its session there.
     let row = text
         .lines()
         .find(|l| l.contains(" first "))
@@ -291,4 +295,26 @@ fn e2e_9b_list_without_a_host_asks_every_alias() {
         "{err}"
     );
     eprintln!("VERIFIED acs --list over ssh (BatchMode):\n{text}{err}");
+}
+
+#[test]
+fn e2e_10_user_at_alias_logs_in_as_that_user() {
+    let Some(h) = host() else { return };
+    // The entry's own user has no key on the host: only the override works.
+    let cfg = acs::testutil::TempDir::new();
+    let env = config_env(
+        cfg.path(),
+        "hosts:\n  box:\n    - host: 127.0.0.1\n      user: nobody\n      reachability_check: false\n",
+    );
+    let mut args = h.ssh_args();
+    args.extend(["-v", "dev@box", "alias", "--"].map(String::from));
+    args.extend(["/bin/sh", "-c", "echo \"as-$(id -un)\"; sleep 60"].map(String::from));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut c = Client::spawn(std::path::Path::new(&h.client), &args, &env);
+    c.wait_for("dev@box: logging in as dev, from the command line", T);
+    c.wait_for("as-dev", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+    eprintln!("VERIFIED dev@<alias> logs in as dev over ssh");
 }

@@ -41,7 +41,7 @@ environment: ACS_DEFAULT_SESSION ACS_IDENTITY ACS_ESCAPE_KEY ACS_ESCAPE_TIMEOUT_
              ACS_SSH ACS_SOCKET_DIR
 
 configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml;
-               <host> may be an alias defined there (hosts:)";
+               the <host> of [user@]<host> may be an alias defined there (hosts:)";
 
 /// Which session the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +64,8 @@ pub struct ClientArgs {
     /// The configuration file's settings (DESIGN §7.2); defaults until the
     /// client loads them.
     pub config: Config,
-    /// The alias the destination was resolved from, if any (DESIGN §7.3).
+    /// The alias the destination was resolved from, as given (`[user@]<alias>`),
+    /// if any (DESIGN §7.3).
     pub alias: Option<String>,
 }
 
