@@ -11,11 +11,13 @@ pub mod keys;
 pub mod list;
 pub mod master;
 pub mod modes;
+pub mod payload;
 pub mod proto;
 pub mod proxy;
 pub mod reconnect;
 pub mod resume;
 pub mod session;
+pub mod sha256;
 pub mod ssh;
 pub mod sys;
 #[doc(hidden)]
