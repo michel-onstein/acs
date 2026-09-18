@@ -85,6 +85,43 @@ pub fn session_pid(sock: &Path) -> std::io::Result<u32> {
     }
 }
 
+/// CPU time (user + system) process `pid` has used so far: from `/proc` on
+/// Linux, `ps` elsewhere. For tests that a process waits rather than spins.
+pub fn cpu_time(pid: u32) -> Option<std::time::Duration> {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // After "(comm)": state is field 3, utime 14, stime 15.
+        let rest = stat.get(stat.rfind(')')? + 2..)?;
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let ticks = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        return Some(std::time::Duration::from_millis(ticks * 1000 / hz));
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    // [[dd-]hh:]mm:ss[.cc]
+    let text = String::from_utf8_lossy(&out.stdout);
+    let t = text.trim();
+    let (days, t) = match t.split_once('-') {
+        Some((d, rest)) => (d.parse::<f64>().ok()?, rest),
+        None => (0.0, t),
+    };
+    let mut secs = 0.0;
+    for part in t.split(':') {
+        secs = secs * 60.0 + part.parse::<f64>().ok()?;
+    }
+    Some(std::time::Duration::from_secs_f64(days * 86_400.0 + secs))
+}
+
+/// CPU time `pid` burns over `span`.
+pub fn cpu_over(pid: u32, span: std::time::Duration) -> std::time::Duration {
+    let before = cpu_time(pid).expect("cpu time of the process");
+    std::thread::sleep(span);
+    let after = cpu_time(pid).expect("cpu time of the process");
+    after.saturating_sub(before)
+}
+
 use crate::proto::{Decoder, Hello, Mode, Msg, WinSize, PROTO_VERSION};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

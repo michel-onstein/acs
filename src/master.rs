@@ -292,6 +292,34 @@ struct Master {
     next_rebind: Instant,
 }
 
+/// The pty's foreground process group, if it is one we may signal
+/// (`sys::valid_pgrp`: never 0, which a pty without one reports).
+fn fg_pgrp(pty: RawFd) -> Option<i32> {
+    sys::tcgetpgrp(pty)
+        .ok()
+        .and_then(|p| sys::valid_pgrp(p, sys::getpgrp()))
+}
+
+/// The pty's poll entry. With nothing to wait for it is left out (`fd -1`):
+/// Linux reports POLLHUP on a hung-up pty whatever `events` asks for, and
+/// while the ring is full that would spin the loop (acs-gkl).
+fn pty_pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
+    sys::pollfd(if events == 0 { -1 } else { fd }, events)
+}
+
+/// After the child's exit status is known: whether the pty has nothing
+/// more to read. Only a poll that runs its full course afterwards can say
+/// so — the poll that saw the status may have been cut short by SIGCHLD, or
+/// have returned for another descriptor, while the child's last output was
+/// still on its way to the master side (acs-u3c).
+fn pty_drained(fd: RawFd) -> bool {
+    let mut p = [sys::pollfd(fd, libc::POLLIN)];
+    match sys::poll_retry(&mut p, 50) {
+        Ok(_) => p[0].revents & libc::POLLIN == 0,
+        Err(_) => true,
+    }
+}
+
 fn bind(path: &Path) -> io::Result<(UnixListener, (u64, u64))> {
     let l = UnixListener::bind(path)?;
     l.set_nonblocking(true)?;
@@ -392,7 +420,7 @@ impl Master {
                         pty_events |= libc::POLLOUT;
                     }
                 }
-                fds.push(sys::pollfd(ch.pty.as_raw_fd(), pty_events));
+                fds.push(pty_pollfd(ch.pty.as_raw_fd(), pty_events));
             }
             let conn_base = fds.len();
             for c in &self.conns {
@@ -449,10 +477,16 @@ impl Master {
                 }
                 // A dead child and nothing more to read although we asked:
                 // the output is complete (a background job may still hold
-                // the pty open, but the session is over).
+                // the pty open, but the session is over) — once a quiet
+                // poll after the exit confirms it.
                 if let Some(ch) = &mut self.child {
                     let asked = pty_events & libc::POLLIN != 0;
-                    if ch.status.is_some() && ch.pty_open && asked && re & libc::POLLIN == 0 {
+                    if ch.status.is_some()
+                        && ch.pty_open
+                        && asked
+                        && re & libc::POLLIN == 0
+                        && pty_drained(ch.pty.as_raw_fd())
+                    {
                         ch.pty_open = false;
                     }
                 }
@@ -527,6 +561,12 @@ impl Master {
                 return;
             }
         };
+        if self.conns[i].state == ConnState::Closing {
+            // Taken over, detached or refused: whatever it still sends —
+            // INPUT, RESIZE, KILL — is no longer for this session (acs-d1v).
+            // Reading on lets us see its end of stream.
+            return;
+        }
         self.conns[i].dec.push(&buf[..n]);
         loop {
             let msg = match self.conns[i].dec.next_msg() {
@@ -769,7 +809,7 @@ impl Master {
             let _ = sys::set_winsize(ch.pty.as_raw_fd(), &s);
             self.size = s;
         } else if force_redraw {
-            let pgrp = sys::tcgetpgrp(ch.pty.as_raw_fd()).unwrap_or(ch.pid);
+            let pgrp = fg_pgrp(ch.pty.as_raw_fd()).unwrap_or(ch.pid);
             let _ = sys::kill(-pgrp, libc::SIGWINCH);
         }
     }
@@ -868,7 +908,7 @@ impl Master {
         if ch.status.is_some() {
             return;
         }
-        let pgrp = sys::tcgetpgrp(ch.pty.as_raw_fd()).ok();
+        let pgrp = fg_pgrp(ch.pty.as_raw_fd());
         let _ = sys::kill(-ch.pid, libc::SIGHUP);
         if let Some(p) = pgrp.filter(|&p| p != ch.pid) {
             let _ = sys::kill(-p, libc::SIGHUP);
@@ -883,7 +923,7 @@ impl Master {
         if let Some(ch) = &self.child {
             if ch.status.is_none() {
                 mlog!("child ignored SIGHUP: SIGKILL");
-                if let Ok(p) = sys::tcgetpgrp(ch.pty.as_raw_fd()) {
+                if let Some(p) = fg_pgrp(ch.pty.as_raw_fd()) {
                     let _ = sys::kill(-p, libc::SIGKILL);
                 }
                 let _ = sys::kill(-ch.pid, libc::SIGKILL);
@@ -998,5 +1038,35 @@ impl Master {
                 Read::Future => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (acs-u3c): output the child wrote just before exiting is
+    /// seen by the drain check even though an earlier poll saw nothing —
+    /// the check polls afresh instead of trusting that poll's revents.
+    #[test]
+    fn the_drain_check_sees_output_written_after_the_last_poll() {
+        let (master, slave) = sys::openpty().unwrap();
+        let m = master.as_raw_fd();
+        // The poll the loop made: nothing to read yet.
+        let mut p = [sys::pollfd(m, libc::POLLIN)];
+        assert_eq!(sys::poll(&mut p, 0).unwrap(), 0);
+        // The child's last words, then (as far as the loop knows) its exit.
+        sys::write_all(slave.as_raw_fd(), b"last line\r\n").unwrap();
+        assert!(!pty_drained(m), "output still to read");
+        let mut buf = [0u8; 64];
+        assert!(sys::read(m, &mut buf).unwrap() > 0);
+        // Read out, with the slave still open (a background job): drained.
+        assert!(pty_drained(m));
+    }
+
+    #[test]
+    fn an_idle_pty_is_left_out_of_the_poll() {
+        assert_eq!(pty_pollfd(7, 0).fd, -1);
+        assert_eq!(pty_pollfd(7, libc::POLLIN).fd, 7);
     }
 }

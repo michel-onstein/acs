@@ -496,3 +496,111 @@ fn duplicate_input_after_a_resend_is_written_once() {
         other => panic!("{other:?}"),
     }
 }
+
+// ---- bug hunt 2026-09-18 -----------------------------------------------------
+
+/// Regression (acs-u3c): the child's last line, written just before it
+/// exits, reaches the client — the pty is only declared drained by a quiet
+/// poll after the exit was seen, not by the poll SIGCHLD cut short.
+#[test]
+fn the_last_output_before_exit_is_never_lost() {
+    // A burst right before the exit leaves the most in flight.
+    for i in 0..100 {
+        let t = TempDir::new();
+        let cmd = format!("head -c 30000 /dev/zero | tr '\\0' y; echo last-{i}");
+        let (mut c, _) = start(t.path(), "e", &["/bin/sh", "-c", &cmd], "me");
+        let status = wait_exit(&mut c);
+        assert_eq!(acs::sys::exit_code(status), 0);
+        let out = String::from_utf8_lossy(&c.output);
+        assert!(
+            out.contains(&format!("last-{i}")),
+            "run {i}: output ends {:?}",
+            &out[out.len().saturating_sub(40)..]
+        );
+    }
+}
+
+/// Regression (acs-gkl): while a stalled client has the ring full, a pty
+/// that hangs up (the child died) must not make the master spin.
+#[test]
+fn a_hangup_while_the_client_is_stalled_does_not_spin_the_master() {
+    let t = TempDir::new();
+    let (mut a, _) = start_env(
+        t.path(),
+        "hs",
+        &["/bin/sh", "-c", "echo PID:$$; exec yes"],
+        "me",
+        &[("ACS_RING", "65536")],
+    );
+    a.wait_output("PID:", T);
+    let out = String::from_utf8_lossy(&a.output).into_owned();
+    let pid: i32 = out
+        .split("PID:")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no pid in {out:?}"));
+    // Stall: the client socket, its buffer and the ring fill; `yes` blocks.
+    a.set_paused(true);
+    std::thread::sleep(Duration::from_millis(1500));
+    // The child dies; its pty hangs up while nothing can be read.
+    acs::sys::kill(pid, libc::SIGKILL).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let master = acs::testutil::session_pid(&sock(t.path(), "hs")).unwrap();
+    let burnt = acs::testutil::cpu_over(master, Duration::from_secs(1));
+    assert!(
+        burnt < Duration::from_millis(300),
+        "master used {burnt:?} of CPU in 1 s while waiting"
+    );
+    // Reading again, the client gets the rest and the exit.
+    a.set_paused(false);
+    let status = wait_exit(&mut a);
+    assert_eq!(status & 0x7f, libc::SIGKILL, "{status:#x}");
+}
+
+/// Regression (acs-d1v): frames a taken-over client still sends — INPUT,
+/// RESIZE, KILL — are ignored, and the new client's input is not mistaken
+/// for a duplicate.
+#[test]
+fn a_taken_over_client_is_not_listened_to() {
+    let t = TempDir::new();
+    // Much output at once, so a stalled old client keeps its connection
+    // open (Closing, with output queued) after the takeover.
+    let (mut a, wa) = start(
+        t.path(),
+        "to",
+        &[
+            "/bin/sh",
+            "-c",
+            "stty -echo; sleep 0.3; head -c 400000 /dev/zero | tr '\\0' y; echo; while read l; do echo got:$l; done",
+        ],
+        "me@one",
+    );
+    a.set_paused(true);
+    std::thread::sleep(Duration::from_millis(1000));
+    let (mut b, m) = attach(t.path(), "to", "me@one", None);
+    let Msg::Welcome(wb) = m else { panic!("{m:?}") };
+    // The old client, not yet gone, still sends — then leaves.
+    let _ = a.try_send(&Msg::Input {
+        seq: wa.input_seq,
+        bytes: b"evil\r".to_vec(),
+    });
+    let _ = a.try_send(&Msg::Resize(acs::proto::WinSize {
+        cols: 20,
+        rows: 5,
+        xpixel: 0,
+        ypixel: 0,
+    }));
+    let _ = a.try_send(&Msg::Kill);
+    drop(a);
+    std::thread::sleep(Duration::from_millis(300));
+    // The session lives, and the new client's first input counts.
+    b.send(&Msg::Input {
+        seq: wb.input_seq,
+        bytes: b"good\r".to_vec(),
+    });
+    b.wait_output("got:good", T);
+    let out = String::from_utf8_lossy(&b.output).into_owned();
+    assert!(!out.contains("got:evil"), "{out:?}");
+    assert!(acs::testutil::session_pid(&sock(t.path(), "to")).is_ok());
+}

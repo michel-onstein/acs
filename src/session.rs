@@ -181,6 +181,12 @@ impl SocketDir {
         Flock::lock(&self.path.join(format!("{name}.lock")))
     }
 
+    /// [`create_lock`](Self::create_lock) if it is free; `Ok(None)` while a
+    /// master start holds it.
+    pub fn try_create_lock(&self, name: &str) -> io::Result<Option<Flock>> {
+        Flock::try_lock(&self.path.join(format!("{name}.lock")))
+    }
+
     /// Lock held while `--new` picks and creates a numbered session.
     pub fn dir_lock(&self) -> io::Result<Flock> {
         Flock::lock(&self.path.join(".lock"))

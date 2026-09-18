@@ -28,14 +28,14 @@ fn upgrade(
     server: &ReleaseServer,
     args: &[&str],
 ) -> (i32, String, String) {
-    let out = Command::new(path)
-        .arg("upgrade")
-        .args(args)
-        .env("ACS_RELEASES_URL", &server.url)
-        .env("HOME", home)
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .output()
-        .unwrap();
+    let out = output_of(
+        Command::new(path)
+            .arg("upgrade")
+            .args(args)
+            .env("ACS_RELEASES_URL", &server.url)
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+    );
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -44,7 +44,7 @@ fn upgrade(
 }
 
 fn version_of(path: &Path) -> String {
-    let out = Command::new(path).arg("--version").output().unwrap();
+    let out = output_of(Command::new(path).arg("--version"));
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()

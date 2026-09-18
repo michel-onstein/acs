@@ -57,6 +57,60 @@ fn welcome(p: &mut Proxy) -> acs::proto::Welcome {
     }
 }
 
+/// Regression (acs-wza): after the client's side closes while its input is
+/// still backed up towards a master that is not reading, the proxy waits
+/// instead of spinning on the closed pipe.
+#[test]
+fn a_closed_client_with_input_backed_up_does_not_spin_the_proxy() {
+    let t = TempDir::new();
+    let mut p = session(t.path(), "bp");
+    // The program never reads its input. Raw mode: a canonical-mode tty
+    // discards input past a full line instead of pushing back.
+    p.conn
+        .send(&hello_cmd("bp", "me", "stty raw -echo; sleep 30"));
+    let w = welcome(&mut p);
+    std::thread::sleep(Duration::from_millis(200));
+    let chunk = vec![b'x'; acs::proto::MAX_CHUNK];
+    let mut seq = w.input_seq;
+    // More than the master takes in (1 MiB) plus what the sockets hold, but
+    // less than the proxy then buffers itself: it ends up holding input.
+    for _ in 0..(1_600_000 / chunk.len()) {
+        p.conn.send(&Msg::Input {
+            seq,
+            bytes: chunk.clone(),
+        });
+        seq += chunk.len() as u64;
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    p.conn.close_write();
+    std::thread::sleep(Duration::from_millis(200));
+    let burnt = acs::testutil::cpu_over(p.child.id(), Duration::from_secs(1));
+    assert!(
+        burnt < Duration::from_millis(300),
+        "proxy used {burnt:?} of CPU in 1 s while waiting"
+    );
+}
+
+/// Regression (acs-ljl): `--list` does not remove a socket while a master
+/// start holds the session's create lock (it may just have bound it).
+#[test]
+fn list_leaves_a_socket_alone_while_a_master_starts() {
+    let t = TempDir::new();
+    let stale = t.path().join("st.sock");
+    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    let lock = acs::sys::Flock::lock(&t.path().join("st.lock")).unwrap();
+    let mut p = proxy(t.path(), &["--list"]);
+    assert!(p.conn.closed(T));
+    assert!(p.child.wait().unwrap().success());
+    assert!(stale.exists(), "removed under a master start's lock");
+
+    drop(lock);
+    let mut p = proxy(t.path(), &["--list"]);
+    assert!(p.conn.closed(T));
+    assert!(p.child.wait().unwrap().success());
+    assert!(!stale.exists(), "a stale socket is still cleaned up");
+}
+
 #[test]
 fn creates_a_session_and_relays_both_ways() {
     let t = TempDir::new();

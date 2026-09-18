@@ -174,13 +174,13 @@ fn finisher_rejects_a_corrupt_upload() {
     std::fs::create_dir_all(&dir).unwrap();
     let tmp = dir.join("acs.new.00ff");
     std::fs::copy(exe(), &tmp).unwrap();
-    let out = Command::new(&tmp)
-        .args([
-            "_install", "--finish", "--token", "00ff", "--sha256", "0000",
-        ])
-        .env("HOME", remote.home())
-        .output()
-        .unwrap();
+    let out = output_of(
+        Command::new(&tmp)
+            .args([
+                "_install", "--finish", "--token", "00ff", "--sha256", "0000",
+            ])
+            .env("HOME", remote.home()),
+    );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("checksum mismatch"));
     assert!(!tmp.exists(), "corrupt upload must be removed");

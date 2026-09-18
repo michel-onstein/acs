@@ -204,10 +204,26 @@ fn session(dir: &SocketDir, name: Option<String>, mode: Mode) -> Result<ExitCode
 }
 
 /// Splice stdin → master and master → stdout until either side closes.
-fn relay(master: UnixStream, mut to_master: Vec<u8>) -> io::Result<()> {
+fn relay(master: UnixStream, to_master: Vec<u8>) -> io::Result<()> {
+    relay_fds(master, to_master, STDIN, STDOUT)
+}
+
+/// A poll entry, or none (`fd -1`) when there is nothing to wait for: a
+/// closed pipe reports POLLHUP whatever `events` asks, which would spin the
+/// loop while the other direction is stuck (acs-wza).
+fn wait_for(fd: RawFd, events: libc::c_short) -> libc::pollfd {
+    sys::pollfd(if events == 0 { -1 } else { fd }, events)
+}
+
+fn relay_fds(
+    master: UnixStream,
+    mut to_master: Vec<u8>,
+    input: RawFd,
+    output: RawFd,
+) -> io::Result<()> {
     master.set_nonblocking(true)?;
-    sys::set_nonblocking(STDIN, true)?;
-    sys::set_nonblocking(STDOUT, true)?;
+    sys::set_nonblocking(input, true)?;
+    sys::set_nonblocking(output, true)?;
     let m = master.as_raw_fd();
     let mut to_client: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -215,8 +231,8 @@ fn relay(master: UnixStream, mut to_master: Vec<u8>) -> io::Result<()> {
     let limit = 1 << 20;
     loop {
         let mut fds = [
-            sys::pollfd(
-                STDIN,
+            wait_for(
+                input,
                 if stdin_open && to_master.len() < limit {
                     libc::POLLIN
                 } else {
@@ -233,8 +249,8 @@ fn relay(master: UnixStream, mut to_master: Vec<u8>) -> io::Result<()> {
                 }
                 ev
             }),
-            sys::pollfd(
-                STDOUT,
+            wait_for(
+                output,
                 if to_client.is_empty() {
                     0
                 } else {
@@ -245,7 +261,7 @@ fn relay(master: UnixStream, mut to_master: Vec<u8>) -> io::Result<()> {
         sys::poll(&mut fds, -1)?;
 
         if fds[0].revents != 0 {
-            match sys::read(STDIN, &mut buf) {
+            match sys::read(input, &mut buf) {
                 Ok(0) => stdin_open = false,
                 Ok(n) => to_master.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -256,15 +272,19 @@ fn relay(master: UnixStream, mut to_master: Vec<u8>) -> io::Result<()> {
             match sys::read(m, &mut buf) {
                 Ok(0) => {
                     // The master is done: deliver what it said, then leave.
-                    return drain(STDOUT, &to_client);
+                    return drain(output, &to_client);
                 }
                 Ok(n) => to_client.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(_) => return drain(STDOUT, &to_client),
+                Err(_) => return drain(output, &to_client),
             }
         }
-        flush(m, &mut to_master)?;
-        if flush(STDOUT, &mut to_client).is_err() {
+        if flush(m, &mut to_master).is_err() {
+            // The master closed after its last words (an EXIT just read):
+            // they still go to the client (acs-er6).
+            return drain(output, &to_client);
+        }
+        if flush(output, &mut to_client).is_err() {
             // The client side is gone.
             return Ok(());
         }
@@ -314,19 +334,29 @@ fn list(dir: &SocketDir) -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::ECONNREFUSED) | Some(libc::ENOENT)
-                ) =>
-            {
+            Err(e) if refused(&e) => {
                 // Nobody listening: a master that died without cleaning up.
-                let _ = std::fs::remove_file(&path);
+                // Remove it only under the create lock, as a starting master
+                // does, and only if it is still dead then: a master may have
+                // bound a fresh socket there since (acs-ljl).
+                if let Ok(Some(_lock)) = dir.try_create_lock(&name) {
+                    if UnixStream::connect(&path).is_err_and(|e| refused(&e)) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
             }
             Err(_) => {}
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Nobody is listening on the socket (or it is gone).
+fn refused(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ECONNREFUSED) | Some(libc::ENOENT)
+    )
 }
 
 /// Versions the running masters report (kept by the pruner).
@@ -390,5 +420,31 @@ mod tests {
         assert!(p(&["--session", "../x"]).is_err());
         assert!(p(&[]).is_err());
         assert!(p(&["--mode", "sideways", "--session", "a"]).is_err());
+    }
+
+    /// Regression (acs-er6): when the master says its last words (EXIT) and
+    /// closes before our next write to it, the write fails — and what it
+    /// said must still reach the client.
+    #[test]
+    fn last_words_reach_the_client_when_writing_to_the_master_fails() {
+        use std::io::{Read, Write};
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let exit = Msg::Exit { status: 0 }.to_bytes();
+        theirs.write_all(&exit).unwrap();
+        drop(theirs);
+        let (input, _keep_open) = sys::pipe().unwrap();
+        let (out_r, out_w) = sys::pipe().unwrap();
+        // Queued input for the master makes the relay write to it.
+        relay_fds(
+            ours,
+            Msg::Ping(7).to_bytes(),
+            input.as_raw_fd(),
+            out_w.as_raw_fd(),
+        )
+        .unwrap();
+        drop(out_w);
+        let mut got = Vec::new();
+        std::fs::File::from(out_r).read_to_end(&mut got).unwrap();
+        assert_eq!(got, exit);
     }
 }
