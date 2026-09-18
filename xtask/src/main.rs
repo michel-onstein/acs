@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
 mod bump;
+mod package;
 
 const LINUX: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
 const MAC: &[&str] = &["aarch64-apple-darwin", "x86_64-apple-darwin"];
@@ -34,9 +35,15 @@ fn main() {
                 exit(1);
             }
         }
+        Some("package") => {
+            if let Err(e) = package::main(&args[1..]) {
+                eprintln!("xtask package: {e}");
+                exit(1);
+            }
+        }
         _ => {
             eprintln!(
-                "usage: cargo xtask dist [--targets t1,t2] [--out dir]\n       cargo xtask bump [--dry-run] [--major|--minor|--patch] (see docs/VERSIONING.md)"
+                "usage: cargo xtask dist [--targets t1,t2] [--out dir]\n       cargo xtask bump [--dry-run] [--major|--minor|--patch] (see docs/VERSIONING.md)\n       cargo xtask package --dist DIR --version X.Y.Z --out DIR"
             );
             exit(2);
         }

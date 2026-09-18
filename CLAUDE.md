@@ -25,7 +25,8 @@ The version moves automatically after every merge to `main`
 MINOR for a feature or a larger fix, MAJOR only with `--major`. **Title pull
 requests in Conventional Commits form** (`fix: …`, `feat: …`, `docs: …`) —
 the squash commit takes the title — and add a `Semver: minor` trailer or a
-`semver:minor` label to a fix that deserves a minor release. Rules in
+`semver:minor` label to a fix that deserves a minor release. Each release's
+binaries are published to GitHub Releases by the same script. Rules in
 [docs/VERSIONING.md](docs/VERSIONING.md).
 
 ## Document index
@@ -34,5 +35,5 @@ the squash commit takes the title — and add a `Semver: minor` trailer or a
 | --- | --- | --- |
 | [README.md](README.md) | Install, usage, command keys, environment, migration from dsh | Current |
 | [DESIGN.md](docs/DESIGN.md) | Architecture, protocol, command mode, remote install | Built |
-| [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning: rules and the bump script | Built |
+| [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning and release binaries on GitHub | Built |
 | [VERIFICATION.md](docs/VERIFICATION.md) | End-to-end results over real ssh; checks still to do by hand | Automated checks pass |
