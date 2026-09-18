@@ -14,6 +14,7 @@ pub mod ssh;
 pub mod sys;
 #[doc(hidden)]
 pub mod testutil;
+pub mod tty;
 
 /// The crate version, baked into the remote prelude so a client always runs
 /// its own version on the remote (DESIGN §8).
