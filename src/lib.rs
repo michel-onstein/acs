@@ -5,11 +5,15 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 pub mod cli;
+pub mod client;
+pub mod install;
 pub mod keys;
+pub mod list;
 pub mod master;
 pub mod modes;
 pub mod proto;
 pub mod proxy;
+pub mod reconnect;
 pub mod resume;
 pub mod session;
 pub mod ssh;
@@ -61,6 +65,7 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         }
         Role::Master => master::main(&args[2..]),
         Role::Proxy => proxy::main(&args[2..]),
+        Role::Client => client::main(&args[1..]),
         other => {
             eprintln!("acs: role {other:?} is not implemented yet");
             ExitCode::from(70)
