@@ -95,6 +95,7 @@ own default instead of `main`.
 scripts/verify.sh       # fmt, clippy (macOS and Linux targets), tests, markdownlint
 scripts/test_linux.sh   # the suite on Linux in a container, plus multi-user isolation
 scripts/e2e_ssh.sh      # end to end over real ssh against a container host
+scripts/version-bump.sh # release the next version (see docs/VERSIONING.md)
 ```
 
 Results of the checks that need a real terminal are in
