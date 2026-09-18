@@ -16,6 +16,10 @@ pub const TRANSPORT_OPTS: &[&str] = &[
     "ControlPath=none",
     "-o",
     "ServerAliveInterval=0",
+    // A redial into a dead network must fail fast so the client returns to
+    // its backoff wait, where the command keys work.
+    "-o",
+    "ConnectTimeout=10",
 ];
 
 /// Options for side calls (`--list`, install): no pty and no escape char,
@@ -180,6 +184,8 @@ mod tests {
                 "ControlPath=none",
                 "-o",
                 "ServerAliveInterval=0",
+                "-o",
+                "ConnectTimeout=10",
                 "-i",
                 "~/.ssh/id_work",
                 "-o",

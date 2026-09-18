@@ -129,7 +129,7 @@ the connection ends. The proxy is a dumb relay — ~100 lines — so all state
 lives in the master and the client.
 
 **Transport** is `ssh -T -e none -o ControlMaster=no -o ControlPath=none
--o ServerAliveInterval=0 <host> <remote command>`:
+-o ServerAliveInterval=0 -o ConnectTimeout=10 <host> <remote command>`:
 
 - `-T`: no remote pty. The ssh channel is an 8-bit clean pipe carrying frames;
   the only pty is the master's. One pty instead of two.
@@ -139,6 +139,8 @@ lives in the master and the client.
   connection, so a reconnect never waits on a dead multiplexer. Side commands
   (`--list`, install) keep using the user's multiplexing.
 - `ServerAliveInterval=0`: liveness is ours (§5.3), much faster than ssh's.
+- `ConnectTimeout=10`: a redial into a dead network fails fast and the
+  client returns to its backoff wait, where `d` still detaches (§6.1).
 - Everything else — keys, agent, `ProxyJump`, host aliases — comes from the
   user's ssh config unchanged, plus any ssh options given on the `acs`
   command line (`-i`, `-p`, `-J`, `-F`, `-o`; §7.1). `acs` opens no ports
@@ -652,11 +654,12 @@ for anything else.
 
 ## 9. Implementation
 
-- **Crates, chosen for size**: `rustix` (termios, pty, poll, signals, `flock`)
-  or `nix`; `lexopt` for arguments (clap adds hundreds of KB); hand-written
-  frame codec; no compression crate (the remote's `gzip` unpacks payloads,
-  §8.1); `sha2` for the install digest. **No async runtime**: two
-  single-threaded poll loops do not need tokio.
+- **Crates, chosen for size**: only `libc` (termios, pty, poll, signals,
+  `flock`, peer credentials — wrapped in `sys.rs`) and `lexopt` for arguments
+  (clap adds hundreds of KB); hand-written frame codec; no compression crate
+  (the remote's `gzip` unpacks payloads, §8.1); an in-crate SHA-256 for the
+  install digest. **No async runtime**: the single-threaded poll loops do not
+  need tokio.
 - **Profile**: `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
   `panic = "abort"`, `strip = true`.
 - **Targets**: `aarch64-apple-darwin` (local, installed), `x86_64-apple-darwin`,
@@ -664,17 +667,33 @@ for anything else.
   `cargo-zigbuild` (not installed yet; the installed
   `aarch64-unknown-linux-gnu` target would produce a glibc-linked binary, which
   is not what a copy-anywhere remote needs).
-- **Layout** (single crate):
+- **Layout** (single crate plus `xtask`):
 
 ```text
 src/
-  main.rs        role dispatch: client | _proxy | _master | _version-check
-  proto.rs       frame codec, HELLO/WELCOME types
-  client/        tty, command-key detector, mode observer, reconnect loop, ssh spawn
-  master/        pty, ring buffer, child lifecycle, socket/lock handling
-  proxy.rs       connect-or-spawn, splice, --list
-  install.rs     ACS-NEED handling, target mapping, payload trailer / embed, _install --finish
-xtask/           cargo xtask dist: slim builds, payload set, complete builds, signing
+  lib.rs        role dispatch (client | _proxy | _master | _install), --version
+  cli.rs        dsh-compatible arguments, ssh option passthrough
+  client.rs     dial, handshake, session loop, detach/exit, messages
+  reconnect.rs  liveness, backoff, offline status line, takeover prompt
+  keys.rs       Ctrl-] Ctrl-] command-key detector
+  modes.rs      passive terminal-mode observer and resets
+  netwatch.rs   network-change watcher (PF_ROUTE / NETLINK_ROUTE)
+  tty.rs        raw mode and emergency restore
+  proto.rs      frames, messages, ACS-READY / ACS-NEED markers
+  resume.rs     output ring, input ack tracking
+  ssh.rs        ssh argv builder, remote prelude, quoting
+  session.rs    session names, per-uid socket directory, locks
+  proxy.rs      acs _proxy: connect-or-spawn, relay, --list
+  master.rs     acs _master: pty, child, ring, protocol
+  list.rs       --list table
+  install.rs    remote self-install and _install --finish
+  payload.rs    payload set format, ELF trailer, Mach-O embed
+  prune.rs      pruning of unused remote versions
+  sha256.rs     SHA-256 for install checks
+  sys.rs        libc wrappers
+xtask/          cargo xtask dist
+tests/          integration tests (tests/common: fake remote, pty runner)
+scripts/        verify.sh, test_linux.sh, e2e_ssh.sh
 ```
 
 ### 9.1 Testing

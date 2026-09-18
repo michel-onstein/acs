@@ -182,6 +182,14 @@ impl Client {
 
     /// Run a specific acs binary as the client.
     pub fn start_exe(exe: &Path, remote: &Remote, args: &[&str], env: &[(&str, &str)]) -> Client {
+        let mut full = vec!["--transport-cmd".to_string(), remote.transport()];
+        full.extend(args.iter().map(|s| s.to_string()));
+        let full: Vec<&str> = full.iter().map(String::as_str).collect();
+        Client::spawn(exe, &full, env)
+    }
+
+    /// Run `exe` with exactly `args` on a pty (real ssh, no fake remote).
+    pub fn spawn(exe: &Path, args: &[&str], env: &[(&str, &str)]) -> Client {
         let (master, slave) = sys::openpty().unwrap();
         sys::set_winsize(
             slave.as_raw_fd(),
@@ -194,9 +202,7 @@ impl Client {
         )
         .unwrap();
         let mut cmd = Command::new(exe);
-        cmd.arg("--transport-cmd")
-            .arg(remote.transport())
-            .args(args);
+        cmd.args(args);
         cmd.env("TERM", "xterm-256color")
             .env_remove("ACS_DEFAULT_SESSION")
             .env_remove("ACS_SOCKET_DIR")
