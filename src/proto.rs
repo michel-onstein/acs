@@ -85,6 +85,9 @@ pub struct Welcome {
     pub offset: u64,
     pub created: bool,
     pub kind: AttachKind,
+    /// Input bytes the master has written to the pty so far: the sequence
+    /// number of the next INPUT byte it will accept.
+    pub input_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -332,6 +335,7 @@ impl Msg {
                         AttachKind::Resumed => 1,
                         AttachKind::Gap => 2,
                     });
+                    w.u64(x.input_seq);
                     ty::WELCOME
                 }
                 Msg::Busy { identity, since } => {
@@ -462,6 +466,7 @@ impl Msg {
                     2 => AttachKind::Gap,
                     _ => return Err(ProtoError::BadValue("kind")),
                 },
+                input_seq: r.u64("input_seq")?,
             }),
             ty::BUSY => Msg::Busy {
                 identity: r.str("identity")?,
@@ -692,6 +697,7 @@ mod tests {
                 offset: 9,
                 created: true,
                 kind: AttachKind::Gap,
+                input_seq: 12,
             }),
             Msg::Busy {
                 identity: "alice@laptop".into(),
@@ -816,9 +822,10 @@ mod tests {
             offset: 1,
             created: false,
             kind: AttachKind::Fresh,
+            input_seq: 0,
         })
         .to_bytes();
-        let last = frame.len() - 1;
+        let last = frame.len() - 9;
         frame[last] = 9;
         let mut d = Decoder::new();
         d.push(&frame);

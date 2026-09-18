@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 pub mod proto;
+pub mod resume;
 
 /// The crate version, baked into the remote prelude so a client always runs
 /// its own version on the remote (DESIGN §8).

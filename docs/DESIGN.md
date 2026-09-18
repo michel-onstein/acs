@@ -333,7 +333,7 @@ Length-prefixed, same format on the ssh leg and the unix-socket leg:
 | --- | --- | --- |
 | `HELLO` | c→m | proto version, session, mode (`attach`/`create`/`attach-or-create`), client identity, `force` flag, `TERM`, `COLORTERM`, cols, rows, xpixel, ypixel, optional `resume{instance, output_offset}` |
 | `BUSY` | m→c | identity attached and since when; the client may retry `HELLO` with `force` (§4.5) |
-| `WELCOME` | m→c | proto version, instance id, current output offset, `created` flag, `resumed` / `gap` / `fresh` |
+| `WELCOME` | m→c | proto version, instance id, current output offset, `created` flag, `resumed` / `gap` / `fresh`, input sequence (bytes written to the pty so far — input sequence numbers count in the master's stream, so clients taking turns never collide) |
 | `DATA` | m→c | `u64` offset of first byte, then raw pty bytes |
 | `INPUT` | c→m | `u64` sequence of first byte, then raw bytes for the pty |
 | `ACK` | m→c | highest input sequence written to the pty |
