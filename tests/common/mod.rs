@@ -23,7 +23,8 @@ pub const NO_CONFIG: &str = "/nonexistent/acs-test-config";
 /// configuration.
 pub fn acs_cmd() -> Command {
     let mut c = Command::new(exe());
-    c.env("XDG_CONFIG_HOME", NO_CONFIG)
+    c.env("ACS_NO_UPDATE_CHECK", "1")
+        .env("XDG_CONFIG_HOME", NO_CONFIG)
         .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"));
     c
 }
@@ -228,7 +229,9 @@ impl Client {
         cmd.env("TERM", "xterm-256color")
             .env_remove("ACS_DEFAULT_SESSION")
             .env_remove("ACS_SOCKET_DIR")
-            // Never the developer's own configuration files.
+            // Never the developer's own configuration files, and never
+            // GitHub.
+            .env("ACS_NO_UPDATE_CHECK", "1")
             .env("XDG_CONFIG_HOME", NO_CONFIG)
             .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
             .env("ACS_IDENTITY", "tester@local");

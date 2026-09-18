@@ -61,6 +61,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(code::USAGE);
         }
     };
+    // Before connecting: a newer release found by an earlier check.
+    crate::update_check::on_client_start(&args.config);
     let name = args.transport.destination.clone();
     if let Err(e) = resolve_alias(&mut args, &name) {
         eprintln!("acs: {e}");

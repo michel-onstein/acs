@@ -26,10 +26,10 @@ usage: acs config show                 the merged configuration and where each v
 
   --global  edit /etc/acs/config.yaml instead of ~/.config/acs/config.yaml
 
-settings: install_on_remote (true|false)";
+settings: install_on_remote, update_check (true|false)";
 
-/// Settings `get`/`set`/`unset` know, with their type.
-const SCALARS: &[&str] = &["install_on_remote"];
+/// Settings `get`/`set`/`unset` know: all true or false.
+const SCALARS: &[&str] = config::BOOLS;
 
 /// What to do, parsed from the arguments after `config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,10 +178,10 @@ pub fn run(cmd: &Cmd, target: &Path) -> Result<String, Error> {
         Cmd::Show => Ok(show(&Config::load_files(&files)?, &files)),
         Cmd::Get(key) => {
             let c = Config::load_files(&files)?;
-            match key.as_str() {
-                "install_on_remote" => Ok(format!("{}\n", c.install_on_remote.value)),
-                "hosts" => Ok(host_list(&c)),
-                other => Err(unknown_key(other).into()),
+            match (key.as_str(), c.bool_setting(key)) {
+                (_, Some(s)) => Ok(format!("{}\n", s.value)),
+                ("hosts", None) => Ok(host_list(&c)),
+                (other, None) => Err(unknown_key(other).into()),
             }
         }
         Cmd::HostList => Ok(host_list(&Config::load_files(&files)?)),
@@ -257,13 +257,16 @@ fn from(origin: &Option<config::Origin>) -> String {
 /// The merged configuration as YAML, each value commented with its origin.
 pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
     let mut root = Vec::new();
-    root.push((
-        "install_on_remote".to_string(),
-        Node {
-            comment: Some(from(&c.install_on_remote.origin)),
-            ..Node::bool(c.install_on_remote.value)
-        },
-    ));
+    for key in SCALARS {
+        let s = c.bool_setting(key).expect("a bool setting");
+        root.push((
+            key.to_string(),
+            Node {
+                comment: Some(from(&s.origin)),
+                ..Node::bool(s.value)
+            },
+        ));
+    }
     let mut aliases = Vec::new();
     for (alias, entries) in &c.hosts {
         let items = entries
@@ -423,7 +426,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
     match cmd {
         Cmd::Set(key, value) => {
             let node = match key.as_str() {
-                "install_on_remote" => Node::bool(parse_bool(key, value)?),
+                k if SCALARS.contains(&k) => Node::bool(parse_bool(key, value)?),
                 other => return Err(unknown_key(other)),
             };
             let map = root_map(doc)?;

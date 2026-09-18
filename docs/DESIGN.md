@@ -562,6 +562,7 @@ Directory spec; either may be missing:
 
 ```yaml
 install_on_remote: true        # install acs on a host that lacks it (§8)
+update_check: true             # look for a newer release once a week (§7.6)
 hosts:                         # aliases: acs devbox tries these in order
   devbox:
     - host: devbox.lan
@@ -632,7 +633,7 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`); `set` checks the type |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`); `set` checks the type |
 | `host list` | every alias and its hosts, in the order they are tried, with where each is defined |
 | `host add <alias> <host> [--user U] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one), or the alias |
@@ -688,6 +689,34 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
 - **Remote hosts need nothing**: the upgraded client's next connection finds
   no binary of its version there and installs it (§8).
 - `upgrade` is a reserved first argument, like `config` (§7.4).
+
+### 7.6 Update check
+
+The client looks for a newer release **at most once a week** and says so:
+
+```text
+acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
+```
+
+- **Only the local client** checks, when it starts a session or `--list`;
+  `_proxy`, `_master`, `_install`, `acs config` and `acs upgrade` never do.
+- **It never delays connecting.** When the last check is 7 days old (or in
+  the future: the clock went back), the client records the time, starts
+  `acs _update-check` in the background — detached through `sh … &`, so it
+  is nobody's child — and carries on. That process fetches the latest
+  `SHA256SUMS` the way `acs upgrade` does (§7.5), with curl's 3 s limit, and
+  writes the version it found. A later start shows the message on stderr,
+  before raw mode and outside the session stream, **once per new version**.
+- **State** is `$XDG_STATE_HOME/acs/update-check` (default
+  `~/.local/state/acs/update-check`): `checked=<unix time>`,
+  `latest=<version>`, `shown=<version>`. It is a cache — unreadable or
+  garbled means "never checked". The client writes it before starting the
+  check, which re-reads it before adding `latest`, so neither undoes the
+  other.
+- **Silent when it cannot ask**: offline, rate-limited or no curl, nothing is
+  shown and the next attempt is a week later.
+- **Off** with `ACS_NO_UPDATE_CHECK=1` or `update_check: false` (§7.2). The
+  test harness sets the variable, so the suite never contacts GitHub.
 
 ## 8. Installing the remote binary
 
@@ -839,6 +868,7 @@ src/
   config_cmd.rs acs config: show, get/set/unset, host list/add/remove
   release.rs    published releases: SHA256SUMS, versions, curl downloads
   upgrade.rs    acs upgrade: replace this binary with a newer release
+  update_check.rs  weekly check for a newer release (_update-check)
   alias.rs      host aliases: ping check and fallback hosts
   yaml.rs       the YAML subset those files use, parsed and written back
   install.rs    remote self-install and _install --finish

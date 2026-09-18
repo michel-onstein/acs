@@ -71,6 +71,17 @@ the new version); if its directory is not yours, it says to use
 `sudo acs upgrade`. It uses `curl` (or `wget`). Remote hosts need nothing:
 the next connection installs the new version there.
 
+Once a week acs looks for a newer release in the background (it never
+delays connecting) and, if there is one, says so once when you next start
+it:
+
+```text
+acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
+```
+
+Offline, it says nothing. Turn it off with `ACS_NO_UPDATE_CHECK=1` or
+`update_check: false` in the configuration.
+
 Nothing is needed on the remote beyond ssh, a POSIX `sh` and `gzip`: on first
 contact acs installs its own version under `~/.local/share/acs/<version>/`
 and links `~/.local/bin/acs` to it.
@@ -134,6 +145,7 @@ merge key by key and lists add up, global entries first.
 ```yaml
 # ~/.config/acs/config.yaml
 install_on_remote: false   # never install acs on a host (default: true)
+update_check: false        # never look for a newer release (default: true)
 hosts:
   devbox:                  # acs devbox
     - host: devbox.lan     # at home: used if it answers a ping
@@ -147,6 +159,7 @@ hosts:
 | Setting | Meaning |
 | --- | --- |
 | `install_on_remote` | install acs on a host that lacks it (default `true`); when `false`, acs says what is missing and exits with 254 |
+| `update_check` | look for a newer acs release once a week (default `true`) |
 | `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user` and `reachability_check` (default `true`) |
 
 A mistake in a file stops acs with the file and line, for example
@@ -175,6 +188,7 @@ acs config host add nas nas.lan --no-reachability-check
 acs config host list                                  # aliases and their hosts
 acs config host remove devbox devbox.lan              # one host, or the alias
 acs config set install_on_remote false
+acs config set update_check false                     # no weekly release check
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default
 acs config show                                       # everything, and where it is from
@@ -200,7 +214,9 @@ reached as `user@config`.
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |
-| `ACS_RELEASES_URL` | where `acs upgrade` looks for releases (default GitHub) |
+| `ACS_RELEASES_URL` | where `acs upgrade` and the update check look for releases (default GitHub) |
+| `ACS_NO_UPDATE_CHECK` | `1`: never look for a newer release |
+| `XDG_STATE_HOME` | where the update check keeps its state (default `~/.local/state`) |
 
 ## Development
 
