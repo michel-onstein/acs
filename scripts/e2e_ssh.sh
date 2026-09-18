@@ -1,8 +1,8 @@
 #!/bin/sh
 # End-to-end checks over real ssh against a container host (DESIGN §9.1):
 # first-contact install from the macOS complete build, TUI escape sequences,
-# the kitty keyboard protocol, mouse reports, OSC 52, -i key selection, and
-# drops (a killed connection, a frozen host).
+# the kitty keyboard protocol, mouse reports, OSC 52, key selection by -i and
+# by identity_file, and drops (a killed connection, a frozen host).
 #
 #   scripts/e2e_ssh.sh [--no-build]
 #
