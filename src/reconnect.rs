@@ -55,12 +55,14 @@ impl Backoff {
     }
 }
 
-/// Serve the session over as many links as it takes.
+/// Serve the session over as many links as it takes, the first one the
+/// session menu's when it opened one (`picked`, DESIGN §4.4).
 pub fn run(
     args: &ClientArgs,
     state: &mut State,
     raw: &mut Option<RawMode>,
     signals: &OwnedFd,
+    mut picked: Option<client::Picked>,
 ) -> u8 {
     let mut backoff = Backoff::new(env_ms("ACS_BACKOFF_MS", 1000));
     let netwatch = crate::netwatch::NetWatch::new();
@@ -72,13 +74,18 @@ pub fn run(
         // An alias is resolved again for every redial, so a fallback host is
         // picked up after a network change (DESIGN §7.3).
         let reachable = !resuming || redial_alias(&mut args, state);
+        let first = picked.take();
+        let was_picked = first.is_some();
         let outcome = if reachable {
-            client::connect_and_serve(&args, state, raw, signals, resuming)
+            client::connect_and_serve(&args, state, raw, signals, resuming, first)
         } else {
             Outcome::LinkLost
         };
         match outcome {
             Outcome::Exit(c) => return c,
+            // The menu's connection sat idle while the user read it, and may
+            // have died meanwhile: before any session, dial it afresh once.
+            Outcome::LinkLost if was_picked && state.instance.is_none() => continue,
             Outcome::LinkLost => {}
         }
         let name = state.session.clone().unwrap_or_default();

@@ -36,7 +36,7 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 | `user@<alias>` | `acs dev@box` where alias `box`'s only entry says `user: nobody` | Pass — logs in as `dev` (2026-09-18) |
 | Ctrl-L after reconnecting | a program reporting each byte it receives: a new session, then a re-attach, then the `sshd-session` killed | Pass — nothing to the new session, one `0c` after the re-attach and one after the resume (2026-09-18) |
 | `identity_file` | no `-i`; the key only at `~/.ssh/id_box` under a HOME of the test's own, named by a host entry over a missing alias key, then by an alias | Pass — both log in; acs expands the `~` (2026-09-18) |
-| Session menu | plain `acs dev@127.0.0.1` with sessions `menu-a` and `menu-b` detached: cursor to `menu-b`, `x`, `y`, then `menu-a`'s number | Pass — `menu-b` ended and gone from the menu, `menu-a` attached (2026-09-18) |
+| Session menu | plain `acs dev@127.0.0.1` with sessions `menu-a` and `menu-b` detached: cursor to `menu-b`, `x`, `y`, then `menu-a`'s number | Pass — `menu-b` ended and gone from the menu, `menu-a` attached (2026-09-18); with `-v`, one `running ssh … _proxy --pick` from the list to the attach (2026-09-19) |
 | Full test suite on Linux | `scripts/test_linux.sh` | Pass — found and fixed two Linux-only bugs first (a master stall under backpressure; a replaced binary breaking master start) |
 | Multi-user isolation | squatted and symlinked socket directories, foreign peer uid, per-user `main` | Pass |
 | Static Linux binaries run | `dist/*-linux-musl/acs --version` in Alpine (aarch64 native, x86_64 emulated) | Pass |

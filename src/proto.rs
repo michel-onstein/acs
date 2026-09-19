@@ -153,6 +153,14 @@ pub enum Msg {
         code: u16,
         message: String,
     },
+    /// Client → `_proxy --pick`: end this session, then send the list
+    /// again (the session menu, DESIGN §4.4).
+    EndSession {
+        name: String,
+    },
+    /// `_proxy --pick` → client: the STATUS_REPLY frames before it are the
+    /// whole list.
+    ListEnd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +205,8 @@ mod ty {
     pub const STATUS: u8 = 14;
     pub const STATUS_REPLY: u8 = 15;
     pub const ERROR: u8 = 16;
+    pub const END_SESSION: u8 = 17;
+    pub const LIST_END: u8 = 18;
 }
 
 struct W<'a>(&'a mut Vec<u8>);
@@ -398,6 +408,11 @@ impl Msg {
                     w.str(message);
                     ty::ERROR
                 }
+                Msg::EndSession { name } => {
+                    w.str(name);
+                    ty::END_SESSION
+                }
+                Msg::ListEnd => ty::LIST_END,
             }
         };
         let len = (out.len() - start - HEADER) as u32;
@@ -515,6 +530,10 @@ impl Msg {
                 code: r.u16("code")?,
                 message: r.str("message")?,
             },
+            ty::END_SESSION => Msg::EndSession {
+                name: r.str("name")?,
+            },
+            ty::LIST_END => Msg::ListEnd,
             other => return Err(ProtoError::UnknownType(other)),
         };
         r.done(t)?;
@@ -567,6 +586,15 @@ impl Decoder {
     /// Bytes buffered but not yet decoded.
     pub fn pending(&self) -> usize {
         self.buf.len() - self.start
+    }
+
+    /// Hand over the bytes buffered but not yet decoded, for another
+    /// decoder to go on from (the pick phase's to the session's).
+    pub fn take_rest(&mut self) -> Vec<u8> {
+        let rest = self.buf[self.start..].to_vec();
+        self.buf.clear();
+        self.start = 0;
+        rest
     }
 }
 
@@ -754,7 +782,29 @@ mod tests {
                 code: err::PROTO_MISMATCH,
                 message: "old master — finish or kill the session".into(),
             },
+            Msg::EndSession {
+                name: "work".into(),
+            },
+            Msg::ListEnd,
         ]
+    }
+
+    #[test]
+    fn the_rest_of_a_decoder_goes_on_in_another() {
+        let mut stream = Msg::ListEnd.to_bytes();
+        Msg::Ping(9).encode(&mut stream);
+        let pong = Msg::Pong(9).to_bytes();
+        stream.extend_from_slice(&pong[..3]);
+        let mut d = Decoder::new();
+        d.push(&stream);
+        assert_eq!(d.next_msg().unwrap(), Some(Msg::ListEnd));
+        let mut next = Decoder::new();
+        next.push(&d.take_rest());
+        assert_eq!(d.pending(), 0);
+        next.push(&pong[3..]);
+        assert_eq!(next.next_msg().unwrap(), Some(Msg::Ping(9)));
+        assert_eq!(next.next_msg().unwrap(), Some(Msg::Pong(9)));
+        assert_eq!(next.next_msg().unwrap(), None);
     }
 
     #[test]

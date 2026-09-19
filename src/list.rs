@@ -119,38 +119,16 @@ fn not_installed(host: &str) -> String {
     )
 }
 
-/// Ask the host's proxy for every session's STATUS, all within `timeout`;
-/// `Ok(None)` if acs of our version is not installed there.
+/// Ask the host's proxy (`_proxy --list`) for every session's STATUS, all
+/// within `timeout`; `Ok(None)` if acs of our version is not installed
+/// there.
 pub(crate) fn query(
     args: &ClientArgs,
     call: Call,
     timeout: Duration,
 ) -> Result<Option<Vec<StatusInfo>>, Failure> {
-    Ok(side_call(args, &["--list"], call, timeout)?.map(|a| a.sessions))
-}
-
-/// What the proxy said to a side call.
-pub(crate) struct Answer {
-    /// Every session's STATUS, in the proxy's order.
-    pub sessions: Vec<StatusInfo>,
-    /// The message of an ERROR it sent along (`--kill` of a session that
-    /// would not end).
-    pub error: Option<String>,
-}
-
-/// Run `acs _proxy <proxy_args>` on the host and collect its STATUS
-/// replies, all within `timeout`; `Ok(None)` if acs of our version is not
-/// installed there.
-pub(crate) fn side_call(
-    args: &ClientArgs,
-    proxy_args: &[&str],
-    call: Call,
-    timeout: Duration,
-) -> Result<Option<Answer>, Failure> {
     let deadline = Instant::now() + timeout;
-    let mut remote_args = vec!["_proxy"];
-    remote_args.extend_from_slice(proxy_args);
-    let remote = ssh::remote_acs(crate::VERSION, &remote_args);
+    let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--list"]);
     let (link, marker) = client::dial(args, call, &remote, timeout)
         .map_err(|e| Failure::Unreachable(e.to_string()))?;
     let rest = match marker {
@@ -163,17 +141,12 @@ pub(crate) fn side_call(
     let mut dec = Decoder::new();
     dec.push(&rest);
     let mut sessions = Vec::new();
-    let mut error = None;
     let mut buf = [0u8; 16 * 1024];
     let from = link.from_fd().as_raw_fd();
     loop {
         match dec.next_msg() {
             Ok(Some(Msg::StatusReply(s))) => {
                 sessions.push(s);
-                continue;
-            }
-            Ok(Some(Msg::Error { message, .. })) => {
-                error = Some(message);
                 continue;
             }
             Ok(Some(_)) => continue,
@@ -213,7 +186,7 @@ pub(crate) fn side_call(
         }
     }
     link.close();
-    Ok(Some(Answer { sessions, error }))
+    Ok(Some(sessions))
 }
 
 /// Compact durations in one unit: `42s`, `7m`, `3h`, `12d`.

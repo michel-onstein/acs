@@ -244,47 +244,132 @@ fn a_dropped_client_leaves_the_session_detached() {
     assert!(!w.created);
 }
 
-/// Everything a side call answers, until it closes.
-fn answers(p: &mut Proxy) -> Vec<Msg> {
+/// One list from `--pick`: every frame up to and without its LIST_END.
+fn pick_list(p: &mut Proxy) -> Vec<Msg> {
     let mut got = Vec::new();
-    while let Some(m) = p.conn.recv(T) {
-        got.push(m);
+    loop {
+        match p.conn.recv(T) {
+            Some(Msg::ListEnd) => return got,
+            Some(m) => got.push(m),
+            None => panic!("the list ended without LIST_END: {got:?}"),
+        }
     }
-    assert!(p.conn.closed(T), "the side call did not end");
-    got
 }
 
-/// `--kill` (the session menu's `x`, acs-s0g): the session ends — its
-/// attached client gets EXIT, as with `x` inside it — and the answer, once
-/// it is gone, is the sessions left.
+fn names(list: &[Msg]) -> Vec<String> {
+    list.iter()
+        .map(|m| match m {
+            Msg::StatusReply(s) => s.name.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+/// `--pick` (acs-68z): the session menu and the attach on one connection —
+/// the list at once, a session ended on request with the list again, and
+/// then the HELLO attaches like any session call.
 #[test]
-fn kill_ends_a_session_then_lists_the_rest() {
+fn pick_lists_ends_on_request_and_attaches_what_the_hello_names() {
     let t = TempDir::new();
     let mut a = session(t.path(), "a");
     a.conn.send(&hello_cmd("a", "me", "sleep 30"));
     welcome(&mut a);
     let mut b = session(t.path(), "b");
-    b.conn.send(&hello_cmd("b", "me", "sleep 30"));
+    b.conn
+        .send(&hello_cmd("b", "me", "read l; echo got:$l; sleep 30"));
     welcome(&mut b);
+    b.conn.close_write();
+    assert!(b.conn.closed(T));
 
-    let mut k = proxy(t.path(), &["--kill", "a"]);
-    let got = answers(&mut k);
-    assert!(
-        matches!(&got[..], [Msg::StatusReply(s)] if s.name == "b"),
-        "{got:?}"
-    );
-    assert!(!t.path().join("a.sock").exists());
+    let mut p = proxy(t.path(), &["--pick"]);
+    let mut first = names(&pick_list(&mut p));
+    first.sort();
+    assert_eq!(first, ["a", "b"]);
+    p.conn.send(&Msg::EndSession { name: "a".into() });
+    assert_eq!(names(&pick_list(&mut p)), ["b"]);
     assert!(matches!(a.conn.recv_control(T), Some(Msg::Exit { .. })));
+    assert!(!t.path().join("a.sock").exists());
+    // Ending one that is not there says so, and lists again.
+    p.conn.send(&Msg::EndSession { name: "a".into() });
+    let again = pick_list(&mut p);
+    assert!(
+        matches!(&again[..], [Msg::Error { code, message }, Msg::StatusReply(s)]
+            if *code == err::NO_SESSION && message == "no session 'a'" && s.name == "b"),
+        "{again:?}"
+    );
+
+    p.conn
+        .send(&Msg::Hello(hello("b", Mode::AttachOrCreate, "me")));
+    let w = welcome(&mut p);
+    assert_eq!(w.session, "b");
+    assert!(!w.created);
+    p.conn.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"hi\r".to_vec(),
+    });
+    p.conn.wait_output("got:hi", T);
 }
 
 #[test]
-fn kill_of_a_missing_session_says_so() {
+fn pick_creates_a_session_by_name_or_a_new_numbered_one() {
     let t = TempDir::new();
-    let mut k = proxy(t.path(), &["--kill", "nope"]);
-    let got = answers(&mut k);
-    assert!(
-        matches!(&got[..], [Msg::Error { code, message }]
-            if *code == err::NO_SESSION && message == "no session 'nope'"),
-        "{got:?}"
-    );
+    let mut p = proxy(t.path(), &["--pick"]);
+    assert!(pick_list(&mut p).is_empty());
+    p.conn.send(&hello_cmd("main", "me", "sleep 30"));
+    let w = welcome(&mut p);
+    assert_eq!((w.session.as_str(), w.created), ("main", true));
+
+    // An empty name with Create: the lowest free number, as --new.
+    let mut q = proxy(t.path(), &["--pick"]);
+    assert_eq!(names(&pick_list(&mut q)), ["main"]);
+    let mut h = hello("", Mode::Create, "me");
+    h.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+    q.conn.send(&Msg::Hello(h));
+    let w = welcome(&mut q);
+    assert_eq!((w.session.as_str(), w.created), ("1", true));
+}
+
+#[test]
+fn pick_refuses_what_is_not_a_menu_request() {
+    let t = TempDir::new();
+    for (sent, why) in [
+        (
+            Msg::Hello(hello("", Mode::AttachOrCreate, "me")),
+            "HELLO names no session",
+        ),
+        (
+            Msg::Hello(hello("../x", Mode::AttachOrCreate, "me")),
+            "../x",
+        ),
+        (Msg::Detach, "expected HELLO or END_SESSION"),
+    ] {
+        let mut p = proxy(t.path(), &["--pick"]);
+        assert!(pick_list(&mut p).is_empty());
+        p.conn.send(&sent);
+        match p.conn.recv_control(T) {
+            Some(Msg::Error { code, message }) => {
+                assert_eq!(code, err::BAD_REQUEST, "{message}");
+                assert!(message.contains(why), "{message}");
+            }
+            other => panic!("{sent:?}: {other:?}"),
+        }
+        assert!(p.conn.closed(T));
+    }
+    assert!(!t.path().join("x.sock").exists());
+}
+
+#[test]
+fn leaving_the_pick_closes_the_connection_and_starts_nothing() {
+    let t = TempDir::new();
+    let mut p = proxy(t.path(), &["--pick"]);
+    assert!(pick_list(&mut p).is_empty());
+    p.conn.close_write();
+    assert!(p.conn.closed(T));
+    assert!(p.child.wait().unwrap().success());
+    let left: Vec<_> = std::fs::read_dir(t.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "sock"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
 }

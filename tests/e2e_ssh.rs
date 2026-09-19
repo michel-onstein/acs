@@ -423,7 +423,8 @@ fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
         c.send(&command(b'd'));
         assert_eq!(c.wait(T), 0);
     }
-    let mut args = h.ssh_args();
+    let mut args = vec!["-v".to_string()];
+    args.extend(h.ssh_args());
     args.push("dev@127.0.0.1".into());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut c = Client::spawn(std::path::Path::new(&h.client), &args, &[]);
@@ -456,7 +457,15 @@ fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
     c.send(b"hi\r");
     // menu-a existed, so the attach sends Ctrl-L first (redraw_on_reconnect).
     c.wait_for("got-menu-a:\x0chi", T);
+    // One ssh connection from the list to the attach (acs-68z).
+    let text = c.text();
+    let running: Vec<&str> = text
+        .split("\r\n")
+        .filter(|l| l.contains("acs: running "))
+        .collect();
+    assert_eq!(running.len(), 1, "{running:?}");
+    assert!(running[0].contains("_proxy --pick"), "{running:?}");
     c.send(&command(b'x'));
     c.wait(T);
-    eprintln!("VERIFIED plain acs <host>: menu over ssh, x ends a session, a number attaches");
+    eprintln!("VERIFIED plain acs <host>: menu, x and the attach over one ssh connection");
 }

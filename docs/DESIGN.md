@@ -138,8 +138,9 @@ lives in the master and the client.
 - `-e none`: ssh's `~.` escape is off (it is already off without a tty; this
   makes it explicit).
 - `ControlMaster=no`, `ControlPath=none`: the session gets its own TCP
-  connection, so a reconnect never waits on a dead multiplexer. Side commands
-  (`--list`, install) keep using the user's multiplexing; `acs --list` on
+  connection, so a reconnect never waits on a dead multiplexer; the session
+  menu rides that connection too (§4.4). Side commands (`--list`, install)
+  keep using the user's multiplexing; `acs --list` on
   every alias adds `BatchMode=yes` and `ConnectTimeout=10` (§7.3).
 - `ServerAliveInterval=0`: liveness is ours (§5.3), much faster than ssh's.
 - `ConnectTimeout=10`: a redial into a dead network fails fast and the
@@ -234,13 +235,26 @@ parse frames beyond checking the protocol version in the HELLO. `acs _proxy
 attached/detached, the client identity attached (or last attached), created-at,
 idle time, child command, and size. Sockets that
 refuse connections are reported stale and removed — no `ps` parsing.
-`acs _proxy --kill <name>` (the session menu's `x`, §4.4) first sends that
-master `KILL`, as `x` inside the session does, and waits until the master
-has exited — it holds the connection open until then, at most the 3 s kill
-grace and some, 10 s in all — then answers as `--list` with the sessions
-left, after an `ERROR` frame if the session was not there or did not end.
-Only the user's own masters can be reached (the per-uid directory and the
-peer-uid check, §4.5), so nobody else's session can be ended this way.
+`acs _proxy --pick` serves the session menu (§4.4) on the session's own
+connection. After `ACS-READY` it sends the list as `--list` does, one
+`STATUS_REPLY` per session, closed by `LIST_END`, since the connection
+stays open. It then reads the client's frames:
+
+- `END_SESSION <name>` (the menu's `x`): it sends that master `KILL`, as
+  `x` inside the session does, and waits until the master has exited — it
+  holds the connection open until then, at most the 3 s kill grace and
+  some, 10 s in all — then sends the list again, after an `ERROR` frame if
+  the session was not there or did not end. Only the user's own masters can
+  be reached (the per-uid directory and the peer-uid check, §4.5), so
+  nobody else's session can be ended this way.
+- `HELLO`: the session and mode the client settled on, as the proxy's own
+  arguments give them on a plain session call; an empty name with `create`
+  is a new numbered session, chosen under the directory lock as `--new`
+  does. The proxy connects to or starts that master and from there is the
+  ordinary relay, the HELLO checked and forwarded as usual. It prints no
+  second marker.
+- End of input (the user left the menu): it exits, starting nothing.
+  Anything else is an `ERROR` (bad request).
 
 ### 4.4 Session names and getting back in
 
@@ -268,11 +282,12 @@ So the unnamed case is covered two ways: plain `acs <host>` offers what is
 there to get back into, and `--new` gives short numeric names (as tmux
 does) for when you want a second session without inventing a name.
 
-**The session menu.** Plain `acs <host>` first lists the host's sessions
-with the `--list` side call (§4.3) — one ssh round trip more before the
-attach, which dials its own connection as ever (a side call keeps the
-user's ssh multiplexing, the session gets its own; reusing one connection
-for both is not worth a second proxy mode). Then:
+**The session menu.** Plain `acs <host>` dials its session connection
+with `_proxy --pick` (§4.3) and gets the host's sessions on it first. The
+menu, ending sessions with `x`, and the attach all go over that one
+connection: one ssh handshake (and one hardware-key touch) from the list to
+the session, where a separate `--list` side call used to cost a second
+(decision 8). Then:
 
 - **No session detached** (none at all, or all attached elsewhere): a new
   session, without a menu — named `main` (or `$ACS_DEFAULT_SESSION`) if no
@@ -303,7 +318,7 @@ for both is not worth a second proxy mode). Then:
 | Enter | attach the session under the cursor; on *new session*, create one (named as above); on *exit*, leave |
 | `n` | create a new session |
 | `.` | show attached sessions too, or hide them again. Picking an attached session asks `session 'x' is attached from alice@laptop — take over? [y/N]`; `y` attaches with `force`, the `--force` path of §4.5 (and `--force` on the command line skips the question) |
-| `x` | end the session under the cursor, after `end session 'x'? y (or x) ends it`: `_proxy --kill` (§4.3), then the menu shows the sessions left and what happened |
+| `x` | end the session under the cursor, after `end session 'x'? y (or x) ends it`: `END_SESSION` on the menu's connection (§4.3), then the menu shows the sessions left and what happened |
 | Esc | leave, exit status 0 — at any point, a question pending or not. A lone ESC waits 100 ms for the rest of an arrow key's sequence (as the session's input does for an incomplete sequence, §6.3), so it is never taken for one |
 | Ctrl-C | leave, exit status 130 |
 
@@ -315,10 +330,20 @@ for both is not worth a second proxy mode). Then:
   (`[user@]<alias>`, §7.3) is resolved once, before the list, and the
   first connection uses that resolution; only a redial resolves again.
 - A host that cannot be reached, or answers the list with garbage, fails as
-  `acs <host> --list` does (255, or 1), with the same message.
+  `acs <host> --list` does (255, or 1), with the same message. The first
+  connection's deadlines (§5.3) apply: to its marker, then to each list.
+- A host **without acs** answers the pick call with `ACS-NEED`, as any
+  call: the client closes it and attaches `main` (or the default name) by
+  the ordinary session call, which installs acs first (§8). A fresh host
+  has no sessions to pick from.
 - A session picked from the menu is attached with `attach-or-create`: if
   it ended in the meantime, the client says `new session '…'` as it would
   for a typo.
+- The connection **sits idle** while the user reads the menu: no liveness
+  pings run before `WELCOME` (§5.3). If it has died meanwhile — the attach
+  on it is lost before any `WELCOME` — the client dials the chosen session
+  once more with the ordinary session call instead of giving up. Redials
+  later always use that call too: they know the session.
 
 To keep a session findable, the client says what it did **outside** the
 session's byte stream — on stderr, before raw mode starts or after the
@@ -409,11 +434,17 @@ Length-prefixed, same format on the ssh leg and the unix-socket leg:
 | `RESIZE` | c→m | cols, rows, xpixel, ypixel |
 | `PING` / `PONG` | both | `u64` nonce |
 | `DETACH` | c→m | — |
-| `KILL` | c→m | — (also from `_proxy --kill` before any HELLO: the master ends the session and holds that connection until it exits, §4.3) |
+| `KILL` | c→m | — (also from the proxy for the menu's `END_SESSION`, before any HELLO: the master ends the session and holds that connection until it exits, §4.3) |
 | `EXIT` | m→c | child wait status |
 | `TAKEOVER` | m→c | — (another client attached) |
-| `STATUS` / `STATUS_REPLY` | proxy↔m | session metadata for `--list` |
+| `STATUS` / `STATUS_REPLY` | proxy↔m, proxy→c | session metadata for `--list` and the session menu |
 | `ERROR` | m→c | code, message |
+| `END_SESSION` | c→proxy | session name: end it, then list again (`_proxy --pick`, §4.3) |
+| `LIST_END` | proxy→c | — the `STATUS_REPLY` frames before it are the whole list (`_proxy --pick`) |
+
+`END_SESSION` and `LIST_END` pass only between a client and a proxy of
+its own version (§8), never to a master, so they need no protocol version
+of their own.
 
 Pty bytes are carried as opaque payload and written verbatim; framing is
 invisible to the terminal. That is the unfiltered guarantee, restated in wire
@@ -1227,4 +1258,5 @@ and **Remote self-install** make it a `dsh` replacement.
 | 4 | Takeover vs. mirrored clients | Takeover (§4.2) |
 | 5 | Escape key | Ctrl-] Ctrl-] with a 400 ms window, configurable (§6.2) |
 | 6 | Multiple users per host | Per-uid socket directory with ownership and peer-uid checks; per-version installs; on shared accounts, client identity with confirmed cross-identity takeover (§4.5) |
-| 7 | What plain `acs <host>` attaches | Revisited at the user's request (2026-09-18). It used to mean `main` always, created if absent, so that the default "never depends on what else happens to exist". In use that meant a detached session under another name (`--new`'s `2`, a named one) was only found by `--list` and retyping its name, and `acs <host>` with `main` attached elsewhere took it over (or asked to) instead of giving a fresh shell. Now it lists the sessions first: with none detached it creates one (`main` if free, else numbered), otherwise it shows a menu of the detached ones (§4.4). The cost is one ssh round trip before attaching. The predictable form stays: `acs <host> <name>`, and without a terminal plain `acs <host>` is still `main` |
+| 7 | What plain `acs <host>` attaches | Revisited at the user's request (2026-09-18). It used to mean `main` always, created if absent, so that the default "never depends on what else happens to exist". In use that meant a detached session under another name (`--new`'s `2`, a named one) was only found by `--list` and retyping its name, and `acs <host>` with `main` attached elsewhere took it over (or asked to) instead of giving a fresh shell. Now it lists the sessions first: with none detached it creates one (`main` if free, else numbered), otherwise it shows a menu of the detached ones (§4.4). The list costs no second connection since decision 8. The predictable form stays: `acs <host> <name>`, and without a terminal plain `acs <host>` is still `main` |
+| 8 | One connection for the session menu and the attach | Revisited at the user's request (2026-09-19). The menu first listed with a `--list` side call and the attach dialed its own connection, since "reusing one connection for both is not worth a second proxy mode". In use the second full ssh handshake (TCP, key exchange, auth) cost a few hundred ms before every plain `acs <host>`, more through a jump host, and a hardware key needed two touches. The session call cannot share a multiplexed connection (it opts out on purpose, §3), so the fix is the proxy mode after all: `_proxy --pick` lists, ends sessions and then relays the session the client's HELLO names, on one connection (§4.3, §4.4) |
