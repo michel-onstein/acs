@@ -118,6 +118,7 @@ fn input_sent_around_a_drop_arrives_exactly_once() {
     c.send(b"hello\r");
     remote.cut_link();
     remote.wait_connections(2, T);
+    c.wait_resumed();
     c.send(b"after\r");
     // The resume's Ctrl-L comes first (DESIGN §5.2).
     c.wait_for("got:\x0cafter", T);
