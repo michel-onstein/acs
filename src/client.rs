@@ -760,7 +760,9 @@ fn serve(
                             }
                         }
                     } else if let Some(r) = raw.as_mut() {
-                        let _ = r.resume();
+                        // Keys typed during the redial were for a link that
+                        // was down: dropped, as while waiting (DESIGN §5.2).
+                        let _ = r.resume_discarding();
                     }
                     match w.kind {
                         AttachKind::Resumed => {}

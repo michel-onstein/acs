@@ -176,6 +176,53 @@ fn detach_works_while_the_link_is_down() {
     assert!(c.text().contains("\x1b[23;0t"));
 }
 
+/// Regression (acs-qty): keys typed while ssh redials (in cooked mode, for
+/// its prompts) are dropped, not delivered to the program on WELCOME.
+#[test]
+fn keys_typed_during_a_redial_are_dropped() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "typed",
+        "echo ready; while read l; do echo got:$l; done",
+        FAST,
+    );
+    c.wait_for("ready", T);
+    remote.slow_dial(Some("1.5"));
+    remote.cut_link();
+    remote.wait_connections(2, T);
+    // The redial is under way: its transport sleeps before the remote runs.
+    std::thread::sleep(Duration::from_millis(300));
+    c.send(b"typed\r");
+    remote.slow_dial(None);
+    // The status line goes when the resume's WELCOME arrives.
+    c.wait_for("\x1b[23;0t", T);
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    let text = c.text();
+    assert!(!text.contains("got:typed"), "{text:?}");
+}
+
+/// Regression (acs-qty): a Ctrl-C while ssh redials ends the client with the
+/// status line taken away and the title popped.
+#[test]
+fn ctrl_c_during_a_redial_clears_the_status_line() {
+    let remote = Remote::installed();
+    let mut c = start(&remote, "cc", "echo ready; sleep 30", FAST);
+    c.wait_for("ready", T);
+    remote.slow_dial(Some("5"));
+    remote.cut_link();
+    c.wait_for("\x1b[22;0t", T);
+    remote.wait_connections(2, T);
+    std::thread::sleep(Duration::from_millis(300));
+    c.send(b"\x03");
+    c.wait(T);
+    let text = c.text();
+    let tail = &text[text.rfind("\x1b[22;0t").unwrap()..];
+    assert!(tail.contains("\x1b[23;0t"), "title not popped: {tail:?}");
+    assert!(c.echo_on());
+}
+
 #[test]
 fn exit_needs_the_link() {
     let remote = Remote::installed();

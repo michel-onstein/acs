@@ -353,6 +353,7 @@ fn show_status(state: &mut State, msg: &str) {
     );
     let _ = sys::write_all(1, &out);
     state.status_shown = true;
+    crate::tty::set_status_shown(true);
 }
 
 /// Take the title back (pop the stack) and blank the status row, if we
@@ -364,6 +365,7 @@ pub fn clear_status(state: &mut State) {
         let out = format!("\x1b[23;0t\x1b7\x1b[{rows};1H\x1b[2K\x1b8");
         let _ = sys::write_all(1, out.as_bytes());
         state.status_shown = false;
+        crate::tty::set_status_shown(false);
     }
 }
 
@@ -403,6 +405,8 @@ pub fn ask_takeover(state: &mut State, identity: &str, since: u64) -> bool {
         state.host,
         sys::local_hhmm(since)
     );
+    // Keys typed before the question are not its answer (acs-qty).
+    let _ = sys::flush_input(0);
     let _ = sys::write_all(2, question.as_bytes());
     let mut line = Vec::new();
     let mut b = [0u8; 1];

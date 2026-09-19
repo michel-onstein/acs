@@ -300,9 +300,10 @@ impl Remote {
         let script = self.root.path().join("transport.sh");
         if !script.exists() {
             let body = format!(
-                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\nexec /bin/sh -c \"$1\"\n",
+                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\n[ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\nexec /bin/sh -c \"$1\"\n",
                 pids = self.pid_file().display(),
                 silent = self.silent_file().display(),
+                delay = self.delay_file().display(),
                 noise = self.noise_file().display(),
                 home = self.home().display(),
                 sock = self.sockets().display(),
@@ -325,6 +326,21 @@ impl Remote {
 
     fn silent_file(&self) -> PathBuf {
         self.root.path().join("silent")
+    }
+
+    fn delay_file(&self) -> PathBuf {
+        self.root.path().join("delay")
+    }
+
+    /// Make new connections take `secs` seconds to reach the remote command,
+    /// as a slow ssh handshake does; `None` makes them prompt again.
+    pub fn slow_dial(&self, secs: Option<&str>) {
+        match secs {
+            Some(s) => std::fs::write(self.delay_file(), s).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(self.delay_file());
+            }
+        }
     }
 
     /// Make new connections go quiet once accepted, as a half-alive host

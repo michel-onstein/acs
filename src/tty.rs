@@ -5,7 +5,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Once, OnceLock};
 
 use crate::sys;
@@ -20,9 +20,26 @@ static ALT_FD: AtomicI32 = AtomicI32::new(-1);
 /// Back to the normal screen, with the cursor shown.
 const LEAVE_ALT: &[u8] = b"\x1b[?25h\x1b[?1049l";
 
+/// The reconnect status line is showing (on standard output).
+static STATUS_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Pop the title pushed for the status line and blank the bottom row (a row
+/// past the last is taken as the last), cursor saved and restored.
+const CLEAR_STATUS: &[u8] = b"\x1b[23;0t\x1b7\x1b[9999;1H\x1b[2K\x1b8";
+
+/// Whether the reconnect status line is showing, so a fatal signal — a
+/// Ctrl-C while ssh redials in cooked mode — takes it away too (acs-qty).
+pub fn set_status_shown(on: bool) {
+    STATUS_SHOWN.store(on, Ordering::Release);
+}
+
 /// Restore the saved settings. Async-signal-safe: one `write` for the
 /// screen, one `tcsetattr`.
 fn emergency_restore() {
+    if STATUS_SHOWN.swap(false, Ordering::AcqRel) {
+        // SAFETY: write is async-signal-safe; the bytes are static.
+        unsafe { libc::write(1, CLEAR_STATUS.as_ptr().cast(), CLEAR_STATUS.len()) };
+    }
     let alt = ALT_FD.swap(-1, Ordering::AcqRel);
     if alt >= 0 {
         // SAFETY: write is async-signal-safe; the bytes are static.
@@ -120,6 +137,16 @@ impl RawMode {
     pub fn resume(&mut self) -> io::Result<()> {
         if !self.raw {
             sys::tcsetattr(self.fd, &sys::make_raw(&self.orig))?;
+            self.raw = true;
+        }
+        Ok(())
+    }
+
+    /// [`RawMode::resume`], discarding what was typed while suspended: keys
+    /// typed during a redial are dropped, not delivered late (acs-qty).
+    pub fn resume_discarding(&mut self) -> io::Result<()> {
+        if !self.raw {
+            sys::tcsetattr_flush(self.fd, &sys::make_raw(&self.orig))?;
             self.raw = true;
         }
         Ok(())
