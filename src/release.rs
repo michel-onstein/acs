@@ -26,7 +26,15 @@ pub fn releases_url() -> String {
 /// as static musl binaries, whatever libc this one was built against.
 pub fn archive_target(own: &str) -> String {
     match own.split_once("-unknown-linux-") {
-        Some((arch, _)) => format!("{arch}-unknown-linux-musl"),
+        // Keep the ABI suffix: armv7's musl triple is musleabihf, and
+        // armv7-unknown-linux-musl is not a target at all (acs-ad5).
+        Some((arch, libc)) => {
+            let abi = libc
+                .strip_prefix("gnu")
+                .or_else(|| libc.strip_prefix("musl"))
+                .unwrap_or("");
+            format!("{arch}-unknown-linux-musl{abi}")
+        }
         None => own.to_string(),
     }
 }
@@ -88,8 +96,81 @@ pub fn compare(a: &str, b: &str) -> Option<Ordering> {
         (None, None) => Ordering::Equal,
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
-        (Some(x), Some(y)) => x.cmp(y),
+        (Some(x), Some(y)) => compare_pre(x, y),
     }))
+}
+
+/// Pre-release order: identifiers (split on `.`) field by field, a numeric
+/// one below an alphanumeric one and a longer pre-release above a shorter
+/// one that it starts with, as semver says. Within a field, runs of digits
+/// compare as numbers, so `rc2` is below `rc10` as a person reads it —
+/// strict semver would compare that pair as text (acs-ad5).
+fn compare_pre(a: &str, b: &str) -> Ordering {
+    let mut x = a.split('.');
+    let mut y = b.split('.');
+    loop {
+        let ord = match (x.next(), y.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(p), Some(q)) => match (numeric(p), numeric(q)) {
+                (Some(m), Some(n)) => m.cmp(&n),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => natural(p, q),
+            },
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+}
+
+/// The identifier as a number, if it is all digits.
+fn numeric(s: &str) -> Option<u64> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+/// Text order with runs of digits compared as numbers: `rc2` < `rc10`.
+fn natural(a: &str, b: &str) -> Ordering {
+    let (mut x, mut y) = (a.as_bytes(), b.as_bytes());
+    loop {
+        let ord = match (x.first(), y.first()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(p), Some(q)) if p.is_ascii_digit() && q.is_ascii_digit() => {
+                let (m, rx) = take_digits(x);
+                let (n, ry) = take_digits(y);
+                x = rx;
+                y = ry;
+                m.cmp(&n)
+            }
+            (Some(p), Some(q)) => {
+                x = &x[1..];
+                y = &y[1..];
+                p.cmp(q)
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+}
+
+/// The leading run of digits as a number (saturating), and the rest.
+fn take_digits(s: &[u8]) -> (u64, &[u8]) {
+    let end = s
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(s.len());
+    let n = std::str::from_utf8(&s[..end])
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(u64::MAX);
+    (n, &s[end..])
 }
 
 /// `version` without a leading `v`.
@@ -217,6 +298,30 @@ nothexnothexnothexnothexnothexnothexnothexnothexnothexnothexnoth  acs-0.2.0-x86_
             archive_target("aarch64-apple-darwin"),
             "aarch64-apple-darwin"
         );
+        // The ABI suffix stays: there is no armv7-unknown-linux-musl.
+        assert_eq!(
+            archive_target("armv7-unknown-linux-musleabihf"),
+            "armv7-unknown-linux-musleabihf"
+        );
+        assert_eq!(
+            archive_target("armv7-unknown-linux-gnueabihf"),
+            "armv7-unknown-linux-musleabihf"
+        );
+    }
+
+    /// Regression (acs-ad5): pre-releases were compared as text, so
+    /// 0.3.0-rc10 sorted below 0.3.0-rc2.
+    #[test]
+    fn pre_releases_compare_by_number_not_by_text() {
+        use Ordering::*;
+        assert_eq!(compare("0.3.0-rc2", "0.3.0-rc10"), Some(Less));
+        assert_eq!(compare("0.3.0-rc.2", "0.3.0-rc.10"), Some(Less));
+        assert_eq!(compare("0.3.0-rc10", "0.3.0-rc10"), Some(Equal));
+        // Semver's own rules still hold.
+        assert_eq!(compare("0.3.0-alpha", "0.3.0-alpha.1"), Some(Less));
+        assert_eq!(compare("0.3.0-1", "0.3.0-alpha"), Some(Less));
+        assert_eq!(compare("0.3.0-alpha.2", "0.3.0-beta.1"), Some(Less));
+        assert_eq!(compare("0.3.0-dev", "0.3.0-rc1"), Some(Less));
     }
 
     #[test]
