@@ -162,6 +162,9 @@ struct Parser {
 
 /// Parse a configuration file.
 pub fn parse(src: &str) -> Result<Document> {
+    // A BOM is not part of the first key: editors that write one produce a
+    // file every other YAML reader accepts (acs-qjx).
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let mut lines = Vec::new();
     for (i, raw) in src.lines().enumerate() {
         let no = i + 1;
@@ -375,8 +378,9 @@ fn split_key(text: &str, line: usize) -> Result<Option<(String, &str)>> {
             return Ok(None);
         }
         let b = text.as_bytes();
-        let Some(colon) =
-            (0..b.len()).find(|&i| b[i] == b':' && (i + 1 == b.len() || b[i + 1] == b' '))
+        // YAML 1.2 separates the key with a space or a tab (acs-qjx).
+        let Some(colon) = (0..b.len())
+            .find(|&i| b[i] == b':' && (i + 1 == b.len() || b[i + 1] == b' ' || b[i + 1] == b'\t'))
         else {
             return Ok(None);
         };
@@ -389,7 +393,7 @@ fn split_key(text: &str, line: usize) -> Result<Option<(String, &str)>> {
     let Some(rest) = after.strip_prefix(':') else {
         return Ok(None);
     };
-    if !(rest.is_empty() || rest.starts_with(' ')) {
+    if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
         return Ok(None);
     }
     Ok(Some((key, rest)))
@@ -399,7 +403,7 @@ fn split_key(text: &str, line: usize) -> Result<Option<(String, &str)>> {
 /// flow collection) and a trailing comment.
 #[allow(clippy::type_complexity)]
 fn inline(text: &str, line: usize) -> Result<(Option<(Value, bool)>, Option<String>)> {
-    let t = text.trim_start_matches(' ');
+    let t = text.trim_start_matches([' ', '\t']);
     if t.is_empty() {
         return Ok((None, None));
     }
@@ -883,6 +887,35 @@ hosts:
   - {host: nas.lan, reachability_check: false}
 list: [a, \"b c\", 3]
 ";
+
+    /// Regression (acs-qjx): YAML 1.2 separates a key from its value with a
+    /// space or a tab, and a leading BOM belongs to no key.
+    #[test]
+    fn a_tab_after_the_colon_and_a_leading_bom_are_accepted() {
+        let d =
+            parse("install_on_remote:\tfalse\naliases:\n  nas:\n    - host:\tnas.lan\n").unwrap();
+        assert_eq!(text(get(&d.root, "install_on_remote")), "false");
+        let nas = &items(get(get(&d.root, "aliases"), "nas"))[0];
+        assert_eq!(text(get(nas, "host")), "nas.lan");
+        // Written back, the separator is the usual single space.
+        assert!(
+            emit(&d).starts_with("install_on_remote: false\n"),
+            "{:?}",
+            emit(&d)
+        );
+
+        let d = parse("\u{feff}install_on_remote: true\n").unwrap();
+        assert_eq!(text(get(&d.root, "install_on_remote")), "true");
+        assert_eq!(emit(&d), "install_on_remote: true\n");
+
+        // A colon with no space at all is still not a key (a bare scalar).
+        assert!(parse("install_on_remote:false\n")
+            .unwrap()
+            .root
+            .value
+            .map()
+            .is_none());
+    }
 
     #[test]
     fn parses_the_config_shapes() {

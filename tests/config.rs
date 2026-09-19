@@ -77,6 +77,29 @@ fn a_malformed_file_is_an_error_naming_file_and_line() {
     assert!(out.stdout.is_empty());
 }
 
+/// Regression (acs-qjx): a file whose keys are separated by a tab, behind a
+/// BOM, is read — it used to be "expected settings as 'key: value' lines".
+#[test]
+fn a_tab_after_the_colon_and_a_bom_are_read() {
+    let remote = Remote::installed();
+    let cfg = TempDir::new();
+    let env = config_env(
+        cfg.path(),
+        "\u{feff}install_on_remote:\tfalse\naliases:\n  devbox:\n    - host:\tdevbox.lan\n",
+    );
+    let out = acs_cmd()
+        .envs(env)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(shown.contains("install_on_remote: false"), "{shown}");
+    assert!(shown.contains("devbox.lan"), "{shown}");
+    let _ = remote;
+}
+
 #[test]
 fn help_and_version_ignore_a_broken_file() {
     let cfg = TempDir::new();

@@ -866,7 +866,10 @@ aliases:                       # acs devbox tries its hosts in order
 **Parser.** The files use a small subset of YAML — block mappings and lists,
 plain and quoted scalars, one-line `[…]`/`{…}`, comments — parsed by hand in
 `yaml.rs`, which refuses anchors, tags, block scalars and multi-line flow
-collections with the line they are on. The tree keeps every node's line and
+collections with the line they are on. A key may be separated from its
+value by a space or a tab, as YAML 1.2 says, and a leading byte-order mark
+is skipped; a tab for *indentation* is still refused, with that advice.
+The tree keeps every node's line and
 the comments around it, so a file rewritten by the client keeps its comments
 and order. Measured on the release profile, a minimal load-and-dump binary
 grows by about 100 KB with `yaml-rust2` and 150 KB with `serde_yaml`, and
