@@ -1,8 +1,11 @@
-//! The session menu of a plain `acs <host>` (DESIGN §4.4).
+//! The session menu of a plain `acs <host>` (DESIGN §4.4), and of
+//! `acs list` on every host alias at once (§7.3).
 //!
 //! [`Menu`] is a pure state machine over the bytes typed and an injected
 //! millisecond clock: keys in, a [`Choice`] out, and [`Menu::render`] for
-//! the screen that shows it. `pick.rs` runs it on the terminal.
+//! the screen that shows it. `pick.rs` runs it on the terminal. Its rows are
+//! grouped by host: one for `acs <host>`, every alias in configuration order
+//! for `acs list`, where each host's rows arrive as it answers.
 
 use crate::proto::StatusInfo;
 
@@ -14,24 +17,46 @@ pub const ESC_WAIT_MS: u64 = 100;
 /// Longest escape sequence read before it is dropped as garbage.
 const MAX_SEQ: usize = 32;
 
-/// What the user chose.
+/// What the user chose. `host` is an index into the menu's hosts (always 0
+/// in the menu of one host).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
     /// Attach to this session; `force` takes it over from the client
     /// attached to it (DESIGN §4.5).
-    Attach { name: String, force: bool },
-    /// Create a new session.
-    New,
+    Attach {
+        host: usize,
+        name: String,
+        force: bool,
+    },
+    /// Create a new session on this host.
+    New { host: usize },
     /// End this session on the host; the menu then goes on.
-    Kill(String),
+    Kill { host: usize, name: String },
     /// Leave the menu with this exit status.
     Leave(u8),
 }
 
+/// What a host said to the listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// Not yet: its rows come when it answers.
+    Asking,
+    /// Its sessions, perhaps none.
+    Sessions(Vec<StatusInfo>),
+    /// No sessions to offer, and the line `acs list` prints instead (not
+    /// installed, unreachable).
+    Line(String),
+}
+
+struct Host {
+    name: String,
+    answer: Answer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
-    /// An index into the sessions.
-    Session(usize),
+    /// A host, and an index into its sessions.
+    Session(usize, usize),
     New,
     Exit,
 }
@@ -47,17 +72,19 @@ enum Key {
     Other,
 }
 
-/// A question waiting for its answer.
+/// A question waiting for its answer, about a host's session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
     /// End this session? `y`, or `x` again.
-    Kill(String),
+    Kill(usize, String),
     /// Take this attached session over? `y`.
-    Takeover(String),
+    Takeover(usize, String),
 }
 
 pub struct Menu {
-    sessions: Vec<StatusInfo>,
+    hosts: Vec<Host>,
+    /// Every host alias (`acs list`): a HOST column, no new-session row.
+    every: bool,
     /// Attached sessions are shown too (`.`).
     all: bool,
     /// Take over without asking (`--force`).
@@ -73,9 +100,35 @@ pub struct Menu {
 }
 
 impl Menu {
+    /// The menu of one host's `sessions`.
     pub fn new(sessions: Vec<StatusInfo>, force: bool) -> Menu {
+        Menu::with_hosts(
+            vec![Host {
+                name: String::new(),
+                answer: Answer::Sessions(sessions),
+            }],
+            false,
+            force,
+        )
+    }
+
+    /// The menu of every host alias, `names` in configuration order, each
+    /// asked still ([`Menu::set_answer`] as it answers).
+    pub fn every_host(names: Vec<String>, force: bool) -> Menu {
+        let hosts = names
+            .into_iter()
+            .map(|name| Host {
+                name,
+                answer: Answer::Asking,
+            })
+            .collect();
+        Menu::with_hosts(hosts, true, force)
+    }
+
+    fn with_hosts(hosts: Vec<Host>, every: bool, force: bool) -> Menu {
         Menu {
-            sessions,
+            hosts,
+            every,
             all: false,
             force,
             cursor: 0,
@@ -86,28 +139,56 @@ impl Menu {
         }
     }
 
-    pub fn sessions(&self) -> &[StatusInfo] {
-        &self.sessions
+    /// Host `host`'s sessions (none until it has answered).
+    pub fn sessions(&self, host: usize) -> &[StatusInfo] {
+        match &self.hosts[host].answer {
+            Answer::Sessions(s) => s,
+            _ => &[],
+        }
+    }
+
+    /// Host `host`'s name, as configured (empty in the menu of one host).
+    pub fn host_name(&self, host: usize) -> &str {
+        &self.hosts[host].name
     }
 
     pub fn set_note(&mut self, note: String) {
         self.note = note;
     }
 
-    /// The host's sessions changed (one was ended): the cursor stays on its
+    /// A host's sessions changed (one was ended): the cursor stays on its
     /// row, or on the row that took its place.
-    pub fn set_sessions(&mut self, sessions: Vec<StatusInfo>) {
-        self.keep_cursor(|m| m.sessions = sessions);
+    pub fn set_sessions(&mut self, host: usize, sessions: Vec<StatusInfo>) {
+        self.set_answer(host, Answer::Sessions(sessions));
     }
 
-    /// The shown sessions — detached only, unless `.` — then a row to
-    /// create a new session and one to leave.
+    /// A host answered (or failed to): its rows come in, the cursor stays
+    /// on its row — except on an exit row with nothing above it yet, the
+    /// first thing shown while every host is still being asked: then the
+    /// first rows to come take the cursor.
+    pub fn set_answer(&mut self, host: usize, answer: Answer) {
+        let waiting = self.cursor == 0 && self.rows()[0] == Row::Exit;
+        self.keep_cursor(|m| m.hosts[host].answer = answer);
+        if waiting {
+            self.cursor = 0;
+        }
+    }
+
+    /// The shown sessions, host by host — detached only, unless `.` — then
+    /// a row to create a new session (one host only) and one to leave.
     fn rows(&self) -> Vec<Row> {
-        let mut rows: Vec<Row> = (self.sessions.iter().enumerate())
-            .filter(|(_, s)| self.all || !s.attached)
-            .map(|(i, _)| Row::Session(i))
-            .collect();
-        rows.extend([Row::New, Row::Exit]);
+        let mut rows: Vec<Row> = Vec::new();
+        for h in 0..self.hosts.len() {
+            rows.extend(
+                (self.sessions(h).iter().enumerate())
+                    .filter(|(_, s)| self.all || !s.attached)
+                    .map(|(i, _)| Row::Session(h, i)),
+            );
+        }
+        if !self.every {
+            rows.push(Row::New);
+        }
+        rows.push(Row::Exit);
         rows
     }
 
@@ -116,14 +197,14 @@ impl Menu {
     fn keep_cursor(&mut self, change: impl FnOnce(&mut Menu)) {
         let at = self.rows()[self.cursor];
         let name = match at {
-            Row::Session(i) => Some(self.sessions[i].name.clone()),
+            Row::Session(h, i) => Some((h, self.sessions(h)[i].name.clone())),
             _ => None,
         };
         change(self);
         let rows = self.rows();
         self.cursor = (rows.iter())
             .position(|&r| match r {
-                Row::Session(i) => name.as_ref() == Some(&self.sessions[i].name),
+                Row::Session(h, i) => name.as_ref() == Some(&(h, self.sessions(h)[i].name.clone())),
                 other => other == at,
             })
             .unwrap_or(self.cursor.min(rows.len() - 1));
@@ -204,10 +285,14 @@ impl Menu {
         if let Some(ask) = self.ask.take() {
             // Any other key is a no.
             return match (ask, key) {
-                (Ask::Kill(name), Key::Byte(b'y' | b'Y' | b'x')) => Some(Choice::Kill(name)),
-                (Ask::Takeover(name), Key::Byte(b'y' | b'Y')) => {
-                    Some(Choice::Attach { name, force: true })
+                (Ask::Kill(host, name), Key::Byte(b'y' | b'Y' | b'x')) => {
+                    Some(Choice::Kill { host, name })
                 }
+                (Ask::Takeover(host, name), Key::Byte(b'y' | b'Y')) => Some(Choice::Attach {
+                    host,
+                    name,
+                    force: true,
+                }),
                 _ => None,
             };
         }
@@ -219,51 +304,71 @@ impl Menu {
             // Sessions come first, so the n-th row is the n-th session.
             Key::Byte(d @ b'1'..=b'9') => {
                 let n = (d - b'1') as usize;
-                if let Some(&row @ Row::Session(_)) = rows.get(n) {
+                if let Some(&row @ Row::Session(..)) = rows.get(n) {
                     self.cursor = n;
                     return self.choose(row);
                 }
             }
             Key::Byte(b'.') => self.keep_cursor(|m| m.all = !m.all),
             Key::Byte(b'x') => {
-                if let Row::Session(i) = rows[self.cursor] {
-                    let s = &self.sessions[i];
+                if let Row::Session(h, i) = rows[self.cursor] {
+                    let s = self.sessions(h)[i].clone();
                     let whose = match s.attached {
                         true => format!(", attached from {},", s.identity),
                         false => String::new(),
                     };
                     self.note = format!(
-                        "end session '{}'{whose}? y (or x) ends it, any other key keeps it",
-                        s.name
+                        "end session '{}'{}{whose}? y (or x) ends it, any other key keeps it",
+                        s.name,
+                        self.on(h)
                     );
-                    self.ask = Some(Ask::Kill(s.name.clone()));
+                    self.ask = Some(Ask::Kill(h, s.name.clone()));
                 }
             }
-            Key::Byte(b'n') => return Some(Choice::New),
+            Key::Byte(b'n') => match (self.every, rows[self.cursor]) {
+                (false, _) => return Some(Choice::New { host: 0 }),
+                (true, Row::Session(host, _)) => return Some(Choice::New { host }),
+                (true, _) => {
+                    self.note =
+                        "n makes a new session on the host of the session under the cursor".into()
+                }
+            },
             _ => {}
         }
         None
     }
 
+    /// ` on <host>` in a message of the menu of every host; nothing in the
+    /// menu of one.
+    fn on(&self, host: usize) -> String {
+        match self.every {
+            true => format!(" on {}", self.hosts[host].name),
+            false => String::new(),
+        }
+    }
+
     /// Enter on `row`, or its number.
     fn choose(&mut self, row: Row) -> Option<Choice> {
-        let i = match row {
-            Row::New => return Some(Choice::New),
+        let (h, i) = match row {
+            Row::New => return Some(Choice::New { host: 0 }),
             Row::Exit => return Some(Choice::Leave(0)),
-            Row::Session(i) => i,
+            Row::Session(h, i) => (h, i),
         };
-        let s = &self.sessions[i];
+        let s = self.sessions(h)[i].clone();
         if !s.attached || self.force {
             return Some(Choice::Attach {
-                name: s.name.clone(),
+                host: h,
+                name: s.name,
                 force: s.attached,
             });
         }
         self.note = format!(
-            "session '{}' is attached from {} — take over? [y/N]",
-            s.name, s.identity
+            "session '{}'{} is attached from {} — take over? [y/N]",
+            s.name,
+            self.on(h),
+            s.identity
         );
-        self.ask = Some(Ask::Takeover(s.name.clone()));
+        self.ask = Some(Ask::Takeover(h, s.name.clone()));
         None
     }
 
@@ -273,11 +378,32 @@ impl Menu {
     /// is marked and reversed, in a bar as wide as the widest row of the
     /// list, so it keeps its width as it moves; the rows scroll to keep it
     /// in view, and no line is wider than the terminal, so nothing wraps.
+    ///
+    /// The menu of every host titles itself with "every host" (`host` is not
+    /// used), puts a HOST column first, and lists under the rows, as
+    /// `acs list` does, each host that has no row to offer and why: still
+    /// being asked, no sessions (or only attached ones while they are
+    /// hidden), not installed, unreachable.
     pub fn render(&self, host: &str, now: u64, cols: usize, height: usize) -> String {
-        let table = crate::list::lines(&self.sessions, now);
+        // The table of every session, heading first; each host's sessions
+        // start at its offset in it.
+        let (table, offsets) = if self.every {
+            let listed: Vec<(&str, &[StatusInfo])> = (0..self.hosts.len())
+                .map(|h| (self.hosts[h].name.as_str(), self.sessions(h)))
+                .collect();
+            let mut offsets = Vec::new();
+            let mut at = 0;
+            for (_, s) in &listed {
+                offsets.push(at);
+                at += s.len();
+            }
+            (crate::list::host_lines(&listed, now), offsets)
+        } else {
+            (crate::list::lines(self.sessions(0), now), vec![0])
+        };
         let rows = self.rows();
         let label = |row: Row| match row {
-            Row::Session(i) => table[i + 1].as_str(),
+            Row::Session(h, i) => table[offsets[h] + i + 1].as_str(),
             Row::New => "new session",
             Row::Exit => "exit",
         };
@@ -288,34 +414,40 @@ impl Menu {
             .max()
             .unwrap_or(0)
             .min(cols);
-        let fit = height.saturating_sub(6).max(1);
+        let info = self.host_lines();
+        let spare = if info.is_empty() { 0 } else { info.len() + 1 };
+        let fit = height.saturating_sub(6 + spare).max(1);
         let first = (self.cursor + 1).saturating_sub(fit);
+        let shown = if self.all { "all" } else { "detached" };
+        let title = match self.every {
+            true => format!("acs: {shown} sessions on every host"),
+            false => format!("acs: {shown} sessions on {host}"),
+        };
         let mut lines: Vec<(String, bool)> = vec![
-            (
-                format!(
-                    "acs: {} sessions on {host}",
-                    if self.all { "all" } else { "detached" }
-                ),
-                false,
-            ),
+            (title, false),
             (String::new(), false),
             (format!("     {}", table[0]), false),
         ];
         for (n, &row) in rows.iter().enumerate().skip(first).take(fit) {
             let key = match row {
-                Row::Session(_) if n < 9 => (b'1' + n as u8) as char,
+                Row::Session(..) if n < 9 => (b'1' + n as u8) as char,
                 Row::New => 'n',
-                Row::Session(_) | Row::Exit => ' ',
+                Row::Session(..) | Row::Exit => ' ',
             };
             let here = n == self.cursor;
             let mark = if here { '>' } else { ' ' };
             lines.push((format!("{mark} {key}  {}", label(row)), here));
         }
+        if !info.is_empty() {
+            lines.push((String::new(), false));
+            lines.extend(info.into_iter().map(|l| (format!("     {l}"), false)));
+        }
         lines.push((String::new(), false));
         lines.push((
             format!(
-                "1-9, or ↑↓ jk and Enter: attach   .: {}   x: end   n: new   Esc: leave",
-                if self.all { "detached only" } else { "all" }
+                "1-9, or ↑↓ jk and Enter: attach   .: {}   x: end   n: new{}   Esc: leave",
+                if self.all { "detached only" } else { "all" },
+                if self.every { " there" } else { "" }
             ),
             false,
         ));
@@ -336,6 +468,33 @@ impl Menu {
         }
         out.push_str("\x1b[J");
         out
+    }
+
+    /// In the menu of every host, a line for each host without a row shown,
+    /// in configuration order; none in the menu of one.
+    fn host_lines(&self) -> Vec<String> {
+        if !self.every {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        for h in &self.hosts {
+            match &h.answer {
+                Answer::Asking => lines.push(format!("asking {}…", h.name)),
+                Answer::Line(l) => lines.push(l.clone()),
+                Answer::Sessions(s) if s.is_empty() => {
+                    lines.push(format!("no sessions on {}", h.name))
+                }
+                Answer::Sessions(s) if !self.all && s.iter().all(|s| s.attached) => {
+                    lines.push(format!(
+                        "no detached sessions on {} ({} attached: . shows them)",
+                        h.name,
+                        s.len()
+                    ))
+                }
+                Answer::Sessions(_) => {}
+            }
+        }
+        lines
     }
 }
 
@@ -422,6 +581,7 @@ mod tests {
 
     fn attach(name: &str) -> Option<Choice> {
         Some(Choice::Attach {
+            host: 0,
             name: name.into(),
             force: false,
         })
@@ -460,8 +620,8 @@ mod tests {
     fn the_new_session_row_and_n_create_one() {
         let mut m = menu();
         m.feed(b"jj", 0);
-        assert_eq!(m.feed(b"\r", 0), Some(Choice::New));
-        assert_eq!(menu().feed(b"n", 0), Some(Choice::New));
+        assert_eq!(m.feed(b"\r", 0), Some(Choice::New { host: 0 }));
+        assert_eq!(menu().feed(b"n", 0), Some(Choice::New { host: 0 }));
     }
 
     #[test]
@@ -521,6 +681,7 @@ mod tests {
         assert_eq!(
             m.feed(b"y", 0),
             Some(Choice::Attach {
+                host: 0,
                 name: "busy".into(),
                 force: true
             })
@@ -541,6 +702,7 @@ mod tests {
         assert_eq!(
             m.feed(b".1", 0),
             Some(Choice::Attach {
+                host: 0,
                 name: "busy".into(),
                 force: true
             })
@@ -552,9 +714,21 @@ mod tests {
         let mut m = menu();
         m.feed(b"jx", 0);
         assert!(m.note.contains("end session 'work'?"), "{}", m.note);
-        assert_eq!(m.feed(b"y", 0), Some(Choice::Kill("work".into())));
+        assert_eq!(
+            m.feed(b"y", 0),
+            Some(Choice::Kill {
+                host: 0,
+                name: "work".into()
+            })
+        );
         // x twice is a yes too.
-        assert_eq!(menu().feed(b"xx", 0), Some(Choice::Kill("main".into())));
+        assert_eq!(
+            menu().feed(b"xx", 0),
+            Some(Choice::Kill {
+                host: 0,
+                name: "main".into()
+            })
+        );
         // Anything else keeps it.
         let mut m = menu();
         assert_eq!(m.feed(b"xk", 0), None);
@@ -569,11 +743,11 @@ mod tests {
     fn the_menu_follows_an_ended_session() {
         let mut m = menu();
         m.feed(b"j", 0); // on work
-        m.set_sessions(vec![info("busy", true), info("work", false)]);
+        m.set_sessions(0, vec![info("busy", true), info("work", false)]);
         assert_eq!(m.cursor, 0, "still on work");
-        m.set_sessions(vec![info("busy", true)]);
+        m.set_sessions(0, vec![info("busy", true)]);
         // work went: the cursor is on what took its row, the new-session one.
-        assert_eq!(m.feed(b"\r", 0), Some(Choice::New));
+        assert_eq!(m.feed(b"\r", 0), Some(Choice::New { host: 0 }));
     }
 
     #[test]
@@ -671,10 +845,159 @@ mod tests {
         wide.command = "vim 日本語.txt".into();
         let m = Menu::new(vec![wide, info("main", false)], false);
         let b = m.render("devbox", 0, 80, 24);
-        let widest = 5 + width(crate::list::lines(m.sessions(), 0)[1].as_str());
+        let widest = 5 + width(crate::list::lines(m.sessions(0), 0)[1].as_str());
         assert_eq!(width(bar(&b)), widest, "{:?}", bar(&b));
         let clipped = m.render("devbox", 0, 20, 24);
         assert!(width(bar(&clipped)) <= 20, "{:?}", bar(&clipped));
+    }
+
+    /// acs-uxj: devbox, nas, pi and old, as `acs list` asks them.
+    fn every() -> Menu {
+        Menu::every_host(
+            ["devbox", "nas", "pi", "old"].map(String::from).to_vec(),
+            false,
+        )
+    }
+
+    /// The screen's lines after the heading, without the escapes.
+    fn shown(m: &Menu) -> Vec<String> {
+        let screen = m.render("", 0, 100, 30);
+        screen
+            .split("\r\n")
+            .map(|l| {
+                let l = l.replace("\x1b[H", "").replace("\x1b[7m", "");
+                l.split('\x1b').next().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_host_rows_arrive_as_hosts_answer_in_configuration_order() {
+        let mut m = every();
+        let lines = shown(&m);
+        assert_eq!(lines[0], "acs: detached sessions on every host");
+        assert!(lines[2].starts_with("     HOST  NAME  STATE"), "{lines:?}");
+        // Nothing yet but the exit row and a line per host being asked.
+        assert!(lines[3].starts_with(">    exit"), "{lines:?}");
+        assert_eq!(lines[5], "     asking devbox…");
+        assert_eq!(lines[8], "     asking old…");
+        // nas answers first; its session is the first row.
+        m.set_answer(1, Answer::Sessions(vec![info("work", false)]));
+        assert!(shown(&m)[3].starts_with("> 1  nas   work  detached"));
+        // devbox answers: its rows come first, in configuration order, and
+        // the cursor stays on nas's work.
+        m.set_answer(
+            0,
+            Answer::Sessions(vec![info("main", false), info("busy", true)]),
+        );
+        m.set_answer(2, Answer::Line("no sessions on pi (not installed)".into()));
+        m.set_answer(
+            3,
+            Answer::Line("old: no host for 'old' is reachable".into()),
+        );
+        let lines = shown(&m);
+        assert!(
+            lines[3].starts_with("  1  devbox  main  detached"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[4].starts_with("> 2  nas     work  detached"),
+            "{lines:?}"
+        );
+        assert!(lines[5].starts_with("     exit"), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("new session")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[7..9],
+            [
+                "     no sessions on pi (not installed)",
+                "     old: no host for 'old' is reachable",
+            ]
+        );
+        assert!(lines[10].contains("n: new there"), "{lines:?}");
+        // A host with only attached sessions says so until `.` shows them.
+        let mut m = every();
+        m.set_answer(0, Answer::Sessions(vec![info("busy", true)]));
+        m.set_answer(1, Answer::Sessions(vec![]));
+        let lines = shown(&m);
+        assert!(lines.contains(
+            &"     no detached sessions on devbox (1 attached: . shows them)".to_string()
+        ));
+        assert!(lines.contains(&"     no sessions on nas".to_string()));
+        m.feed(b".", 0);
+        let lines = shown(&m);
+        assert_eq!(lines[0], "acs: all sessions on every host");
+        // Shown now; the cursor keeps its row (exit), as `.` always does.
+        assert!(
+            lines[3].starts_with("  1  devbox  busy  attached"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn every_host_choices_name_their_host() {
+        let mut m = every();
+        m.set_answer(0, Answer::Sessions(vec![info("main", false)]));
+        m.set_answer(
+            1,
+            Answer::Sessions(vec![info("main", false), info("busy", true)]),
+        );
+        // The same name on two hosts: the number picks the row's host.
+        assert_eq!(
+            m.feed(b"2", 0),
+            Some(Choice::Attach {
+                host: 1,
+                name: "main".into(),
+                force: false
+            })
+        );
+        // n makes a new session on the cursor's host; on exit it explains.
+        let mut m = every();
+        m.set_answer(1, Answer::Sessions(vec![info("work", false)]));
+        assert_eq!(m.feed(b"n", 0), Some(Choice::New { host: 1 }));
+        m.feed(b"j", 0);
+        assert_eq!(m.feed(b"n", 0), None);
+        assert!(shown(&m)
+            .iter()
+            .any(|l| l.starts_with("n makes a new session")));
+        // x asks with the host named and ends that host's session.
+        m.feed(b"k", 0);
+        assert_eq!(m.feed(b"x", 0), None);
+        assert!(
+            shown(&m)
+                .iter()
+                .any(|l| l.starts_with("end session 'work' on nas?")),
+            "{:?}",
+            shown(&m)
+        );
+        assert_eq!(
+            m.feed(b"y", 0),
+            Some(Choice::Kill {
+                host: 1,
+                name: "work".into()
+            })
+        );
+        // Its answer comes back for that host only; the others keep theirs.
+        m.set_sessions(1, vec![]);
+        assert_eq!(m.sessions(1), &[]);
+        assert_eq!(m.host_name(1), "nas");
+        // Taking over asks with the host named.
+        let mut m = every();
+        m.set_answer(2, Answer::Sessions(vec![info("busy", true)]));
+        m.feed(b".1", 0);
+        assert!(shown(&m)
+            .iter()
+            .any(|l| l.starts_with("session 'busy' on pi is attached from alice@laptop")));
+        assert_eq!(
+            m.feed(b"y", 0),
+            Some(Choice::Attach {
+                host: 2,
+                name: "busy".into(),
+                force: true
+            })
+        );
     }
 
     #[test]

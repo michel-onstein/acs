@@ -296,7 +296,12 @@ hosts are in the global file (`lab: {identity_file: ~/.ssh/mine}`).
 
 ### Sessions on every host
 
-`acs list` without a host lists the sessions on every alias at once:
+`acs list` without a host shows the sessions on every alias at once. In a
+terminal it is the session menu above, with a HOST column: pick a session
+on any host with its number or the cursor, `x` ends one on its host, `n`
+starts a new one on the host of the row under the cursor, and each host's
+rows appear as it answers. `acs list <alias>` is that one host's menu.
+Into a pipe (`acs list | less`) it is a table:
 
 ```text
 HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND

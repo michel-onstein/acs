@@ -275,8 +275,8 @@ know anything:
 | `acs <host>` | a detached session picked from a menu; with none detached, a new one — `main` (or `$ACS_DEFAULT_SESSION`, §4.5) if that name is free, else as `--new` |
 | `acs <host> <name>` | `<name>` — attach, or create it if absent |
 | `acs <host> --new` | a new session named with the lowest free number: `1`, `2`, … (picked under the directory lock, so two `--new`s never collide) |
-| `acs list <host>` | list sessions: name, attached/detached, idle time, command |
-| `acs list` | the same for every host alias at once, with a HOST column (§7.3) |
+| `acs list <host>` | list sessions: name, attached/detached, idle time, command; in a terminal, the session menu below whatever is detached |
+| `acs list` | the same for every host alias at once, with a HOST column; in a terminal, the session menu over every host (§7.3) |
 
 So the unnamed case is covered two ways: plain `acs <host>` offers what is
 there to get back into, and `--new` gives short numeric names (as tmux
@@ -902,6 +902,48 @@ acs: lab: no host for 'lab' is reachable (tried lab.lan)
   standard library marks a child's pipes close-on-exec only after creating
   them, and a child another thread forks in between would hold one host's
   pipe open, so that host's list would not end until the other child did.
+
+**The session menu on every host.** The table is what `acs list` prints
+into a pipe. In a terminal (stdin and stdout both ttys) it is the session
+menu of §4.4 over every alias, with the table's HOST column (`pick.rs`
+`every_host`, `menu.rs` rows grouped by host):
+
+```text
+acs: detached sessions on every host
+
+     HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
+> 1  devbox  work  detached  (michel@mbp)  4m    1d   htop
+  2  nas     main  detached  (michel@mbp)  2h    3d   /bin/zsh -l
+     exit
+
+     asking pi…
+     lab: no host for 'lab' is reachable (tried lab.lan)
+
+1-9, or ↑↓ jk and Enter: attach   .: all   x: end   n: new there   Esc: leave
+```
+
+- The hosts are asked as for the table — resolved, in parallel, BatchMode,
+  the redial's answer limit — and each host's rows come in **as it
+  answers**: the threads wake the menu through a pipe, so a slow host holds
+  up only its own `asking …` line. Rows keep configuration order; the
+  cursor stays on its session as rows arrive above it (while nothing has
+  answered it rests on *exit*, and the first rows to come take it).
+- A host with no row to offer gets a line under the rows, as the table
+  prints it: no sessions, only attached ones while `.` hides them (`.`
+  shows them), not installed, unreachable or a bad reply.
+- The keys are the one-host menu's. Enter or a number attaches as
+  `acs <alias> <session>` does: the menu is left, the alias resolved again,
+  and the ordinary session call made with its key and user — the one that
+  may prompt. `.` shows attached sessions too, a takeover asking first.
+- `x` ends a session on its row's host over a short `_proxy --pick` call
+  of its own, in BatchMode (the menu holds the terminal), and refreshes
+  only that host's rows. A host that needs a password is reached for this
+  with `acs <alias>`.
+- There is no *new session* row (it would need a host); `n` makes a new
+  numbered session (as `--new`) on the host of the row under the cursor.
+- `acs list <host>` in a terminal is that host's menu of §4.4, shown even
+  with nothing detached (plain `acs <host>` then creates a session
+  instead); into a pipe it is that host's table.
 
 ### 7.4 `acs config`
 

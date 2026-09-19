@@ -73,20 +73,27 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     };
     // Before connecting: a newer release found by an earlier check.
     crate::update_check::on_client_start(&args.config);
+    // `acs list` in a terminal is the session menu; into a pipe, the table
+    // (DESIGN §7.3).
+    let menu = sys::isatty(STDIN) && sys::isatty(STDOUT);
     if every_alias {
-        return crate::list::run_all(&args);
+        return match menu {
+            true => ExitCode::from(crate::pick::every_host(&args)),
+            false => crate::list::run_all(&args),
+        };
     }
     let name = args.transport.destination.clone();
     if let Err(e) = resolve_alias(&mut args, &name) {
         eprintln!("acs: {e}");
         return ExitCode::from(code::UNREACHABLE);
     }
-    if args.list {
+    if args.list && !menu {
         return crate::list::run(&args);
     }
     // No session named: pick one on the host just resolved (DESIGN §4.4),
     // over the connection the session then uses.
-    match crate::pick::choose(&mut args) {
+    let always = args.list;
+    match crate::pick::choose(&mut args, always) {
         Ok(picked) => ExitCode::from(run(args, picked)),
         Err(c) => ExitCode::from(c),
     }

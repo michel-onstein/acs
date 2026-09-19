@@ -291,3 +291,133 @@ fn without_a_terminal_for_the_menu_it_attaches_main() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+// ---- acs list in a terminal: every host (acs-uxj) ---------------------------
+
+const TWO_HOSTS: &str = "\
+hosts:
+  devbox:
+    - host: devbox.lan
+  nas:
+    - host: nas.lan
+  old:
+    - host: old.lan
+";
+
+/// devbox and nas, reached through the fake `ssh`, with a session detached
+/// on each; old answers no ping. The client runs `acs list` in a terminal.
+struct Every {
+    devbox: Remote,
+    nas: Remote,
+    ssh: Ssh,
+    net: Net,
+}
+
+impl Every {
+    fn new() -> Every {
+        let devbox = Remote::installed();
+        let nas = Remote::installed();
+        detached(&devbox, "main");
+        detached(&nas, "work");
+        let ssh = Ssh::new(&[("devbox.lan", &devbox), ("nas.lan", &nas)]);
+        let net = Net::new(&["devbox.lan", "nas.lan"]);
+        Every {
+            devbox,
+            nas,
+            ssh,
+            net,
+        }
+    }
+
+    fn list(&self) -> Client {
+        let env = self.net.env(TWO_HOSTS);
+        let path = self.ssh.path().display().to_string();
+        let mut c = Client::spawn(&exe(), &["list", "--ssh", &path], &refs(&env));
+        c.wait_for("\x1b[?1049h", T);
+        c.wait_for("acs: detached sessions on every host", T);
+        c.wait_for("nas     work", T);
+        c.wait_for("devbox  main", T);
+        c
+    }
+}
+
+#[test]
+fn acs_list_in_a_terminal_picks_a_session_on_any_host() {
+    let e = Every::new();
+    let mut c = e.list();
+    // Configuration order; the host no ping reached gets a line of its own.
+    c.wait_for("old: no host for 'old' is reachable (tried old.lan)", T);
+    let screen = last_screen(&c);
+    assert!(
+        screen.find("devbox  main") < screen.find("nas     work"),
+        "{screen:?}"
+    );
+    assert!(!screen.contains("new session"), "{screen:?}");
+    // nas's work is the second row: attach it there.
+    c.send(b"2");
+    attached_to(&mut c, "work");
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+    c.wait_for("detached from nas/work", T);
+    // Listed in BatchMode, then attached with the ordinary session call.
+    let calls = e.ssh.calls();
+    assert!(
+        calls.iter().filter(|c| c.contains("BatchMode=yes")).count() >= 2,
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("nas.lan") && c.contains("--session work")),
+        "{calls:?}"
+    );
+    assert!(e.devbox.session_exists("main"));
+}
+
+#[test]
+fn acs_list_in_a_terminal_ends_and_creates_on_the_rows_host() {
+    let e = Every::new();
+    let mut c = e.list();
+    // x on devbox's main ends it there, over a call of its own; nas keeps
+    // its row. The cursor follows whichever host answered first, so it is
+    // taken to the top (devbox's row) first.
+    c.send(b"kk");
+    c.wait_for("\x1b[7m> 1  devbox", T);
+    c.send(b"x");
+    c.wait_for("end session 'main' on devbox?", T);
+    c.send(b"y");
+    c.wait_for("session 'main' ended", T);
+    assert!(!e.devbox.session_exists("main"));
+    assert!(e.nas.session_exists("work"));
+    let screen = last_screen(&c);
+    assert!(screen.contains("no sessions on devbox"), "{screen:?}");
+    assert!(screen.contains("\x1b[7m> 1  nas"), "{screen:?}");
+    // n on nas's row: a new numbered session there.
+    c.send(b"n");
+    c.wait_for("\x1b[?1049l", T);
+    c.wait_for("new session '1' on nas", T);
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+    assert!(e.nas.session_exists("1"));
+}
+
+#[test]
+fn acs_list_of_one_host_in_a_terminal_is_its_menu_even_with_nothing_detached() {
+    let remote = Remote::installed();
+    let t = remote.transport();
+    let mut c = Client::spawn(&exe(), &["list", "--transport-cmd", &t, "devbox"], &[]);
+    c.wait_for("\x1b[?1049h", T);
+    c.wait_for("acs: detached sessions on devbox", T);
+    c.wait_for("n  new session", T);
+    c.send(b"\x1b");
+    assert_eq!(c.wait(T), 0);
+    // Into a pipe it is the table, as ever.
+    let out = acs_cmd()
+        .args(["list", "--transport-cmd", &t, "devbox"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "no sessions on devbox\n"
+    );
+}

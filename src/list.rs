@@ -58,9 +58,7 @@ pub fn run(args: &ClientArgs) -> ExitCode {
 pub fn run_all(args: &ClientArgs) -> ExitCode {
     let aliases: Vec<&str> = args.config.hosts.iter().map(|a| a.name.as_str()).collect();
     if aliases.is_empty() {
-        eprintln!(
-            "acs: no host aliases in the configuration: list one host with acs list <host>, or add an alias with acs config host add <alias> <host>"
-        );
+        eprintln!("acs: {NO_ALIASES}");
         return ExitCode::from(code::USAGE);
     }
     // Nobody can type a password into several ssh at once (Call::Batch), so
@@ -101,8 +99,11 @@ pub fn run_all(args: &ClientArgs) -> ExitCode {
     }
 }
 
-/// Resolve `alias` and ask the host it stands for now.
-fn ask(
+/// Why `acs list` without a host has nothing to ask.
+pub(crate) const NO_ALIASES: &str = "no host aliases in the configuration: list one host with acs list <host>, or add an alias with acs config host add <alias> <host>";
+
+/// Resolve `alias` and ask the host it stands for now, in BatchMode.
+pub(crate) fn ask(
     base: &ClientArgs,
     alias: &str,
     timeout: Duration,
@@ -112,7 +113,7 @@ fn ask(
     query(&args, Call::Batch, timeout)
 }
 
-fn not_installed(host: &str) -> String {
+pub(crate) fn not_installed(host: &str) -> String {
     format!(
         "no sessions on {host} (acs {} is not installed there)",
         crate::VERSION
@@ -257,6 +258,31 @@ fn table_lines(head: &[&str], rows: &[Vec<String>]) -> Vec<String> {
 pub(crate) fn lines(sessions: &[StatusInfo], now: u64) -> Vec<String> {
     let rows: Vec<Vec<String>> = sessions.iter().map(|s| cells(s, now)).collect();
     table_lines(&HEAD, &rows)
+        .into_iter()
+        .map(|mut l| {
+            l.pop();
+            l
+        })
+        .collect()
+}
+
+/// The `acs list` table of every host's sessions under a HOST column, as
+/// lines without their `\n`: the heading, then each host's sessions in
+/// order (the session menu on every host, DESIGN §7.3).
+pub(crate) fn host_lines(hosts: &[(&str, &[StatusInfo])], now: u64) -> Vec<String> {
+    let rows: Vec<Vec<String>> = hosts
+        .iter()
+        .flat_map(|(host, sessions)| {
+            sessions.iter().map(move |s| {
+                let mut row = vec![host.to_string()];
+                row.extend(cells(s, now));
+                row
+            })
+        })
+        .collect();
+    let mut head = vec!["HOST"];
+    head.extend(HEAD);
+    table_lines(&head, &rows)
         .into_iter()
         .map(|mut l| {
             l.pop();
