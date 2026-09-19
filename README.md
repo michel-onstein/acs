@@ -146,6 +146,23 @@ disconnected a status line shows at the bottom of the screen, typed keys are
 dropped, and Ctrl-] Ctrl-] `d` still detaches. `--no-reconnect` exits
 instead.
 
+### Ctrl-L after reconnecting
+
+Whenever acs attaches to a session that was already running — resuming
+after a drop, `acs host session` again after a detach, or taking a session
+over — it sends the program one **Ctrl-L** first, so a shell or full-screen
+program repaints the screen. A session acs has just created gets none. The
+Ctrl-L comes after any keys the drop left unsent and before anything you
+type next, reaches the program once per reconnect, and is never sent into
+the middle of a paste.
+
+Ctrl-L is a key, not a terminal command: a shell clears the screen, `vim`,
+`less` and `htop` redraw, but a program reading raw input receives a form
+feed, and `vim` in Insert mode inserts one. Turn it off with
+`redraw_on_reconnect: false` in the configuration, for everything or for one
+host alias (below), or with `ACS_REDRAW_ON_RECONNECT=0`. The screen is still
+cleared and the program still asked to redraw on a re-attach, as before.
+
 ### Several people, one account
 
 Each client has an identity (`user@hostname`, or `ACS_IDENTITY`). Attaching
@@ -170,6 +187,7 @@ merge key by key and lists add up, global entries first.
 install_on_remote: false   # never install acs on a host (default: true)
 update_check: false        # never look for a newer release (default: true)
 command_bell: false        # no bell when Ctrl-] Ctrl-] arms (default: true)
+redraw_on_reconnect: true  # Ctrl-L after reconnecting (default: true)
 hosts:
   devbox:                  # acs devbox
     - host: devbox.lan     # at home: used if it answers a ping
@@ -178,8 +196,9 @@ hosts:
   nas:
     - host: nas.lan
       reachability_check: false   # it drops pings: use it unchecked
-  lab:                     # an alias with a setting of its own
+  lab:                     # an alias with settings of its own
     identity_file: ~/.ssh/id_lab  # the key for every host below…
+    redraw_on_reconnect: false    # no Ctrl-L after reconnecting to lab
     hosts:
       - host: lab.lan
       - host: lab.example.com
@@ -191,7 +210,8 @@ hosts:
 | `install_on_remote` | install acs on a host that lacks it (default `true`); when `false`, acs says what is missing and exits with 254 |
 | `update_check` | look for a newer acs release once a week (default `true`) |
 | `command_bell` | ring the terminal bell when Ctrl-] Ctrl-] arms command mode (default `true`; `ACS_COMMAND_BELL` overrides it) |
-| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file` and `reachability_check` (default `true`) — or to a mapping of the alias's own `identity_file` and its `hosts` |
+| `redraw_on_reconnect` | send Ctrl-L after reconnecting to a session (default `true`); an alias's own value wins, and `ACS_REDRAW_ON_RECONNECT` over both |
+| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file` and `reachability_check` (default `true`) — or to a mapping of the alias's own `identity_file` and `redraw_on_reconnect` and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -260,11 +280,13 @@ acs config host add nas nas.lan --no-reachability-check
 acs config host add lab lab.lan --identity-file ~/.ssh/id_lab_home
 acs config host set lab identity_file ~/.ssh/id_lab   # the alias's key
 acs config host unset lab identity_file
+acs config host set lab redraw_on_reconnect false     # no Ctrl-L for lab
 acs config host list                                  # aliases, hosts and keys
 acs config host remove devbox devbox.lan              # one host, or the alias
 acs config set install_on_remote false
 acs config set update_check false                     # no weekly release check
 acs config set command_bell false                     # no bell for command mode
+acs config set redraw_on_reconnect false              # no Ctrl-L on reconnect
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default
 acs config show                                       # everything, and where it is from
@@ -285,6 +307,7 @@ reached as `user@config`.
 | `ACS_ESCAPE_KEY` | command key in `^X` notation (default `^]`) |
 | `ACS_ESCAPE_TIMEOUT_MS` | window for the double press (default 400) |
 | `ACS_COMMAND_BELL` | `0`: no bell when command mode arms; `1`: a bell even if the configuration turns it off |
+| `ACS_REDRAW_ON_RECONNECT` | `0`: no Ctrl-L after reconnecting; `1`: a Ctrl-L even if the configuration (global or the alias's) turns it off |
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |

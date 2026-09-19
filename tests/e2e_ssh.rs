@@ -381,3 +381,34 @@ fn e2e_11_identity_file_from_the_configuration() {
     }
     eprintln!("VERIFIED identity_file (per host over the alias's, and per alias) over ssh");
 }
+
+#[test]
+fn e2e_12_ctrl_l_after_a_reattach_and_a_resume() {
+    let Some(h) = host() else { return };
+    // Every byte the program receives, as `in:xx`.
+    let reporter = "stty raw -echo; echo ready; \
+        while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1); printf 'in:%s\\n' $b; done";
+    let mut c = h.client("redraw", reporter, &[]);
+    c.wait_for("ready", T);
+    c.send(b"z");
+    c.wait_for("in:7a", T);
+    assert!(!c.text().contains("in:0c"), "sent to a new session");
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+    let mut c = h.client("redraw", "", &[("ACS_BACKOFF_MS", "300")]);
+    c.wait_for("in:0c", T);
+    h.docker(&[
+        "exec",
+        &h.container,
+        "sh",
+        "-c",
+        "pkill -f '[s]shd-session: dev@' || pkill -f '[s]shd: dev@'",
+    ]);
+    c.wait_for("in:0c", Duration::from_secs(30));
+    c.send(b"z");
+    c.wait_for("in:7a", T);
+    assert_eq!(c.text().matches("in:0c").count(), 2, "{}", c.text());
+    c.send(&command(b'x'));
+    c.wait(T);
+    eprintln!("VERIFIED Ctrl-L once after a re-attach and once after a resume over ssh");
+}

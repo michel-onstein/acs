@@ -5,7 +5,7 @@
 //! presses it consumes, recognising the escape key in all three encodings a
 //! terminal may use (legacy byte, kitty `CSI … u`, xterm modifyOtherKeys),
 //! never matching inside another escape sequence, and passing bracketed pastes
-//! through untouched.
+//! through untouched. [`PasteTracker`] follows the pastes in what was sent.
 
 /// What a completed command asks the client to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +66,7 @@ pub struct Output {
 /// How long an incomplete escape sequence is held before being sent as is.
 const PENDING_MS: u64 = 100;
 const MAX_SEQ: usize = 64;
+const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,9 +474,68 @@ fn parse_params(body: &[u8]) -> Vec<Vec<u32>> {
         .collect()
 }
 
+/// Whether the input sent to the program so far ends inside a bracketed
+/// paste (`CSI 200 ~` without its `CSI 201 ~` yet), so that a byte the client
+/// adds of its own — the Ctrl-L after a reconnect (DESIGN §5.2) — never lands
+/// in the middle of pasted text. Markers split across writes are found.
+#[derive(Debug, Default)]
+pub struct PasteTracker {
+    open: bool,
+    /// The last bytes seen, which may be the start of a marker.
+    tail: Vec<u8>,
+}
+
+impl PasteTracker {
+    /// Bytes just sent to the program.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.extend_from_slice(bytes);
+        for (i, _) in buf.iter().enumerate().filter(|(_, b)| **b == 0x1b) {
+            if buf[i..].starts_with(PASTE_START) {
+                self.open = true;
+            } else if buf[i..].starts_with(PASTE_END) {
+                self.open = false;
+            }
+        }
+        // Shorter than a marker, so a whole one is never counted twice.
+        let keep = buf.len().min(PASTE_END.len() - 1);
+        self.tail = buf.split_off(buf.len() - keep);
+    }
+
+    pub fn open(&self) -> bool {
+        self.open
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_paste_tracker_follows_markers_split_anywhere() {
+        let input: &[u8] = b"ls\x1b[200~pasted\x1b[201~\x1b[200~more";
+        let open_after = |sent: &[u8]| {
+            let mut p = PasteTracker::default();
+            p.feed(sent);
+            p.open()
+        };
+        assert!(!open_after(b"ls\x0c\x1b[A"));
+        assert!(open_after(input));
+        assert!(!open_after(&input[..input.len() - 10]), "closed again");
+        assert!(!open_after(b"\x1b[200"), "half a marker opens nothing");
+        for split in 0..=input.len() {
+            let mut p = PasteTracker::default();
+            p.feed(&input[..split]);
+            p.feed(&input[split..]);
+            assert!(p.open(), "split at {split}");
+        }
+        // One byte at a time, and the end marker after it.
+        let mut p = PasteTracker::default();
+        for b in input.iter().chain(b"\x1b[201~") {
+            p.feed(std::slice::from_ref(b));
+        }
+        assert!(!p.open());
+    }
 
     const CB: u8 = 0x1d;
 

@@ -22,6 +22,9 @@ use crate::tty::{self, RawMode};
 const STDIN: RawFd = 0;
 const STDOUT: RawFd = 1;
 
+/// Form feed: shells and most full-screen programs repaint on it.
+const CTRL_L: u8 = 0x0c;
+
 /// Exit codes besides the session's own (DESIGN §7).
 pub mod code {
     pub const DETACHED: u8 = 0;
@@ -145,15 +148,26 @@ pub(crate) fn escape_config() -> keys::Config {
 
 /// Whether arming command mode rings the bell (DESIGN §6.1).
 pub(crate) fn command_bell(config: &crate::config::Config) -> bool {
-    bell_setting(
+    env_switch(
         std::env::var("ACS_COMMAND_BELL").ok().as_deref(),
         config.command_bell.value,
     )
 }
 
-/// `ACS_COMMAND_BELL` over the configuration: `0` is off, anything else
+/// Whether a reconnect sends Ctrl-L (DESIGN §5.2): `ACS_REDRAW_ON_RECONNECT`,
+/// then the alias's `redraw_on_reconnect`, then the global one.
+pub(crate) fn redraw_on_reconnect(args: &ClientArgs) -> bool {
+    env_switch(
+        std::env::var("ACS_REDRAW_ON_RECONNECT").ok().as_deref(),
+        args.config
+            .redraw_on_reconnect_for(args.alias.as_deref())
+            .value,
+    )
+}
+
+/// An `ACS_*` switch over the configuration: `0` is off, anything else
 /// non-empty on.
-fn bell_setting(env: Option<&str>, config: bool) -> bool {
+fn env_switch(env: Option<&str>, config: bool) -> bool {
     match env {
         Some(v) if !v.is_empty() => v != "0",
         _ => config,
@@ -296,6 +310,10 @@ pub struct State {
     pub command_bell: bool,
     /// A bell waits for the output to reach a boundary.
     pub bell_pending: bool,
+    /// Send Ctrl-L after reconnecting to a session (DESIGN §5.2).
+    pub redraw_on_reconnect: bool,
+    /// Whether the input sent so far is inside a bracketed paste.
+    pub paste: keys::PasteTracker,
 }
 
 /// How serving a link ended.
@@ -400,6 +418,8 @@ pub fn run(args: ClientArgs) -> u8 {
         status_shown: false,
         command_bell: command_bell(&args.config),
         bell_pending: false,
+        redraw_on_reconnect: redraw_on_reconnect(&args),
+        paste: keys::PasteTracker::default(),
     };
     let mut raw: Option<RawMode> = None;
     let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals);
@@ -527,8 +547,10 @@ fn write_output(state: &mut State, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Send INPUT for bytes the user typed.
+/// Send INPUT for bytes for the program: what the user typed, or the
+/// Ctrl-L after a reconnect.
 fn queue_input(state: &mut State, out: &mut Vec<u8>, bytes: &[u8]) {
+    state.paste.feed(bytes);
     for chunk in bytes.chunks(proto::MAX_CHUNK) {
         let seq = state.unacked.push(chunk);
         Msg::Input {
@@ -598,6 +620,10 @@ fn serve(
                     state.session = Some(w.session.clone());
                     state.instance = Some(w.instance);
                     state.unacked.rebase(w.input_seq, same);
+                    if !same {
+                        // Another program's input: no paste of ours is open.
+                        state.paste = keys::PasteTracker::default();
+                    }
                     if raw.is_none() {
                         match RawMode::enter(STDIN) {
                             Ok(r) => *raw = Some(r),
@@ -632,6 +658,15 @@ fn serve(
                             }
                             .encode(&mut out);
                         }
+                    }
+                    // Then Ctrl-L, so the program repaints (DESIGN §5.2):
+                    // after what was typed before the drop, before anything
+                    // typed now, and as input, so a later resume resends it
+                    // like any key and the master writes it once. Not for a
+                    // program just started, which has nothing to repaint,
+                    // nor into a paste the program has not seen the end of.
+                    if !w.created && state.redraw_on_reconnect && !state.paste.open() {
+                        queue_input(state, &mut out, &[CTRL_L]);
                     }
                     crate::reconnect::on_welcome(state, w.kind, &mut out);
                 }
@@ -831,11 +866,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_environment_decides_the_bell_over_the_configuration() {
-        assert!(bell_setting(None, true));
-        assert!(!bell_setting(None, false));
-        assert!(bell_setting(Some(""), true), "empty is unset");
-        assert!(!bell_setting(Some("0"), true));
-        assert!(bell_setting(Some("1"), false));
+    fn the_environment_decides_a_switch_over_the_configuration() {
+        assert!(env_switch(None, true));
+        assert!(!env_switch(None, false));
+        assert!(env_switch(Some(""), true), "empty is unset");
+        assert!(!env_switch(Some("0"), true));
+        assert!(env_switch(Some("1"), false));
     }
 }
