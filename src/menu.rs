@@ -270,11 +270,24 @@ impl Menu {
     /// The whole screen, for a terminal `cols` wide and `height` high: a
     /// title; the sessions as `--list` shows them, the first nine numbered;
     /// the new-session and exit rows; the keys; the note. The cursor's row
-    /// is marked and reversed; the rows scroll to keep it in view, and no
-    /// line is longer than the width, so nothing wraps.
+    /// is marked and reversed, in a bar as wide as the widest row of the
+    /// list, so it keeps its width as it moves; the rows scroll to keep it
+    /// in view, and no line is wider than the terminal, so nothing wraps.
     pub fn render(&self, host: &str, now: u64, cols: usize, height: usize) -> String {
         let table = crate::list::lines(&self.sessions, now);
         let rows = self.rows();
+        let label = |row: Row| match row {
+            Row::Session(i) => table[i + 1].as_str(),
+            Row::New => "new session",
+            Row::Exit => "exit",
+        };
+        // Every row is `{mark} {key}  {label}`.
+        let bar = rows
+            .iter()
+            .map(|&r| 5 + width(label(r)))
+            .max()
+            .unwrap_or(0)
+            .min(cols);
         let fit = height.saturating_sub(6).max(1);
         let first = (self.cursor + 1).saturating_sub(fit);
         let mut lines: Vec<(String, bool)> = vec![
@@ -289,15 +302,14 @@ impl Menu {
             (format!("     {}", table[0]), false),
         ];
         for (n, &row) in rows.iter().enumerate().skip(first).take(fit) {
-            let (key, text) = match row {
-                Row::Session(i) if n < 9 => ((b'1' + n as u8) as char, table[i + 1].as_str()),
-                Row::Session(i) => (' ', table[i + 1].as_str()),
-                Row::New => ('n', "new session"),
-                Row::Exit => (' ', "exit"),
+            let key = match row {
+                Row::Session(_) if n < 9 => (b'1' + n as u8) as char,
+                Row::New => 'n',
+                Row::Session(_) | Row::Exit => ' ',
             };
             let here = n == self.cursor;
             let mark = if here { '>' } else { ' ' };
-            lines.push((format!("{mark} {key}  {text}"), here));
+            lines.push((format!("{mark} {key}  {}", label(row)), here));
         }
         lines.push((String::new(), false));
         lines.push((
@@ -313,16 +325,67 @@ impl Menu {
             if i > 0 {
                 out.push_str("\r\n");
             }
-            let text: String = text.chars().take(cols).collect();
+            let text = clip(text, cols);
             if *here {
-                out.push_str(&format!("\x1b[7m{text}\x1b[0m"));
+                let pad = bar.saturating_sub(width(text));
+                out.push_str(&format!("\x1b[7m{text}{:pad$}\x1b[0m", ""));
             } else {
-                out.push_str(&text);
+                out.push_str(text);
             }
             out.push_str("\x1b[K");
         }
         out.push_str("\x1b[J");
         out
+    }
+}
+
+/// How many terminal columns `s` takes: see [`char_width`].
+fn width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// The longest start of `s` that fits in `cols` columns.
+fn clip(s: &str, cols: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        used += char_width(c);
+        if used > cols {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+/// Columns a character takes in a terminal, as `wcwidth` has it for the
+/// common cases: none for combining marks, zero-width characters and
+/// variation selectors; two for East Asian wide and fullwidth characters
+/// and emoji; one otherwise. A session's command (from `--list`) may hold
+/// any of them.
+fn char_width(c: char) -> usize {
+    match c as u32 {
+        0x0300..=0x036F
+        | 0x1AB0..=0x1AFF
+        | 0x1DC0..=0x1DFF
+        | 0x200B..=0x200F
+        | 0x20D0..=0x20FF
+        | 0xFE00..=0xFE0F
+        | 0xFE20..=0xFE2F => 0,
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x2FFFD
+        | 0x30000..=0x3FFFD => 2,
+        _ => 1,
     }
 }
 
@@ -553,6 +616,65 @@ mod tests {
             let text = text.split('\x1b').next().unwrap();
             assert!(text.chars().count() <= 12, "{l:?}");
         }
+    }
+
+    /// The reversed bar on a screen: the cursor's row, padding included.
+    fn bar(screen: &str) -> &str {
+        let start = screen.find("\x1b[7m").expect("no bar") + 4;
+        let len = screen[start..].find("\x1b[0m").expect("an open bar");
+        &screen[start..start + len]
+    }
+
+    /// acs-km8: the bar keeps one width as the cursor moves — the widest
+    /// row's, or the terminal's if that is narrower.
+    #[test]
+    fn the_bar_is_as_wide_as_the_widest_row_on_every_row() {
+        let mut long = info("work", false);
+        long.command = "htop --delay 10 --sort-key PERCENT_CPU".into();
+        let mut m = Menu::new(vec![info("main", false), long], false);
+        // main, work, new session, exit.
+        let mut bars = Vec::new();
+        let mut narrow = Vec::new();
+        for _ in 0..4 {
+            bars.push(bar(&m.render("devbox", 0, 120, 24)).to_string());
+            narrow.push(bar(&m.render("devbox", 0, 30, 24)).to_string());
+            m.feed(b"j", 0);
+        }
+        let widest = width(&bars[1]);
+        assert!(bars[1].ends_with("PERCENT_CPU"), "{:?}", bars[1]);
+        assert!(bars[1].starts_with("> 2  work"), "{:?}", bars[1]);
+        for b in &bars {
+            assert_eq!(width(b), widest, "{bars:?}");
+        }
+        // The short rows are padded with spaces to it.
+        assert!(bars[3].starts_with(">    exit   "), "{:?}", bars[3]);
+        assert_eq!(bars[3].trim_end(), ">    exit");
+        assert!(bars[0].starts_with("> 1  main"), "{:?}", bars[0]);
+        // Narrower than the widest row: the terminal's width, and no wrap.
+        for b in &narrow {
+            assert_eq!(width(b), 30, "{narrow:?}");
+        }
+    }
+
+    #[test]
+    fn widths_count_terminal_columns() {
+        assert_eq!(width("exit"), 4);
+        assert_eq!(width("日本"), 4);
+        assert_eq!(width("e\u{301}"), 1);
+        assert_eq!(width("🦀x"), 3);
+        assert_eq!(clip("日本語", 5), "日本");
+        assert_eq!(clip("日本語", 6), "日本語");
+        assert_eq!(clip("abc", 5), "abc");
+        assert_eq!(clip("abc", 0), "");
+        // A wide command is clipped and padded in columns, not characters.
+        let mut wide = info("jp", false);
+        wide.command = "vim 日本語.txt".into();
+        let m = Menu::new(vec![wide, info("main", false)], false);
+        let b = m.render("devbox", 0, 80, 24);
+        let widest = 5 + width(crate::list::lines(m.sessions(), 0)[1].as_str());
+        assert_eq!(width(bar(&b)), widest, "{:?}", bar(&b));
+        let clipped = m.render("devbox", 0, 20, 24);
+        assert!(width(bar(&clipped)) <= 20, "{:?}", bar(&clipped));
     }
 
     #[test]

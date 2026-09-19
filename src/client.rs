@@ -78,11 +78,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
     if args.list {
         return crate::list::run(&args);
     }
-    // No session named: pick one on the host just resolved (DESIGN §4.4).
-    if let Err(c) = crate::pick::choose(&mut args) {
-        return ExitCode::from(c);
+    // No session named: pick one on the host just resolved (DESIGN §4.4),
+    // over the connection the session then uses.
+    match crate::pick::choose(&mut args) {
+        Ok(picked) => ExitCode::from(run(args, picked)),
+        Err(c) => ExitCode::from(c),
     }
-    ExitCode::from(run(args))
+}
+
+/// A session connection already open and past its marker: the pick's
+/// (DESIGN §4.4), which the attach goes on over. `rest` is what arrived
+/// after the pick's last frame.
+pub struct Picked {
+    pub link: Link,
+    pub rest: Vec<u8>,
 }
 
 /// If `name` is an alias, or `user@<alias>`, point the transport at the host
@@ -395,7 +404,8 @@ fn hello(args: &ClientArgs, state: &State, force: bool) -> Hello {
 // ---- running ---------------------------------------------------------------
 
 /// Run the session until it ends or the user leaves; returns the exit code.
-pub fn run(args: ClientArgs) -> u8 {
+/// `picked` is the first connection when the session menu opened it.
+pub fn run(args: ClientArgs, picked: Option<Picked>) -> u8 {
     if !sys::isatty(STDIN) {
         eprintln!("acs: stdin is not a terminal");
         return code::USAGE;
@@ -431,7 +441,7 @@ pub fn run(args: ClientArgs) -> u8 {
         paste: keys::PasteTracker::default(),
     };
     let mut raw: Option<RawMode> = None;
-    let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals);
+    let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals, picked);
     leave(&mut state, &mut raw);
     result
 }
@@ -448,14 +458,20 @@ pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
 }
 
 /// Connect once: dial, handshake, and serve until the link ends.
-/// `resuming` is true for a redial after a lost link.
+/// `resuming` is true for a redial after a lost link. `picked`, a
+/// connection the session menu opened, is used instead of dialing.
 pub fn connect_and_serve(
     args: &ClientArgs,
     state: &mut State,
     raw: &mut Option<RawMode>,
     signals: &OwnedFd,
     resuming: bool,
+    picked: Option<Picked>,
 ) -> Outcome {
+    let timeout = answer_timeout(resuming);
+    if let Some(p) = picked {
+        return serve(args, state, raw, signals, p.link, p.rest, timeout);
+    }
     let pargs = proxy_args(args, state, resuming);
     let pargs: Vec<&str> = pargs.iter().map(String::as_str).collect();
     let remote = ssh::remote_acs(crate::VERSION, &pargs);
@@ -463,7 +479,6 @@ pub fn connect_and_serve(
     if let Some(r) = raw.as_mut() {
         let _ = r.suspend();
     }
-    let timeout = answer_timeout(resuming);
     let (link, marker) = match dial(args, Call::Session, &remote, timeout) {
         Ok(x) => x,
         Err(e) => {
@@ -493,7 +508,7 @@ pub fn connect_and_serve(
                 return Outcome::Exit(code::INSTALL_FAILED);
             }
             return match crate::install::install(args, &os, &arch) {
-                Ok(()) => connect_and_serve(args, state, raw, signals, resuming),
+                Ok(()) => connect_and_serve(args, state, raw, signals, resuming, None),
                 Err(e) => {
                     note(&e);
                     Outcome::Exit(code::INSTALL_FAILED)
