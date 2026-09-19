@@ -1199,7 +1199,10 @@ would not be recognised.
   a link into `~/.local/share/acs/` to an **older or pruned** version. A file
   or link the user put there is left alone, and an older client never moves
   the link back from a newer version. Nothing in the protocol depends on
-  that link.
+  that link, so failing to make it (`HOME` unset in the ssh environment,
+  `~/.local/bin` a regular file or unwritable) is a warning printed after
+  the finisher's `ok`, not a failed install: the binary under
+  `~/.local/share/acs/<version>/` is complete and every connection works.
 - `acs _proxy` touches its version directory on start; versions untouched for
   30 days whose sessions have all ended are removed by the next proxy start —
   only under the user's own `~/.local/share/acs`, never in the system-wide

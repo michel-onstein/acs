@@ -278,7 +278,15 @@ fn finish(f: &Finish) -> Result<(), String> {
         }
         rename(&me, &final_path)?;
     }
-    link_bin(&final_path, &f.token)?;
+    if let Err(e) = link_bin(&final_path, &f.token) {
+        // The link is a convenience: nothing in the protocol depends on it
+        // (DESIGN §8), and the client finds the binary through the prelude.
+        // So it is a warning after the ok, not a failed install (acs-iry).
+        eprintln!(
+            "acs: warning: cannot link ~/.local/bin/acs: {e} (acs is installed at {})",
+            final_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -322,7 +330,10 @@ fn link_bin(target: &Path, token: &str) -> Result<(), String> {
 /// user put there is left alone, and a newer version keeps the link.
 fn should_link(link: &Path, target: &Path, share: &Path) -> bool {
     let meta = match std::fs::symlink_metadata(link) {
-        Err(e) => return e.kind() == io::ErrorKind::NotFound,
+        // Nothing there: link. Anything else wrong with the path (~/.local
+        // /bin is a regular file): try, so the failure is said out loud
+        // rather than passed over (acs-iry).
+        Err(_) => return true,
         Ok(m) => m,
     };
     if !meta.file_type().is_symlink() {
