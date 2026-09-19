@@ -230,7 +230,10 @@ found the same way.
 
 `acs _proxy <session> [--create] [--proto N]` — connect (or start and connect)
 the master, then splice bytes both ways until either side closes. It does not
-parse frames beyond checking the protocol version in the HELLO. `acs _proxy
+parse frames beyond checking the protocol version in the HELLO. Whatever
+arrived after that HELLO goes to the master ahead of the splice — complete
+frames re-encoded, and the bytes of a frame that had only half arrived as
+they are, so the master's decoder never sees a frame without its head. `acs _proxy
 --list` enumerates `<dir>/*.sock`, sends each master `STATUS`, and prints name,
 attached/detached, the client identity attached (or last attached), created-at,
 idle time, child command, and size. Sockets that
