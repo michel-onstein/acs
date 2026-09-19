@@ -12,6 +12,12 @@ const CMD: &[&str] = &[
     "echo up; while read l; do echo got:$l; done",
 ];
 
+/// What the program prints for a line typed after taking over: a takeover
+/// is a re-attach, so the client's Ctrl-L comes first (DESIGN §5.2).
+fn got(line: &str) -> String {
+    format!("got:\x0c{line}")
+}
+
 fn client(remote: &Remote, identity: &str, extra: &[&str]) -> Client {
     let mut args = vec!["devbox", "main"];
     args.extend_from_slice(extra);
@@ -32,7 +38,7 @@ fn same_identity_takes_over_silently() {
     );
     assert!(a.echo_on());
     b.send(b"x\r");
-    b.wait_for("got:x", T);
+    b.wait_for(&got("x"), T);
     assert!(!b.text().contains("take over?"));
 }
 
@@ -64,7 +70,7 @@ fn other_identity_can_accept() {
     b.send(b"y\r");
     assert_eq!(a.wait(T), 3);
     b.send(b"mine\r");
-    b.wait_for("got:mine", T);
+    b.wait_for(&got("mine"), T);
 }
 
 #[test]
@@ -75,7 +81,7 @@ fn force_skips_the_question() {
     let mut b = client(&remote, "bob@desk", &["--force"]);
     assert_eq!(a.wait(T), 3);
     b.send(b"f\r");
-    b.wait_for("got:f", T);
+    b.wait_for(&got("f"), T);
     assert!(!b.text().contains("take over?"));
 }
 

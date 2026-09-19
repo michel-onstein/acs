@@ -106,7 +106,8 @@ fn input_sent_around_a_drop_arrives_exactly_once() {
     remote.cut_link();
     remote.wait_connections(2, T);
     c.send(b"after\r");
-    c.wait_for("got:after", T);
+    // The resume's Ctrl-L comes first (DESIGN §5.2).
+    c.wait_for("got:\x0cafter", T);
     let text = c.text();
     assert_eq!(text.matches("got:hello").count(), 1, "{text}");
 }

@@ -497,7 +497,9 @@ impl Client {
         loop {
             {
                 let out = self.output.lock().unwrap();
-                let start = self.searched.saturating_sub(n.len());
+                // From the end of the last match: backing up would find
+                // that match again.
+                let start = self.searched;
                 if let Some(p) = out[start..].windows(n.len()).position(|w| w == n) {
                     self.searched = start + p + n.len();
                     return;

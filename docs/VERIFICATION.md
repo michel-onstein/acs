@@ -34,6 +34,7 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 | `--list` | over ssh after the sessions above | Pass — sessions listed |
 | `--list` on every alias | no host; aliases `box` (the container) and `gone` (192.0.2.1, answers no ping); ssh in `BatchMode` | Pass — `box` sessions under a HOST column, one stderr line for `gone`, exit 255 |
 | `user@<alias>` | `acs dev@box` where alias `box`'s only entry says `user: nobody` | Pass — logs in as `dev` (2026-09-18) |
+| Ctrl-L after reconnecting | a program reporting each byte it receives: a new session, then a re-attach, then the `sshd-session` killed | Pass — nothing to the new session, one `0c` after the re-attach and one after the resume (2026-09-18) |
 | `identity_file` | no `-i`; the key only at `~/.ssh/id_box` under a HOME of the test's own, named by a host entry over a missing alias key, then by an alias | Pass — both log in; acs expands the `~` (2026-09-18) |
 | Session menu | plain `acs dev@127.0.0.1` with sessions `menu-a` and `menu-b` detached: cursor to `menu-b`, `x`, `y`, then `menu-a`'s number | Pass — `menu-b` ended and gone from the menu, `menu-a` attached (2026-09-18) |
 | Full test suite on Linux | `scripts/test_linux.sh` | Pass — found and fixed two Linux-only bugs first (a master stall under backpressure; a replaced binary breaking master start) |
@@ -59,6 +60,9 @@ claimed as verified:
 - **The command-mode bell** in a real terminal (heard, or flashed, as the
   terminal is set up). Tests show the BEL byte arrives, and never inside an
   OSC the program is sending.
+- **The Ctrl-L repaint** after a re-attach and a resume, in zsh, bash, vim,
+  less and htop at a real terminal. Tests show the byte arrives once per
+  reconnect and in order; how each program repaints has not been looked at.
 - **htop and less** interactively. Covered only indirectly (vim, raw mouse and
   key paths).
 - **A real Wi-Fi switch and laptop sleep/wake.** Simulated by killing and

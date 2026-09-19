@@ -438,6 +438,7 @@ sequenceDiagram
         Note over C: "session was restarted", then as a fresh attach
     end
     C->>M: INPUT(seq, unacked bytes typed before the drop)
+    C->>M: INPUT(seq', Ctrl-L) unless turned off
 ```
 
 - **Output**: the client records the offset of the last byte it wrote to its
@@ -453,6 +454,35 @@ sequenceDiagram
   machine) does **not** replay the ring: the local terminal's state is unknown,
   and replaying mode-changing sequences into it is unsafe. It behaves like
   dtach: clear screen, set size, force redraw.
+- **Ctrl-L after reconnecting.** Whenever the client attaches to a session
+  that was already there — a resume (lossless or after a gap), a re-attach
+  by a new client, a takeover — it sends the program one Ctrl-L (`0x0c`),
+  which shells and most full-screen programs take as "repaint the screen".
+  Not to a session it has just created (`WELCOME` says `created`): a new
+  program has nothing to repaint.
+  - It is **input**, not a terminal operation: an `INPUT` frame queued
+    right after `WELCOME`, behind the resent unacked bytes and ahead of
+    anything typed from then on — so the program sees the keys in the order
+    they were typed, with the Ctrl-L where the reconnect happened. Being
+    input, it is tracked like a key: if the link drops again before the
+    `ACK`, the next resume resends it and the master's dedupe writes it
+    once; that resume then adds its own.
+  - It is **added** to the redraws above, not instead of them: a fresh
+    attach or a gap still clears the screen and gets the master's
+    `SIGWINCH`, and a resume after a status line still sends the two
+    `RESIZE` frames (§5.4). Programs that ignore Ctrl-L repaint as before;
+    a shell at its prompt, which redraws at most its own line on
+    `SIGWINCH`, now clears the screen and repaints its prompt.
+  - Never **inside a bracketed paste**: the client follows the paste
+    markers in the input it has sent (`keys::PasteTracker`), and when the
+    drop cut a paste off after its `CSI 200 ~` but before its `CSI 201 ~`,
+    the Ctrl-L is left out — it would land in the pasted text.
+  - A program reading raw input receives a form feed, and a line-reading one
+    a `^L` at the start of the next line; vim in Insert mode inserts it.
+    Hence the switch: `redraw_on_reconnect: false` (§7.2), globally or on an
+    alias (§7.3), and `ACS_REDRAW_ON_RECONNECT` over both (`0` off, `1`
+    on). The environment wins, then the alias's own setting, then the
+    global one; the default is on.
 
 ### 5.3 Liveness and reconnect
 
@@ -492,7 +522,8 @@ lossless resume will not repaint it. So:
    redraw to clean up the line: the client sends two RESIZE frames (one row
    fewer, then the real size), since an unchanged size raises no `SIGWINCH`.
    Full-screen programs repaint; a plain shell prompt may leave the line in
-   scrollback, which is acceptable.
+   scrollback, which is acceptable. The Ctrl-L every resume sends (§5.2,
+   unless turned off) makes a shell clear and repaint too.
 4. Whatever ends the client — resume, detach, or the session ending while
    the link was down — pops the title and blanks the status row on the way
    out, so the terminal is left as it was. While offline, the command key
@@ -671,6 +702,7 @@ Directory spec; either may be missing:
 install_on_remote: true        # install acs on a host that lacks it (§8)
 update_check: true             # look for a newer release once a week (§7.6)
 command_bell: true             # ring the bell when command mode arms (§6.1)
+redraw_on_reconnect: true      # send Ctrl-L after reconnecting (§5.2)
 hosts:                         # aliases: acs devbox tries these in order
   devbox:
     - host: devbox.lan
@@ -680,12 +712,13 @@ hosts:                         # aliases: acs devbox tries these in order
       identity_file: ~/.ssh/id_outside # this host's ssh key (-i)
   lab:                         # an alias with settings of its own
     identity_file: ~/.ssh/id_lab # the key of every host naming none
+    redraw_on_reconnect: false # over the global setting, for this alias
     hosts:
       - host: lab.lan
 ```
 
 - **Merging**: a setting in the local file replaces the global one — an
-  alias's `identity_file` too; mappings (`hosts`) merge key by key; lists (an
+  alias's own settings too; mappings (`hosts`) merge key by key; lists (an
   alias's hosts) concatenate, global entries first. An empty value (`key:`)
   sets nothing.
 - **Errors are not defaults**: a malformed file, an unknown key or a value of
@@ -700,11 +733,12 @@ hosts:                         # aliases: acs devbox tries these in order
   and one entry may be written without the list. How an alias is resolved is
   §7.3.
 - **An alias's own settings**: an alias is a list of entries (or one entry,
-  a mapping with `host`), or a mapping of its settings — `identity_file` —
-  and its `hosts`, that list. The list form stays the usual one; the mapping
-  is only needed for a setting shared by the entries. A file may give the
-  mapping without `hosts`, to set the key of an alias whose hosts are in the
-  other file, but an alias with no host in either is an error (at its first
+  a mapping with `host`), or a mapping of its settings — `identity_file`
+  and `redraw_on_reconnect` — and its `hosts`, that list. The list form
+  stays the usual one; the mapping is only needed for a setting shared by
+  the entries. A file may give the mapping without `hosts`, to set the key
+  (or `redraw_on_reconnect`) of an alias whose hosts are in the other file,
+  but an alias with no host in either is an error (at its first
   definition). An `identity_file` is one path, not a list: several keys are
   a job for `~/.ssh/config`.
 - Only the local client reads the files; `_proxy`, `_master` and `_install`
@@ -748,6 +782,9 @@ one of the alias's entries instead of `<name>`:
   the password database rather than `$HOME`). `-v` names the key and where
   it was set, or says the command line's replaces it. ssh still offers the
   agent's and its default keys after it unless `IdentitiesOnly` is set.
+- **Ctrl-L after reconnecting** (§5.2): the alias's `redraw_on_reconnect`,
+  when it has one, replaces the global setting for sessions reached through
+  it, as `<alias>` or `user@<alias>`; `ACS_REDRAW_ON_RECONNECT` still wins.
 - **None answers**: the client names every host it tried and exits with the
   unreachable code (255) without calling ssh.
 - It applies to every ssh call — the session, `--list`, install — since they
@@ -813,11 +850,11 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`); `set` checks the type |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`); `set` checks the type |
 | `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
 | `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
-| `host set <alias> identity_file <K>` / `host unset <alias> identity_file` | the alias's own key (§7.3); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` turns it back into a list |
+| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
 | `path` | the two files and whether they exist |
 
 - Edits go to the local file; `--global` edits the global one (and needs

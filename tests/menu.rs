@@ -35,12 +35,14 @@ fn menu_up(c: &mut Client) {
 }
 
 /// After the menu is left for a session: it is attached (a fresh attach
-/// clears the screen) and answers as `name`.
+/// clears the screen) and answers as `name`. Every session the menu offers
+/// already existed, so the attach sends Ctrl-L first (redraw_on_reconnect)
+/// and the line the program reads starts with it.
 fn attached_to(c: &mut Client, name: &str) {
     c.wait_for("\x1b[?1049l", T);
     c.wait_for("\x1b[H\x1b[J", T);
     c.send(b"hi\r");
-    c.wait_for(&format!("got-{name}:hi"), T);
+    c.wait_for(&format!("got-{name}:\x0chi"), T);
 }
 
 /// The last screen the menu drew.
@@ -241,7 +243,8 @@ fn without_a_terminal_for_the_menu_it_attaches_main() {
     };
     wait_for("\x1b[H\x1b[J");
     acs::sys::write_all(pty.as_raw_fd(), b"hi\r").unwrap();
-    wait_for("got-main:hi");
+    // `main` existed, so the attach sent Ctrl-L before the line.
+    wait_for("got-main:\x0chi");
     let text = String::from_utf8_lossy(&out.lock().unwrap()).into_owned();
     assert!(!text.contains("\x1b[?1049h"), "no menu: {text:?}");
     let _ = child.kill();
