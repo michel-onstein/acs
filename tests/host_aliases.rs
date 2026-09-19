@@ -48,6 +48,24 @@ fn falls_back_to_the_next_host_and_its_user() {
     c.wait_for("up", T);
 }
 
+/// Regression (acs-4pv): macOS ping cannot reach an IPv6 host at all — it
+/// exits 68 for one — so an IPv6 host is pinged with ping6 rather than
+/// counted as unreachable.
+#[test]
+fn an_ipv6_host_is_pinged_with_ping6() {
+    let remote = Remote::installed();
+    let net = Net::new(&["fd00:1::20"]);
+    let env = net.env("aliases:\n  nas:\n    - host: \"fd00:1::20\"\n");
+    let mut c = Client::start_env(&remote, &session("nas"), &refs(&env));
+    c.wait_for("nas: fd00:1::20 answers ping, using fd00:1::20", T);
+    c.wait_for("up", T);
+    assert_eq!(
+        net.pinged(),
+        ["fd00:1::20", "fd00:1::20"],
+        "ping, then ping6"
+    );
+}
+
 #[test]
 fn an_unchecked_host_is_used_without_a_ping() {
     let remote = Remote::installed();

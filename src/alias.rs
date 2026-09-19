@@ -225,17 +225,35 @@ pub fn ranked(entries: &[HostEntry]) -> Vec<&HostEntry> {
         .collect()
 }
 
+/// What macOS `ping` exits with when it cannot resolve the host — which it
+/// says for every IPv6 address, being IPv4-only (`EX_NOHOST`).
+const NO_HOST: i32 = 68;
+
 /// Ping `host` once, waiting at most `deadline` for the answer (`ACS_PING`
-/// names the program).
+/// names the program, `ACS_PING6` the IPv6 one).
 pub fn ping(host: &str, deadline: Duration) -> bool {
     let prog = std::env::var_os("ACS_PING")
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| "ping".into());
-    ping_with(&prog, host, deadline)
+    match ping_with(&prog, host, deadline) {
+        Some(0) => true,
+        // macOS ping is IPv4-only: an IPv6 literal, or a name with only
+        // AAAA records, is "cannot resolve" to it. ping6 does those, and
+        // takes no timeout flag — our own deadline kills it (acs-4pv).
+        // Linux ping is dual-stack and never exits this way.
+        Some(NO_HOST) => {
+            let prog6 = std::env::var_os("ACS_PING6")
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "ping6".into());
+            run_ping(&prog6, &["-c", "1", "--", host], deadline) == Some(0)
+        }
+        _ => false,
+    }
 }
 
-fn ping_with(prog: &OsStr, host: &str, deadline: Duration) -> bool {
-    let mut c = Command::new(prog);
+/// One ping with the usual arguments; the exit code, or `None` when it had
+/// to be killed at the deadline or could not be run.
+fn ping_with(prog: &OsStr, host: &str, deadline: Duration) -> Option<i32> {
     // One packet. The deadline is acs's own, to the millisecond: macOS -t
     // and BusyBox -W take whole seconds, and iputils -W fractions only in
     // newer releases. The one given to ping, a second or more past it, is a
@@ -246,23 +264,28 @@ fn ping_with(prog: &OsStr, host: &str, deadline: Duration) -> bool {
         "-W"
     };
     let backstop = (deadline.as_secs() + 2).to_string();
-    c.args(["-c", "1", flag, &backstop, "--", host])
+    run_ping(prog, &["-c", "1", flag, &backstop, "--", host], deadline)
+}
+
+fn run_ping(prog: &OsStr, args: &[&str], deadline: Duration) -> Option<i32> {
+    let mut c = Command::new(prog);
+    c.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // Spawned apart from waited for: several threads ping at once.
     let Ok(mut child) = crate::sys::spawn(&mut c) else {
-        return false;
+        return None;
     };
     let end = Instant::now() + deadline;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => return Some(status.code().unwrap_or(-1)),
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(5)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return None;
             }
         }
     }
@@ -835,16 +858,25 @@ aliases:
             "-W"
         };
         for (ms, secs) in [(1500, 3), (2500, 4), (4000, 6)] {
-            assert!(ping_with(p.as_os_str(), "h.lan", Duration::from_millis(ms)));
+            assert_eq!(
+                ping_with(p.as_os_str(), "h.lan", Duration::from_millis(ms)),
+                Some(0)
+            );
             assert_eq!(
                 std::fs::read_to_string(&args).unwrap(),
                 format!("-c 1 {flag} {secs} -- h.lan\n")
             );
         }
         let down = script(&dir, "down", "exit 1");
-        assert!(!ping_with(down.as_os_str(), "h", Duration::from_secs(1)));
+        assert_eq!(
+            ping_with(down.as_os_str(), "h", Duration::from_secs(1)),
+            Some(1)
+        );
         let none = dir.path().join("no-such-ping");
-        assert!(!ping_with(none.as_os_str(), "h", Duration::from_secs(1)));
+        assert_eq!(
+            ping_with(none.as_os_str(), "h", Duration::from_secs(1)),
+            None
+        );
     }
 
     #[test]
@@ -857,7 +889,10 @@ aliases:
             &format!("sleep 1; touch '{}'", late.display()),
         );
         let start = Instant::now();
-        assert!(!ping_with(p.as_os_str(), "h", Duration::from_millis(100)));
+        assert_eq!(
+            ping_with(p.as_os_str(), "h", Duration::from_millis(100)),
+            None
+        );
         assert!(
             start.elapsed() < Duration::from_millis(800),
             "{:?}",

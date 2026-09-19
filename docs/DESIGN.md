@@ -876,6 +876,10 @@ one of the alias's entries instead of `<name>`:
 - Entries are chosen **in order**: the first that answers a ping is used. One
   with `reachability_check: false` is used without a ping, for hosts that
   drop ICMP, as soon as every entry before it has not answered.
+  - The ping is the system's (`ACS_PING`). macOS's is IPv4-only and exits 68
+    ("cannot resolve") for an IPv6 address, so that answer is taken as "ask
+    `ping6`" (`ACS_PING6`), which takes no timeout flag — acs's own deadline
+    ends it. Linux's ping is dual-stack and never exits that way.
 - **Preferred entries** (`prefer: true`) come first: the order is the
   preferred entries, then the rest, each group in configured order
   (`alias::ranked`; `acs config host list` shows it). So a preferred host
