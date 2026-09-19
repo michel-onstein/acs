@@ -258,6 +258,14 @@ hosts:
         identity_file: ~/.ssh/id_lab_outside   # …but this one
 ```
 
+An alias has one of two shapes, and the example uses both. Usually it is
+just its **list of hosts**, as `devbox` and `nas` are. When it has settings
+of its own, as `lab` has, it is a **mapping** of those settings, with the
+list under `hosts:` — YAML cannot make one node both a list and a mapping.
+The mapping form is always allowed, even without settings, and
+`acs config host set <alias> <setting> <value>` rewrites a list-form alias
+into it (`host unset` of its last setting turns it back into a list).
+
 | Setting | Meaning |
 | --- | --- |
 | `install_on_remote` | install acs on a host that lacks it (default `true`); when `false`, acs says what is missing and exits with 254 |
@@ -268,7 +276,7 @@ hosts:
 | `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
 | `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
-| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer` and `persist` — or to a mapping of the alias's own `identity_file`, `redraw_on_reconnect` and `reachability_timeout` and its `hosts` |
+| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer` and `persist` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`) and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
