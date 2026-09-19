@@ -92,3 +92,30 @@ fn dropping_a_remote_ends_its_sessions() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+/// Regression: waiting twice for the same text waits for its second
+/// occurrence — the search backed up over the first match and found it
+/// again, so the second wait returned at once.
+#[test]
+fn waiting_twice_for_the_same_text_needs_it_twice() {
+    let remote = Remote::installed();
+    let mut c = Client::start(
+        &remote,
+        &[
+            "devbox",
+            "twice",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo tick; sleep 1; echo tick; sleep 30",
+        ],
+    );
+    c.wait_for("tick", T);
+    let t0 = std::time::Instant::now();
+    c.wait_for("tick", T);
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
+}

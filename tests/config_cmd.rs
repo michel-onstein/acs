@@ -333,6 +333,61 @@ fn identity_files_for_a_host_and_for_an_alias() {
 }
 
 #[test]
+fn redraw_on_reconnect_globally_and_for_an_alias() {
+    // acs-ome: off for everything, back on for one alias.
+    let h = Home::new();
+    assert_eq!(h.ok(&["config", "get", "redraw_on_reconnect"]), "true\n");
+    h.ok(&["config", "set", "redraw_on_reconnect", "false"]);
+    assert_eq!(h.ok(&["config", "get", "redraw_on_reconnect"]), "false\n");
+    h.ok(&["config", "host", "add", "devbox", "devbox.lan"]);
+    assert_eq!(
+        h.ok(&[
+            "config",
+            "host",
+            "set",
+            "devbox",
+            "redraw_on_reconnect",
+            "true"
+        ]),
+        "set redraw_on_reconnect of devbox to true in ~/.config/acs/config.yaml\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "redraw_on_reconnect: false\nhosts:\n  devbox:\n    redraw_on_reconnect: true\n    hosts:\n      - host: devbox.lan\n"
+    );
+    let show = h.ok(&["config", "show"]);
+    let l = "~/.config/acs/config.yaml";
+    assert!(
+        show.contains(&format!("redraw_on_reconnect: false # {l}:1\n")),
+        "{show}"
+    );
+    assert!(
+        show.contains(&format!(
+            "  devbox:\n    redraw_on_reconnect: true # {l}:4\n    hosts:\n"
+        )),
+        "{show}"
+    );
+    h.fails(
+        &[
+            "config",
+            "host",
+            "set",
+            "devbox",
+            "redraw_on_reconnect",
+            "1",
+        ],
+        2,
+        "redraw_on_reconnect is true or false, not '1'",
+    );
+    h.ok(&["config", "host", "unset", "devbox", "redraw_on_reconnect"]);
+    h.ok(&["config", "unset", "redraw_on_reconnect"]);
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "hosts:\n  devbox:\n    - host: devbox.lan\n"
+    );
+}
+
+#[test]
 fn an_alias_with_a_key_but_no_hosts_is_an_error() {
     let h = Home::new();
     std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();

@@ -72,10 +72,11 @@ fn detach_leaves_the_session_and_reattach_finds_it() {
     assert!(remote.session_exists("work"));
 
     let mut c2 = Client::start(&remote, &["devbox", "work"]);
-    // A fresh attach clears the screen and asks the program to redraw.
+    // A fresh attach clears the screen and asks the program to redraw,
+    // with a Ctrl-L ahead of what is typed (DESIGN §5.2).
     c2.wait_for("\x1b[H\x1b[J", T);
     c2.send(b"two\r");
-    c2.wait_for("got:two", T);
+    c2.wait_for("got:\x0ctwo", T);
     assert!(!c2.text().contains("new session"));
 }
 

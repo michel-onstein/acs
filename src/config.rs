@@ -3,7 +3,7 @@
 //! (local, default `~/.config/acs/config.yaml`). Either may be missing.
 //!
 //! Merging: a setting in the local file replaces the global one (an alias's
-//! `identity_file` too); mappings (`hosts`) merge key by key; lists (an
+//! own settings too); mappings (`hosts`) merge key by key; lists (an
 //! alias's hosts) concatenate, global entries first. An empty value (`key:`)
 //! sets nothing.
 //!
@@ -74,6 +74,9 @@ pub struct Alias {
     pub entries: Vec<HostEntry>,
     /// The ssh key of every entry that names none itself.
     pub identity_file: Option<Setting<String>>,
+    /// Send Ctrl-L after reconnecting; `None` leaves it to the global
+    /// setting.
+    pub redraw_on_reconnect: Option<Setting<bool>>,
     /// Where the alias is first defined.
     pub origin: Origin,
 }
@@ -86,6 +89,9 @@ pub struct Config {
     pub update_check: Setting<bool>,
     /// Ring the terminal bell when command mode arms (default true).
     pub command_bell: Setting<bool>,
+    /// Send Ctrl-L to the program after reconnecting to a session that was
+    /// already there (default true; DESIGN §5.2).
+    pub redraw_on_reconnect: Setting<bool>,
     /// Aliases in the order first defined, each with its hosts in order.
     pub hosts: Vec<Alias>,
     /// The files that were read, global first.
@@ -98,6 +104,7 @@ impl Default for Config {
             install_on_remote: Setting::default(true),
             update_check: Setting::default(true),
             command_bell: Setting::default(true),
+            redraw_on_reconnect: Setting::default(true),
             hosts: Vec::new(),
             files: Vec::new(),
         }
@@ -105,17 +112,31 @@ impl Default for Config {
 }
 
 /// Every top-level setting, for error messages and `acs config`.
-pub const KEYS: &[&str] = &["install_on_remote", "update_check", "command_bell", "hosts"];
+pub const KEYS: &[&str] = &[
+    "install_on_remote",
+    "update_check",
+    "command_bell",
+    "redraw_on_reconnect",
+    "hosts",
+];
 
 /// The settings that are true or false.
-pub const BOOLS: &[&str] = &["install_on_remote", "update_check", "command_bell"];
+pub const BOOLS: &[&str] = &[
+    "install_on_remote",
+    "update_check",
+    "command_bell",
+    "redraw_on_reconnect",
+];
 
 /// Every key of a host entry.
 pub const HOST_KEYS: &[&str] = &["host", "user", "reachability_check", "identity_file"];
 
 /// Every key of an alias written as a mapping (`devbox: {identity_file: …,
 /// hosts: […]}`) rather than as its list of hosts.
-pub const ALIAS_KEYS: &[&str] = &["identity_file", "hosts"];
+pub const ALIAS_KEYS: &[&str] = &["identity_file", "redraw_on_reconnect", "hosts"];
+
+/// The alias settings that are true or false.
+pub const ALIAS_BOOLS: &[&str] = &["redraw_on_reconnect"];
 
 /// The global file: `/etc/acs/config.yaml` (`ACS_GLOBAL_CONFIG` overrides it,
 /// for packagers and tests).
@@ -225,7 +246,7 @@ impl Config {
                     })?;
                     for (name, n) in aliases {
                         validate_alias(name).map_err(|e| fail(n, e))?;
-                        let (entries, identity) = alias_parts(name, n, &at)?;
+                        let (entries, settings) = alias_parts(name, n, &at)?;
                         let i = match self.hosts.iter().position(|a| a.name == *name) {
                             Some(i) => i,
                             None => {
@@ -233,6 +254,7 @@ impl Config {
                                     name: name.clone(),
                                     entries: Vec::new(),
                                     identity_file: None,
+                                    redraw_on_reconnect: None,
                                     origin: at(n),
                                 });
                                 self.hosts.len() - 1
@@ -240,8 +262,11 @@ impl Config {
                         };
                         let alias = &mut self.hosts[i];
                         alias.entries.extend(entries);
-                        if identity.is_some() {
-                            alias.identity_file = identity;
+                        if settings.identity_file.is_some() {
+                            alias.identity_file = settings.identity_file;
+                        }
+                        if settings.redraw_on_reconnect.is_some() {
+                            alias.redraw_on_reconnect = settings.redraw_on_reconnect;
                         }
                     }
                 }
@@ -262,6 +287,7 @@ impl Config {
             "install_on_remote" => Some(&self.install_on_remote),
             "update_check" => Some(&self.update_check),
             "command_bell" => Some(&self.command_bell),
+            "redraw_on_reconnect" => Some(&self.redraw_on_reconnect),
             _ => None,
         }
     }
@@ -271,6 +297,7 @@ impl Config {
             "install_on_remote" => Some(&mut self.install_on_remote),
             "update_check" => Some(&mut self.update_check),
             "command_bell" => Some(&mut self.command_bell),
+            "redraw_on_reconnect" => Some(&mut self.redraw_on_reconnect),
             _ => None,
         }
     }
@@ -278,6 +305,15 @@ impl Config {
     /// The alias called `name`, if there is one.
     pub fn alias(&self, name: &str) -> Option<&Alias> {
         self.hosts.iter().find(|a| a.name == name)
+    }
+
+    /// `redraw_on_reconnect` for a session reached as `name` (`[user@]<alias>`,
+    /// or `None` for a plain host): the alias's own setting, else the global
+    /// one.
+    pub fn redraw_on_reconnect_for(&self, name: Option<&str>) -> &Setting<bool> {
+        name.and_then(|n| self.alias(crate::alias::split_user(n).1))
+            .and_then(|a| a.redraw_on_reconnect.as_ref())
+            .unwrap_or(&self.redraw_on_reconnect)
     }
 }
 
@@ -350,17 +386,24 @@ fn identity_file(
     }
 }
 
-/// One file's entries and `identity_file` for `hosts.<name>`: a list of
-/// entries, one entry without the list, or a mapping of the alias's
-/// settings and its `hosts` (which another file may supply instead).
-#[allow(clippy::type_complexity)]
+/// The settings one file gives an alias of its own (DESIGN §7.2); `None`
+/// where it gives none.
+#[derive(Default)]
+struct AliasSettings {
+    identity_file: Option<Setting<String>>,
+    redraw_on_reconnect: Option<Setting<bool>>,
+}
+
+/// One file's entries and settings for `hosts.<name>`: a list of entries,
+/// one entry without the list, or a mapping of the alias's settings and its
+/// `hosts` (which another file may supply instead).
 fn alias_parts(
     name: &str,
     node: &Node,
     at: &dyn Fn(&Node) -> Origin,
-) -> Result<(Vec<HostEntry>, Option<Setting<String>>), String> {
+) -> Result<(Vec<HostEntry>, AliasSettings), String> {
     let fail = |n: &Node, msg: String| format!("{}: hosts.{name}: {msg}", at(n));
-    let mut identity = None;
+    let mut settings = AliasSettings::default();
     let list = match &node.value {
         Value::Map(m) if !m.iter().any(|(k, _)| k == "host") => {
             let mut list = None;
@@ -368,9 +411,17 @@ fn alias_parts(
                 match k.as_str() {
                     "hosts" => list = Some(v).filter(|v| v.value != Value::Null),
                     "identity_file" => {
-                        identity = identity_file(v, at)
+                        settings.identity_file = identity_file(v, at)
                             .map_err(|e| fail(v, format!("identity_file: {e}")))?
                     }
+                    "redraw_on_reconnect" if v.value != Value::Null => {
+                        let value = bool_value(v).map_err(|e| fail(v, format!("{k}: {e}")))?;
+                        settings.redraw_on_reconnect = Some(Setting {
+                            value,
+                            origin: Some(at(v)),
+                        })
+                    }
+                    "redraw_on_reconnect" => {}
                     other => {
                         return Err(fail(
                             v,
@@ -384,7 +435,7 @@ fn alias_parts(
             }
             match list {
                 Some(l) => l,
-                None => return Ok((Vec::new(), identity)),
+                None => return Ok((Vec::new(), settings)),
             }
         }
         _ => node,
@@ -409,7 +460,7 @@ fn alias_parts(
     if entries.is_empty() {
         return Err(fail(list, "no hosts listed".into()));
     }
-    Ok((entries, identity))
+    Ok((entries, settings))
 }
 
 /// Name the field (and its line) in an error about its value.
@@ -564,7 +615,7 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, hosts)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, hosts)",
             ),
             ("hosts: [a]\n", ":1: hosts: expected a mapping"),
             (
@@ -712,7 +763,7 @@ hosts:
             ),
             (
                 "hosts:\n  d:\n    user: me\n",
-                ":3: hosts.d: unknown key 'user' (an alias takes identity_file, hosts; a single host entry needs 'host: <name>')",
+                ":3: hosts.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, hosts; a single host entry needs 'host: <name>')",
             ),
             (
                 "hosts:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
@@ -727,6 +778,65 @@ hosts:
             let e = load("", src).unwrap_err();
             assert!(e.contains("local.yaml") && e.contains(want), "{src:?}: {e}");
         }
+    }
+
+    #[test]
+    fn redraw_on_reconnect_the_alias_over_the_global_over_the_default() {
+        let at = |s: &Setting<bool>| {
+            let line = s.origin.as_ref().map_or(0, |o| o.line);
+            format!("{}@{line}", s.value)
+        };
+        // Nothing set: on.
+        let c = load("", "hosts:\n  d:\n    - host: a\n").unwrap();
+        assert_eq!(at(c.redraw_on_reconnect_for(Some("d"))), "true@0");
+        assert_eq!(at(c.redraw_on_reconnect_for(None)), "true@0");
+
+        let g = "redraw_on_reconnect: false\nhosts:\n  d:\n    - host: a\n  e:\n    - host: b\n";
+        let l = "hosts:\n  d:\n    redraw_on_reconnect: true\n";
+        let c = load(g, l).unwrap();
+        // The alias's own setting wins, as `user@<alias>` too; an alias
+        // without one, a plain host and an unknown name take the global one.
+        assert_eq!(at(c.redraw_on_reconnect_for(Some("d"))), "true@3");
+        assert_eq!(at(c.redraw_on_reconnect_for(Some("me@d"))), "true@3");
+        assert_eq!(at(c.redraw_on_reconnect_for(Some("e"))), "false@1");
+        assert_eq!(at(c.redraw_on_reconnect_for(None)), "false@1");
+        assert_eq!(at(c.redraw_on_reconnect_for(Some("other"))), "false@1");
+        let d = c.alias("d").unwrap();
+        assert!(d
+            .redraw_on_reconnect
+            .as_ref()
+            .unwrap()
+            .origin
+            .as_ref()
+            .unwrap()
+            .file
+            .ends_with("local.yaml"));
+        assert_eq!(hosts(&c, "d"), ["a/true"]);
+
+        // The local file's alias setting replaces the global file's; an
+        // empty value sets nothing.
+        let g = "hosts:\n  d:\n    redraw_on_reconnect: false\n    hosts: [{host: a}]\n";
+        let c = load(g, "hosts:\n  d:\n    redraw_on_reconnect: true\n").unwrap();
+        assert_eq!(at(c.redraw_on_reconnect_for(Some("d"))), "true@3");
+        let c = load(g, "hosts:\n  d:\n    redraw_on_reconnect:\n").unwrap();
+        assert_eq!(at(c.redraw_on_reconnect_for(Some("d"))), "false@3");
+
+        let e = load(
+            "",
+            "hosts:\n  d:\n    redraw_on_reconnect: 0\n    hosts: [{host: a}]\n",
+        )
+        .unwrap_err();
+        assert!(
+            e.contains(
+                "local.yaml:3: hosts.d: redraw_on_reconnect: expected true or false, found '0'"
+            ),
+            "{e}"
+        );
+        let e = load("", "redraw_on_reconnect: yes\n").unwrap_err();
+        assert!(
+            e.contains(":1: redraw_on_reconnect: expected true or false"),
+            "{e}"
+        );
     }
 
     #[test]

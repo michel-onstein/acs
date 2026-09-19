@@ -23,22 +23,27 @@ usage: acs config show                 the merged configuration and where each v
                                        add a host to an alias (after its other hosts)
        acs config host remove <alias> [<host>]
                                        remove one host, or the whole alias
-       acs config host set <alias> identity_file <key>
-                                       the ssh key of the alias's hosts that name none
-       acs config host unset <alias> identity_file
-                                       remove the alias's key from the file
+       acs config host set <alias> <setting> <value>
+                                       one of the alias's own settings
+       acs config host unset <alias> <setting>
+                                       remove one of the alias's settings from the file
        acs config path                 the files acs reads
 
   --global  edit /etc/acs/config.yaml instead of ~/.config/acs/config.yaml
 
-settings: install_on_remote, update_check, command_bell (true|false)
+settings: install_on_remote, update_check, command_bell, redraw_on_reconnect (true|false)
+alias settings: identity_file <key> (the ssh key of its hosts that name none),
+                redraw_on_reconnect (true|false, over the global setting)
 precedence of the ssh key: -i, then the host's identity_file, then the alias's";
 
 /// Settings `get`/`set`/`unset` know: all true or false.
 const SCALARS: &[&str] = config::BOOLS;
 
-/// Settings of an alias that `host set`/`host unset` know.
-const ALIAS_SETTINGS: &[&str] = &["identity_file"];
+/// Settings of an alias that `host set`/`host unset` know: every key of the
+/// alias's mapping but its `hosts`.
+fn alias_settings() -> impl Iterator<Item = &'static str> {
+    config::ALIAS_KEYS.iter().copied().filter(|k| *k != "hosts")
+}
 
 /// What to do, parsed from the arguments after `config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,10 +110,10 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
     }
     let w: Vec<&str> = words.iter().map(String::as_str).collect();
     if let ["host", "set" | "unset", _, key, ..] = w.as_slice() {
-        if !ALIAS_SETTINGS.contains(key) {
+        if !alias_settings().any(|k| k == *key) {
             return Err(format!(
                 "unknown alias setting '{key}' (settings: {})",
-                ALIAS_SETTINGS.join(", ")
+                alias_settings().collect::<Vec<_>>().join(", ")
             ));
         }
     }
@@ -365,18 +370,30 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
             .collect();
         let list = Node::new(Value::Seq(items));
         // An alias with a setting of its own is written as a mapping.
-        let node = match &a.identity_file {
-            None => list,
-            Some(key) => Node::new(Value::Map(vec![
-                (
-                    "identity_file".to_string(),
-                    Node {
-                        comment: Some(from(&key.origin)),
-                        ..Node::string(&key.value)
-                    },
-                ),
-                ("hosts".to_string(), list),
-            ])),
+        let mut settings = Vec::new();
+        if let Some(key) = &a.identity_file {
+            settings.push((
+                "identity_file".to_string(),
+                Node {
+                    comment: Some(from(&key.origin)),
+                    ..Node::string(&key.value)
+                },
+            ));
+        }
+        if let Some(r) = &a.redraw_on_reconnect {
+            settings.push((
+                "redraw_on_reconnect".to_string(),
+                Node {
+                    comment: Some(from(&r.origin)),
+                    ..Node::bool(r.value)
+                },
+            ));
+        }
+        let node = if settings.is_empty() {
+            list
+        } else {
+            settings.push(("hosts".to_string(), list));
+            Node::new(Value::Map(settings))
         };
         aliases.push((a.name.clone(), node));
     }
@@ -609,8 +626,12 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
         }
         Cmd::HostSet { alias, key, value } => {
             config::validate_alias(alias)?;
+            let new = if config::ALIAS_BOOLS.contains(&key.as_str()) {
+                Node::bool(parse_bool(key, value)?)
+            } else {
+                Node::string(value)
+            };
             let settings = alias_form(alias_node(aliases_mut(doc)?, alias));
-            let new = Node::string(value);
             match settings.iter_mut().find(|(k, _)| k == key) {
                 Some((_, n)) => {
                     n.value = new.value;
@@ -1156,6 +1177,49 @@ mod tests {
     }
 
     #[test]
+    fn host_set_takes_every_alias_setting_with_its_type() {
+        assert_eq!(
+            cmd("host set d redraw_on_reconnect false"),
+            Cmd::HostSet {
+                alias: "d".into(),
+                key: "redraw_on_reconnect".into(),
+                value: "false".into()
+            }
+        );
+        let src = "hosts:\n  d:\n    - host: a\n";
+        let set = apply(src, "host set d redraw_on_reconnect FALSE").unwrap();
+        assert_eq!(
+            set,
+            "hosts:\n  d:\n    redraw_on_reconnect: false\n    hosts:\n      - host: a\n"
+        );
+        let e = apply(src, "host set d redraw_on_reconnect off").unwrap_err();
+        assert!(
+            e.contains("redraw_on_reconnect is true or false, not 'off'"),
+            "{e}"
+        );
+        // Beside the key; unsetting one keeps the other and the mapping.
+        let both = apply(&set, "host set d identity_file /k").unwrap();
+        assert_eq!(
+            both,
+            "hosts:\n  d:\n    identity_file: /k\n    redraw_on_reconnect: false\n    hosts:\n      - host: a\n"
+        );
+        assert_eq!(
+            apply(&both, "host unset d redraw_on_reconnect").unwrap(),
+            "hosts:\n  d:\n    identity_file: /k\n    hosts:\n      - host: a\n"
+        );
+        // The last setting gone, the alias is its list of hosts again.
+        assert_eq!(
+            apply(&set, "host unset d redraw_on_reconnect").unwrap(),
+            src
+        );
+        let e = parse(&args("host set d command_bell false")).unwrap_err();
+        assert!(
+            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect)"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn host_set_on_one_entry_or_an_alias_of_the_other_file() {
         // One entry without a list becomes the alias's first host.
         assert_eq!(
@@ -1274,5 +1338,47 @@ mod tests {
             again.hosts[0].identity_file.as_ref().unwrap().value,
             "~/.ssh/d"
         );
+    }
+
+    #[test]
+    fn show_has_redraw_on_reconnect_globally_and_per_alias() {
+        let dir = crate::testutil::TempDir::new();
+        let g = dir.path().join("g.yaml");
+        let l = dir.path().join("l.yaml");
+        std::fs::write(&g, "redraw_on_reconnect: false\n").unwrap();
+        std::fs::write(
+            &l,
+            "hosts:\n  d:\n    redraw_on_reconnect: true\n    hosts:\n      - host: a\n  e:\n    - host: b\n",
+        )
+        .unwrap();
+        let files = [g.clone(), l.clone()];
+        let c = Config::load_files(&files).unwrap();
+        let out = show(&c, &files);
+        assert!(
+            out.contains(&format!("redraw_on_reconnect: false # {}:1\n", g.display())),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "  d:\n    redraw_on_reconnect: true # {}:3\n    hosts:\n      - host: a # {}:5\n  e:\n    - host: b # {}:7\n",
+                l.display(),
+                l.display(),
+                l.display()
+            )),
+            "{out}"
+        );
+        let doc = yaml::parse(&out).unwrap();
+        let mut again = Config::default();
+        again.apply(Path::new("x"), &doc.root).unwrap();
+        assert!(
+            again
+                .alias("d")
+                .unwrap()
+                .redraw_on_reconnect
+                .as_ref()
+                .unwrap()
+                .value
+        );
+        assert!(!again.redraw_on_reconnect.value);
     }
 }
