@@ -170,6 +170,13 @@ impl InputDedupe {
         self.written
     }
 
+    /// Give up on the last `n` accepted bytes: they were queued for the pty
+    /// and dropped unwritten, so they were never written and the client is
+    /// to send them again (acs-evm).
+    pub fn rewind(&mut self, n: usize) {
+        self.written = self.written.saturating_sub(n as u64);
+    }
+
     /// The part of an INPUT frame not yet written. A frame that starts beyond
     /// `written` (a client whose bytes were lost in between) is accepted in
     /// full and the counter jumps forward, so the stream never stalls.
@@ -193,6 +200,22 @@ mod tests {
             Read::Data(a, b) => [a, b].concat(),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Regression (acs-evm): input dropped before it reached the pty was
+    /// never written, so the counter goes back and the client resends it.
+    #[test]
+    fn rewinding_undoes_accepted_bytes() {
+        let mut d = InputDedupe::default();
+        assert_eq!(d.accept(0, b"abcd"), b"abcd");
+        assert_eq!(d.written(), 4);
+        d.rewind(3);
+        assert_eq!(d.written(), 1);
+        // The client resends from 1; the whole frame is written again but
+        // for the byte that did reach the pty.
+        assert_eq!(d.accept(0, b"abcd"), b"bcd");
+        d.rewind(100);
+        assert_eq!(d.written(), 0);
     }
 
     #[test]

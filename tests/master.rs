@@ -512,6 +512,41 @@ fn the_master_pings_a_silent_client() {
     }
 }
 
+/// Regression (acs-evm): an ACK means the pty took the bytes. A program in
+/// raw mode that never reads fills its terminal's input buffer, and the
+/// master acknowledges only what the pty took — it used to acknowledge
+/// input the moment it queued it, and a queued write that is then dropped
+/// (the terminal hangs up) would be lost for good, since the client never
+/// sends acknowledged input again.
+#[test]
+fn input_is_acked_only_as_fast_as_the_pty_takes_it() {
+    let t = TempDir::new();
+    let (mut c, w) = start(
+        t.path(),
+        "ack",
+        // Says it is ready, then closes every descriptor of its terminal.
+        &[
+            "/bin/sh",
+            "-c",
+            "stty -echo -icanon min 1 time 0; echo ready; sleep 5",
+        ],
+        "me",
+    );
+    c.wait_output("ready", T);
+    let n: usize = 200_000;
+    let end = w.input_seq + n as u64;
+    c.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: vec![b'x'; n],
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if let Some(Msg::Ack { seq }) = c.recv(Duration::from_millis(200)) {
+            assert!(seq < end, "acked {seq}: input the pty never took");
+        }
+    }
+}
+
 #[test]
 fn resize_reaches_the_program() {
     let t = TempDir::new();

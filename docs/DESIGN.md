@@ -485,7 +485,11 @@ sequenceDiagram
   alternate screen, modes, scrollback — is correct with no redraw.
 - **Input**: the client keeps bytes sent but not yet `ACK`ed and resends them
   on resume; the master discards any sequence it already wrote, so nothing is
-  typed twice. Keys typed **while the client knows the link is down** are
+  typed twice. The `ACK` counts what the pty has **taken**, not what the
+  master has queued for it, since that is what the client may forget: input
+  still queued when the terminal hangs up is dropped and its sequence goes
+  back, so the next resume sends it again. `WELCOME`'s input sequence is the
+  same count. Keys typed **while the client knows the link is down** are
   dropped rather than queued: blind typing into a frozen screen replayed
   seconds later is how accidents happen. (Command-mode keys still work — §6.)
   That includes the redial itself, where the terminal is back in cooked mode

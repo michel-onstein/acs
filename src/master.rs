@@ -290,6 +290,8 @@ struct Master {
     ring: OutputRing,
     input: InputDedupe,
     pty_in: Vec<u8>,
+    /// Input sequence last ACKed to the attached client.
+    acked: u64,
     instance: u64,
     created_at: u64,
     creator: String,
@@ -362,6 +364,7 @@ impl Master {
             ring: OutputRing::new(args.ring),
             input: InputDedupe::default(),
             pty_in: Vec::new(),
+            acked: 0,
             instance: sys::random_u64(),
             created_at: sys::unix_now(),
             creator: String::new(),
@@ -540,6 +543,10 @@ impl Master {
             if !self.pty_in.is_empty() {
                 self.write_pty();
             }
+            self.ack_written();
+            for c in &mut self.conns {
+                c.flush();
+            }
         }
     }
 
@@ -654,8 +661,9 @@ impl Master {
                     self.pty_in.extend_from_slice(new);
                     self.last_activity = Instant::now();
                 }
-                let ack = self.input.written();
-                self.conns[i].send(&Msg::Ack { seq: ack });
+                // No ACK here: it goes out once the bytes have reached the
+                // pty, since DESIGN §5.2 lets the client forget what is
+                // ACKed and a queued write can still be dropped (acs-evm).
             }
             Msg::Resize(s) => self.resize(s, false),
             Msg::Ping(n) => self.conns[i].send(&Msg::Pong(n)),
@@ -740,6 +748,7 @@ impl Master {
         // A new session starts at offset 0 so the first prompt is not lost.
         let next = if created { 0 } else { next };
 
+        let input_seq = self.written_to_pty();
         let c = &mut self.conns[i];
         c.identity = h.identity.clone();
         c.since = sys::unix_now();
@@ -752,7 +761,7 @@ impl Master {
             offset: next,
             created,
             kind,
-            input_seq: self.input.written(),
+            input_seq,
         }));
         self.last_identity = h.identity;
         self.last_activity = Instant::now();
@@ -887,10 +896,36 @@ impl Master {
         }
     }
 
+    /// Input bytes the pty has taken: what was accepted, less what is still
+    /// queued for it. This, not what was accepted, is what a client may
+    /// forget (DESIGN §5.2).
+    fn written_to_pty(&self) -> u64 {
+        self.input.written() - self.pty_in.len() as u64
+    }
+
+    /// Tell the attached client how much of its input the pty has taken.
+    fn ack_written(&mut self) {
+        let seq = self.written_to_pty();
+        if seq == self.acked {
+            return;
+        }
+        self.acked = seq;
+        if let Some(i) = self.active() {
+            self.conns[i].send(&Msg::Ack { seq });
+        }
+    }
+
+    /// Drop the input queued for the pty, unwritten: it never reached the
+    /// program, so it was never written (acs-evm).
+    fn drop_queued_input(&mut self) {
+        self.input.rewind(self.pty_in.len());
+        self.pty_in.clear();
+    }
+
     fn write_pty(&mut self) {
         let Some(ch) = &self.child else { return };
         if !ch.pty_open {
-            self.pty_in.clear();
+            self.drop_queued_input();
             return;
         }
         while !self.pty_in.is_empty() {
@@ -901,7 +936,7 @@ impl Master {
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => {
-                    self.pty_in.clear();
+                    self.drop_queued_input();
                     break;
                 }
             }
