@@ -782,6 +782,7 @@ hosts:                         # aliases: acs devbox tries these in order
       user: michel             # otherwise ~/.ssh/config decides
       identity_file: ~/.ssh/id_outside # this host's ssh key (-i)
       persist: true            # wait for this host when it is lost (§5.3)
+      prefer: true             # used over devbox.lan when both answer (§7.3)
   lab:                         # an alias with settings of its own
     identity_file: ~/.ssh/id_lab # the key of every host naming none
     redraw_on_reconnect: false # over the global setting, for this alias
@@ -804,9 +805,9 @@ hosts:                         # aliases: acs devbox tries these in order
   the client installs nothing; it says which host lacks which version, where
   the setting came from, and exits with the install-failed code (254).
 - `hosts` is parsed and validated: `host` is required, `user`,
-  `identity_file`, `reachability_check` (default `true`) and `persist` are
-  optional, and one entry may be written without the list. How an alias is
-  resolved is §7.3.
+  `identity_file`, `reachability_check` (default `true`), `prefer`
+  (default `false`, §7.3) and `persist` are optional, and one entry may be
+  written without the list. How an alias is resolved is §7.3.
 - **An alias's own settings**: an alias is a list of entries (or one entry,
   a mapping with `host`), or a mapping of its settings — `identity_file`,
   `redraw_on_reconnect`, `reachability_timeout`, `persist` and
@@ -847,6 +848,17 @@ one of the alias's entries instead of `<name>`:
 - Entries are chosen **in order**: the first that answers a ping is used. One
   with `reachability_check: false` is used without a ping, for hosts that
   drop ICMP, as soon as every entry before it has not answered.
+- **Preferred entries** (`prefer: true`) come first: the order is the
+  preferred entries, then the rest, each group in configured order
+  (`alias::ranked`; `acs config host list` shows it). So a preferred host
+  that answers wins over an earlier unpreferred one that answered first —
+  the choice waits for the preferred hosts' pings up to the deadline — and
+  one that does not answer leaves the choice to the rest, in order. Several
+  entries may be preferred; a preferred entry with
+  `reachability_check: false` is used at once, as if listed first. This
+  also lets a user's file pick the primary host of an alias whose other
+  entries come from the global file, listed ahead of its own (§7.2). `-v`
+  says when a host was used because it is preferred.
 - The pings run **at once**: every entry with `reachability_check: true`
   (the default) that could be chosen — those before the first unchecked
   one — is pinged when the alias is resolved, each from a thread of its
@@ -999,7 +1011,7 @@ their YAML shape:
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
 | `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`); `set` checks the type |
 | `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
-| `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check] [--persist]` | append an entry, so repeated adds give an alias its fallback hosts in order |
+| `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check] [--prefer] [--persist]` | append an entry, so repeated adds give an alias its fallback hosts in order |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
 | `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `persist true\|false`, `reachability_interval <duration>` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
 | `path` | the two files and whether they exist |
