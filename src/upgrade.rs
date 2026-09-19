@@ -307,7 +307,9 @@ pub fn run(opts: &Opts) -> Result<String, Error> {
             m.permissions().mode() & 0o7777
         })
         .unwrap_or(0o755);
-    place(&new, &dest, mode)?;
+    let staged = Staged::new(&new, &dest, mode)?;
+    check_runs(staged.path(), &v)?;
+    staged.commit(&dest)?;
     if let Layout::Versioned { links, .. } = &layout {
         for l in links {
             relink(&dest, l)?;
@@ -371,39 +373,78 @@ fn download(base: &str, asset: &Asset, target: &str, tmp: &Path) -> Result<PathB
             asset.file, asset.version
         )));
     }
-    // It must run here and be what it says.
-    let out = Command::new(&new)
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("the downloaded acs does not run here: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || !text.starts_with(&format!("acs {} ", asset.version)) {
-        return Err(Error::Failed(format!(
-            "the downloaded acs does not report version {} ({})",
-            asset.version,
-            text.lines().next().unwrap_or("no output")
-        )));
-    }
     Ok(new)
 }
 
-/// Copy `from` next to `to` under a temporary name, then rename it over
-/// `to`: the path is never missing or half-written.
-fn place(from: &Path, to: &Path, mode: u32) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = to.parent().ok_or("no directory to install into")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let tmp = dir.join(format!(
-        ".acs.upgrade.{:08x}",
-        crate::sys::random_u64() as u32
-    ));
-    let r = std::fs::copy(from, &tmp)
-        .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)))
-        .and_then(|_| std::fs::rename(&tmp, to));
-    r.map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("cannot install {}: {e}", to.display())
-    })
+/// Run the new binary where it will live and check what it says: proof
+/// that it works on this machine, from the directory it will work from.
+/// Running it from the scratch directory instead would fail wherever /tmp
+/// is mounted noexec, common hardening the upgrade must not trip on
+/// (acs-x1k).
+fn check_runs(new: &Path, version: &str) -> Result<(), Error> {
+    let out = Command::new(new).arg("--version").output().map_err(|e| {
+        let dir = new.parent().unwrap_or(Path::new(".")).display();
+        format!("the downloaded acs does not run from {dir}: {e} (is it mounted noexec?)")
+    })?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || !text.starts_with(&format!("acs {version} ")) {
+        return Err(Error::Failed(format!(
+            "the downloaded acs does not report version {version} ({})",
+            text.lines().next().unwrap_or("no output")
+        )));
+    }
+    Ok(())
+}
+
+/// The new binary beside its destination under a temporary name, removed
+/// again unless it is committed. Kept apart so it can be run from there
+/// before the rename.
+struct Staged {
+    tmp: PathBuf,
+    committed: bool,
+}
+
+impl Staged {
+    /// Copy `from` next to `to` under a temporary name, with `mode`.
+    fn new(from: &Path, to: &Path, mode: u32) -> Result<Staged, String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = to.parent().ok_or("no directory to install into")?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let tmp = dir.join(format!(
+            ".acs.upgrade.{:08x}",
+            crate::sys::random_u64() as u32
+        ));
+        std::fs::copy(from, &tmp)
+            .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("cannot install {}: {e}", to.display())
+            })?;
+        Ok(Staged {
+            tmp,
+            committed: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.tmp
+    }
+
+    /// Rename it over `to`: the path is never missing or half-written.
+    fn commit(mut self, to: &Path) -> Result<(), String> {
+        std::fs::rename(&self.tmp, to)
+            .map_err(|e| format!("cannot install {}: {e}", to.display()))?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
 }
 
 /// Point the symlink `link` at `target`, atomically.
@@ -495,10 +536,27 @@ mod tests {
         // Installing and relinking.
         let new = d.path().join("new");
         std::fs::write(&new, "new").unwrap();
-        place(&new, &l.destination("0.3.0"), 0o755).unwrap();
+        let staged = Staged::new(&new, &l.destination("0.3.0"), 0o755).unwrap();
+        assert!(staged.path().exists());
+        staged.commit(&l.destination("0.3.0")).unwrap();
         relink(&l.destination("0.3.0"), &link).unwrap();
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+    }
+
+    /// A staged copy that is not committed leaves nothing behind (acs-x1k).
+    #[test]
+    fn a_staged_copy_that_is_not_committed_is_removed() {
+        let d = TempDir::new();
+        let new = d.path().join("new");
+        std::fs::write(&new, "new").unwrap();
+        let dest = d.path().join("dir/acs");
+        let tmp = {
+            let staged = Staged::new(&new, &dest, 0o755).unwrap();
+            staged.path().to_path_buf()
+        };
+        assert!(!tmp.exists(), "{} was left behind", tmp.display());
+        assert!(!dest.exists());
     }
 
     #[test]

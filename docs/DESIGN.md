@@ -1107,10 +1107,13 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
 - **Checks before replacing**: the directories it will write are probed
   first, so an unwritable one (`/usr/local/bin`) fails before any download
   with `re-run with sudo: sudo acs upgrade`; the archive must match its
-  SHA-256; the new binary must run and report the expected version. Only
-  then is it copied next to the destination under a temporary name and
-  renamed over it, keeping the old file's mode — the path is never missing or
-  half-written, and a running acs keeps its old inode.
+  SHA-256; the new binary must run and report the expected version. It is
+  copied next to the destination under a temporary name first, keeping the
+  old file's mode, and **run from there** — not from the scratch directory
+  under `/tmp`, which is mounted `noexec` on hardened hosts, where the
+  upgrade would otherwise be impossible. Only then is it renamed over the
+  destination — the path is never missing or half-written, and a running acs
+  keeps its old inode. A temporary copy left by a failure is removed.
 - **Layouts**: a plain file (a manual install, `ACS_INSTALL_DIR`) is replaced
   in place. A versioned install — `…/acs/<version>/acs`, as the installer and
   the remote install lay it out (§8) — gets the new version beside it, and

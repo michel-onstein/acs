@@ -245,6 +245,32 @@ fn a_download_that_is_not_what_it_says_is_refused() {
     assert_eq!(std::fs::read(&acs).unwrap(), std::fs::read(exe()).unwrap());
 }
 
+/// Regression (acs-x1k): the "it runs here" check runs the new binary from
+/// the directory it will live in, not from the scratch directory under
+/// /tmp, which is mounted noexec on hardened hosts.
+#[test]
+fn the_new_binary_is_run_from_its_destination_directory() {
+    let d = TempDir::new();
+    let log = d.path().join("ran-from");
+    let server = ReleaseServer::start();
+    let fake = format!(
+        "#!/bin/sh\necho 'acs {NEW} (protocol 9, {t})'\ndirname \"$0\" >> '{log}'\n",
+        t = acs::payload::OWN_TARGET,
+        log = log.display()
+    );
+    server.release(NEW, fake.as_bytes(), true, false);
+    let acs = plain_copy(d.path());
+    let (code, _, err) = upgrade(&acs, d.path(), &server, &[]);
+    assert_eq!(code, 0, "{err}");
+    let first = std::fs::read_to_string(&log).unwrap();
+    let first = first.lines().next().expect("the check ran the binary");
+    assert_eq!(
+        std::fs::canonicalize(first).unwrap(),
+        std::fs::canonicalize(acs.parent().unwrap()).unwrap(),
+        "checked from {first}, not from the destination directory"
+    );
+}
+
 #[test]
 fn a_missing_release_or_no_network_is_explained() {
     let d = TempDir::new();
