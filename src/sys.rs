@@ -248,6 +248,18 @@ pub fn tcsetattr(fd: RawFd, t: &libc::termios) -> io::Result<()> {
     Ok(())
 }
 
+/// [`tcsetattr`], discarding the input not read yet.
+pub fn tcsetattr_flush(fd: RawFd, t: &libc::termios) -> io::Result<()> {
+    retry(|| unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, t) })?;
+    Ok(())
+}
+
+/// Discard the input not read yet.
+pub fn flush_input(fd: RawFd) -> io::Result<()> {
+    cvt(unsafe { libc::tcflush(fd, libc::TCIFLUSH) })?;
+    Ok(())
+}
+
 /// dtach's raw mode: no input translation, no output post-processing, no
 /// echo, no canonical mode, no signals from keys, 8-bit, one byte at a time.
 pub fn make_raw(orig: &libc::termios) -> libc::termios {

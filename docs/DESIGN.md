@@ -485,6 +485,11 @@ sequenceDiagram
   typed twice. Keys typed **while the client knows the link is down** are
   dropped rather than queued: blind typing into a frozen screen replayed
   seconds later is how accidents happen. (Command-mode keys still work — §6.)
+  That includes the redial itself, where the terminal is back in cooked mode
+  for ssh's prompts: what was typed then is discarded when raw mode resumes
+  on `WELCOME` (`TCSAFLUSH`), and the takeover question discards it before
+  asking. A Ctrl-C there ends the client with the status line blanked and
+  the title popped, as any fatal signal does.
 - **Fresh attach** (new client, e.g. after an explicit detach or from another
   machine) does **not** replay the ring: the local terminal's state is unknown,
   and replaying mode-changing sequences into it is unsafe. It behaves like
