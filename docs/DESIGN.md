@@ -311,6 +311,10 @@ the session, where a separate `--list` side call used to cost a second
   1-9, or ↑↓ jk and Enter: attach   .: all   x: end   n: new   Esc: leave
   ```
 
+  The cursor's row is reversed in a bar as wide as the widest row listed
+  (or the terminal, if narrower), so it keeps its width from row to row;
+  widths are in terminal columns, a wide character counting two.
+
 | Key | Effect |
 | --- | --- |
 | `1`–`9` | attach that session at once; with more than nine, the rest have no number and are reached with the cursor |
