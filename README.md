@@ -103,12 +103,41 @@ and links `~/.local/bin/acs` to it.
 ## Use
 
 ```text
-acs [ssh options] [user@]host [session]   attach, or create (default session: main)
-acs [ssh options] [user@]host --new       create a new numbered session (1, 2, …)
-acs [ssh options] [user@]host --list      list sessions on host
-acs [ssh options] --list                  list sessions on every host alias
-acs host session -- command args…         run a command instead of the login shell
+acs [ssh options] [user@]host            pick a detached session, or create one
+acs [ssh options] [user@]host session    attach, or create
+acs [ssh options] [user@]host --new      create a new numbered session (1, 2, …)
+acs [ssh options] [user@]host --list     list sessions on host
+acs [ssh options] --list                 list sessions on every host alias
+acs host session -- command args…        run a command instead of the login shell
 ```
+
+A plain `acs host` looks at the host's sessions first. With none
+detached, it creates one — `main`, or the lowest free number if `main` is
+taken. With some detached, it shows them:
+
+```text
+acs: detached sessions on devbox
+
+     NAME  STATE     WHO           IDLE  AGE  COMMAND
+> 1  main  detached  (michel@mbp)  4m    1d   /bin/zsh -l
+  2  work  detached  (michel@mbp)  2h    3d   htop
+  n  new session
+     exit
+
+1-9, or ↑↓ jk and Enter: attach   .: all   x: end   n: new   Esc: leave
+```
+
+| Key | Effect |
+| --- | --- |
+| `1`–`9` | attach that session (more than nine: the rest by cursor) |
+| ↑ ↓ or `k` `j`, then Enter | attach the session under the cursor, or pick *new session* or *exit* |
+| `n` | create a new session |
+| `.` | show attached sessions too; taking one over asks first (`--force` does not) |
+| `x` | end the session under the cursor, after a `y` (or a second `x`) |
+| Esc | leave the menu (Ctrl-C too) |
+
+Listing costs one ssh round trip before attaching. Without a terminal on
+stdout there is no menu: `acs host` attaches `main`, creating it if needed.
 
 In a session, press **Ctrl-] Ctrl-]** quickly, then:
 
@@ -173,7 +202,7 @@ acs: session 'main' on devbox is attached from alice@laptop since 10:02 — take
 ```
 
 `--force` skips the question. `ACS_DEFAULT_SESSION` gives each person their
-own default instead of `main`.
+own name instead of `main` for the session a plain `acs host` creates.
 
 ## Configuration
 
@@ -302,7 +331,7 @@ reached as `user@config`.
 
 | Variable | Meaning |
 | --- | --- |
-| `ACS_DEFAULT_SESSION` | session plain `acs host` means (default `main`) |
+| `ACS_DEFAULT_SESSION` | name of the session plain `acs host` creates, and attaches without a terminal (default `main`) |
 | `ACS_IDENTITY` | identity shown to others on a shared account |
 | `ACS_ESCAPE_KEY` | command key in `^X` notation (default `^]`) |
 | `ACS_ESCAPE_TIMEOUT_MS` | window for the double press (default 400) |

@@ -14,11 +14,29 @@ use crate::sys;
 
 /// Why a host's sessions could not be listed.
 #[derive(Debug)]
-enum Failure {
+pub(crate) enum Failure {
     /// No connection, or no answer in time.
     Unreachable(String),
     /// The proxy answered with something that is not a STATUS reply.
     BadReply(String),
+}
+
+impl Failure {
+    /// What to tell the user about `host`.
+    pub(crate) fn message(&self, host: &str) -> String {
+        match self {
+            Failure::Unreachable(e) => e.clone(),
+            Failure::BadReply(e) => format!("bad reply from {host}: {e}"),
+        }
+    }
+
+    /// The client's exit status for it.
+    pub(crate) fn code(&self) -> u8 {
+        match self {
+            Failure::Unreachable(_) => code::UNREACHABLE,
+            Failure::BadReply(_) => code::ERROR,
+        }
+    }
 }
 
 pub fn run(args: &ClientArgs) -> ExitCode {
@@ -26,13 +44,9 @@ pub fn run(args: &ClientArgs) -> ExitCode {
     match query(args, Call::Side, client::answer_timeout(false)) {
         Ok(Some(sessions)) => print!("{}", render(host, &sessions, sys::unix_now())),
         Ok(None) => println!("{}", not_installed(host)),
-        Err(Failure::Unreachable(e)) => {
-            eprintln!("acs: {e}");
-            return ExitCode::from(code::UNREACHABLE);
-        }
-        Err(Failure::BadReply(e)) => {
-            eprintln!("acs: bad reply from {host}: {e}");
-            return ExitCode::from(code::ERROR);
+        Err(f) => {
+            eprintln!("acs: {}", f.message(host));
+            return ExitCode::from(f.code());
         }
     }
     ExitCode::SUCCESS
@@ -107,13 +121,36 @@ fn not_installed(host: &str) -> String {
 
 /// Ask the host's proxy for every session's STATUS, all within `timeout`;
 /// `Ok(None)` if acs of our version is not installed there.
-fn query(
+pub(crate) fn query(
     args: &ClientArgs,
     call: Call,
     timeout: Duration,
 ) -> Result<Option<Vec<StatusInfo>>, Failure> {
+    Ok(side_call(args, &["--list"], call, timeout)?.map(|a| a.sessions))
+}
+
+/// What the proxy said to a side call.
+pub(crate) struct Answer {
+    /// Every session's STATUS, in the proxy's order.
+    pub sessions: Vec<StatusInfo>,
+    /// The message of an ERROR it sent along (`--kill` of a session that
+    /// would not end).
+    pub error: Option<String>,
+}
+
+/// Run `acs _proxy <proxy_args>` on the host and collect its STATUS
+/// replies, all within `timeout`; `Ok(None)` if acs of our version is not
+/// installed there.
+pub(crate) fn side_call(
+    args: &ClientArgs,
+    proxy_args: &[&str],
+    call: Call,
+    timeout: Duration,
+) -> Result<Option<Answer>, Failure> {
     let deadline = Instant::now() + timeout;
-    let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--list"]);
+    let mut remote_args = vec!["_proxy"];
+    remote_args.extend_from_slice(proxy_args);
+    let remote = ssh::remote_acs(crate::VERSION, &remote_args);
     let (link, marker) = client::dial(args, call, &remote, timeout)
         .map_err(|e| Failure::Unreachable(e.to_string()))?;
     let rest = match marker {
@@ -126,12 +163,17 @@ fn query(
     let mut dec = Decoder::new();
     dec.push(&rest);
     let mut sessions = Vec::new();
+    let mut error = None;
     let mut buf = [0u8; 16 * 1024];
     let from = link.from_fd().as_raw_fd();
     loop {
         match dec.next_msg() {
             Ok(Some(Msg::StatusReply(s))) => {
                 sessions.push(s);
+                continue;
+            }
+            Ok(Some(Msg::Error { message, .. })) => {
+                error = Some(message);
                 continue;
             }
             Ok(Some(_)) => continue,
@@ -171,7 +213,7 @@ fn query(
         }
     }
     link.close();
-    Ok(Some(sessions))
+    Ok(Some(Answer { sessions, error }))
 }
 
 /// Compact durations in one unit: `42s`, `7m`, `3h`, `12d`.
@@ -207,6 +249,12 @@ fn cells(s: &StatusInfo, now: u64) -> Vec<String> {
 /// `rows` under `head`, each column as wide as its widest cell (the last,
 /// the command, is not padded).
 fn table(head: &[&str], rows: &[Vec<String>]) -> String {
+    table_lines(head, rows).concat()
+}
+
+/// The lines of [`table`], each ending in `\n`: the heading, then a line
+/// per row.
+fn table_lines(head: &[&str], rows: &[Vec<String>]) -> Vec<String> {
     let mut width: Vec<usize> = head.iter().map(|h| h.len()).collect();
     for r in rows {
         for (w, c) in width.iter_mut().zip(r.iter()) {
@@ -224,11 +272,24 @@ fn table(head: &[&str], rows: &[Vec<String>]) -> String {
         }
         s.trim_end().to_string() + "\n"
     };
-    let mut out = line(head);
+    let mut out = vec![line(head)];
     for r in rows {
-        out.push_str(&line(&r.iter().map(String::as_str).collect::<Vec<_>>()));
+        out.push(line(&r.iter().map(String::as_str).collect::<Vec<_>>()));
     }
     out
+}
+
+/// The `--list` table of `sessions` as lines without their `\n`: the
+/// heading first (the session menu, DESIGN §4.4).
+pub(crate) fn lines(sessions: &[StatusInfo], now: u64) -> Vec<String> {
+    let rows: Vec<Vec<String>> = sessions.iter().map(|s| cells(s, now)).collect();
+    table_lines(&HEAD, &rows)
+        .into_iter()
+        .map(|mut l| {
+            l.pop();
+            l
+        })
+        .collect()
 }
 
 /// The table `acs <host> --list` prints.

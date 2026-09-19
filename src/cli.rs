@@ -13,7 +13,8 @@ use crate::session;
 use crate::ssh::Transport;
 
 pub const USAGE: &str = "\
-usage: acs [ssh options] [user@]<host> [session]   attach, or create (default session: main)
+usage: acs [ssh options] [user@]<host>             pick a detached session from a menu, or create one
+       acs [ssh options] [user@]<host> <session>   attach, or create
        acs [ssh options] [user@]<host> --new       create a new numbered session
        acs [ssh options] [user@]<host> --list      list sessions on <host>
        acs [ssh options] --list                    list sessions on every host alias (hosts:)
@@ -51,6 +52,11 @@ pub enum Target {
     Named(String),
     /// Create a new session with the lowest free number.
     New,
+    /// No session named: pick a detached one from a menu, or create one
+    /// (DESIGN §4.4). The name is `$ACS_DEFAULT_SESSION` or `main`, which
+    /// a new session gets if it is free, and which is attached or created
+    /// without a terminal for the menu.
+    Pick(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,15 +186,13 @@ where
         return Err("--new picks the session name itself; give either --new or a name".into());
     }
 
-    let target = if new {
-        Target::New
-    } else {
-        let name = match session {
-            Some(s) => s,
-            None => session::default_name_from(default_session)?,
-        };
-        session::validate_name(&name)?;
-        Target::Named(name)
+    let target = match session {
+        _ if new => Target::New,
+        Some(name) => {
+            session::validate_name(&name)?;
+            Target::Named(name)
+        }
+        None => Target::Pick(session::default_name_from(default_session)?),
     };
 
     let mut transport = Transport::new(host.clone().unwrap_or_default());
@@ -238,7 +242,7 @@ mod tests {
     fn dsh_forms() {
         let a = run(&["devbox"]).unwrap();
         assert_eq!(a.transport.destination, "devbox");
-        assert_eq!(a.target, Target::Named("main".into()));
+        assert_eq!(a.target, Target::Pick("main".into()));
         assert!(a.reconnect && !a.list);
 
         let a = run(&["devbox", "work"]).unwrap();
@@ -330,7 +334,7 @@ mod tests {
     #[test]
     fn default_session_from_environment() {
         match parse(["h"].iter().map(OsString::from), Some("michel")).unwrap() {
-            Parsed::Run(a) => assert_eq!(a.target, Target::Named("michel".into())),
+            Parsed::Run(a) => assert_eq!(a.target, Target::Pick("michel".into())),
             other => panic!("{other:?}"),
         }
     }

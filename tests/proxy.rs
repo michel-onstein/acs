@@ -243,3 +243,48 @@ fn a_dropped_client_leaves_the_session_detached() {
     let w = welcome(&mut q);
     assert!(!w.created);
 }
+
+/// Everything a side call answers, until it closes.
+fn answers(p: &mut Proxy) -> Vec<Msg> {
+    let mut got = Vec::new();
+    while let Some(m) = p.conn.recv(T) {
+        got.push(m);
+    }
+    assert!(p.conn.closed(T), "the side call did not end");
+    got
+}
+
+/// `--kill` (the session menu's `x`, acs-s0g): the session ends — its
+/// attached client gets EXIT, as with `x` inside it — and the answer, once
+/// it is gone, is the sessions left.
+#[test]
+fn kill_ends_a_session_then_lists_the_rest() {
+    let t = TempDir::new();
+    let mut a = session(t.path(), "a");
+    a.conn.send(&hello_cmd("a", "me", "sleep 30"));
+    welcome(&mut a);
+    let mut b = session(t.path(), "b");
+    b.conn.send(&hello_cmd("b", "me", "sleep 30"));
+    welcome(&mut b);
+
+    let mut k = proxy(t.path(), &["--kill", "a"]);
+    let got = answers(&mut k);
+    assert!(
+        matches!(&got[..], [Msg::StatusReply(s)] if s.name == "b"),
+        "{got:?}"
+    );
+    assert!(!t.path().join("a.sock").exists());
+    assert!(matches!(a.conn.recv_control(T), Some(Msg::Exit { .. })));
+}
+
+#[test]
+fn kill_of_a_missing_session_says_so() {
+    let t = TempDir::new();
+    let mut k = proxy(t.path(), &["--kill", "nope"]);
+    let got = answers(&mut k);
+    assert!(
+        matches!(&got[..], [Msg::Error { code, message }]
+            if *code == err::NO_SESSION && message == "no session 'nope'"),
+        "{got:?}"
+    );
+}
