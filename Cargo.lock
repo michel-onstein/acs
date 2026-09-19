@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "acs"
-version = "0.10.9"
+version = "0.10.10"
 dependencies = [
  "lexopt",
  "libc",
