@@ -56,6 +56,8 @@ pub enum Role {
     Config,
     /// `acs upgrade`: replace this binary with a newer release.
     Upgrade,
+    /// `acs list [host]`: the client, listing sessions (DESIGN §4.3, §7.3).
+    List,
     /// Background check for a newer release, started by the client.
     UpdateCheck,
 }
@@ -71,10 +73,11 @@ impl Role {
             Some("_update-check") => Role::UpdateCheck,
             Some("_version") | Some("--version") | Some("-V") => Role::Version,
             // Reserved words, only as the very first argument: a host
-            // called `config` or `upgrade` is still reachable as
+            // called `config`, `upgrade` or `list` is still reachable as
             // `user@config`, or with any option before it.
             Some("config") => Role::Config,
             Some("upgrade") => Role::Upgrade,
+            Some("list") => Role::List,
             _ => Role::Client,
         }
     }
@@ -118,7 +121,8 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         }
         Role::Master => master::main(&args[2..]),
         Role::Proxy => proxy::main(&args[2..]),
-        Role::Client => client::main(&args[1..]),
+        Role::Client => client::main(&args[1..], false),
+        Role::List => client::main(&args[2..], true),
         Role::Install => install::finish_main(&args[2..]),
         Role::Config => config_cmd::main(&args[2..]),
         Role::Upgrade => upgrade::main(&args[2..]),
@@ -156,6 +160,10 @@ mod tests {
     fn commands_are_reserved_as_the_first_argument() {
         assert_eq!(role("config"), Role::Config);
         assert_eq!(role("upgrade"), Role::Upgrade);
+        assert_eq!(role("list"), Role::List);
         assert_eq!(Role::from_first_arg(None), Role::Client);
+        // A host of that name: as user@list, or behind an option.
+        assert_eq!(role("me@list"), Role::Client);
+        assert_eq!(role("-v"), Role::Client);
     }
 }

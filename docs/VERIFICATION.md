@@ -31,8 +31,8 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 | Mouse reports | program enables mode 1000; client sends an X10 report | Pass — program receives `1b 5b 4d 20 21 21` |
 | Killed connection | the host's `sshd-session` for the connection is killed mid-stream | Pass — reconnect, numbered output consecutive, nothing lost or repeated |
 | Frozen host | `docker pause` for 4 s beyond the dead-link timeout | Pass — dead link detected in 3.0 s (`ACS_DEAD_MS=3000`), resumed with no loss |
-| `--list` | over ssh after the sessions above | Pass — sessions listed |
-| `--list` on every alias | no host; aliases `box` (the container) and `gone` (192.0.2.1, answers no ping); ssh in `BatchMode` | Pass — `box` sessions under a HOST column, one stderr line for `gone`, exit 255 |
+| `acs list <host>` | over ssh after the sessions above | Pass — sessions listed |
+| `acs list` on every alias | no host; aliases `box` (the container) and `gone` (192.0.2.1, answers no ping); ssh in `BatchMode` | Pass — `box` sessions under a HOST column, one stderr line for `gone`, exit 255 |
 | `user@<alias>` | `acs dev@box` where alias `box`'s only entry says `user: nobody` | Pass — logs in as `dev` (2026-09-18) |
 | Ctrl-L after reconnecting | a program reporting each byte it receives: a new session, then a re-attach, then the `sshd-session` killed | Pass — nothing to the new session, one `0c` after the re-attach and one after the resume (2026-09-18) |
 | `identity_file` | no `-i`; the key only at `~/.ssh/id_box` under a HOME of the test's own, named by a host entry over a missing alias key, then by an alias | Pass — both log in; acs expands the `~` (2026-09-18) |

@@ -22,11 +22,11 @@ pub const TRANSPORT_OPTS: &[&str] = &[
     "ConnectTimeout=10",
 ];
 
-/// Options for side calls (`--list`, install): no pty and no escape char,
+/// Options for side calls (`acs list`, install): no pty and no escape char,
 /// but the user's connection multiplexing is kept.
 pub const SIDE_OPTS: &[&str] = &["-T", "-e", "none"];
 
-/// Side calls made to several hosts at once (`acs --list`, DESIGN §7.3): no
+/// Side calls made to several hosts at once (`acs list`, DESIGN §7.3): no
 /// ssh may ask for a password or a host key on the shared terminal, and a
 /// dead host must fail within the time the others take to answer.
 pub const BATCH_OPTS: &[&str] = &[

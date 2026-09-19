@@ -1,5 +1,5 @@
 //! The weekly check for a newer release (acs-fh5, DESIGN §7.6), against a
-//! fake release server; `acs --list` stands for any client start.
+//! fake release server; `acs list` stands for any client start.
 
 mod common;
 
@@ -37,7 +37,7 @@ impl Setup {
         std::fs::read_to_string(self.file()).unwrap_or_default()
     }
 
-    /// `acs devbox --list` with the check turned on; returns stderr.
+    /// `acs list devbox` with the check turned on; returns stderr.
     fn start(&self, extra: &[(&str, &str)]) -> String {
         self.start_as(&exe(), extra)
     }
@@ -46,10 +46,10 @@ impl Setup {
     fn start_as(&self, acs: &Path, extra: &[(&str, &str)]) -> String {
         let mut c = acs_cmd_as(acs);
         c.args([
+            "list",
             "--transport-cmd",
             &self.remote.transport(),
             "devbox",
-            "--list",
         ])
         .env("ACS_NO_UPDATE_CHECK", "")
         .env("XDG_STATE_HOME", self.state.path())
@@ -200,7 +200,7 @@ fn the_state_file_defaults_under_home() {
     let s = Setup::new();
     let home = TempDir::new();
     let mut c = acs_cmd();
-    c.args(["--transport-cmd", &s.remote.transport(), "devbox", "--list"])
+    c.args(["list", "--transport-cmd", &s.remote.transport(), "devbox"])
         .env("ACS_NO_UPDATE_CHECK", "")
         .env_remove("XDG_STATE_HOME")
         .env("HOME", home.path())

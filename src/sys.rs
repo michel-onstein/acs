@@ -462,7 +462,7 @@ pub fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
 /// the standard library makes a child's pipes with `pipe` and marks them
 /// close-on-exec a moment later; a child another thread forks in between
 /// keeps them open, and the first child's output then never reaches end of
-/// file while the second one lives. `acs --list` dials every alias at once.
+/// file while the second one lives. `acs list` dials every alias at once.
 pub fn spawn(cmd: &mut std::process::Command) -> io::Result<std::process::Child> {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());

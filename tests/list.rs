@@ -1,4 +1,4 @@
-//! `acs <host> --list` (acs-5v9.12), and `acs --list` on every alias
+//! `acs list <host>` (acs-5v9.12), and `acs list` on every alias
 //! (acs-7zi, DESIGN §7.3).
 
 mod common;
@@ -9,7 +9,7 @@ use common::*;
 
 fn list(remote: &Remote) -> (i32, String) {
     let out = acs_cmd()
-        .args(["--transport-cmd", &remote.transport(), "devbox", "--list"])
+        .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
         .output()
         .unwrap();
     (
@@ -68,7 +68,7 @@ fn empty_and_not_installed() {
 }
 
 /// Regression: a host that starts acs and then says nothing is given up on
-/// in time; `--list` used to wait for it forever.
+/// in time; listing used to wait for it forever.
 #[test]
 fn a_host_silent_after_its_marker_is_given_up_on() {
     let remote = Remote::installed();
@@ -76,7 +76,7 @@ fn a_host_silent_after_its_marker_is_given_up_on() {
     let t0 = Instant::now();
     let out = acs_cmd()
         .env("ACS_DIAL_TIMEOUT_MS", "500")
-        .args(["--transport-cmd", &remote.transport(), "devbox", "--list"])
+        .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
         .output()
         .unwrap();
     assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
@@ -85,9 +85,9 @@ fn a_host_silent_after_its_marker_is_given_up_on() {
     assert!(err.contains("no answer from devbox within 0.5 s"), "{err}");
 }
 
-// ---- acs --list: every alias -----------------------------------------------
+// ---- acs list: every alias --------------------------------------------------
 
-/// `acs [args] --list` with no host, through `ssh` and `net`: exit code,
+/// `acs list [args]` with no host, through `ssh` and `net`: exit code,
 /// stdout, stderr.
 fn list_all(
     ssh: &Ssh,
@@ -100,10 +100,10 @@ fn list_all(
         acs_cmd()
             .envs(net.env(config))
             .envs(env.iter().copied())
+            .arg("list")
             .arg("--ssh")
             .arg(ssh.path())
-            .args(args)
-            .arg("--list"),
+            .args(args),
     );
     (
         out.status.code().unwrap_or(-1),

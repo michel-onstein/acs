@@ -106,10 +106,14 @@ and links `~/.local/bin/acs` to it.
 acs [ssh options] [user@]host            pick a detached session, or create one
 acs [ssh options] [user@]host session    attach, or create
 acs [ssh options] [user@]host --new      create a new numbered session (1, 2, …)
-acs [ssh options] [user@]host --list     list sessions on host
-acs [ssh options] --list                 list sessions on every host alias
+acs list [ssh options] [user@]host       list sessions on host
+acs list [ssh options]                   list sessions on every host alias
 acs host session -- command args…        run a command instead of the login shell
 ```
+
+`list`, `config` and `upgrade` are commands when they come first. A host
+with one of those names is reached as `user@list`, with an option before
+it (`acs -p 22 list`), or listed as `acs list list`.
 
 A plain `acs host` looks at the host's sessions first. With none
 detached, it creates one — `main`, or the lowest free number if `main` is
@@ -162,9 +166,10 @@ usual. The command key works in every keyboard encoding a terminal may use
 
 `-i <identity_file>`, `-p <port>`, `-J <jump>`, `-F <config>` and
 `-o <option=value>` are passed to every ssh call acs makes, with ssh's
-meaning. `-l` is `--list`, not ssh's login option: put a login name in
-`user@host` or `-o User=`. Your `~/.ssh/config`, agent and keys apply as
-usual; nothing needs configuring on either side. A key can also be set per
+meaning. There is no `-l`, neither ssh's login option nor a list option:
+put a login name in `user@host` or `-o User=`, and list with `acs list`.
+Your `~/.ssh/config`, agent and keys apply as usual; nothing needs
+configuring on either side. A key can also be set per
 host alias in the configuration (`identity_file`, below); `-i` on the
 command line wins.
 
@@ -291,7 +296,7 @@ hosts are in the global file (`lab: {identity_file: ~/.ssh/mine}`).
 
 ### Sessions on every host
 
-`acs --list` without a host lists the sessions on every alias at once:
+`acs list` without a host lists the sessions on every alias at once:
 
 ```text
 HOST    NAME  STATE     WHO           IDLE  AGE  COMMAND
@@ -306,7 +311,7 @@ that is down or slow only costs its own line — on stderr, after at most 30 s
 (`ACS_DIAL_TIMEOUT_MS`). The exit status is 0 when every host answered and
 255 when any did not. Several ssh cannot ask for passwords on one terminal,
 so these calls run with ssh's `BatchMode`: list a host that needs a password
-on its own, with `acs <alias> --list`. With no aliases configured, it says so
+on its own, with `acs list <alias>`. With no aliases configured, it says so
 and exits with 2.
 
 ### Editing it from the command line
@@ -351,7 +356,7 @@ reached as `user@config`.
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
-| `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial and for each host of `acs --list`) |
+| `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial and for each host of `acs list`) |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |

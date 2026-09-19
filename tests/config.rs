@@ -65,7 +65,7 @@ fn a_malformed_file_is_an_error_naming_file_and_line() {
     let env = config_env(cfg.path(), "hosts:\n  devbox:\n\t- host: x\n");
     let out = acs_cmd()
         .envs(env)
-        .args(["--transport-cmd", &remote.transport(), "devbox", "--list"])
+        .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
