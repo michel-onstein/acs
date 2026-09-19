@@ -111,6 +111,23 @@ fn a_login_banner_that_is_not_utf8_does_not_fail_the_install() {
     assert!(leftovers(&remote).is_empty(), "{:?}", leftovers(&remote));
 }
 
+/// Regression (acs-iry): the link into ~/.local/bin is a convenience — when
+/// it cannot be made (here ~/.local/bin is a regular file) the install still
+/// counts, with a warning, and the session runs.
+#[test]
+fn a_link_that_cannot_be_made_is_a_warning_not_a_failed_install() {
+    let remote = Remote::new();
+    let local = remote.home().join(".local");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(local.join("bin"), "not a directory\n").unwrap();
+    let mut c = Client::start(&remote, &args("w"));
+    c.wait_for("warning: cannot link ~/.local/bin/acs", T);
+    c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
+    c.wait_for("up", T);
+    assert!(remote.installed_binary(acs::VERSION).exists());
+    assert!(leftovers(&remote).is_empty(), "{:?}", leftovers(&remote));
+}
+
 /// Regression (acs-14k): a startup file that prints without a trailing
 /// newline must not hide the ACS-NEED or ACS-READY marker.
 #[test]
