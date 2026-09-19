@@ -330,3 +330,35 @@ fn no_aliases_is_a_usage_error() {
     );
     assert!(ssh.calls().is_empty());
 }
+
+/// acs-pcs: with no configuration file at all `acs list` says so, naming
+/// where it looked, rather than blaming a configuration that is not there;
+/// a file without aliases keeps its own message. Both exit 2, from the
+/// table and from the menu alike.
+#[test]
+fn no_configuration_at_all_is_told_apart_from_one_without_aliases() {
+    let hint = "list one host with acs list <host>, or add an alias with acs config host add <alias> <host>";
+    let none = format!(
+        "acs: no configuration (looked for {NO_CONFIG}/global.yaml and {NO_CONFIG}/acs/config.yaml): {hint}\n"
+    );
+    // The harness points both files at a directory that does not exist.
+    let out = acs_cmd().arg("list").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), none);
+    let mut c = Client::spawn(&exe(), &["list"], &[]);
+    assert_eq!(c.wait(T), 2);
+    c.wait_for(none.trim_end(), T);
+    // A file, even an empty one or one with an empty hosts:, is a
+    // configuration without aliases.
+    for yaml in ["", "hosts:\n", "update_check: false\n"] {
+        let cfg = acs::testutil::TempDir::new();
+        let env = config_env(cfg.path(), yaml);
+        let out = acs_cmd().envs(env).arg("list").output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{yaml:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("acs: no host aliases in the configuration: {hint}\n"),
+            "{yaml:?}"
+        );
+    }
+}
