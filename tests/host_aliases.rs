@@ -31,7 +31,7 @@ fn an_alias_connects_to_its_first_reachable_host() {
     let mut c = Client::start_env(&remote, &session("devbox"), &refs(&env));
     c.wait_for("devbox: devbox.lan answers ping, using devbox.lan", T);
     c.wait_for("up", T);
-    assert_eq!(net.pinged(), ["devbox.lan"]);
+    assert_eq!(net.pinged(), ["devbox.example.com", "devbox.lan"]);
 }
 
 #[test]
@@ -71,6 +71,38 @@ fn no_reachable_host_is_an_error_with_exit_255() {
         T,
     );
     assert!(remote.transport_pids().is_empty(), "no connection is made");
+}
+
+#[test]
+fn a_host_slower_than_the_deadline_is_passed_over() {
+    // devbox.lan would answer, but only after 30 s: at the alias's 2 s
+    // deadline acs gives up on it and takes the next host, which answered
+    // at once — about 2 s, not 30.
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    net.set_slow(&["devbox.lan"]);
+    let config = "\
+reachability_timeout: 20s
+hosts:
+  devbox:
+    reachability_timeout: 2s
+    hosts:
+      - host: devbox.lan
+      - host: devbox.example.com
+        user: me
+";
+    let env = net.env(config);
+    let t0 = std::time::Instant::now();
+    let mut c = Client::start_env(&remote, &session("devbox"), &refs(&env));
+    c.wait_for("devbox: devbox.lan does not answer ping within 2s", T);
+    c.wait_for(
+        "devbox: devbox.example.com answers ping, using me@devbox.example.com",
+        T,
+    );
+    c.wait_for("up", T);
+    let took = t0.elapsed();
+    assert!(took < std::time::Duration::from_secs(15), "{took:?}");
+    assert!(took >= std::time::Duration::from_secs(2), "{took:?}");
 }
 
 #[test]

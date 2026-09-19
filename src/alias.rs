@@ -1,9 +1,17 @@
 //! Host aliases (DESIGN §7.3): `acs [user@]<alias>` connects to the first of
 //! the alias's configured hosts that answers a ping, or that is not checked.
+//! The hosts are pinged at once, and the configured order decides.
 
+use std::ffi::OsStr;
 use std::process::{Command, Stdio};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
-use crate::config::{Alias, Config, HostEntry};
+use crate::config::{format_timeout, Alias, Config, HostEntry};
+
+/// Whether a host answers a ping within the deadline given. Shared with the
+/// threads that ping an alias's hosts at once.
+pub type Reachable = dyn Fn(&str, Duration) -> bool + Send + Sync;
 
 /// The entry `name` stands for: `Ok(None)` if it is not an alias, the chosen
 /// entry otherwise, and an error naming every host tried when none answers.
@@ -15,7 +23,7 @@ use crate::config::{Alias, Config, HostEntry};
 pub fn resolve(
     name: &str,
     config: &Config,
-    reachable: &mut dyn FnMut(&str) -> bool,
+    reachable: Arc<Reachable>,
     log: &mut dyn FnMut(String),
 ) -> Result<Option<HostEntry>, String> {
     let (user, alias) = split_user(name);
@@ -25,7 +33,8 @@ pub fn resolve(
     if let Some(u) = user {
         log(format!("{name}: logging in as {u}, from the command line"));
     }
-    pick(name, alias, user, reachable, log).map(Some)
+    let timeout = config.reachability_timeout_for(alias).value;
+    pick(name, alias, user, timeout, reachable, log).map(Some)
 }
 
 /// `user@host` as its login name and host, split at the last `@` as ssh
@@ -37,37 +46,77 @@ pub fn split_user(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The entry to use: every checked host that could be chosen is pinged at
+/// once, and host k is taken as soon as it has answered and every one before
+/// it has not — what trying them one after another would choose, in at most
+/// one `timeout`.
 fn pick(
     name: &str,
     alias: &Alias,
     user: Option<&str>,
-    reachable: &mut dyn FnMut(&str) -> bool,
+    timeout: Duration,
+    reachable: Arc<Reachable>,
     log: &mut dyn FnMut(String),
 ) -> Result<HostEntry, String> {
-    let mut tried = Vec::new();
-    for e in &alias.entries {
-        let e = HostEntry {
+    let mut entries: Vec<HostEntry> = alias
+        .entries
+        .iter()
+        .map(|e| HostEntry {
             user: user.map(String::from).or_else(|| e.user.clone()),
             identity_file: e
                 .identity_file
                 .clone()
                 .or_else(|| alias.identity_file.clone()),
             ..e.clone()
-        };
+        })
+        .collect();
+    // Nothing after an unchecked host can be chosen, so nothing there is
+    // pinged.
+    if let Some(i) = entries.iter().position(|e| !e.reachability_check) {
+        entries.truncate(i + 1);
+    }
+    let deadline = Instant::now() + timeout;
+    let (tx, rx) = mpsc::channel();
+    for (i, e) in entries.iter().enumerate() {
+        if e.reachability_check {
+            let (tx, host, reachable) = (tx.clone(), e.host.clone(), Arc::clone(&reachable));
+            // Not joined: once a host is chosen nobody waits for the others,
+            // whose pings give up at the deadline by themselves.
+            std::thread::spawn(move || {
+                let _ = tx.send((i, reachable(&host, timeout)));
+            });
+        }
+    }
+    drop(tx);
+    let mut answered = vec![None; entries.len()];
+    let mut tried = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
         let dest = e.destination();
         if !e.reachability_check {
             log(format!(
                 "{name}: using {dest} (reachability_check is off, {})",
                 e.origin
             ));
-            return Ok(e);
+            return Ok(e.clone());
         }
-        if reachable(&e.host) {
+        // An answer after the deadline counts as none.
+        while answered[i].is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok((j, up)) => answered[j] = Some(up),
+                Err(_) => break,
+            }
+        }
+        if answered[i] == Some(true) {
             log(format!("{name}: {} answers ping, using {dest}", e.host));
-            return Ok(e);
+            return Ok(e.clone());
         }
-        log(format!("{name}: {} does not answer ping", e.host));
-        tried.push(e.host);
+        log(format!(
+            "{name}: {} does not answer ping within {}",
+            e.host,
+            format_timeout(timeout)
+        ));
+        tried.push(e.host.clone());
     }
     Err(format!(
         "no host for '{name}' is reachable (tried {})",
@@ -75,34 +124,54 @@ fn pick(
     ))
 }
 
-/// Ping `host` once with a short timeout (`ACS_PING` names the program).
-pub fn ping(host: &str) -> bool {
+/// Ping `host` once, waiting at most `deadline` for the answer (`ACS_PING`
+/// names the program).
+pub fn ping(host: &str, deadline: Duration) -> bool {
     let prog = std::env::var_os("ACS_PING")
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| "ping".into());
+    ping_with(&prog, host, deadline)
+}
+
+fn ping_with(prog: &OsStr, host: &str, deadline: Duration) -> bool {
     let mut c = Command::new(prog);
-    // One packet, give up after 2 s: macOS spells the deadline -t, Linux
-    // (iputils and busybox) -W.
-    let timeout = if cfg!(target_os = "macos") {
+    // One packet. The deadline is acs's own, to the millisecond: macOS -t
+    // and BusyBox -W take whole seconds, and iputils -W fractions only in
+    // newer releases. The one given to ping, a second or more past it, is a
+    // backstop should acs not get to kill it.
+    let flag = if cfg!(target_os = "macos") {
         "-t"
     } else {
         "-W"
     };
-    c.args(["-c", "1", timeout, "2", "--", host])
+    let backstop = (deadline.as_secs() + 2).to_string();
+    c.args(["-c", "1", flag, &backstop, "--", host])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // Spawned apart from waited for: `acs --list` pings from several threads.
-    crate::sys::spawn(&mut c)
-        .and_then(|mut child| child.wait())
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // Spawned apart from waited for: several threads ping at once.
+    let Ok(mut child) = crate::sys::spawn(&mut c) else {
+        return false;
+    };
+    let end = Instant::now() + deadline;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+    use std::sync::Mutex;
 
     fn config(yaml: &str) -> Config {
         let dir = TempDir::new();
@@ -124,23 +193,95 @@ hosts:
     - host: lab3
 ";
 
+    /// A fake ping: each host answers (`true`) or not after its delay in
+    /// milliseconds, and every host asked about is recorded with the
+    /// deadline it was given.
+    struct Fake {
+        hosts: Vec<(String, u64, bool)>,
+        asked: Mutex<Vec<(String, Duration)>>,
+    }
+
+    impl Fake {
+        fn new(hosts: &[(&str, u64, bool)]) -> Arc<Fake> {
+            Arc::new(Fake {
+                hosts: hosts
+                    .iter()
+                    .map(|&(h, ms, up)| (h.to_string(), ms, up))
+                    .collect(),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn up(up: &[&str]) -> Arc<Fake> {
+            Fake::new(&up.iter().map(|&h| (h, 0, true)).collect::<Vec<_>>())
+        }
+
+        /// The closure for `resolve`.
+        fn reachable(self: &Arc<Fake>) -> Arc<Reachable> {
+            let f = Arc::clone(self);
+            Arc::new(move |h: &str, deadline| {
+                f.asked.lock().unwrap().push((h.to_string(), deadline));
+                match f.hosts.iter().find(|(name, ..)| name == h) {
+                    Some(&(_, ms, up)) => {
+                        std::thread::sleep(Duration::from_millis(ms));
+                        up
+                    }
+                    None => false,
+                }
+            })
+        }
+
+        /// Every host asked about, sorted, once every ping has returned.
+        fn pinged(self: &Arc<Fake>) -> Vec<String> {
+            // The pinging threads each hold the closure, which holds `self`.
+            let end = Instant::now() + Duration::from_secs(10);
+            while Arc::strong_count(self) > 1 && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut v: Vec<String> = self
+                .asked
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|a| a.0.clone())
+                .collect();
+            v.sort();
+            v
+        }
+    }
+
     /// Resolve with `up` as the hosts that answer; returns the chosen
-    /// destination, the hosts pinged, and the log.
+    /// destination, the hosts pinged (sorted), and the log.
     fn run(name: &str, up: &[&str]) -> (Result<Option<String>, String>, Vec<String>, Vec<String>) {
         let c = config(TWO);
-        let mut pinged = Vec::new();
+        let fake = Fake::up(up);
         let mut log = Vec::new();
-        let r = resolve(
-            name,
-            &c,
-            &mut |h| {
-                pinged.push(h.to_string());
-                up.contains(&h)
-            },
-            &mut |m| log.push(m),
-        );
-        (r.map(|e| e.map(|e| e.destination())), pinged, log)
+        let r = resolve(name, &c, fake.reachable(), &mut |m| log.push(m));
+        (r.map(|e| e.map(|e| e.destination())), fake.pinged(), log)
     }
+
+    /// Resolve `name` in `yaml` against `fake`; returns the chosen
+    /// destination, the log, and how long it took.
+    fn timed(
+        yaml: &str,
+        name: &str,
+        fake: &Arc<Fake>,
+    ) -> (Result<String, String>, Vec<String>, Duration) {
+        let c = config(yaml);
+        let mut log = Vec::new();
+        let start = Instant::now();
+        let r = resolve(name, &c, fake.reachable(), &mut |m| log.push(m));
+        let took = start.elapsed();
+        (r.map(|e| e.unwrap().destination()), log, took)
+    }
+
+    const ABC: &str = "\
+hosts:
+  abc:
+    - host: a
+    - host: b
+    - host: c
+";
 
     #[test]
     fn a_name_that_is_not_an_alias_is_left_alone() {
@@ -164,7 +305,7 @@ hosts:
     fn user_at_alias_logs_in_as_that_user_on_the_first_host() {
         let (r, pinged, log) = run("you@devbox", &["devbox.lan"]);
         assert_eq!(r, Ok(Some("you@devbox.lan".into())));
-        assert_eq!(pinged, ["devbox.lan"]);
+        assert_eq!(pinged, ["devbox.example.com", "devbox.lan"]);
         assert_eq!(
             log,
             [
@@ -178,7 +319,7 @@ hosts:
     fn user_at_alias_replaces_the_fallback_hosts_own_user() {
         let (r, pinged, _) = run("you@devbox", &["devbox.example.com"]);
         assert_eq!(r, Ok(Some("you@devbox.example.com".into())));
-        assert_eq!(pinged, ["devbox.lan", "devbox.example.com"]);
+        assert_eq!(pinged, ["devbox.example.com", "devbox.lan"]);
         let (r, _, _) = run("you@lab", &[]);
         assert_eq!(r, Ok(Some("you@lab2".into())));
         let (r, _, _) = run("you@devbox", &[]);
@@ -195,7 +336,8 @@ hosts:
     fn the_first_host_that_answers_is_used() {
         let (r, pinged, log) = run("devbox", &["devbox.lan", "devbox.example.com"]);
         assert_eq!(r, Ok(Some("devbox.lan".into())));
-        assert_eq!(pinged, ["devbox.lan"]);
+        // Both were pinged, at once; the configured order decides.
+        assert_eq!(pinged, ["devbox.example.com", "devbox.lan"]);
         assert_eq!(log, ["devbox: devbox.lan answers ping, using devbox.lan"]);
     }
 
@@ -203,8 +345,11 @@ hosts:
     fn falls_back_to_the_next_host_with_its_user() {
         let (r, pinged, log) = run("devbox", &["devbox.example.com"]);
         assert_eq!(r, Ok(Some("me@devbox.example.com".into())));
-        assert_eq!(pinged, ["devbox.lan", "devbox.example.com"]);
-        assert_eq!(log[0], "devbox: devbox.lan does not answer ping");
+        assert_eq!(pinged, ["devbox.example.com", "devbox.lan"]);
+        assert_eq!(
+            log[0],
+            "devbox: devbox.lan does not answer ping within 500ms"
+        );
         assert!(log[1].ends_with("using me@devbox.example.com"), "{log:?}");
     }
 
@@ -235,7 +380,7 @@ hosts:
 ",
         );
         let key = |name: &str, up: &[&str]| {
-            resolve(name, &c, &mut |h| up.contains(&h), &mut |_| {})
+            resolve(name, &c, Fake::up(up).reachable(), &mut |_| {})
                 .unwrap()
                 .unwrap()
                 .identity_file
@@ -266,5 +411,132 @@ hosts:
             Err("no host for 'devbox' is reachable (tried devbox.lan, devbox.example.com)".into())
         );
         assert_eq!(pinged.len(), 2);
+    }
+
+    #[test]
+    fn a_later_host_answering_first_does_not_beat_an_earlier_one_in_time() {
+        // b answers at once, a after 150ms: a is first in the list and
+        // answers within the deadline, so a it is.
+        let fake = Fake::new(&[("a", 150, true), ("b", 0, true), ("c", 0, true)]);
+        let (r, log, took) = timed(ABC, "abc", &fake);
+        assert_eq!(r, Ok("a".into()));
+        assert_eq!(log, ["abc: a answers ping, using a"]);
+        assert!(took >= Duration::from_millis(150), "{took:?}");
+        // And b, answering, is taken over a c that answered first.
+        let fake = Fake::new(&[("a", 0, false), ("b", 150, true), ("c", 0, true)]);
+        let (r, log, _) = timed(ABC, "abc", &fake);
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(
+            log,
+            [
+                "abc: a does not answer ping within 500ms",
+                "abc: b answers ping, using b",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_hosts_are_pinged_at_once() {
+        // One after another, three 300ms pings take 900ms.
+        let fake = Fake::new(&[("a", 300, false), ("b", 300, false), ("c", 300, true)]);
+        let (r, _, took) = timed(&format!("reachability_timeout: 2s\n{ABC}"), "abc", &fake);
+        assert_eq!(r, Ok("c".into()));
+        assert!(took < Duration::from_millis(700), "{took:?}");
+        assert_eq!(fake.pinged(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn an_answer_after_the_deadline_counts_as_none() {
+        let yaml = format!("reachability_timeout: 100ms\n{ABC}");
+        let fake = Fake::new(&[("a", 2000, true), ("b", 0, true)]);
+        let (r, log, took) = timed(&yaml, "abc", &fake);
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(log[0], "abc: a does not answer ping within 100ms");
+        assert!(took < Duration::from_millis(1000), "{took:?}");
+        // Nothing answering in time takes one deadline, not one per host.
+        let fake = Fake::new(&[("a", 2000, true), ("b", 2000, true), ("c", 2000, true)]);
+        let (r, _, took) = timed(&yaml, "abc", &fake);
+        assert_eq!(
+            r,
+            Err("no host for 'abc' is reachable (tried a, b, c)".into())
+        );
+        assert!(took < Duration::from_millis(1000), "{took:?}");
+    }
+
+    #[test]
+    fn the_aliass_own_deadline_is_the_one_used() {
+        let yaml = "\
+reachability_timeout: 2s
+hosts:
+  quick:
+    reachability_timeout: 250ms
+    hosts: [{host: a}]
+  plain: [{host: b}]
+";
+        let fake = Fake::up(&["a", "b"]);
+        assert_eq!(timed(yaml, "quick", &fake).0, Ok("a".into()));
+        assert_eq!(timed(yaml, "plain", &fake).0, Ok("b".into()));
+        fake.pinged();
+        let asked = fake.asked.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            [
+                ("a".to_string(), Duration::from_millis(250)),
+                ("b".to_string(), Duration::from_secs(2))
+            ]
+        );
+    }
+
+    /// An executable `sh` script in `dir`.
+    fn script(dir: &TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.path().join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn ping_is_one_packet_with_a_backstop_past_the_deadline() {
+        let dir = TempDir::new();
+        let args = dir.path().join("args");
+        let p = script(&dir, "ping", &format!("echo \"$@\" > '{}'", args.display()));
+        let flag = if cfg!(target_os = "macos") {
+            "-t"
+        } else {
+            "-W"
+        };
+        for (ms, secs) in [(500, 2), (1000, 3), (2500, 4)] {
+            assert!(ping_with(p.as_os_str(), "h.lan", Duration::from_millis(ms)));
+            assert_eq!(
+                std::fs::read_to_string(&args).unwrap(),
+                format!("-c 1 {flag} {secs} -- h.lan\n")
+            );
+        }
+        let down = script(&dir, "down", "exit 1");
+        assert!(!ping_with(down.as_os_str(), "h", Duration::from_secs(1)));
+        let none = dir.path().join("no-such-ping");
+        assert!(!ping_with(none.as_os_str(), "h", Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn ping_is_killed_at_the_deadline() {
+        let dir = TempDir::new();
+        let late = dir.path().join("late");
+        let p = script(
+            &dir,
+            "ping",
+            &format!("sleep 1; touch '{}'", late.display()),
+        );
+        let start = Instant::now();
+        assert!(!ping_with(p.as_os_str(), "h", Duration::from_millis(100)));
+        assert!(
+            start.elapsed() < Duration::from_millis(800),
+            "{:?}",
+            start.elapsed()
+        );
+        // Killed, not left to answer late.
+        std::thread::sleep(Duration::from_millis(1300));
+        assert!(!late.exists());
     }
 }

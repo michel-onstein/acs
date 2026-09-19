@@ -10,6 +10,7 @@
 //! Only the local client reads it; the remote roles never do.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::yaml::{self, Node, Value};
 
@@ -77,6 +78,9 @@ pub struct Alias {
     /// Send Ctrl-L after reconnecting; `None` leaves it to the global
     /// setting.
     pub redraw_on_reconnect: Option<Setting<bool>>,
+    /// How long to wait for the hosts' pings; `None` leaves it to the
+    /// global setting.
+    pub reachability_timeout: Option<Setting<Duration>>,
     /// Where the alias is first defined.
     pub origin: Origin,
 }
@@ -92,6 +96,9 @@ pub struct Config {
     /// Send Ctrl-L to the program after reconnecting to a session that was
     /// already there (default true; DESIGN §5.2).
     pub redraw_on_reconnect: Setting<bool>,
+    /// How long an alias's hosts have to answer a ping (default 0.5 s;
+    /// DESIGN §7.3).
+    pub reachability_timeout: Setting<Duration>,
     /// Aliases in the order first defined, each with its hosts in order.
     pub hosts: Vec<Alias>,
     /// The files that were read, global first.
@@ -105,6 +112,7 @@ impl Default for Config {
             update_check: Setting::default(true),
             command_bell: Setting::default(true),
             redraw_on_reconnect: Setting::default(true),
+            reachability_timeout: Setting::default(DEFAULT_REACHABILITY_TIMEOUT),
             hosts: Vec::new(),
             files: Vec::new(),
         }
@@ -117,6 +125,7 @@ pub const KEYS: &[&str] = &[
     "update_check",
     "command_bell",
     "redraw_on_reconnect",
+    "reachability_timeout",
     "hosts",
 ];
 
@@ -133,10 +142,25 @@ pub const HOST_KEYS: &[&str] = &["host", "user", "reachability_check", "identity
 
 /// Every key of an alias written as a mapping (`devbox: {identity_file: …,
 /// hosts: […]}`) rather than as its list of hosts.
-pub const ALIAS_KEYS: &[&str] = &["identity_file", "redraw_on_reconnect", "hosts"];
+pub const ALIAS_KEYS: &[&str] = &[
+    "identity_file",
+    "redraw_on_reconnect",
+    "reachability_timeout",
+    "hosts",
+];
 
 /// The alias settings that are true or false.
 pub const ALIAS_BOOLS: &[&str] = &["redraw_on_reconnect"];
+
+/// The settings, global or an alias's, that are a duration.
+pub const DURATIONS: &[&str] = &["reachability_timeout"];
+
+/// `reachability_timeout` when nothing sets it.
+pub const DEFAULT_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The longest `reachability_timeout`: a minute is already far past any
+/// ping worth waiting for.
+pub const MAX_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The global file: `/etc/acs/config.yaml` (`ACS_GLOBAL_CONFIG` overrides it,
 /// for packagers and tests).
@@ -234,6 +258,14 @@ impl Config {
                         origin: Some(at(node)),
                     }
                 }
+                "reachability_timeout" => {
+                    let value =
+                        timeout_value(node).map_err(|e| fail(node, format!("{key}: {e}")))?;
+                    self.reachability_timeout = Setting {
+                        value,
+                        origin: Some(at(node)),
+                    }
+                }
                 "hosts" => {
                     let aliases = node.value.map().ok_or_else(|| {
                         fail(
@@ -255,6 +287,7 @@ impl Config {
                                     entries: Vec::new(),
                                     identity_file: None,
                                     redraw_on_reconnect: None,
+                                    reachability_timeout: None,
                                     origin: at(n),
                                 });
                                 self.hosts.len() - 1
@@ -267,6 +300,9 @@ impl Config {
                         }
                         if settings.redraw_on_reconnect.is_some() {
                             alias.redraw_on_reconnect = settings.redraw_on_reconnect;
+                        }
+                        if settings.reachability_timeout.is_some() {
+                            alias.reachability_timeout = settings.reachability_timeout;
                         }
                     }
                 }
@@ -315,6 +351,15 @@ impl Config {
             .and_then(|a| a.redraw_on_reconnect.as_ref())
             .unwrap_or(&self.redraw_on_reconnect)
     }
+
+    /// `reachability_timeout` for `alias`: its own setting, else the global
+    /// one.
+    pub fn reachability_timeout_for<'a>(&'a self, alias: &'a Alias) -> &'a Setting<Duration> {
+        alias
+            .reachability_timeout
+            .as_ref()
+            .unwrap_or(&self.reachability_timeout)
+    }
 }
 
 /// An alias is used where a host name goes: no `@`, spaces or leading `-`.
@@ -346,6 +391,60 @@ pub fn bool_value(n: &Node) -> Result<bool, String> {
             s.text
         )),
         other => Err(format!("expected true or false, found {}", other.kind())),
+    }
+}
+
+/// A `reachability_timeout` node: see [`parse_timeout`].
+fn timeout_value(n: &Node) -> Result<Duration, String> {
+    match &n.value {
+        Value::Scalar(s) => parse_timeout(&s.text),
+        other => Err(format!(
+            "expected a duration such as 500ms or 2s, found {}",
+            other.kind()
+        )),
+    }
+}
+
+/// A duration as `500ms`, `0.5s`, `2s`, or a bare number of seconds (`0.5`);
+/// to the millisecond, more than 0 and at most a minute.
+pub fn parse_timeout(text: &str) -> Result<Duration, String> {
+    let bad = || format!("expected a duration such as 500ms or 2s, found '{text}'");
+    let t = text.trim();
+    let (number, scale) = match t.strip_suffix("ms") {
+        Some(n) => (n, 1.0),
+        None => (t.strip_suffix('s').unwrap_or(t), 1000.0),
+    };
+    let number = number.trim_end();
+    // Decimal figures and at most one point: no sign, exponent, inf or nan.
+    if number.is_empty()
+        || number == "."
+        || !number.chars().all(|c| c.is_ascii_digit() || c == '.')
+        || number.matches('.').count() > 1
+    {
+        return Err(bad());
+    }
+    let ms = (number.parse::<f64>().map_err(|_| bad())? * scale).round();
+    if ms < 1.0 {
+        return Err(format!("'{text}' is too short: at least 1ms"));
+    }
+    let d = Duration::from_millis(ms.min(u64::MAX as f64) as u64);
+    if d > MAX_REACHABILITY_TIMEOUT {
+        return Err(format!(
+            "'{text}' is too long: at most {}",
+            format_timeout(MAX_REACHABILITY_TIMEOUT)
+        ));
+    }
+    Ok(d)
+}
+
+/// A duration as [`parse_timeout`] reads it: `2s` if whole seconds, else
+/// `500ms`.
+pub fn format_timeout(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms % 1000 == 0 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{ms}ms")
     }
 }
 
@@ -392,6 +491,7 @@ fn identity_file(
 struct AliasSettings {
     identity_file: Option<Setting<String>>,
     redraw_on_reconnect: Option<Setting<bool>>,
+    reachability_timeout: Option<Setting<Duration>>,
 }
 
 /// One file's entries and settings for `hosts.<name>`: a list of entries,
@@ -422,6 +522,14 @@ fn alias_parts(
                         })
                     }
                     "redraw_on_reconnect" => {}
+                    "reachability_timeout" if v.value != Value::Null => {
+                        let value = timeout_value(v).map_err(|e| fail(v, format!("{k}: {e}")))?;
+                        settings.reachability_timeout = Some(Setting {
+                            value,
+                            origin: Some(at(v)),
+                        })
+                    }
+                    "reachability_timeout" => {}
                     other => {
                         return Err(fail(
                             v,
@@ -615,7 +723,7 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, hosts)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, hosts)",
             ),
             ("hosts: [a]\n", ":1: hosts: expected a mapping"),
             (
@@ -763,7 +871,7 @@ hosts:
             ),
             (
                 "hosts:\n  d:\n    user: me\n",
-                ":3: hosts.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, hosts; a single host entry needs 'host: <name>')",
+                ":3: hosts.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, hosts; a single host entry needs 'host: <name>')",
             ),
             (
                 "hosts:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
@@ -846,6 +954,95 @@ hosts:
         assert_eq!(expand_home("~"), home);
         for p in ["~bob/.ssh/id", "/abs/~/x", "rel/key", "~x"] {
             assert_eq!(expand_home(p), p);
+        }
+    }
+
+    #[test]
+    fn reachability_timeout_globally_and_per_alias() {
+        let c = load("", "hosts:\n  a: [{host: a1}]\n").unwrap();
+        assert_eq!(c.reachability_timeout.value, Duration::from_millis(500));
+        assert_eq!(c.reachability_timeout.origin, None);
+        let c = load(
+            "reachability_timeout: 2s\nhosts:\n  a:\n    reachability_timeout: 250ms\n    hosts: [{host: a1}]\n  b: [{host: b1}]\n",
+            "reachability_timeout: 1.5\n",
+        )
+        .unwrap();
+        // The local file's global value replaces the global file's; an
+        // alias's own wins over both.
+        assert_eq!(c.reachability_timeout.value, Duration::from_millis(1500));
+        assert_eq!(c.reachability_timeout.origin.as_ref().unwrap().line, 1);
+        let a = c.reachability_timeout_for(c.alias("a").unwrap());
+        assert_eq!(a.value, Duration::from_millis(250));
+        assert_eq!(a.origin.as_ref().unwrap().line, 4);
+        let b = c.reachability_timeout_for(c.alias("b").unwrap());
+        assert_eq!(b.value, Duration::from_millis(1500));
+        // Set on an alias whose hosts are in the other file.
+        let c = load(
+            "hosts:\n  a: [{host: a1}]\n",
+            "hosts:\n  a:\n    reachability_timeout: 3s\n",
+        )
+        .unwrap();
+        let a = c.alias("a").unwrap();
+        assert_eq!(c.reachability_timeout_for(a).value, Duration::from_secs(3));
+        assert_eq!(a.entries.len(), 1);
+    }
+
+    #[test]
+    fn durations_are_read_and_written() {
+        for (text, ms) in [
+            ("500ms", 500),
+            ("0.5s", 500),
+            ("0.5", 500),
+            ("2s", 2000),
+            ("2", 2000),
+            ("1ms", 1),
+            ("1.25 s", 1250),
+            (" 60s ", 60_000),
+            ("60000ms", 60_000),
+        ] {
+            assert_eq!(parse_timeout(text), Ok(Duration::from_millis(ms)), "{text}");
+        }
+        for (text, why) in [
+            ("", "expected a duration"),
+            ("ms", "expected a duration"),
+            ("s", "expected a duration"),
+            (".", "expected a duration"),
+            ("-1s", "expected a duration"),
+            ("1e3ms", "expected a duration"),
+            ("1.2.3", "expected a duration"),
+            ("inf", "expected a duration"),
+            ("5m", "expected a duration"),
+            ("0", "too short"),
+            ("0.0001s", "too short"),
+            ("61s", "too long: at most 60s"),
+            ("99999999999999999999999", "too long"),
+        ] {
+            let e = parse_timeout(text).unwrap_err();
+            assert!(e.contains(why), "{text}: {e}");
+        }
+        assert_eq!(format_timeout(Duration::from_millis(500)), "500ms");
+        assert_eq!(format_timeout(Duration::from_millis(1500)), "1500ms");
+        assert_eq!(format_timeout(Duration::from_secs(2)), "2s");
+    }
+
+    #[test]
+    fn a_bad_reachability_timeout_names_the_file_and_line() {
+        for (local, want) in [
+            (
+                "reachability_timeout: soon\n",
+                ":1: reachability_timeout: expected a duration such as 500ms or 2s, found 'soon'",
+            ),
+            (
+                "reachability_timeout: [1s]\n",
+                ":1: reachability_timeout: expected a duration such as 500ms or 2s, found a list",
+            ),
+            (
+                "hosts:\n  d:\n    reachability_timeout: 0ms\n    hosts: [{host: a}]\n",
+                ":3: hosts.d: reachability_timeout: '0ms' is too short: at least 1ms",
+            ),
+        ] {
+            let e = load("", local).unwrap_err();
+            assert!(e.ends_with(want), "{local:?}: {e}");
         }
     }
 

@@ -217,6 +217,7 @@ install_on_remote: false   # never install acs on a host (default: true)
 update_check: false        # never look for a newer release (default: true)
 command_bell: false        # no bell when Ctrl-] Ctrl-] arms (default: true)
 redraw_on_reconnect: true  # Ctrl-L after reconnecting (default: true)
+reachability_timeout: 1s   # how long hosts have to answer a ping (default: 500ms)
 hosts:
   devbox:                  # acs devbox
     - host: devbox.lan     # at home: used if it answers a ping
@@ -228,6 +229,7 @@ hosts:
   lab:                     # an alias with settings of its own
     identity_file: ~/.ssh/id_lab  # the key for every host below…
     redraw_on_reconnect: false    # no Ctrl-L after reconnecting to lab
+    reachability_timeout: 2s      # a slow link: wait longer for its pings
     hosts:
       - host: lab.lan
       - host: lab.example.com
@@ -240,18 +242,23 @@ hosts:
 | `update_check` | look for a newer acs release once a week (default `true`) |
 | `command_bell` | ring the terminal bell when Ctrl-] Ctrl-] arms command mode (default `true`; `ACS_COMMAND_BELL` overrides it) |
 | `redraw_on_reconnect` | send Ctrl-L after reconnecting to a session (default `true`); an alias's own value wins, and `ACS_REDRAW_ON_RECONNECT` over both |
-| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file` and `reachability_check` (default `true`) — or to a mapping of the alias's own `identity_file` and `redraw_on_reconnect` and its `hosts` |
+| `reachability_timeout` | how long an alias's hosts have to answer a ping: `500ms`, `0.5s`, `2s`, up to `60s` (default `500ms`); an alias's own value wins |
+| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file` and `reachability_check` (default `true`) — or to a mapping of the alias's own `identity_file`, `redraw_on_reconnect` and `reachability_timeout` and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
 
 ### Host aliases
 
-`acs devbox` with the file above pings `devbox.lan` once; if it answers, acs
-connects there, otherwise it tries `michel@devbox.example.com`. An entry
-with `reachability_check: false` is used without a ping. Without a `user`,
-your `~/.ssh/config` picks the login name. If no entry answers, acs lists the
-hosts it tried and exits with 255. `-v` shows which entry was chosen and why.
+`acs devbox` with the file above uses `devbox.lan` if it answers a ping,
+otherwise `michel@devbox.example.com` if that one does. An entry with
+`reachability_check: false` is used without a ping. The hosts are pinged
+all at once, and the order in the file still decides: an earlier host that
+answers within `reachability_timeout` wins over a later one that answered
+first, so choosing takes at most that long however many hosts there are.
+Without a `user`, your `~/.ssh/config` picks the login name. If no entry
+answers, acs lists the hosts it tried and exits with 255. `-v` shows which
+entry was chosen and why.
 
 The alias is resolved again on every reconnect, so when you move from home
 to outside, the redial goes to whichever address answers. List ways of
@@ -310,12 +317,14 @@ acs config host add lab lab.lan --identity-file ~/.ssh/id_lab_home
 acs config host set lab identity_file ~/.ssh/id_lab   # the alias's key
 acs config host unset lab identity_file
 acs config host set lab redraw_on_reconnect false     # no Ctrl-L for lab
+acs config host set lab reachability_timeout 2s       # lab's hosts may take 2 s
 acs config host list                                  # aliases, hosts and keys
 acs config host remove devbox devbox.lan              # one host, or the alias
 acs config set install_on_remote false
 acs config set update_check false                     # no weekly release check
 acs config set command_bell false                     # no bell for command mode
 acs config set redraw_on_reconnect false              # no Ctrl-L on reconnect
+acs config set reachability_timeout 250ms             # pings must answer within 250 ms
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default
 acs config show                                       # everything, and where it is from
