@@ -136,8 +136,10 @@ acs: detached sessions on devbox
 | `x` | end the session under the cursor, after a `y` (or a second `x`) |
 | Esc | leave the menu (Ctrl-C too) |
 
-Listing costs one ssh round trip before attaching. Without a terminal on
-stdout there is no menu: `acs host` attaches `main`, creating it if needed.
+The list, the menu's `x` and the attach share one ssh connection, so a
+plain `acs host` logs in once (one touch of a hardware key), and `acs -v
+host` shows a single `running ssh …`. Without a terminal on stdout there is
+no menu: `acs host` attaches `main`, creating it if needed.
 
 In a session, press **Ctrl-] Ctrl-]** quickly, then:
 

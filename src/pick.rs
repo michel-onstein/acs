@@ -1,17 +1,19 @@
 //! What a plain `acs [user@]<host>` attaches to (DESIGN §4.4): the host's
 //! sessions are listed first; with none detached a session is created,
 //! otherwise the user picks one from the menu (`menu.rs`), ends some, or
-//! leaves.
+//! leaves. All of it happens on the session's own connection
+//! (`_proxy --pick`), which the attach then goes on over.
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::time::{Duration, Instant};
 
 use crate::cli::{ClientArgs, Target};
-use crate::client::{self, code};
-use crate::list;
+use crate::client::{self, code, Link, Picked};
+use crate::list::Failure;
 use crate::menu::{Choice, Menu};
-use crate::proto::StatusInfo;
-use crate::ssh::Call;
+use crate::proto::{self, Decoder, Marker, Msg, StatusInfo};
+use crate::ssh::{self, Call};
 use crate::sys;
 use crate::tty::{self, AltScreen, RawMode};
 
@@ -19,51 +21,183 @@ const STDIN: RawFd = 0;
 const STDOUT: RawFd = 1;
 
 /// Settle a [`Target::Pick`]: to the session the user picked (with `force`
-/// set for a takeover they confirmed), or to a new session. `Err` is the
-/// exit status when they left the menu or the host could not be asked. The
-/// host is the one `args` was resolved to, so the list and the attach reach
-/// the same machine.
-pub fn choose(args: &mut ClientArgs) -> Result<(), u8> {
+/// set for a takeover they confirmed), or to a new session. `Ok(Some)` is
+/// the connection to attach over — the one the list came on, so the list
+/// and the attach reach the same machine with one ssh call; `Ok(None)`
+/// leaves the attach to dial its own (no terminal for a menu, acs not yet
+/// installed there, or the connection lost while the menu was up). `Err` is
+/// the exit status when the user left the menu or the host could not be
+/// asked.
+pub fn choose(args: &mut ClientArgs) -> Result<Option<Picked>, u8> {
     let Target::Pick(default) = args.target.clone() else {
-        return Ok(());
+        return Ok(None);
     };
     // No terminal for a menu: the default session, as ever.
     if !(sys::isatty(STDIN) && sys::isatty(STDOUT)) {
         args.target = Target::Named(default);
-        return Ok(());
+        return Ok(None);
     }
     let host = args.host_name().to_string();
-    let sessions = match list::query(args, Call::Side, client::answer_timeout(false)) {
-        Ok(Some(s)) => s,
+    let fail = |f: Failure| {
+        eprintln!("acs: {}", f.message(&host));
+        f.code()
+    };
+    let timeout = client::answer_timeout(false);
+    let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--pick"]);
+    let (link, marker) = client::dial(args, Call::Session, &remote, timeout)
+        .map_err(|e| fail(Failure::Unreachable(e.to_string())))?;
+    let mut pick = match marker {
+        Marker::Ready { proto: p, rest } if p == proto::PROTO_VERSION => {
+            let mut dec = Decoder::new();
+            dec.push(&rest);
+            Pick {
+                link,
+                dec,
+                timeout,
+                lost: false,
+            }
+        }
+        Marker::Ready { proto: p, .. } => {
+            link.close();
+            eprintln!(
+                "acs: remote acs speaks protocol {p}, this client {}",
+                proto::PROTO_VERSION
+            );
+            return Err(code::ERROR);
+        }
         // acs is not installed there yet: the attach installs it, and there
         // is nothing to pick.
-        Ok(None) => Vec::new(),
+        Marker::Need { .. } => {
+            link.close();
+            args.target = new_session(&[], &default);
+            return Ok(None);
+        }
+    };
+    let sessions = match pick.list() {
+        Ok(a) => a.sessions,
         Err(f) => {
-            eprintln!("acs: {}", f.message(&host));
-            return Err(f.code());
+            pick.link.close();
+            return Err(fail(f));
         }
     };
     if !sessions.iter().any(|s| !s.attached) {
         args.target = new_session(&sessions, &default);
-        return Ok(());
+        return Ok(Some(pick.into_picked()));
     }
     let mut menu = Menu::new(sessions, args.force);
-    match run_menu(args, &host, &mut menu) {
+    let choice = run_menu(&mut pick, &host, &mut menu);
+    match choice {
         Ok(Choice::Attach { name, force }) => {
             args.target = Target::Named(name);
             args.force |= force;
-            Ok(())
         }
-        Ok(Choice::New) => {
-            args.target = new_session(menu.sessions(), &default);
-            Ok(())
+        Ok(Choice::New) => args.target = new_session(menu.sessions(), &default),
+        Ok(Choice::Leave(c)) => {
+            pick.link.close();
+            return Err(c);
         }
-        Ok(Choice::Leave(c)) => Err(c),
         // Ended in the menu, which goes on.
         Ok(Choice::Kill(_)) => unreachable!(),
         Err(e) => {
+            pick.link.close();
             eprintln!("acs: {e}");
-            Err(code::ERROR)
+            return Err(code::ERROR);
+        }
+    }
+    if pick.lost {
+        pick.link.close();
+        return Ok(None);
+    }
+    Ok(Some(pick.into_picked()))
+}
+
+/// The pick's connection: `_proxy --pick` past its marker.
+struct Pick {
+    link: Link,
+    dec: Decoder,
+    /// How long the host has for each answer (DESIGN §5.3).
+    timeout: Duration,
+    /// The connection failed while the menu was up: the attach dials anew.
+    lost: bool,
+}
+
+/// One list from the proxy: every session's STATUS, and the message of an
+/// ERROR sent along (a session that would not end).
+struct Answer {
+    sessions: Vec<StatusInfo>,
+    error: Option<String>,
+}
+
+impl Pick {
+    fn into_picked(mut self) -> Picked {
+        Picked {
+            rest: self.dec.take_rest(),
+            link: self.link,
+        }
+    }
+
+    /// Read one list, up to its LIST_END, within the timeout.
+    fn list(&mut self) -> Result<Answer, Failure> {
+        let deadline = Instant::now() + self.timeout;
+        let from = self.link.from_fd().as_raw_fd();
+        let mut answer = Answer {
+            sessions: Vec::new(),
+            error: None,
+        };
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match self.dec.next_msg() {
+                Ok(Some(Msg::StatusReply(s))) => answer.sessions.push(s),
+                Ok(Some(Msg::Error { message, .. })) => answer.error = Some(message),
+                Ok(Some(Msg::ListEnd)) => return Ok(answer),
+                Ok(Some(other)) => {
+                    return Err(Failure::BadReply(format!("unexpected {other:?}")));
+                }
+                Ok(None) => match wait_readable(from, deadline) {
+                    Ok(true) => match sys::read(from, &mut buf) {
+                        Ok(0) => {
+                            return Err(Failure::Unreachable(
+                                "the connection closed before the session list".into(),
+                            ))
+                        }
+                        Ok(n) => self.dec.push(&buf[..n]),
+                        Err(e) => return Err(Failure::Unreachable(e.to_string())),
+                    },
+                    Ok(false) => {
+                        return Err(Failure::Unreachable(format!(
+                            "no answer within {} s",
+                            self.timeout.as_secs_f32()
+                        )))
+                    }
+                    Err(e) => return Err(Failure::Unreachable(e.to_string())),
+                },
+                Err(e) => return Err(Failure::BadReply(e.to_string())),
+            }
+        }
+    }
+
+    /// End `name` on the host and read the list that answers it.
+    fn end(&mut self, name: &str) -> Result<Answer, Failure> {
+        let frame = Msg::EndSession { name: name.into() }.to_bytes();
+        sys::write_all(self.link.to_fd().as_raw_fd(), &frame)
+            .map_err(|e| Failure::Unreachable(e.to_string()))?;
+        self.list()
+    }
+}
+
+/// Wait until `fd` is readable or `deadline` passes (`false`).
+fn wait_readable(fd: RawFd, deadline: Instant) -> io::Result<bool> {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        let mut p = [sys::pollfd(fd, libc::POLLIN)];
+        match sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32) {
+            Ok(0) => continue, // the deadline, or a signal cut the wait short
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
 }
@@ -82,11 +216,11 @@ fn new_session(sessions: &[StatusInfo], default: &str) -> Target {
 /// Ending a session happens here, and the menu goes on with what is left.
 /// The terminal comes back as it was on every way out: the guards on
 /// return, the emergency restore on a signal or a panic.
-fn run_menu(args: &ClientArgs, host: &str, menu: &mut Menu) -> io::Result<Choice> {
+fn run_menu(pick: &mut Pick, host: &str, menu: &mut Menu) -> io::Result<Choice> {
     tty::install_emergency_restore()?;
     let signals = sys::signals::install(&[libc::SIGWINCH])?;
     let _ = sys::signals::ignore(libc::SIGPIPE);
-    let mut raw = RawMode::enter(STDIN)?;
+    let _raw = RawMode::enter(STDIN)?;
     let _screen = AltScreen::enter(STDOUT)?;
     let mut buf = [0u8; 1024];
     loop {
@@ -115,7 +249,7 @@ fn run_menu(args: &ClientArgs, host: &str, menu: &mut Menu) -> io::Result<Choice
         };
         match choice {
             None => {}
-            Some(Choice::Kill(name)) => end(args, host, menu, &mut raw, &name),
+            Some(Choice::Kill(name)) => end(pick, host, menu, &name),
             Some(c) => return Ok(c),
         }
     }
@@ -133,23 +267,18 @@ fn draw(menu: &Menu, host: &str) -> io::Result<()> {
     )
 }
 
-/// End `name` on the host (`_proxy --kill`, which answers with the sessions
-/// left) and show the menu with those.
-fn end(args: &ClientArgs, host: &str, menu: &mut Menu, raw: &mut RawMode, name: &str) {
+/// End `name` on the host, over the pick's connection (END_SESSION, which
+/// the proxy answers with the sessions left), and show the menu with those.
+/// A failed connection is noted; the attach then dials its own.
+fn end(pick: &mut Pick, host: &str, menu: &mut Menu, name: &str) {
+    if pick.lost {
+        menu.set_note(format!("the connection to {host} was lost"));
+        return;
+    }
     menu.set_note(format!("ending session '{name}'…"));
     let _ = draw(menu, host);
-    // Cooked while ssh may ask for a password; the next draw repaints over
-    // whatever it said.
-    let _ = raw.suspend();
-    let answer = list::side_call(
-        args,
-        &["--kill", name],
-        Call::Side,
-        client::answer_timeout(false),
-    );
-    let _ = raw.resume();
-    let note = match answer {
-        Ok(Some(a)) => {
+    let note = match pick.end(name) {
+        Ok(a) => {
             let gone = !a.sessions.iter().any(|s| s.name == name);
             menu.set_sessions(a.sessions);
             match (a.error, gone) {
@@ -158,8 +287,10 @@ fn end(args: &ClientArgs, host: &str, menu: &mut Menu, raw: &mut RawMode, name: 
                 (None, false) => format!("session '{name}' is still there"),
             }
         }
-        Ok(None) => format!("acs {} is not installed on {host}", crate::VERSION),
-        Err(f) => f.message(host),
+        Err(f) => {
+            pick.lost = true;
+            f.message(host)
+        }
     };
     menu.set_note(note);
 }

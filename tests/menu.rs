@@ -198,11 +198,52 @@ fn an_alias_is_resolved_once_for_the_list_and_the_attach() {
     attached_to(&mut c, "one");
     assert_eq!(net.pinged(), ["devbox.example.com", "devbox.lan"]);
     let dests: Vec<String> = ssh.keys().into_iter().map(|(d, _)| d).collect();
-    assert_eq!(
-        dests,
-        ["you@devbox.lan", "you@devbox.lan"],
-        "list, then attach"
-    );
+    assert_eq!(dests, ["you@devbox.lan"], "list and attach on one call");
+}
+
+/// acs-68z: the menu's connection sits idle while the user reads it; if it
+/// drops meanwhile, the pick still attaches, over a connection of its own.
+#[test]
+fn a_menu_connection_lost_while_reading_is_dialed_afresh() {
+    let remote = Remote::installed();
+    detached(&remote, "one");
+    let mut c = Client::start(&remote, &["devbox"]);
+    menu_up(&mut c);
+    let before = remote.transport_pids().len();
+    remote.cut_link();
+    std::thread::sleep(Duration::from_millis(200));
+    c.send(b"1");
+    attached_to(&mut c, "one");
+    assert_eq!(remote.transport_pids().len(), before + 1);
+    assert!(!c.text().contains("connection lost"), "{:?}", c.text());
+}
+
+/// acs-68z: the list, ending a session with `x`, showing the attached ones
+/// with `.`, and the attach all go over the one ssh connection the menu
+/// opened (`_proxy --pick`).
+#[test]
+fn the_menu_ends_and_attaches_over_one_ssh_connection() {
+    let remote = Remote::installed();
+    detached(&remote, "one");
+    detached(&remote, "two");
+    let ssh = Ssh::new(&[("devbox", &remote)]);
+    let path = ssh.path().display().to_string();
+    let mut c = Client::spawn(&exe(), &["-v", "--ssh", &path, "devbox"], &[]);
+    menu_up(&mut c);
+    c.send(b"x");
+    c.wait_for("end session 'one'? y (or x) ends it", T);
+    c.send(b"y");
+    c.wait_for("session 'one' ended", T);
+    assert!(!remote.session_exists("one"));
+    c.send(b".");
+    c.wait_for("acs: all sessions on devbox", T);
+    c.send(b"1");
+    attached_to(&mut c, "two");
+    let calls = ssh.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].contains("_proxy --pick"), "{calls:?}");
+    let running = c.text().matches("acs: running ").count();
+    assert_eq!(running, 1, "{:?}", c.text());
 }
 
 #[test]
