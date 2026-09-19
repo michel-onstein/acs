@@ -65,8 +65,9 @@ impl Net {
         std::fs::write(
             &ping,
             format!(
-                "#!/bin/sh\nfor h; do :; done\necho \"$h\" >> '{log}'\ngrep -qx \"$h\" '{up}'\n",
+                "#!/bin/sh\nfor h; do :; done\necho \"$h\" >> '{log}'\nif grep -qx \"$h\" '{slow}'; then sleep 30; fi\ngrep -qx \"$h\" '{up}'\n",
                 log = n.pinged_file().display(),
+                slow = n.slow_file().display(),
                 up = n.up_file().display()
             ),
         )
@@ -74,7 +75,19 @@ impl Net {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&ping, std::fs::Permissions::from_mode(0o755)).unwrap();
         n.set_up(up);
+        n.set_slow(&[]);
         n
+    }
+
+    fn slow_file(&self) -> PathBuf {
+        self.dir.path().join("slow")
+    }
+
+    /// Hosts whose ping takes 30 s to say whether they answer.
+    pub fn set_slow(&self, slow: &[&str]) {
+        let mut s = slow.join("\n");
+        s.push('\n');
+        std::fs::write(self.slow_file(), s).unwrap();
     }
 
     fn ping(&self) -> PathBuf {
@@ -95,19 +108,29 @@ impl Net {
         std::fs::write(self.up_file(), s).unwrap();
     }
 
-    /// Every host pinged so far, in order.
+    /// Every host pinged so far, sorted: an alias's hosts are pinged at
+    /// once.
     pub fn pinged(&self) -> Vec<String> {
-        std::fs::read_to_string(self.pinged_file())
+        let mut v: Vec<String> = std::fs::read_to_string(self.pinged_file())
             .unwrap_or_default()
             .lines()
             .map(String::from)
-            .collect()
+            .collect();
+        v.sort();
+        v
     }
 
     /// The environment for a client with `config` as its configuration and
-    /// this ping.
+    /// this ping. This ping answers at once, but on a machine busy with every
+    /// other test it may not even have started within the 500 ms default, so
+    /// a configuration that sets no `reachability_timeout` gets 10 s.
     pub fn env(&self, config: &str) -> Vec<(String, String)> {
-        let mut env = config_env(self.dir.path(), config);
+        let config = if config.contains("reachability_timeout") {
+            config.to_string()
+        } else {
+            format!("reachability_timeout: 10s\n{config}")
+        };
+        let mut env = config_env(self.dir.path(), &config);
         env.push(("ACS_PING".into(), self.ping().display().to_string()));
         env
     }

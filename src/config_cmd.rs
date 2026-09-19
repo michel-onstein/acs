@@ -31,13 +31,60 @@ usage: acs config show                 the merged configuration and where each v
 
   --global  edit /etc/acs/config.yaml instead of ~/.config/acs/config.yaml
 
-settings: install_on_remote, update_check, command_bell, redraw_on_reconnect (true|false)
+settings: install_on_remote, update_check, command_bell, redraw_on_reconnect (true|false),
+          reachability_timeout (how long an alias's hosts have to answer a ping:
+          500ms, 0.5s, 2s; default 500ms)
 alias settings: identity_file <key> (the ssh key of its hosts that name none),
-                redraw_on_reconnect (true|false, over the global setting)
+                redraw_on_reconnect (true|false, over the global setting),
+                reachability_timeout (over the global setting)
 precedence of the ssh key: -i, then the host's identity_file, then the alias's";
 
-/// Settings `get`/`set`/`unset` know: all true or false.
-const SCALARS: &[&str] = config::BOOLS;
+/// Settings `get`/`set`/`unset` know: every top-level key but `hosts`.
+fn scalars() -> impl Iterator<Item = &'static str> {
+    config::KEYS.iter().copied().filter(|k| *k != "hosts")
+}
+
+fn is_scalar(key: &str) -> bool {
+    scalars().any(|k| k == key)
+}
+
+/// A top-level setting's value as YAML, and where it is from.
+fn scalar(c: &Config, key: &str) -> Option<(Node, Option<config::Origin>)> {
+    if let Some(s) = c.bool_setting(key) {
+        return Some((Node::bool(s.value), s.origin.clone()));
+    }
+    match key {
+        "reachability_timeout" => {
+            let s = &c.reachability_timeout;
+            Some((
+                Node::string(&config::format_timeout(s.value)),
+                s.origin.clone(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `value` as the node for setting `key`, global or an alias's, checked
+/// against its type.
+fn typed(key: &str, value: &str) -> Result<Node, String> {
+    if config::BOOLS.contains(&key) || config::ALIAS_BOOLS.contains(&key) {
+        Ok(Node::bool(parse_bool(key, value)?))
+    } else if config::DURATIONS.contains(&key) {
+        let d = config::parse_timeout(value).map_err(|e| format!("{key}: {e}"))?;
+        Ok(Node::string(&config::format_timeout(d)))
+    } else {
+        Ok(Node::string(value))
+    }
+}
+
+/// The text of a scalar node.
+fn text(n: &Node) -> &str {
+    match &n.value {
+        Value::Scalar(s) => &s.text,
+        _ => "",
+    }
+}
 
 /// Settings of an alias that `host set`/`host unset` know: every key of the
 /// alias's mapping but its `hosts`.
@@ -233,8 +280,8 @@ pub fn run(cmd: &Cmd, target: &Path) -> Result<String, Error> {
         Cmd::Show => Ok(show(&Config::load_files(&files)?, &files)),
         Cmd::Get(key) => {
             let c = Config::load_files(&files)?;
-            match (key.as_str(), c.bool_setting(key)) {
-                (_, Some(s)) => Ok(format!("{}\n", s.value)),
+            match (key.as_str(), scalar(&c, key)) {
+                (_, Some((n, _))) => Ok(format!("{}\n", text(&n))),
                 ("hosts", None) => Ok(host_list(&c)),
                 (other, None) => Err(unknown_key(other).into()),
             }
@@ -308,7 +355,7 @@ fn unknown_key(k: &str) -> String {
     };
     format!(
         "unknown setting '{k}' (settings: {}){hint}",
-        SCALARS.join(", ")
+        scalars().collect::<Vec<_>>().join(", ")
     )
 }
 
@@ -345,13 +392,13 @@ fn from(origin: &Option<config::Origin>) -> String {
 /// The merged configuration as YAML, each value commented with its origin.
 pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
     let mut root = Vec::new();
-    for key in SCALARS {
-        let s = c.bool_setting(key).expect("a bool setting");
+    for key in scalars() {
+        let (node, origin) = scalar(c, key).expect("a scalar setting");
         root.push((
             key.to_string(),
             Node {
-                comment: Some(from(&s.origin)),
-                ..Node::bool(s.value)
+                comment: Some(from(&origin)),
+                ..node
             },
         ));
     }
@@ -386,6 +433,15 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
                 Node {
                     comment: Some(from(&r.origin)),
                     ..Node::bool(r.value)
+                },
+            ));
+        }
+        if let Some(t) = &a.reachability_timeout {
+            settings.push((
+                "reachability_timeout".to_string(),
+                Node {
+                    comment: Some(from(&t.origin)),
+                    ..Node::string(&config::format_timeout(t.value))
                 },
             ));
         }
@@ -560,10 +616,11 @@ fn parse_bool(key: &str, v: &str) -> Result<bool, String> {
 pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
     match cmd {
         Cmd::Set(key, value) => {
-            let node = match key.as_str() {
-                k if SCALARS.contains(&k) => Node::bool(parse_bool(key, value)?),
-                other => return Err(unknown_key(other)),
-            };
+            if !is_scalar(key) {
+                return Err(unknown_key(key));
+            }
+            let node = typed(key, value)?;
+            let shown = text(&node).to_string();
             let map = root_map(doc)?;
             match map.iter_mut().find(|(k, _)| k == key) {
                 Some((_, n)) => {
@@ -572,10 +629,10 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                 }
                 None => map.push((key.clone(), node)),
             }
-            Ok(format!("set {key} to {value}"))
+            Ok(format!("set {key} to {shown}"))
         }
         Cmd::Unset(key) => {
-            if !SCALARS.contains(&key.as_str()) {
+            if !is_scalar(key) {
                 return Err(unknown_key(key));
             }
             let map = root_map(doc)?;
@@ -626,11 +683,8 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
         }
         Cmd::HostSet { alias, key, value } => {
             config::validate_alias(alias)?;
-            let new = if config::ALIAS_BOOLS.contains(&key.as_str()) {
-                Node::bool(parse_bool(key, value)?)
-            } else {
-                Node::string(value)
-            };
+            let new = typed(key, value)?;
+            let shown = text(&new).to_string();
             let settings = alias_form(alias_node(aliases_mut(doc)?, alias));
             match settings.iter_mut().find(|(k, _)| k == key) {
                 Some((_, n)) => {
@@ -640,7 +694,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                 // Settings go before the hosts.
                 None => settings.insert(0, (key.clone(), new)),
             }
-            Ok(format!("set {key} of {alias} to {value}"))
+            Ok(format!("set {key} of {alias} to {shown}"))
         }
         Cmd::HostUnset { alias, key } => {
             let missing = || format!("{key} of {alias} is not set in this file");
@@ -1214,7 +1268,7 @@ mod tests {
         );
         let e = parse(&args("host set d command_bell false")).unwrap_err();
         assert!(
-            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect)"),
+            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout)"),
             "{e}"
         );
     }
@@ -1380,5 +1434,104 @@ mod tests {
                 .value
         );
         assert!(!again.redraw_on_reconnect.value);
+    }
+
+    #[test]
+    fn reachability_timeout_is_set_checked_and_written_one_way() {
+        assert_eq!(
+            apply("", "set reachability_timeout 0.25").unwrap(),
+            "reachability_timeout: 250ms\n"
+        );
+        assert_eq!(
+            apply(
+                "reachability_timeout: 250ms # quick\n",
+                "set reachability_timeout 2000ms"
+            )
+            .unwrap(),
+            "reachability_timeout: 2s # quick\n"
+        );
+        let e = apply("", "set reachability_timeout soon").unwrap_err();
+        assert_eq!(
+            e,
+            "reachability_timeout: expected a duration such as 500ms or 2s, found 'soon'"
+        );
+        let e = apply("", "set reachability_timeout 2m").unwrap_err();
+        assert!(e.contains("expected a duration"), "{e}");
+        assert_eq!(
+            apply(
+                "reachability_timeout: 1s\ncommand_bell: false\n",
+                "unset reachability_timeout"
+            )
+            .unwrap(),
+            "command_bell: false\n"
+        );
+        let mut doc = yaml::parse("").unwrap();
+        assert_eq!(
+            edit(&mut doc, &cmd("set reachability_timeout 1.5s")).unwrap(),
+            "set reachability_timeout to 1500ms"
+        );
+        let e = apply("", "set nope 1").unwrap_err();
+        assert!(
+            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout)"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn host_set_reachability_timeout_on_an_alias() {
+        let src = "hosts:\n  d:\n    - host: a\n";
+        let set = apply(src, "host set d reachability_timeout 100ms").unwrap();
+        assert_eq!(
+            set,
+            "hosts:\n  d:\n    reachability_timeout: 100ms\n    hosts:\n      - host: a\n"
+        );
+        let e = apply(src, "host set d reachability_timeout 0").unwrap_err();
+        assert!(e.contains("reachability_timeout: '0' is too short"), "{e}");
+        assert_eq!(
+            apply(&set, "host unset d reachability_timeout").unwrap(),
+            src
+        );
+    }
+
+    #[test]
+    fn show_and_get_have_reachability_timeout() {
+        let dir = crate::testutil::TempDir::new();
+        let g = dir.path().join("g.yaml");
+        let l = dir.path().join("l.yaml");
+        std::fs::write(&g, "").unwrap();
+        std::fs::write(
+            &l,
+            "hosts:\n  d:\n    reachability_timeout: 1.5\n    hosts:\n      - host: a\n",
+        )
+        .unwrap();
+        let files = [g.clone(), l.clone()];
+        let c = Config::load_files(&files).unwrap();
+        let out = show(&c, &files);
+        assert!(
+            out.contains("reachability_timeout: 500ms # default\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "  d:\n    reachability_timeout: 1500ms # {}:3\n    hosts:\n",
+                l.display()
+            )),
+            "{out}"
+        );
+        let doc = yaml::parse(&out).unwrap();
+        let mut again = Config::default();
+        again.apply(Path::new("x"), &doc.root).unwrap();
+        assert_eq!(
+            again
+                .alias("d")
+                .unwrap()
+                .reachability_timeout
+                .as_ref()
+                .unwrap()
+                .value,
+            std::time::Duration::from_millis(1500)
+        );
+        let (n, origin) = scalar(&c, "reachability_timeout").unwrap();
+        assert_eq!((text(&n), origin), ("500ms", None));
     }
 }

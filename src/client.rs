@@ -91,11 +91,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
 /// resolves it the same way.
 pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
     let verbose = args.verbose > 0;
-    let entry = crate::alias::resolve(name, &args.config, &mut crate::alias::ping, &mut |m| {
-        if verbose {
-            note(&m)
-        }
-    })?;
+    let entry = crate::alias::resolve(
+        name,
+        &args.config,
+        std::sync::Arc::new(crate::alias::ping),
+        &mut |m| {
+            if verbose {
+                note(&m)
+            }
+        },
+    )?;
     if let Some(e) = entry {
         args.alias = Some(name.to_string());
         args.transport.destination = e.destination();
