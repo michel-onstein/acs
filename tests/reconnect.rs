@@ -155,6 +155,35 @@ fn no_reconnect_exits_on_a_drop() {
     assert!(remote.session_exists("nr"));
 }
 
+/// Regression (acs-7k7): a terminal that stops reading for longer than the
+/// dead interval is not a lost link. The client blocks writing to stdout
+/// meanwhile, and judged liveness by what it had decoded before the block
+/// rather than by the bytes waiting in the pipe.
+#[test]
+fn a_stalled_terminal_is_not_a_dead_link() {
+    let remote = Remote::installed();
+    // The master keeps its client for a minute (it has its own liveness,
+    // acs-ode); this is about the client's judgement of the master.
+    remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
+    let mut c = start(
+        &remote,
+        "stall",
+        // A trickle: one small frame per read, and the terminal's buffer
+        // fills partway through the pause, blocking the client in a write
+        // with nothing left to decode.
+        "echo up; while true; do head -c 100 /dev/zero | tr '\\0' y; echo; sleep 0.05; done",
+        FAST,
+    );
+    c.wait_for("up", T);
+    // Nothing is read for well past ACS_DEAD_MS (800 ms).
+    c.set_paused(true);
+    std::thread::sleep(Duration::from_secs(8));
+    c.set_paused(false);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(remote.transport_pids().len(), 1, "the link was given up on");
+    assert!(!c.text().contains("reconnecting"), "{}", c.text());
+}
+
 #[test]
 fn detach_works_while_the_link_is_down() {
     let remote = Remote::installed();
