@@ -77,6 +77,35 @@ fn a_complete_build_installs_another_platform_from_its_payloads() {
     assert!(leftovers(&remote).is_empty(), "{:?}", leftovers(&remote));
 }
 
+/// Regression (acs-28b): the payload path wrote the binary with the mode
+/// the umask left it, so a host with `umask 077` got a 0700 binary while
+/// the self-copy path chmods 0755. Both are 0755 now.
+#[test]
+fn an_install_is_0755_under_a_restrictive_umask() {
+    for payloads in [false, true] {
+        let remote = Remote::new();
+        remote.remote_umask("077");
+        let mut c = if payloads {
+            remote.fake_uname("Linux", "x86_64");
+            let (client, _, _) = complete_client(remote.root.path(), "x86_64-unknown-linux-musl");
+            Client::start_exe(&client, &remote, &args("u"), &[])
+        } else {
+            Client::start(&remote, &args("u"))
+        };
+        c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
+        c.wait_for("up", T);
+        assert_eq!(
+            std::fs::metadata(remote.installed_binary(acs::VERSION))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "payload path: {payloads}"
+        );
+    }
+}
+
 /// Regression (acs-q9t): login-shell noise on stdout must not fail the
 /// payload upload step, which prints nothing of its own.
 #[test]

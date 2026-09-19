@@ -348,6 +348,14 @@ impl Remote {
         self.root.path().join("remote-env")
     }
 
+    /// Run the remote side under `mask`, a restrictive umask (077) masking
+    /// the mode files are created with.
+    pub fn remote_umask(&self, mask: &str) {
+        let mut body = std::fs::read_to_string(self.remote_env_file()).unwrap_or_default();
+        body.push_str(&format!("umask {mask}\n"));
+        std::fs::write(self.remote_env_file(), body).unwrap();
+    }
+
     /// Environment for the remote side only (the proxy and the master),
     /// where the client's own must differ — different liveness timers, say.
     pub fn remote_env(&self, vars: &[(&str, &str)]) {
