@@ -358,6 +358,12 @@ impl Remote {
     /// Make every connection print `text` on stdout before the remote
     /// command runs, as a chatty `.bashrc` or motd script would.
     pub fn login_noise(&self, text: &str) {
+        self.login_noise_bytes(text.as_bytes());
+    }
+
+    /// [`Remote::login_noise`] with bytes, for a banner that is not UTF-8
+    /// (a Latin-1 or CP437 motd).
+    pub fn login_noise_bytes(&self, text: &[u8]) {
         std::fs::write(self.noise_file(), text).unwrap();
     }
 
