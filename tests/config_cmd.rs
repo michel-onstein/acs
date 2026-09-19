@@ -159,6 +159,34 @@ fn set_get_unset_keep_the_rest_of_the_file() {
     );
 }
 
+/// Regression (acs-q8e): a configuration kept in dotfiles is reached through
+/// a symlink. An edit must change the file it points at and leave the link.
+#[test]
+fn an_edit_writes_through_a_symlink() {
+    let h = Home::new();
+    let dotfiles = h.dir.path().join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    let target = dotfiles.join("acs.yaml");
+    std::fs::write(&target, "install_on_remote: true\n").unwrap();
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, h.local()).unwrap();
+
+    h.ok(&["config", "set", "install_on_remote", "false"]);
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "install_on_remote: false\n",
+        "the file the link points at was not edited"
+    );
+    assert!(
+        std::fs::symlink_metadata(h.local())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link was replaced by a regular file"
+    );
+    assert_eq!(h.ok(&["config", "get", "install_on_remote"]), "false\n");
+}
+
 #[test]
 fn errors_are_clear() {
     let h = Home::new();

@@ -1071,6 +1071,8 @@ their YAML shape:
   written as two spaces. The result is parsed and validated again before it
   replaces the file (atomically, keeping its mode), so an edit never saves a
   file the client would refuse — nor overwrites one that is already broken.
+  A path that is a symlink is resolved first, so a configuration kept in
+  dotfiles is edited where it really lives and the link survives.
   It is also checked merged with the other file, so the hosts under an
   alias's key in one file cannot be removed from the other; `host set` on an
   alias that has no host yet says to add one first.

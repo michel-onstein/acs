@@ -1001,6 +1001,13 @@ fn write(path: &Path, doc: &Document) -> Result<(), Error> {
     Config::default()
         .apply(path, &check.root)
         .map_err(|e| Error::Usage(format!("{e} (not saved; fix the file by hand)")))?;
+    // Edit the file the path leads to, not the link: a configuration
+    // kept in dotfiles is reached through a symlink, and renaming over
+    // the link would replace it with a regular file and leave the real
+    // file behind (acs-q8e). A hard-linked file still gets a new inode,
+    // as any atomic replace does.
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = real.as_path();
     let dir = path.parent().unwrap_or(Path::new("."));
     let io = |e: std::io::Error, what: &Path| {
         let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
