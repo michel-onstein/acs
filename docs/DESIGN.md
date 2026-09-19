@@ -529,6 +529,11 @@ sequenceDiagram
 - Each side sends `PING` after 3 s of silence. The client declares the link
   dead after **10 s** with no frame received, kills its ssh child, and redials.
   Drop detection falls from dsh's 45 s to 10 s.
+- **Bytes count, not only decoded frames**: anything read from the link marks
+  the host heard. Writing output to the terminal blocks while the terminal is
+  not reading (an emulator stalled, flow control), and the frames read in that
+  time are only decoded on the next pass — so judging by the last decode alone
+  turned a stalled terminal into a lost link, with `PONG`s waiting in the pipe.
 - The master does the same for its attached client, which answers `PING`
   with `PONG`: a client silent for 10 s is dropped, freeing the pty from
   its backpressure (§4.2). Without it a client that vanished without closing

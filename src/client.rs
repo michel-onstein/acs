@@ -976,7 +976,16 @@ fn serve(
         if fds[0].revents != 0 {
             match sys::read(from, &mut buf) {
                 Ok(0) => return lost(link),
-                Ok(n) => dec.push(&buf[..n]),
+                Ok(n) => {
+                    dec.push(&buf[..n]);
+                    // Bytes from the host are proof it is there. Their
+                    // frames are decoded at the top of the next iteration,
+                    // after the tick below, so without this a terminal that
+                    // stopped reading for longer than the dead interval —
+                    // write_output blocks meanwhile — would look like a lost
+                    // link, with PONGs sitting in the pipe (acs-7k7).
+                    liveness.heard();
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => return lost(link),
             }

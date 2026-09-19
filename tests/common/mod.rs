@@ -311,7 +311,7 @@ impl Remote {
         let script = self.root.path().join("transport.sh");
         if !script.exists() {
             let body = format!(
-                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\n[ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\nexec /bin/sh -c \"$1\"\n",
+                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\n[ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n[ -f '{renv}' ] && . '{renv}'\nexec /bin/sh -c \"$1\"\n",
                 pids = self.pid_file().display(),
                 silent = self.silent_file().display(),
                 delay = self.delay_file().display(),
@@ -319,6 +319,7 @@ impl Remote {
                 home = self.home().display(),
                 sock = self.sockets().display(),
                 fake = self.fake_bin().display(),
+                renv = self.remote_env_file().display(),
             );
             std::fs::write(&script, body).unwrap();
             use std::os::unix::fs::PermissionsExt;
@@ -341,6 +342,20 @@ impl Remote {
 
     fn delay_file(&self) -> PathBuf {
         self.root.path().join("delay")
+    }
+
+    fn remote_env_file(&self) -> PathBuf {
+        self.root.path().join("remote-env")
+    }
+
+    /// Environment for the remote side only (the proxy and the master),
+    /// where the client's own must differ — different liveness timers, say.
+    pub fn remote_env(&self, vars: &[(&str, &str)]) {
+        let body: String = vars
+            .iter()
+            .map(|(k, v)| format!("export {k}='{v}'\n"))
+            .collect();
+        std::fs::write(self.remote_env_file(), body).unwrap();
     }
 
     /// Make new connections take `secs` seconds to reach the remote command,
@@ -451,6 +466,7 @@ pub struct Client {
     pub child: Child,
     pty: OwnedFd,
     output: Arc<Mutex<Vec<u8>>>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
     searched: usize,
 }
 
@@ -513,10 +529,15 @@ impl Client {
         drop(slave);
         let output = Arc::new(Mutex::new(Vec::new()));
         let out = output.clone();
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let p = paused.clone();
         let mut reader = std::fs::File::from(master.try_clone().unwrap());
         std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
             loop {
+                while p.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => return,
                     Ok(n) => out.lock().unwrap().extend_from_slice(&buf[..n]),
@@ -527,8 +548,15 @@ impl Client {
             child,
             pty: master,
             output,
+            paused,
             searched: 0,
         }
+    }
+
+    /// Stop (or start again) draining the terminal, as an emulator that
+    /// stalled does: the client's writes to stdout then block.
+    pub fn set_paused(&self, on: bool) {
+        self.paused.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Type bytes.
