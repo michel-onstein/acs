@@ -72,6 +72,19 @@ fn cut_link_mid_stream_resumes_without_loss() {
     assert!(c.text().contains("reconnecting"), "status line shown");
 }
 
+/// Regression (acs-ode): under steady output the client hears the master
+/// and never pings on its own, so only its PONG to the master's PING keeps
+/// the master from giving it up.
+#[test]
+fn a_client_busy_with_output_answers_the_masters_ping() {
+    let remote = Remote::installed();
+    let mut c = start(&remote, "busy", TICKER, FAST);
+    c.wait_for("#20#", T);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(remote.transport_pids().len(), 1, "the link was dropped");
+    assert!(!c.text().contains("reconnecting"));
+}
+
 #[test]
 fn frozen_link_is_declared_dead_and_replaced() {
     let remote = Remote::installed();

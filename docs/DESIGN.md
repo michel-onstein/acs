@@ -524,6 +524,13 @@ sequenceDiagram
 - Each side sends `PING` after 3 s of silence. The client declares the link
   dead after **10 s** with no frame received, kills its ssh child, and redials.
   Drop detection falls from dsh's 45 s to 10 s.
+- The master does the same for its attached client, which answers `PING`
+  with `PONG`: a client silent for 10 s is dropped, freeing the pty from
+  its backpressure (§4.2). Without it a client that vanished without closing
+  — a laptop powered off, no FIN reaching the host — would hold the session
+  for sshd's keepalive period, the program stalled once the ring filled.
+  Output queued ahead of a `PING` is capped (64 KiB), so a live client
+  answers in time; one that does not only costs a resume.
 - Reconnect is **on by default**: the protocol distinguishes a clean end (`EXIT`,
   `DETACH` acknowledged, `TAKEOVER`) from a drop, so there is nothing to guess.
   `--no-reconnect` restores `dsh`'s default behaviour. Backoff 1 s → 30 s,

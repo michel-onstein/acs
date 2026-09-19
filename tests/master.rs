@@ -425,6 +425,93 @@ fn no_backpressure_while_detached() {
     }
 }
 
+/// Fast liveness timers for the master (DESIGN §5.3).
+const FAST_LIVENESS: &[(&str, &str)] = &[("ACS_PING_MS", "200"), ("ACS_DEAD_MS", "800")];
+
+/// Regression (acs-ode): a client that stops reading and writing without
+/// closing — a laptop powered off, no FIN reaching the host — is given up
+/// after the dead interval, so the program is no longer held back.
+#[test]
+fn a_client_that_vanishes_without_closing_is_dropped() {
+    let t = TempDir::new();
+    let marker = t.path().join("done");
+    let cmd = format!(
+        "head -c 3000000 /dev/zero | tr '\\0' x; touch {}; sleep 30",
+        marker.display()
+    );
+    let mut env = FAST_LIVENESS.to_vec();
+    env.push(("ACS_RING", "65536"));
+    acs::master::spawn_with_env(&exe(), t.path(), "gone", &env).unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(sock(t.path(), "gone")).unwrap();
+    s.set_read_timeout(Some(T)).unwrap();
+    let mut h = hello("gone", Mode::AttachOrCreate, "me");
+    h.command = vec!["/bin/sh".into(), "-c".into(), cmd];
+    std::io::Write::write_all(&mut s, &Msg::Hello(h).to_bytes()).unwrap();
+    // Never read, never write, never close.
+    let deadline = Instant::now() + T;
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "program blocked by a vanished client"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The master hung up on it.
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match std::io::Read::read(&mut s, &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+}
+
+/// The master pings a silent client (acs-ode), and one that answers stays
+/// attached past the dead interval.
+#[test]
+fn the_master_pings_and_keeps_a_client_that_answers() {
+    let t = TempDir::new();
+    let (mut a, w) = start_env(
+        t.path(),
+        "ping",
+        &["/bin/sh", "-c", "while read l; do echo got:$l; done"],
+        "me",
+        FAST_LIVENESS,
+    );
+    // FrameConn answers each PING; wait well past the dead interval.
+    let _ = a.recv_control(Duration::from_millis(2000));
+    a.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"still\r".to_vec(),
+    });
+    a.wait_output("got:still", T);
+}
+
+/// The master sends PING to an attached client that says nothing (acs-ode).
+#[test]
+fn the_master_pings_a_silent_client() {
+    let t = TempDir::new();
+    acs::master::spawn_with_env(&exe(), t.path(), "p", FAST_LIVENESS).unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(sock(t.path(), "p")).unwrap();
+    let mut h = hello("p", Mode::AttachOrCreate, "me");
+    h.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+    std::io::Write::write_all(&mut s, &Msg::Hello(h).to_bytes()).unwrap();
+    s.set_read_timeout(Some(T)).unwrap();
+    let mut dec = acs::proto::Decoder::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match dec.next_msg().unwrap() {
+            Some(Msg::Ping(_)) => return,
+            Some(_) => continue,
+            None => {}
+        }
+        let n = std::io::Read::read(&mut s, &mut buf).expect("a PING in time");
+        assert!(n > 0, "closed before a PING");
+        dec.push(&buf[..n]);
+    }
+}
+
 #[test]
 fn resize_reaches_the_program() {
     let t = TempDir::new();
