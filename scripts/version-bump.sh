@@ -15,6 +15,10 @@ cd "$(dirname "$0")/.."
 before=$(mktemp)
 after=$(mktemp)
 trap 'rm -f "$before" "$after"' EXIT
+# The tags origin already has, before the bump adds one: `cargo xtask bump`
+# fetches them itself, so without this a checkout with stale tags would see
+# every tag it was missing as new and publish those releases again (acs-zc4).
+git fetch --tags origin main
 git tag --list 'v[0-9]*' | sort > "$before"
 
 cargo xtask bump "$@"

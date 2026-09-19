@@ -120,3 +120,112 @@ fn e2e_gives_each_checkout_its_own_host_on_a_free_port() {
         assert!(l.ends_with(&na), "{l}");
     }
 }
+
+/// A checkout whose `scripts/` holds version-bump.sh, a release-binaries.sh
+/// that only logs, and a fake `git`/`cargo` pair driven by tag files:
+/// `local` is what the checkout has, `remote` what origin has, and a bump
+/// appends `bumped` to both.
+fn bump_checkout(dir: &Path, local: &[&str], remote: &[&str], bumped: &str) -> PathBuf {
+    let root = dir.join("repo");
+    let scripts = root.join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/version-bump.sh"),
+        scripts.join("version-bump.sh"),
+    )
+    .unwrap();
+    let write = |path: PathBuf, body: &str| {
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write(
+        scripts.join("release-binaries.sh"),
+        "#!/bin/sh\necho \"release-binaries $*\" >>\"$FAKE_LOG\"\n",
+    );
+    // Every file ends in a newline: the fakes append to them.
+    let lines = |tags: &[&str]| tags.iter().map(|t| format!("{t}\n")).collect::<String>();
+    std::fs::write(dir.join("local"), lines(local)).unwrap();
+    std::fs::write(dir.join("remote"), lines(remote)).unwrap();
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write(
+        bin.join("git"),
+        &format!(
+            "#!/bin/sh\necho \"git $*\" >>\"$FAKE_LOG\"\n\
+             case \"$1 $2\" in\n\
+             \"fetch --tags\") cat '{remote}' >> '{local}' ;;\n\
+             \"tag --list\") sort -u '{local}' | grep -v '^$' ;;\n\
+             esac\n",
+            remote = dir.join("remote").display(),
+            local = dir.join("local").display(),
+        ),
+    );
+    write(
+        bin.join("cargo"),
+        &format!(
+            "#!/bin/sh\necho \"cargo $*\" >>\"$FAKE_LOG\"\n\
+             cat '{remote}' >> '{local}'\n\
+             echo '{bumped}' >> '{local}'\n\
+             echo '{bumped}' >> '{remote}'\n",
+            remote = dir.join("remote").display(),
+            local = dir.join("local").display(),
+        ),
+    );
+    root
+}
+
+fn run_bump(dir: &Path, root: &Path) -> Vec<String> {
+    let log = dir.join("log");
+    let _ = std::fs::remove_file(&log);
+    let path = format!(
+        "{}:{}",
+        dir.join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let out = Command::new("sh")
+        .arg(root.join("scripts/version-bump.sh"))
+        .env("PATH", path)
+        .env("FAKE_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "version-bump.sh: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// Regression (acs-zc4): a tag origin already has, but this checkout does
+/// not, is not published again — only the tag the bump made is.
+#[test]
+fn version_bump_only_releases_the_tag_it_made() {
+    let dir = TempDir::new();
+    let root = bump_checkout(dir.path(), &["v0.1.0"], &["v0.1.0", "v0.2.0"], "v0.3.0");
+    let log = run_bump(dir.path(), &root);
+    let released: Vec<&String> = log
+        .iter()
+        .filter(|l| l.starts_with("release-binaries"))
+        .collect();
+    assert_eq!(released, ["release-binaries v0.3.0"], "{log:?}");
+    // The tags are fetched before they are snapshotted.
+    let fetch = log.iter().position(|l| l.starts_with("git fetch --tags"));
+    let list = log.iter().position(|l| l.starts_with("git tag --list"));
+    assert!(fetch < list, "fetch after the snapshot: {log:?}");
+}
+
+/// A bump that releases nothing (nothing unreleased) publishes nothing.
+#[test]
+fn version_bump_without_a_new_tag_releases_nothing() {
+    let dir = TempDir::new();
+    let root = bump_checkout(dir.path(), &["v0.1.0"], &["v0.1.0", "v0.2.0"], "");
+    let log = run_bump(dir.path(), &root);
+    assert!(
+        !log.iter().any(|l| l.starts_with("release-binaries")),
+        "{log:?}"
+    );
+}
