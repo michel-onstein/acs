@@ -19,7 +19,7 @@ usage: acs config show                 the merged configuration and where each v
        acs config unset <key>          remove a setting from the file
        acs config host list            every alias and its hosts
        acs config host add <alias> <host> [--user <login>] [--identity-file <key>]
-                           [--no-reachability-check]
+                           [--no-reachability-check] [--persist]
                                        add a host to an alias (after its other hosts)
        acs config host remove <alias> [<host>]
                                        remove one host, or the whole alias
@@ -31,12 +31,14 @@ usage: acs config show                 the merged configuration and where each v
 
   --global  edit /etc/acs/config.yaml instead of ~/.config/acs/config.yaml
 
-settings: install_on_remote, update_check, command_bell, redraw_on_reconnect (true|false),
+settings: install_on_remote, update_check, command_bell, redraw_on_reconnect,
+          persist (true|false: keep waiting for a lost host; default false),
           reachability_timeout (how long an alias's hosts have to answer a ping:
-          500ms, 0.5s, 2s; default 500ms)
+          500ms, 0.5s, 2s; default 500ms),
+          reachability_interval (how often a lost host is pinged; default 5s)
 alias settings: identity_file <key> (the ssh key of its hosts that name none),
-                redraw_on_reconnect (true|false, over the global setting),
-                reachability_timeout (over the global setting)
+                redraw_on_reconnect, persist (true|false, over the global setting),
+                reachability_timeout, reachability_interval (over the global setting)
 precedence of the ssh key: -i, then the host's identity_file, then the alias's";
 
 /// Settings `get`/`set`/`unset` know: every top-level key but `hosts`.
@@ -53,16 +55,11 @@ fn scalar(c: &Config, key: &str) -> Option<(Node, Option<config::Origin>)> {
     if let Some(s) = c.bool_setting(key) {
         return Some((Node::bool(s.value), s.origin.clone()));
     }
-    match key {
-        "reachability_timeout" => {
-            let s = &c.reachability_timeout;
-            Some((
-                Node::string(&config::format_timeout(s.value)),
-                s.origin.clone(),
-            ))
-        }
-        _ => None,
-    }
+    let s = c.duration_setting(key)?;
+    Some((
+        Node::string(&config::format_timeout(s.value)),
+        s.origin.clone(),
+    ))
 }
 
 /// `value` as the node for setting `key`, global or an alias's, checked
@@ -71,7 +68,7 @@ fn typed(key: &str, value: &str) -> Result<Node, String> {
     if config::BOOLS.contains(&key) || config::ALIAS_BOOLS.contains(&key) {
         Ok(Node::bool(parse_bool(key, value)?))
     } else if config::DURATIONS.contains(&key) {
-        let d = config::parse_timeout(value).map_err(|e| format!("{key}: {e}"))?;
+        let d = config::parse_duration(key, value).map_err(|e| format!("{key}: {e}"))?;
         Ok(Node::string(&config::format_timeout(d)))
     } else {
         Ok(Node::string(value))
@@ -107,6 +104,7 @@ pub enum Cmd {
         user: Option<String>,
         check: bool,
         identity_file: Option<String>,
+        persist: bool,
     },
     HostRemove {
         alias: String,
@@ -130,6 +128,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
     let mut user = None;
     let mut check = None;
     let mut identity: Option<String> = None;
+    let mut persist = false;
     let mut words = Vec::new();
     let mut it = args.iter().map(|a| a.to_string_lossy().into_owned());
     while let Some(a) = it.next() {
@@ -141,6 +140,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
             }
             "--no-reachability-check" => check = Some(false),
             "--reachability-check" => check = Some(true),
+            "--persist" => persist = true,
             "-h" | "--help" => return Ok((Cmd::Help, global)),
             s if s.starts_with("--user=") => user = Some(s["--user=".len()..].to_string()),
             s if s.starts_with("--identity-file=") => {
@@ -164,7 +164,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
             ));
         }
     }
-    let host_opts = user.is_some() || check.is_some() || identity.is_some();
+    let host_opts = user.is_some() || check.is_some() || identity.is_some() || persist;
     let cmd = match w.as_slice() {
         ["show"] => Cmd::Show,
         ["path"] => Cmd::Path,
@@ -179,6 +179,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
             user,
             check: check.unwrap_or(true),
             identity_file: identity,
+            persist,
         },
         ["host", "remove" | "rm", alias] => Cmd::HostRemove {
             alias: alias.to_string(),
@@ -436,12 +437,26 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
                 },
             ));
         }
-        if let Some(t) = &a.reachability_timeout {
+        for (key, d) in [
+            ("reachability_timeout", &a.reachability_timeout),
+            ("reachability_interval", &a.reachability_interval),
+        ] {
+            if let Some(t) = d {
+                settings.push((
+                    key.to_string(),
+                    Node {
+                        comment: Some(from(&t.origin)),
+                        ..Node::string(&config::format_timeout(t.value))
+                    },
+                ));
+            }
+        }
+        if let Some(p) = &a.persist {
             settings.push((
-                "reachability_timeout".to_string(),
+                "persist".to_string(),
                 Node {
-                    comment: Some(from(&t.origin)),
-                    ..Node::string(&config::format_timeout(t.value))
+                    comment: Some(from(&p.origin)),
+                    ..Node::bool(p.value)
                 },
             ));
         }
@@ -495,6 +510,9 @@ fn entry_node(e: &HostEntry) -> Node {
     }
     if !e.reachability_check {
         m.push(("reachability_check".to_string(), Node::bool(false)));
+    }
+    if let Some(p) = &e.persist {
+        m.push(("persist".to_string(), Node::bool(p.value)));
     }
     Node::new(Value::Map(m))
 }
@@ -648,6 +666,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
             user,
             check,
             identity_file,
+            persist,
         } => {
             config::validate_alias(alias)?;
             let entry = HostEntry {
@@ -656,6 +675,10 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                 reachability_check: *check,
                 identity_file: identity_file.clone().map(|value| config::Setting {
                     value,
+                    origin: None,
+                }),
+                persist: persist.then_some(config::Setting {
+                    value: true,
                     origin: None,
                 }),
                 origin: config::Origin {
@@ -1019,7 +1042,8 @@ mod tests {
                 host: "devbox.lan".into(),
                 user: Some("me".into()),
                 check: false,
-                identity_file: None
+                identity_file: None,
+                persist: false
             }
         );
         assert_eq!(
@@ -1029,17 +1053,19 @@ mod tests {
                 host: "devbox.lan".into(),
                 user: Some("me".into()),
                 check: true,
-                identity_file: Some("~/k".into())
+                identity_file: Some("~/k".into()),
+                persist: false
             }
         );
         assert_eq!(
-            cmd("host add devbox devbox.lan --identity-file /keys/k"),
+            cmd("host add devbox devbox.lan --identity-file /keys/k --persist"),
             Cmd::HostAdd {
                 alias: "devbox".into(),
                 host: "devbox.lan".into(),
                 user: None,
                 check: true,
-                identity_file: Some("/keys/k".into())
+                identity_file: Some("/keys/k".into()),
+                persist: true
             }
         );
         assert_eq!(
@@ -1268,7 +1294,7 @@ mod tests {
         );
         let e = parse(&args("host set d command_bell false")).unwrap_err();
         assert!(
-            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout)"),
+            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval)"),
             "{e}"
         );
     }
@@ -1472,9 +1498,49 @@ mod tests {
         );
         let e = apply("", "set nope 1").unwrap_err();
         assert!(
-            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout)"),
+            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval)"),
             "{e}"
         );
+    }
+
+    /// acs-txt: persist and reachability_interval, globally, per alias and
+    /// (persist) per host entry, typed.
+    #[test]
+    fn persist_and_reachability_interval_are_set_checked_and_shown() {
+        assert_eq!(apply("", "set persist TRUE").unwrap(), "persist: true\n");
+        assert_eq!(
+            apply("", "set reachability_interval 0.5").unwrap(),
+            "reachability_interval: 500ms\n"
+        );
+        let e = apply("", "set reachability_interval 10ms").unwrap_err();
+        assert!(e.contains("at least 100ms"), "{e}");
+        let src = "hosts:\n  d:\n    - host: a\n";
+        let set = apply(src, "host set d persist true").unwrap();
+        let set = apply(&set, "host set d reachability_interval 30s").unwrap();
+        assert_eq!(
+            set,
+            "hosts:\n  d:\n    reachability_interval: 30s\n    persist: true\n    hosts:\n      - host: a\n"
+        );
+        assert_eq!(
+            apply(src, "host add d b --persist").unwrap(),
+            "hosts:\n  d:\n    - host: a\n    - host: b\n      persist: true\n"
+        );
+        // Shown with the rest, and read back the same.
+        let dir = crate::testutil::TempDir::new();
+        let f = dir.path().join("l.yaml");
+        std::fs::write(&f, &set).unwrap();
+        let files = [dir.path().join("none.yaml"), f.clone()];
+        let c = Config::load_files(&files).unwrap();
+        let out = show(&c, &files);
+        assert!(out.contains("persist: false # default\n"), "{out}");
+        assert!(
+            out.contains("reachability_interval: 5s # default\n"),
+            "{out}"
+        );
+        assert!(out.contains("    persist: true # "), "{out}");
+        assert!(out.contains("    reachability_interval: 30s # "), "{out}");
+        let (n, _) = scalar(&c, "reachability_interval").unwrap();
+        assert_eq!(text(&n), "5s");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! acs [ssh options] [user@]<host> [session] [--new]
-//!     [--no-reconnect] [--force] [-v] [-- command...]
+//!     [--no-reconnect | --persist] [--force] [-v] [-- command...]
 //! acs list [ssh options] [-v] [[user@]<host>]
 //! ```
 //!
@@ -28,6 +28,8 @@ usage: acs [ssh options] [user@]<host>             pick a detached session from 
 options:
       --new           create a session named with the lowest free number
       --no-reconnect  exit when the connection drops instead of redialling
+      --persist       never give up on a lost host: ping it every reachability_interval
+                      (default 5s) and dial as soon as it answers, from the first connect on
       --force         take over a session attached by someone else
   -v                  verbose: show ssh commands and remote login noise
       --ssh <path>    ssh program to run (also ACS_SSH)
@@ -43,7 +45,7 @@ in a session: Ctrl-] Ctrl-] then  d  detach (session keeps running)
               a bell says it waits for the key (off: command_bell: false)
 
 environment: ACS_DEFAULT_SESSION ACS_IDENTITY ACS_ESCAPE_KEY ACS_ESCAPE_TIMEOUT_MS
-             ACS_COMMAND_BELL ACS_SSH ACS_SOCKET_DIR
+             ACS_COMMAND_BELL ACS_PERSIST ACS_SSH ACS_SOCKET_DIR
 
 configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml;
                the <host> of [user@]<host> may be an alias defined there (hosts:)";
@@ -68,6 +70,9 @@ pub struct ClientArgs {
     pub target: Target,
     pub list: bool,
     pub reconnect: bool,
+    /// `--persist`: keep waiting for a lost host (DESIGN §5.3), whatever the
+    /// configuration says.
+    pub persist: bool,
     pub force: bool,
     pub verbose: u8,
     pub command: Vec<String>,
@@ -77,6 +82,8 @@ pub struct ClientArgs {
     /// The alias the destination was resolved from, as given (`[user@]<alias>`),
     /// if any (DESIGN §7.3).
     pub alias: Option<String>,
+    /// The index of the alias's entry in use, once one was chosen.
+    pub entry: Option<usize>,
 }
 
 impl ClientArgs {
@@ -125,6 +132,7 @@ where
     let mut positionals: Vec<String> = Vec::new();
     let mut new = false;
     let mut reconnect = true;
+    let mut persist = false;
     let mut force = false;
     let mut verbose = 0u8;
     let mut command = Vec::new();
@@ -166,6 +174,7 @@ where
             }
             Long("new") => new = true,
             Long("no-reconnect") => reconnect = false,
+            Long("persist") => persist = true,
             // dsh's redial flag: reconnecting is the default now.
             Short('r') | Long("reconnect") => {}
             Long("force") => force = true,
@@ -204,6 +213,9 @@ where
     if list && !command.is_empty() {
         return Err("acs list takes no command".into());
     }
+    if persist && !reconnect {
+        return Err("--persist keeps reconnecting and --no-reconnect never does: give one".into());
+    }
     if new && session.is_some() {
         return Err("--new picks the session name itself; give either --new or a name".into());
     }
@@ -229,11 +241,13 @@ where
         target,
         list,
         reconnect,
+        persist,
         force,
         verbose,
         command,
         config: Config::default(),
         alias: None,
+        entry: None,
     });
     Ok(match host {
         Some(_) => Parsed::Run(args),
@@ -371,6 +385,15 @@ mod tests {
             ]
         );
         assert_eq!(a.transport.destination, "me@box");
+    }
+
+    #[test]
+    fn persist_and_its_contradiction() {
+        let a = run(&["devbox", "--persist"]).unwrap();
+        assert!(a.persist && a.reconnect);
+        assert!(!run(&["devbox"]).unwrap().persist);
+        let e = run(&["devbox", "--persist", "--no-reconnect"]).unwrap_err();
+        assert!(e.contains("give one"), "{e}");
     }
 
     #[test]

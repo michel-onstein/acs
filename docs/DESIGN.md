@@ -543,6 +543,34 @@ sequenceDiagram
   marker and again for the handshake (`ACS_DIAL_TIMEOUT_MS` sets both). A
   takeover question restarts the handshake's clock.
 
+**Persisting.** By default the client gives up where there is no session to
+keep: no host of an alias answers at the start, the first connection fails,
+or the link is lost before the first `WELCOME` — each exits 255. With
+`--persist`, `persist: true` or `ACS_PERSIST=1`, a lost host is never given
+up on; it is waited for with pings (`alias.rs`, the ping of §7.3) instead
+of ssh dials:
+
+- **The ping gate**: while the host is lost it is pinged every
+  `reachability_interval` (default 5 s, §7.2), and dialled only once it
+  answers — at once, too, after a network change (netwatch). An alias is
+  resolved again each time, so the first of its hosts to answer is the one
+  dialled (§7.3); a plain host is pinged itself. A host that answers but
+  whose ssh is not up yet gets a dial that fails and the gate again.
+- **Everywhere a host is lost**: after a drop (replacing the 1 s → 30 s
+  backoff for a host that can be pinged), and at the start — an alias none
+  of whose hosts answers, a menu (§4.4) or first connection that cannot be
+  dialled, a link lost before any session. Before a session exists the
+  terminal is still cooked: acs says it is waiting once, shows the status
+  line of §5.4 while it waits, and Ctrl-C gives up; after one, the command
+  keys work as in the backoff wait (Ctrl-] Ctrl-] `d` detaches).
+- **Hosts that drop pings** cannot be gated: an alias whose hosts all have
+  `reachability_check: false` keeps the dial backoff while persisting.
+- **Which setting**: `--persist` over everything, then `ACS_PERSIST` (`0`
+  off, `1` on), then the `persist` of the alias's entry in use, the
+  alias's, the global one (default off). Before any entry answered, the
+  alias's decides. `--persist` and `--no-reconnect` contradict each other
+  and together are a usage error.
+
 ### 5.4 Status while disconnected
 
 Anything the client prints corrupts the screen the remote program drew, and a
@@ -744,6 +772,8 @@ update_check: true             # look for a newer release once a week (§7.6)
 command_bell: true             # ring the bell when command mode arms (§6.1)
 redraw_on_reconnect: true      # send Ctrl-L after reconnecting (§5.2)
 reachability_timeout: 500ms    # how long hosts have to answer a ping (§7.3)
+persist: false                 # wait for a lost host, pinging it (§5.3)
+reachability_interval: 5s      # how often a lost host is pinged (§5.3)
 hosts:                         # aliases: acs devbox tries these in order
   devbox:
     - host: devbox.lan
@@ -751,10 +781,13 @@ hosts:                         # aliases: acs devbox tries these in order
     - host: devbox.example.com
       user: michel             # otherwise ~/.ssh/config decides
       identity_file: ~/.ssh/id_outside # this host's ssh key (-i)
+      persist: true            # wait for this host when it is lost (§5.3)
   lab:                         # an alias with settings of its own
     identity_file: ~/.ssh/id_lab # the key of every host naming none
     redraw_on_reconnect: false # over the global setting, for this alias
     reachability_timeout: 2s   # so is this
+    persist: true              # and this, unless an entry says otherwise
+    reachability_interval: 30s # and this
     hosts:
       - host: lab.lan
 ```
@@ -771,14 +804,15 @@ hosts:                         # aliases: acs devbox tries these in order
   the client installs nothing; it says which host lacks which version, where
   the setting came from, and exits with the install-failed code (254).
 - `hosts` is parsed and validated: `host` is required, `user`,
-  `identity_file` and `reachability_check` (default `true`) are optional,
-  and one entry may be written without the list. How an alias is resolved is
-  §7.3.
+  `identity_file`, `reachability_check` (default `true`) and `persist` are
+  optional, and one entry may be written without the list. How an alias is
+  resolved is §7.3.
 - **An alias's own settings**: an alias is a list of entries (or one entry,
   a mapping with `host`), or a mapping of its settings — `identity_file`,
-  `redraw_on_reconnect` and `reachability_timeout` — and its `hosts`, that
-  list. The list form stays the usual one; the mapping is only needed for a
-  setting shared by the entries. A file may give the mapping without
+  `redraw_on_reconnect`, `reachability_timeout`, `persist` and
+  `reachability_interval` — and its `hosts`, that list. The list form
+  stays the usual one; the mapping is only needed for a setting shared by
+  the entries. A file may give the mapping without
   `hosts`, to set the key (or another setting) of an alias whose hosts are
   in the other file, but an alias with no host in either is an error (at
   its first definition). An `identity_file` is one path, not a list:
@@ -787,7 +821,11 @@ hosts:                         # aliases: acs devbox tries these in order
   bare number of seconds (`0.5`), to the millisecond, from 1 ms to 60 s;
   anything else is an error. The default is `500ms`, and an alias's own
   value replaces the global one (§7.3). `acs config` writes it back as
-  `500ms` or `2s`.
+  `500ms` or `2s`. `reachability_interval` is written the same way, from
+  100 ms to an hour (default `5s`).
+- **`persist`** (§5.3) is true or false at three levels: a host entry's
+  beats its alias's, which beats the global one; `--persist` and
+  `ACS_PERSIST` beat them all.
 - Only the local client reads the files; `_proxy`, `_master` and `_install`
   never do.
 
@@ -847,7 +885,8 @@ one of the alias's entries instead of `<name>`:
   when it has one, replaces the global setting for sessions reached through
   it, as `<alias>` or `user@<alias>`; `ACS_REDRAW_ON_RECONNECT` still wins.
 - **None answers**: the client names every host it tried and exits with the
-  unreachable code (255) without calling ssh.
+  unreachable code (255) without calling ssh — or, persisting (§5.3),
+  pings them every `reachability_interval` until one answers.
 - It applies to every ssh call — the session, `acs list`, install — since they
   share one destination and key. `-v` says which entry was chosen and why.
 - **Redial**: a reconnect (§5.3) resolves the alias again, so after a network
@@ -953,11 +992,11 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`); `set` checks the type |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`); `set` checks the type |
 | `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
-| `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
+| `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check] [--persist]` | append an entry, so repeated adds give an alias its fallback hosts in order |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
-| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
+| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `persist true\|false`, `reachability_interval <duration>` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
 | `path` | the two files and whether they exist |
 
 - Edits go to the local file; `--global` edits the global one (and needs

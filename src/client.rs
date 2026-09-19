@@ -85,7 +85,11 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     let name = args.transport.destination.clone();
     if let Err(e) = resolve_alias(&mut args, &name) {
         eprintln!("acs: {e}");
-        return ExitCode::from(code::UNREACHABLE);
+        // Persisting (DESIGN §5.3): wait until one of its hosts answers.
+        if args.list || !persist(&args) {
+            return ExitCode::from(code::UNREACHABLE);
+        }
+        wait_for_host(&mut args, &name);
     }
     if args.list && !menu {
         return crate::list::run(&args);
@@ -93,9 +97,83 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     // No session named: pick one on the host just resolved (DESIGN §4.4),
     // over the connection the session then uses.
     let always = args.list;
-    match crate::pick::choose(&mut args, always) {
-        Ok(picked) => ExitCode::from(run(args, picked)),
-        Err(c) => ExitCode::from(c),
+    loop {
+        match crate::pick::choose(&mut args, always) {
+            Ok(picked) => return ExitCode::from(run(args, picked)),
+            // The host could not be reached for the menu: persisting, wait
+            // until it answers a ping, then ask again.
+            Err(code::UNREACHABLE) if !args.list && persist(&args) => {
+                wait_for_host(&mut args, &name)
+            }
+            Err(c) => return ExitCode::from(c),
+        }
+    }
+}
+
+/// Whether a lost host is waited for (DESIGN §5.3): `--persist`, then
+/// `ACS_PERSIST`, then the setting of the alias's entry in use, the
+/// alias's, the global one.
+pub(crate) fn persist(args: &ClientArgs) -> bool {
+    if args.persist {
+        return true;
+    }
+    let alias = args_alias(args);
+    let entry = alias.zip(args.entry).and_then(|(a, i)| a.entries.get(i));
+    env_switch(
+        std::env::var("ACS_PERSIST").ok().as_deref(),
+        args.config.persist_for(alias, entry).value,
+    )
+}
+
+/// How often a lost host is pinged while it is waited for: the alias's
+/// `reachability_interval`, else the global one.
+pub(crate) fn reachability_interval(args: &ClientArgs) -> Duration {
+    args.config
+        .reachability_interval_for(args_alias(args))
+        .value
+}
+
+/// The alias `args` go through, resolved or not yet: `[user@]<alias>` as
+/// given.
+fn args_alias(args: &ClientArgs) -> Option<&crate::config::Alias> {
+    let name = args.alias.as_deref().unwrap_or(&args.transport.destination);
+    args.config.alias(crate::alias::split_user(name).1)
+}
+
+/// Before any session: wait, pinging every `reachability_interval`, until
+/// the host `name` stands for answers — an alias's hosts as resolving pings
+/// them (and then points `args` at the one that answered), a plain host
+/// itself. Ctrl-C gives up. A host that cannot be pinged (an alias whose
+/// hosts all have `reachability_check: false`) is just waited for once.
+pub(crate) fn wait_for_host(args: &mut ClientArgs, name: &str) {
+    let every = reachability_interval(args);
+    note(&format!(
+        "waiting for {} to answer a ping, every {} (Ctrl-C gives up)",
+        args.host_name(),
+        crate::config::format_timeout(every)
+    ));
+    loop {
+        std::thread::sleep(every);
+        if host_answers(args, name).unwrap_or(true) {
+            return;
+        }
+    }
+}
+
+/// Whether the host `name` stands for answers a ping now: an alias is
+/// resolved again, pinging its hosts (and `args` then point at the one that
+/// answered); a plain host is pinged. `None` when it cannot be pinged: an
+/// alias whose hosts all have `reachability_check: false`.
+pub(crate) fn host_answers(args: &mut ClientArgs, name: &str) -> Option<bool> {
+    let alias_name = crate::alias::split_user(name).1;
+    match args.config.alias(alias_name) {
+        Some(a) if a.entries.iter().all(|e| !e.reachability_check) => None,
+        Some(_) => Some(resolve_alias(args, name).is_ok()),
+        None => {
+            let host = crate::alias::split_user(&args.transport.destination).1;
+            let timeout = args.config.reachability_timeout.value;
+            Some(crate::alias::ping(host, timeout))
+        }
     }
 }
 
@@ -125,6 +203,11 @@ pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
     )?;
     if let Some(e) = entry {
         args.alias = Some(name.to_string());
+        args.entry = args_alias(args).and_then(|a| {
+            a.entries
+                .iter()
+                .position(|x| x.origin == e.origin && x.host == e.host)
+        });
         args.transport.destination = e.destination();
         args.transport.identity_file = e
             .identity_file
@@ -499,7 +582,12 @@ pub fn connect_and_serve(
                 return Outcome::LinkLost;
             }
             note(&e.to_string());
-            return Outcome::Exit(code::UNREACHABLE);
+            // Persisting, the first connection's failure is waited out
+            // like a later one's (DESIGN §5.3).
+            return match persist(args) {
+                true => Outcome::LinkLost,
+                false => Outcome::Exit(code::UNREACHABLE),
+            };
         }
     };
     let rest = match marker {
@@ -909,5 +997,60 @@ mod tests {
         assert!(env_switch(Some(""), true), "empty is unset");
         assert!(!env_switch(Some("0"), true));
         assert!(env_switch(Some("1"), false));
+    }
+
+    /// acs-txt: `persist` is the entry in use's, else the alias's, else the
+    /// global setting; `--persist` beats them all. (ACS_PERSIST is
+    /// `env_switch`, above: the process environment is not set here, since
+    /// tests run in parallel.)
+    #[test]
+    fn persist_follows_entry_alias_global_and_the_flag_wins() {
+        let dir = crate::testutil::TempDir::new();
+        let f = dir.path().join("c.yaml");
+        std::fs::write(
+            &f,
+            "\
+persist: true
+reachability_interval: 7s
+hosts:
+  off:
+    persist: false
+    reachability_interval: 300ms
+    hosts:
+      - host: a
+        persist: true
+      - host: b
+  plain: [{host: c}]
+",
+        )
+        .unwrap();
+        let config = crate::config::Config::load_files(&[f]).unwrap();
+        let args = |dest: &str, flag: bool, entry: Option<usize>| {
+            let mut a = match cli::parse([dest].iter().map(OsString::from), None).unwrap() {
+                Parsed::Run(a) => *a,
+                other => panic!("{other:?}"),
+            };
+            a.config = config.clone();
+            a.persist = flag;
+            a.entry = entry;
+            a
+        };
+        // The entry in use, then the alias, then the global setting.
+        assert!(persist(&args("off", false, Some(0))));
+        assert!(!persist(&args("off", false, Some(1))));
+        assert!(!persist(&args("off", false, None)));
+        assert!(persist(&args("plain", false, Some(0))));
+        assert!(persist(&args("elsewhere", false, None)));
+        // The flag over everything.
+        assert!(persist(&args("off", true, Some(1))));
+        // The interval: the alias's, else the global one.
+        assert_eq!(
+            reachability_interval(&args("off", false, None)),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            reachability_interval(&args("me@plain", false, None)),
+            Duration::from_secs(7)
+        );
     }
 }

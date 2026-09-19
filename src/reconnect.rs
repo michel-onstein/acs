@@ -68,12 +68,17 @@ pub fn run(
     let netwatch = crate::netwatch::NetWatch::new();
     let mut last_early: Option<Instant> = None;
     let mut resuming = false;
+    // A dial after a wait; `gated`: the host has just answered the ping
+    // gate, so it is resolved already.
+    let mut redial = false;
+    let mut gated = false;
     let mut args = args.clone();
     loop {
         let started = Instant::now();
         // An alias is resolved again for every redial, so a fallback host is
         // picked up after a network change (DESIGN §7.3).
-        let reachable = !resuming || redial_alias(&mut args, state);
+        let reachable = !redial || gated || redial_alias(&mut args, state);
+        gated = false;
         let first = picked.take();
         let was_picked = first.is_some();
         let outcome = if reachable {
@@ -89,7 +94,10 @@ pub fn run(
             Outcome::LinkLost => {}
         }
         let name = state.session.clone().unwrap_or_default();
-        if !args.reconnect || state.instance.is_none() {
+        // Persisting, even a host lost before any session is waited for
+        // (DESIGN §5.3).
+        let persist = client::persist(&args);
+        if !args.reconnect || (state.instance.is_none() && !persist) {
             client::leave(state, raw);
             note(&format!(
                 "connection lost — the session keeps running; reattach with: acs {} {name}",
@@ -97,33 +105,126 @@ pub fn run(
             ));
             return code::UNREACHABLE;
         }
-        if started.elapsed() >= Duration::from_secs(30) {
-            backoff.reset();
-        }
-        let wait = backoff.step();
-        match offline(
-            state,
-            raw,
-            signals,
-            wait,
-            netwatch.as_ref(),
-            &mut last_early,
-        ) {
-            Offline::Retry => resuming = true,
-            Offline::NetworkChanged => {
-                // A new network is a fresh start.
+        redial = true;
+        let detached = if persist && pingable(&args) {
+            // The ping gate: wait for the host to answer, then dial.
+            match wait_for_answer(
+                &mut args,
+                state,
+                raw,
+                signals,
+                netwatch.as_ref(),
+                &mut last_early,
+            ) {
+                true => {
+                    gated = true;
+                    false
+                }
+                false => true,
+            }
+        } else {
+            if started.elapsed() >= Duration::from_secs(30) {
                 backoff.reset();
-                resuming = true;
             }
-            Offline::Detach => {
-                clear_status(state);
-                client::leave(state, raw);
-                note(&format!(
-                    "detached from {}/{name} — reattach with: acs {} {name}",
-                    state.host, state.host
-                ));
-                return code::DETACHED;
+            let wait = backoff.step();
+            let msg = format!(
+                "connection lost — reconnecting in {}s ({})",
+                wait.as_secs().max(1),
+                give_up_keys(state)
+            );
+            match offline(
+                state,
+                raw,
+                signals,
+                wait,
+                netwatch.as_ref(),
+                &mut last_early,
+                &msg,
+            ) {
+                Offline::Retry => false,
+                Offline::NetworkChanged => {
+                    // A new network is a fresh start.
+                    backoff.reset();
+                    false
+                }
+                Offline::Detach => true,
             }
+        };
+        // A session to resume, or (persisting) still the first attach.
+        resuming = state.instance.is_some();
+        if detached {
+            clear_status(state);
+            client::leave(state, raw);
+            if state.instance.is_none() {
+                note(&format!("stopped waiting for {}", state.host));
+                return code::UNREACHABLE;
+            }
+            note(&format!(
+                "detached from {}/{name} — reattach with: acs {} {name}",
+                state.host, state.host
+            ));
+            return code::DETACHED;
+        }
+    }
+}
+
+/// How to stop waiting, for the status line: detach a session, or, before
+/// there is one (the terminal still cooked), give up.
+fn give_up_keys(state: &State) -> &'static str {
+    match state.instance {
+        Some(_) => "Ctrl-] Ctrl-] d to detach",
+        None => "Ctrl-C gives up",
+    }
+}
+
+/// Whether the lost host can be pinged for the gate: a plain host always,
+/// an alias if any of its hosts has `reachability_check` on (the others
+/// keep the dial backoff).
+fn pingable(args: &ClientArgs) -> bool {
+    let Some(name) = &args.alias else {
+        return true;
+    };
+    args.config
+        .alias(crate::alias::split_user(name).1)
+        .map_or(true, |a| a.entries.iter().any(|e| e.reachability_check))
+}
+
+/// Persisting (DESIGN §5.3): ping the lost host every
+/// `reachability_interval` — at once on a network change — until it
+/// answers (`true`: dial it now), showing the status line and honouring
+/// the command keys meanwhile (`false`: the user detached, or gave up).
+/// An alias is resolved again each time, so its first host to answer is
+/// the one dialled.
+fn wait_for_answer(
+    args: &mut ClientArgs,
+    state: &mut State,
+    raw: &mut Option<RawMode>,
+    signals: &OwnedFd,
+    netwatch: Option<&crate::netwatch::NetWatch>,
+    last_early: &mut Option<Instant>,
+) -> bool {
+    let every = client::reachability_interval(args);
+    let msg = format!(
+        "{} is not answering — pinging it every {} ({})",
+        state.host,
+        crate::config::format_timeout(every),
+        give_up_keys(state)
+    );
+    loop {
+        match offline(state, raw, signals, every, netwatch, last_early, &msg) {
+            Offline::Retry | Offline::NetworkChanged => {
+                let answers = match args.alias.clone() {
+                    Some(_) => redial_alias(args, state),
+                    None => {
+                        let name = args.transport.destination.clone();
+                        client::host_answers(args, &name) != Some(false)
+                    }
+                };
+                if answers {
+                    return true;
+                }
+            }
+            Offline::Detach => return false,
         }
     }
 }
@@ -165,8 +266,8 @@ enum Offline {
 /// At most one early redial per this interval, however chatty the network.
 const EARLY_EVERY: Duration = Duration::from_secs(2);
 
-/// Wait `wait` before the next redial with the link down: show the status,
-/// drop typed keys, but honour the command keys.
+/// Wait `wait` before the next redial with the link down: show `msg` as the
+/// status, drop typed keys, but honour the command keys.
 fn offline(
     state: &mut State,
     raw: &mut Option<RawMode>,
@@ -174,17 +275,12 @@ fn offline(
     wait: Duration,
     netwatch: Option<&crate::netwatch::NetWatch>,
     last_early: &mut Option<Instant>,
+    msg: &str,
 ) -> Offline {
     if let Some(r) = raw.as_mut() {
         let _ = r.resume();
     }
-    show_status(
-        state,
-        &format!(
-            "connection lost — reconnecting in {}s (Ctrl-] Ctrl-] d to detach)",
-            wait.as_secs().max(1)
-        ),
-    );
+    show_status(state, msg);
     let deadline = Instant::now() + wait;
     let mut detector = Detector::new(client_escape());
     let mut buf = [0u8; 4096];
