@@ -267,7 +267,7 @@ hosts:
 | `reachability_timeout` | how long an alias's hosts have to answer a ping: `500ms`, `0.5s`, `2s`, up to `60s` (default `500ms`); an alias's own value wins |
 | `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
 | `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
-| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file` and `reachability_check` (default `true`) — or to a mapping of the alias's own `identity_file`, `redraw_on_reconnect` and `reachability_timeout` and its `hosts` |
+| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer` and `persist` — or to a mapping of the alias's own `identity_file`, `redraw_on_reconnect` and `reachability_timeout` and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -280,7 +280,11 @@ otherwise `michel@devbox.example.com` if that one does. An entry with
 all at once, and the order in the file still decides: an earlier host that
 answers within `reachability_timeout` wins over a later one that answered
 first, so choosing takes at most that long however many hosts there are.
-Without a `user`, your `~/.ssh/config` picks the login name. If no entry
+`prefer: true` on an entry puts it ahead of the others: when it answers it
+is used even if an earlier host answered too (several preferred entries go
+by order among themselves), which also lets your own file name the primary
+host of an alias whose other hosts are in the global file. Without a
+`user`, your `~/.ssh/config` picks the login name. If no entry
 answers, acs lists the hosts it tried and exits with 255. `-v` shows which
 entry was chosen and why.
 
@@ -350,6 +354,7 @@ acs config host set lab redraw_on_reconnect false     # no Ctrl-L for lab
 acs config host set lab reachability_timeout 2s       # lab's hosts may take 2 s
 acs config host set lab persist true                  # never give up on lab
 acs config host add nas nas.lan --persist             # nor on this host of nas
+acs config host add devbox devbox.vpn --prefer        # devbox.vpn first when it answers
 acs config host list                                  # aliases, hosts and keys
 acs config host remove devbox devbox.lan              # one host, or the alias
 acs config set install_on_remote false

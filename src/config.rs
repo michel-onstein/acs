@@ -52,6 +52,9 @@ pub struct HostEntry {
     pub user: Option<String>,
     /// Ping the host once before using it (default true).
     pub reachability_check: bool,
+    /// Chosen over the alias's other hosts when several answer (DESIGN
+    /// §7.3); among the preferred, and among the rest, order decides.
+    pub prefer: bool,
     /// The ssh key for this host (`-i`); `None` leaves it to the alias.
     pub identity_file: Option<Setting<String>>,
     /// Keep waiting for the host when it is lost (DESIGN §5.3); `None`
@@ -163,6 +166,7 @@ pub const HOST_KEYS: &[&str] = &[
     "reachability_check",
     "identity_file",
     "persist",
+    "prefer",
 ];
 
 /// Every key of an alias written as a mapping (`devbox: {identity_file: …,
@@ -714,6 +718,7 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
     let mut host = None;
     let mut user = None;
     let mut check = true;
+    let mut prefer = false;
     let mut identity = None;
     let mut persist = None;
     for (k, v) in fields {
@@ -741,6 +746,11 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
                     check = field(k, v, bool_value(v))?;
                 }
             }
+            "prefer" => {
+                if v.value != Value::Null {
+                    prefer = field(k, v, bool_value(v))?;
+                }
+            }
             "identity_file" => identity = field(k, v, identity_file(v, at))?,
             "persist" => {
                 if v.value != Value::Null {
@@ -763,6 +773,7 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
         host,
         user,
         reachability_check: check,
+        prefer,
         identity_file: identity,
         persist,
         origin: at(item),

@@ -19,7 +19,7 @@ usage: acs config show                 the merged configuration and where each v
        acs config unset <key>          remove a setting from the file
        acs config host list            every alias and its hosts
        acs config host add <alias> <host> [--user <login>] [--identity-file <key>]
-                           [--no-reachability-check] [--persist]
+                           [--no-reachability-check] [--prefer] [--persist]
                                        add a host to an alias (after its other hosts)
        acs config host remove <alias> [<host>]
                                        remove one host, or the whole alias
@@ -104,6 +104,7 @@ pub enum Cmd {
         user: Option<String>,
         check: bool,
         identity_file: Option<String>,
+        prefer: bool,
         persist: bool,
     },
     HostRemove {
@@ -129,6 +130,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
     let mut check = None;
     let mut identity: Option<String> = None;
     let mut persist = false;
+    let mut prefer = false;
     let mut words = Vec::new();
     let mut it = args.iter().map(|a| a.to_string_lossy().into_owned());
     while let Some(a) = it.next() {
@@ -141,6 +143,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
             "--no-reachability-check" => check = Some(false),
             "--reachability-check" => check = Some(true),
             "--persist" => persist = true,
+            "--prefer" => prefer = true,
             "-h" | "--help" => return Ok((Cmd::Help, global)),
             s if s.starts_with("--user=") => user = Some(s["--user=".len()..].to_string()),
             s if s.starts_with("--identity-file=") => {
@@ -164,7 +167,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
             ));
         }
     }
-    let host_opts = user.is_some() || check.is_some() || identity.is_some() || persist;
+    let host_opts = user.is_some() || check.is_some() || identity.is_some() || persist || prefer;
     let cmd = match w.as_slice() {
         ["show"] => Cmd::Show,
         ["path"] => Cmd::Path,
@@ -179,6 +182,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
             user,
             check: check.unwrap_or(true),
             identity_file: identity,
+            prefer,
             persist,
         },
         ["host", "remove" | "rm", alias] => Cmd::HostRemove {
@@ -511,6 +515,9 @@ fn entry_node(e: &HostEntry) -> Node {
     if !e.reachability_check {
         m.push(("reachability_check".to_string(), Node::bool(false)));
     }
+    if e.prefer {
+        m.push(("prefer".to_string(), Node::bool(true)));
+    }
     if let Some(p) = &e.persist {
         m.push(("persist".to_string(), Node::bool(p.value)));
     }
@@ -532,12 +539,17 @@ pub fn host_list(c: &Config) -> String {
         "FROM".into(),
     ]];
     for a in &c.hosts {
-        for e in &a.entries {
+        // In the order they are tried: preferred hosts first (DESIGN §7.3).
+        for e in crate::alias::ranked(&a.entries) {
+            let check = if e.reachability_check { "ping" } else { "none" };
             rows.push([
                 a.name.clone(),
                 e.host.clone(),
                 e.user.clone().unwrap_or_else(|| "-".into()),
-                if e.reachability_check { "ping" } else { "none" }.into(),
+                match e.prefer {
+                    true => format!("{check} prefer"),
+                    false => check.into(),
+                },
                 e.identity_file
                     .as_ref()
                     .or(a.identity_file.as_ref())
@@ -666,6 +678,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
             user,
             check,
             identity_file,
+            prefer,
             persist,
         } => {
             config::validate_alias(alias)?;
@@ -673,6 +686,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                 host: host.clone(),
                 user: user.clone(),
                 reachability_check: *check,
+                prefer: *prefer,
                 identity_file: identity_file.clone().map(|value| config::Setting {
                     value,
                     origin: None,
@@ -1043,6 +1057,7 @@ mod tests {
                 user: Some("me".into()),
                 check: false,
                 identity_file: None,
+                prefer: false,
                 persist: false
             }
         );
@@ -1054,6 +1069,7 @@ mod tests {
                 user: Some("me".into()),
                 check: true,
                 identity_file: Some("~/k".into()),
+                prefer: false,
                 persist: false
             }
         );
@@ -1065,6 +1081,7 @@ mod tests {
                 user: None,
                 check: true,
                 identity_file: Some("/keys/k".into()),
+                prefer: false,
                 persist: true
             }
         );
@@ -1541,6 +1558,40 @@ mod tests {
         assert!(out.contains("    reachability_interval: 30s # "), "{out}");
         let (n, _) = scalar(&c, "reachability_interval").unwrap();
         assert_eq!(text(&n), "5s");
+    }
+
+    /// acs-o96: `prefer` on a host entry: added with --prefer, read back,
+    /// validated, and `host list` shows the hosts in the order they are
+    /// tried, preferred first.
+    #[test]
+    fn prefer_is_added_validated_and_listed_in_trial_order() {
+        let src = "hosts:\n  d:\n    - host: a\n";
+        let added = apply(src, "host add d b --prefer").unwrap();
+        assert_eq!(
+            added,
+            "hosts:\n  d:\n    - host: a\n    - host: b\n      prefer: true\n"
+        );
+        let dir = crate::testutil::TempDir::new();
+        let f = dir.path().join("l.yaml");
+        std::fs::write(&f, &added).unwrap();
+        let c = Config::load_files(std::slice::from_ref(&f)).unwrap();
+        let entries = &c.alias("d").unwrap().entries;
+        assert_eq!((entries[0].prefer, entries[1].prefer), (false, true));
+        let lines: Vec<String> = host_list(&c).lines().map(String::from).collect();
+        assert!(
+            lines[1].starts_with("d      b     -     ping prefer"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with("d      a     -     ping "),
+            "{lines:?}"
+        );
+        std::fs::write(&f, "hosts:\n  d:\n    - host: a\n      prefer: yes\n").unwrap();
+        let e = Config::load_files(&[f]).unwrap_err();
+        assert!(
+            e.contains("prefer: expected true or false, found 'yes' (line 4)"),
+            "{e}"
+        );
     }
 
     #[test]

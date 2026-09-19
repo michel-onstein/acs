@@ -46,10 +46,10 @@ pub fn split_user(name: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// The entry to use: every checked host that could be chosen is pinged at
-/// once, and host k is taken as soon as it has answered and every one before
-/// it has not — what trying them one after another would choose, in at most
-/// one `timeout`.
+/// The entry to use: the entries ranked (preferred first, [`ranked`]),
+/// every checked host that could be chosen is pinged at once, and host k is
+/// taken as soon as it has answered and every one before it has not — what
+/// trying them one after another would choose, in at most one `timeout`.
 fn pick(
     name: &str,
     alias: &Alias,
@@ -70,6 +70,8 @@ fn pick(
             ..e.clone()
         })
         .collect();
+    // Tried in rank order: preferred hosts first.
+    entries = ranked(&entries).into_iter().cloned().collect();
     // Nothing after an unchecked host can be chosen, so nothing there is
     // pinged.
     if let Some(i) = entries.iter().position(|e| !e.reachability_check) {
@@ -92,9 +94,10 @@ fn pick(
     let mut tried = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         let dest = e.destination();
+        let preferred = if e.prefer { ", preferred" } else { "" };
         if !e.reachability_check {
             log(format!(
-                "{name}: using {dest} (reachability_check is off, {})",
+                "{name}: using {dest} (reachability_check is off{preferred}, {})",
                 e.origin
             ));
             return Ok(e.clone());
@@ -108,7 +111,11 @@ fn pick(
             }
         }
         if answered[i] == Some(true) {
-            log(format!("{name}: {} answers ping, using {dest}", e.host));
+            let why = if e.prefer { " (preferred)" } else { "" };
+            log(format!(
+                "{name}: {} answers ping, using {dest}{why}",
+                e.host
+            ));
             return Ok(e.clone());
         }
         log(format!(
@@ -122,6 +129,14 @@ fn pick(
         "no host for '{name}' is reachable (tried {})",
         tried.join(", ")
     ))
+}
+
+/// An alias's entries in the order they are tried (DESIGN §7.3): those with
+/// `prefer: true` first, then the rest, each in configured order.
+pub fn ranked(entries: &[HostEntry]) -> Vec<&HostEntry> {
+    let mut v: Vec<&HostEntry> = entries.iter().collect();
+    v.sort_by_key(|e| !e.prefer);
+    v
 }
 
 /// Ping `host` once, waiting at most `deadline` for the answer (`ACS_PING`
@@ -461,6 +476,78 @@ hosts:
             Err("no host for 'abc' is reachable (tried a, b, c)".into())
         );
         assert!(took < Duration::from_millis(1000), "{took:?}");
+    }
+
+    /// acs-o96: hosts `a`, `b`, `c` with `prefer: true` on the ones named.
+    fn preferring(preferred: &[&str], unchecked: &[&str]) -> String {
+        let mut yaml = String::from("hosts:\n  abc:\n");
+        for h in ["a", "b", "c"] {
+            yaml.push_str(&format!("    - host: {h}\n"));
+            if preferred.contains(&h) {
+                yaml.push_str("      prefer: true\n");
+            }
+            if unchecked.contains(&h) {
+                yaml.push_str("      reachability_check: false\n");
+            }
+        }
+        yaml
+    }
+
+    #[test]
+    fn a_preferred_host_beats_an_earlier_one_that_answered_first() {
+        // a answers at once, c (preferred) after 150ms: c it is.
+        let fake = Fake::new(&[("a", 0, true), ("b", 0, true), ("c", 150, true)]);
+        let (r, log, _) = timed(&preferring(&["c"], &[]), "abc", &fake);
+        assert_eq!(r, Ok("c".into()));
+        assert_eq!(log, ["abc: c answers ping, using c (preferred)"]);
+        // A preferred host that does not answer: the configured order.
+        let fake = Fake::new(&[("a", 0, false), ("b", 0, true), ("c", 0, false)]);
+        let (r, log, _) = timed(&preferring(&["c"], &[]), "abc", &fake);
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(
+            log,
+            [
+                "abc: c does not answer ping within 500ms",
+                "abc: a does not answer ping within 500ms",
+                "abc: b answers ping, using b",
+            ]
+        );
+        // None answering: every host named, the preferred first.
+        let fake = Fake::new(&[]);
+        let (r, _, _) = timed(&preferring(&["b"], &[]), "abc", &fake);
+        assert_eq!(
+            r,
+            Err("no host for 'abc' is reachable (tried b, a, c)".into())
+        );
+    }
+
+    #[test]
+    fn several_preferred_hosts_go_by_order_and_an_unchecked_one_wins_outright() {
+        // b and c preferred and both answering: b, the first of them.
+        let fake = Fake::new(&[("a", 0, true), ("b", 100, true), ("c", 0, true)]);
+        let (r, _, _) = timed(&preferring(&["b", "c"], &[]), "abc", &fake);
+        assert_eq!(r, Ok("b".into()));
+        // b down: c, still ahead of a.
+        let fake = Fake::new(&[("a", 0, true), ("b", 0, false), ("c", 0, true)]);
+        let (r, _, _) = timed(&preferring(&["b", "c"], &[]), "abc", &fake);
+        assert_eq!(r, Ok("c".into()));
+        // A preferred host that is never pinged is used at once: nothing is
+        // pinged at all.
+        let fake = Fake::new(&[("a", 0, true)]);
+        let (r, log, _) = timed(&preferring(&["c"], &["c"]), "abc", &fake);
+        assert_eq!(r, Ok("c".into()));
+        assert!(
+            log[0].starts_with("abc: using c (reachability_check is off, preferred, "),
+            "{log:?}"
+        );
+        assert!(fake.pinged().is_empty(), "{:?}", fake.pinged());
+        // Ranked: preferred first, each group in configured order.
+        let c = config(&preferring(&["b", "c"], &[]));
+        let ranked: Vec<&str> = ranked(&c.alias("abc").unwrap().entries)
+            .iter()
+            .map(|e| e.host.as_str())
+            .collect();
+        assert_eq!(ranked, ["b", "c", "a"]);
     }
 
     #[test]
