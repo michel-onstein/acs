@@ -1,6 +1,6 @@
 [package]
 name = "acs"
-version = "0.10.7"
+version = "0.10.8"
 edition = "2021"
 rust-version = "1.80"
 description = "Persistent, reconnecting remote shells over ssh with an unfiltered terminal stream"
