@@ -2,16 +2,23 @@
 //! sessions are listed first; with none detached a session is created,
 //! otherwise the user picks one from the menu (`menu.rs`), ends some, or
 //! leaves. All of it happens on the session's own connection
-//! (`_proxy --pick`), which the attach then goes on over.
+//! (`_proxy --pick`), which the attach then goes on over. `acs list <host>`
+//! in a terminal shows the same menu whatever is detached.
+//!
+//! `acs list` in a terminal shows the menu over every host alias at once
+//! (§7.3): each host asked in parallel as `acs list` asks it, its rows in as
+//! it answers, a session ended over a short `_proxy --pick` call of its
+//! own, and the one picked attached as `acs <alias> <session>` would.
 
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use crate::cli::{ClientArgs, Target};
 use crate::client::{self, code, Link, Picked};
-use crate::list::Failure;
-use crate::menu::{Choice, Menu};
+use crate::list::{self, Failure};
+use crate::menu::{Answer, Choice, Menu};
 use crate::proto::{self, Decoder, Marker, Msg, StatusInfo};
 use crate::ssh::{self, Call};
 use crate::sys;
@@ -27,8 +34,9 @@ const STDOUT: RawFd = 1;
 /// leaves the attach to dial its own (no terminal for a menu, acs not yet
 /// installed there, or the connection lost while the menu was up). `Err` is
 /// the exit status when the user left the menu or the host could not be
-/// asked.
-pub fn choose(args: &mut ClientArgs) -> Result<Option<Picked>, u8> {
+/// asked. `always` shows the menu even with nothing detached
+/// (`acs list <host>`).
+pub fn choose(args: &mut ClientArgs, always: bool) -> Result<Option<Picked>, u8> {
     let Target::Pick(default) = args.target.clone() else {
         return Ok(None);
     };
@@ -42,62 +50,36 @@ pub fn choose(args: &mut ClientArgs) -> Result<Option<Picked>, u8> {
         eprintln!("acs: {}", f.message(&host));
         f.code()
     };
-    let timeout = client::answer_timeout(false);
-    let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--pick"]);
-    let (link, marker) = client::dial(args, Call::Session, &remote, timeout)
-        .map_err(|e| fail(Failure::Unreachable(e.to_string())))?;
-    let mut pick = match marker {
-        Marker::Ready { proto: p, rest } if p == proto::PROTO_VERSION => {
-            let mut dec = Decoder::new();
-            dec.push(&rest);
-            Pick {
-                link,
-                dec,
-                timeout,
-                lost: false,
+    let (mut pick, sessions) =
+        match open_pick(args, Call::Session, client::answer_timeout(false)).map_err(fail)? {
+            Some(p) => p,
+            // acs is not installed there yet: the attach installs it, and
+            // there is nothing to pick.
+            None => {
+                args.target = new_session(&[], &default);
+                return Ok(None);
             }
-        }
-        Marker::Ready { proto: p, .. } => {
-            link.close();
-            eprintln!(
-                "acs: remote acs speaks protocol {p}, this client {}",
-                proto::PROTO_VERSION
-            );
-            return Err(code::ERROR);
-        }
-        // acs is not installed there yet: the attach installs it, and there
-        // is nothing to pick.
-        Marker::Need { .. } => {
-            link.close();
-            args.target = new_session(&[], &default);
-            return Ok(None);
-        }
-    };
-    let sessions = match pick.list() {
-        Ok(a) => a.sessions,
-        Err(f) => {
-            pick.link.close();
-            return Err(fail(f));
-        }
-    };
-    if !sessions.iter().any(|s| !s.attached) {
+        };
+    if !always && !sessions.iter().any(|s| !s.attached) {
         args.target = new_session(&sessions, &default);
         return Ok(Some(pick.into_picked()));
     }
     let mut menu = Menu::new(sessions, args.force);
-    let choice = run_menu(&mut pick, &host, &mut menu);
+    let choice = run_menu(&mut menu, &host, None, &mut |menu, _, name| {
+        end(&mut pick, &host, menu, name)
+    });
     match choice {
-        Ok(Choice::Attach { name, force }) => {
+        Ok(Choice::Attach { name, force, .. }) => {
             args.target = Target::Named(name);
             args.force |= force;
         }
-        Ok(Choice::New) => args.target = new_session(menu.sessions(), &default),
+        Ok(Choice::New { .. }) => args.target = new_session(menu.sessions(0), &default),
         Ok(Choice::Leave(c)) => {
             pick.link.close();
             return Err(c);
         }
         // Ended in the menu, which goes on.
-        Ok(Choice::Kill(_)) => unreachable!(),
+        Ok(Choice::Kill { .. }) => unreachable!(),
         Err(e) => {
             pick.link.close();
             eprintln!("acs: {e}");
@@ -109,6 +91,47 @@ pub fn choose(args: &mut ClientArgs) -> Result<Option<Picked>, u8> {
         return Ok(None);
     }
     Ok(Some(pick.into_picked()))
+}
+
+/// Dial `_proxy --pick` and read its first list: `Ok(None)` if acs of our
+/// version is not installed there.
+fn open_pick(
+    args: &ClientArgs,
+    call: Call,
+    timeout: Duration,
+) -> Result<Option<(Pick, Vec<StatusInfo>)>, Failure> {
+    let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--pick"]);
+    let (link, marker) = client::dial(args, call, &remote, timeout)
+        .map_err(|e| Failure::Unreachable(e.to_string()))?;
+    let rest = match marker {
+        Marker::Ready { proto: p, rest } if p == proto::PROTO_VERSION => rest,
+        Marker::Ready { proto: p, .. } => {
+            link.close();
+            return Err(Failure::BadReply(format!(
+                "remote acs speaks protocol {p}, this client {}",
+                proto::PROTO_VERSION
+            )));
+        }
+        Marker::Need { .. } => {
+            link.close();
+            return Ok(None);
+        }
+    };
+    let mut dec = Decoder::new();
+    dec.push(&rest);
+    let mut pick = Pick {
+        link,
+        dec,
+        timeout,
+        lost: false,
+    };
+    match pick.list() {
+        Ok(a) => Ok(Some((pick, a.sessions))),
+        Err(f) => {
+            pick.link.close();
+            Err(f)
+        }
+    }
 }
 
 /// The pick's connection: `_proxy --pick` past its marker.
@@ -123,7 +146,7 @@ struct Pick {
 
 /// One list from the proxy: every session's STATUS, and the message of an
 /// ERROR sent along (a session that would not end).
-struct Answer {
+struct Listing {
     sessions: Vec<StatusInfo>,
     error: Option<String>,
 }
@@ -137,10 +160,10 @@ impl Pick {
     }
 
     /// Read one list, up to its LIST_END, within the timeout.
-    fn list(&mut self) -> Result<Answer, Failure> {
+    fn list(&mut self) -> Result<Listing, Failure> {
         let deadline = Instant::now() + self.timeout;
         let from = self.link.from_fd().as_raw_fd();
-        let mut answer = Answer {
+        let mut answer = Listing {
             sessions: Vec::new(),
             error: None,
         };
@@ -177,7 +200,7 @@ impl Pick {
     }
 
     /// End `name` on the host and read the list that answers it.
-    fn end(&mut self, name: &str) -> Result<Answer, Failure> {
+    fn end(&mut self, name: &str) -> Result<Listing, Failure> {
         let frame = Msg::EndSession { name: name.into() }.to_bytes();
         sys::write_all(self.link.to_fd().as_raw_fd(), &frame)
             .map_err(|e| Failure::Unreachable(e.to_string()))?;
@@ -212,11 +235,26 @@ fn new_session(sessions: &[StatusInfo], default: &str) -> Target {
     }
 }
 
+/// What ending a session does: `(menu, host, name)`.
+type EndSession<'a> = dyn FnMut(&mut Menu, usize, &str) + 'a;
+
+/// A second thing to wait for besides the keys: `fd` turns readable, and
+/// `ready` brings what came into the menu.
+struct Wake<'a> {
+    fd: RawFd,
+    ready: &'a mut dyn FnMut(&mut Menu),
+}
+
 /// Show the menu until the user picks a session, a new one, or leaving.
-/// Ending a session happens here, and the menu goes on with what is left.
-/// The terminal comes back as it was on every way out: the guards on
+/// Ending a session happens here (`end`), and the menu goes on with what is
+/// left. The terminal comes back as it was on every way out: the guards on
 /// return, the emergency restore on a signal or a panic.
-fn run_menu(pick: &mut Pick, host: &str, menu: &mut Menu) -> io::Result<Choice> {
+fn run_menu(
+    menu: &mut Menu,
+    host: &str,
+    mut wake: Option<Wake>,
+    end: &mut EndSession,
+) -> io::Result<Choice> {
     tty::install_emergency_restore()?;
     let signals = sys::signals::install(&[libc::SIGWINCH])?;
     let _ = sys::signals::ignore(libc::SIGPIPE);
@@ -232,11 +270,17 @@ fn run_menu(pick: &mut Pick, host: &str, menu: &mut Menu) -> io::Result<Choice> 
         let mut fds = [
             sys::pollfd(STDIN, libc::POLLIN),
             sys::pollfd(signals.as_raw_fd(), libc::POLLIN),
+            sys::pollfd(wake.as_ref().map_or(-1, |w| w.fd), libc::POLLIN),
         ];
         sys::poll(&mut fds, timeout)?;
         if fds[1].revents != 0 {
             // A resize: the next draw fits the new size.
             sys::signals::drain(signals.as_raw_fd());
+        }
+        if fds[2].revents != 0 {
+            if let Some(w) = wake.as_mut() {
+                (w.ready)(menu);
+            }
         }
         let choice = if fds[0].revents != 0 {
             match sys::read(STDIN, &mut buf)? {
@@ -249,7 +293,7 @@ fn run_menu(pick: &mut Pick, host: &str, menu: &mut Menu) -> io::Result<Choice> 
         };
         match choice {
             None => {}
-            Some(Choice::Kill(name)) => end(pick, host, menu, &name),
+            Some(Choice::Kill { host: h, name }) => end(menu, h, &name),
             Some(c) => return Ok(c),
         }
     }
@@ -278,19 +322,139 @@ fn end(pick: &mut Pick, host: &str, menu: &mut Menu, name: &str) {
     menu.set_note(format!("ending session '{name}'…"));
     let _ = draw(menu, host);
     let note = match pick.end(name) {
-        Ok(a) => {
-            let gone = !a.sessions.iter().any(|s| s.name == name);
-            menu.set_sessions(a.sessions);
-            match (a.error, gone) {
-                (Some(e), _) => e,
-                (None, true) => format!("session '{name}' ended"),
-                (None, false) => format!("session '{name}' is still there"),
-            }
-        }
+        Ok(a) => ended(menu, 0, name, a),
         Err(f) => {
             pick.lost = true;
             f.message(host)
         }
+    };
+    menu.set_note(note);
+}
+
+/// Show host `h`'s sessions left after ending `name`; what to say about it.
+fn ended(menu: &mut Menu, h: usize, name: &str, a: Listing) -> String {
+    let gone = !a.sessions.iter().any(|s| s.name == name);
+    menu.set_sessions(h, a.sessions);
+    match (a.error, gone) {
+        (Some(e), _) => e,
+        (None, true) => format!("session '{name}' ended"),
+        (None, false) => format!("session '{name}' is still there"),
+    }
+}
+
+// ---- every host --------------------------------------------------------------
+
+/// `acs list` in a terminal: the session menu over every host alias (DESIGN
+/// §7.3). Returns the exit status: the attached session's, or the menu's.
+pub fn every_host(args: &ClientArgs) -> u8 {
+    let names: Vec<String> = args.config.hosts.iter().map(|a| a.name.clone()).collect();
+    if names.is_empty() {
+        eprintln!("acs: {}", list::NO_ALIASES);
+        return code::USAGE;
+    }
+    let (wake_r, wake_w) = match sys::pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("acs: {e}");
+            return code::ERROR;
+        }
+    };
+    let _ = sys::set_nonblocking(wake_r.as_raw_fd(), true);
+    let answers = ask_every_host(args, &names, Arc::new(wake_w));
+    let mut menu = Menu::every_host(names.clone(), args.force);
+    let mut ready = |menu: &mut Menu| {
+        let mut buf = [0u8; 64];
+        while matches!(sys::read(wake_r.as_raw_fd(), &mut buf), Ok(n) if n > 0) {}
+        while let Ok((h, answer)) = answers.try_recv() {
+            menu.set_answer(h, answer);
+        }
+    };
+    let wake = Wake {
+        fd: wake_r.as_raw_fd(),
+        ready: &mut ready,
+    };
+    let choice = run_menu(&mut menu, "", Some(wake), &mut |menu, h, name| {
+        end_on(args, &names[h], menu, h, name)
+    });
+    let (h, target, force) = match choice {
+        Ok(Choice::Attach { host, name, force }) => (host, Target::Named(name), force),
+        Ok(Choice::New { host }) => (host, Target::New, false),
+        Ok(Choice::Leave(c)) => return c,
+        // Ended in the menu, which goes on.
+        Ok(Choice::Kill { .. }) => unreachable!(),
+        Err(e) => {
+            eprintln!("acs: {e}");
+            return code::ERROR;
+        }
+    };
+    // As `acs <alias> <session>`: the alias resolved again, its key and
+    // user, and the ordinary session call, which may prompt.
+    let mut picked = args.clone();
+    picked.list = false;
+    picked.target = target;
+    picked.force |= force;
+    if let Err(e) = client::resolve_alias(&mut picked, &names[h]) {
+        eprintln!("acs: {e}");
+        return code::UNREACHABLE;
+    }
+    client::run(picked, None)
+}
+
+/// Ask every alias in parallel, as `acs list` does; each answer comes on
+/// the channel as `(index, answer)`, with a byte on `wake`.
+fn ask_every_host(
+    args: &ClientArgs,
+    names: &[String],
+    wake: Arc<OwnedFd>,
+) -> mpsc::Receiver<(usize, Answer)> {
+    let (tx, rx) = mpsc::channel();
+    // Nobody can type a password into several ssh at once (Call::Batch),
+    // so a host gets the redial's limit rather than the first connection's.
+    let timeout = client::answer_timeout(true);
+    for (h, name) in names.iter().enumerate() {
+        let (tx, wake, args, name) = (tx.clone(), wake.clone(), args.clone(), name.clone());
+        // Not joined: the menu may be left before a slow host answers.
+        std::thread::spawn(move || {
+            let answer = to_answer(&name, list::ask(&args, &name, timeout));
+            if tx.send((h, answer)).is_ok() {
+                let _ = sys::write_all(wake.as_raw_fd(), b"!");
+            }
+        });
+    }
+    rx
+}
+
+/// A host's listing as the menu shows it.
+fn to_answer(name: &str, listed: Result<Option<Vec<StatusInfo>>, Failure>) -> Answer {
+    match listed {
+        Ok(Some(s)) => Answer::Sessions(s),
+        Ok(None) => Answer::Line(list::not_installed(name)),
+        Err(Failure::Unreachable(e)) => Answer::Line(format!("{name}: {e}")),
+        Err(f) => Answer::Line(f.message(name)),
+    }
+}
+
+/// End `session` on alias `alias` (menu host `h`) over a short
+/// `_proxy --pick` call of its own, in BatchMode since the menu holds the
+/// terminal, and show the host's sessions left.
+fn end_on(args: &ClientArgs, alias: &str, menu: &mut Menu, h: usize, session: &str) {
+    menu.set_note(format!("ending session '{session}' on {alias}…"));
+    let _ = draw(menu, "");
+    let mut on = args.clone();
+    let note = match client::resolve_alias(&mut on, alias) {
+        Err(e) => format!("{alias}: {e}"),
+        Ok(()) => match open_pick(&on, Call::Batch, client::answer_timeout(true)) {
+            Ok(Some((mut pick, _))) => {
+                let note = match pick.end(session) {
+                    Ok(a) => ended(menu, h, session, a),
+                    Err(f) => f.message(alias),
+                };
+                pick.link.close();
+                note
+            }
+            Ok(None) => list::not_installed(alias),
+            Err(f) => f.message(alias),
+        },
     };
     menu.set_note(note);
 }
@@ -317,6 +481,26 @@ mod tests {
         assert_eq!(
             new_session(&[info("main")], "michel"),
             Target::Named("michel".into())
+        );
+    }
+
+    #[test]
+    fn a_hosts_listing_becomes_its_menu_answer() {
+        assert_eq!(
+            to_answer("nas", Ok(Some(vec![info("a")]))),
+            Answer::Sessions(vec![info("a")])
+        );
+        assert_eq!(
+            to_answer("pi", Ok(None)),
+            Answer::Line(list::not_installed("pi"))
+        );
+        assert_eq!(
+            to_answer("old", Err(Failure::Unreachable("no answer".into()))),
+            Answer::Line("old: no answer".into())
+        );
+        assert_eq!(
+            to_answer("lab", Err(Failure::BadReply("junk".into()))),
+            Answer::Line("bad reply from lab: junk".into())
         );
     }
 }
