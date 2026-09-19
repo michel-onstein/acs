@@ -278,10 +278,13 @@ fn attach(
     // resuming under a name we resolved. Ours is authoritative.
     hello.session = name;
     let mut to_master = Msg::Hello(hello).to_bytes();
-    // Bytes that arrived after the HELLO (e.g. early INPUT) follow it.
+    // Bytes that arrived after the HELLO (e.g. early INPUT) follow it —
+    // including a frame that was only half read when the HELLO was decoded,
+    // which the relay would otherwise forward headless (acs-4w8).
     while let Ok(Some(m)) = dec.next_msg() {
         m.encode(&mut to_master);
     }
+    to_master.extend(dec.take_rest());
     relay(master, to_master).map_err(|e| e.to_string())?;
     Ok(ExitCode::SUCCESS)
 }

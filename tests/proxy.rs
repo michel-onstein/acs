@@ -133,6 +133,34 @@ fn creates_a_session_and_relays_both_ways() {
     assert!(p.child.wait().unwrap().success());
 }
 
+/// Regression (acs-4w8): a frame that had only half arrived when the HELLO
+/// was decoded is carried over to the relay. Its remainder used to reach the
+/// master headless, desyncing the master's decoder.
+#[test]
+fn a_frame_split_across_the_hello_hand_off_survives() {
+    let t = TempDir::new();
+    let mut p = session(t.path(), "sp");
+    let mut first = hello_cmd("sp", "me", "read l; echo got:$l; exit 4").to_bytes();
+    let input = Msg::Input {
+        seq: 0,
+        bytes: b"hi\r".to_vec(),
+    }
+    .to_bytes();
+    let cut = input.len() - 2;
+    first.extend_from_slice(&input[..cut]);
+    p.conn.send_raw(&first);
+    let w = welcome(&mut p);
+    assert!(w.created);
+    assert_eq!(w.input_seq, 0);
+    // The rest of the frame, after the proxy handed over to the relay.
+    p.conn.send_raw(&input[cut..]);
+    p.conn.wait_output("got:hi", T);
+    match p.conn.recv_control(T) {
+        Some(Msg::Exit { status }) => assert_eq!(acs::sys::exit_code(status), 4),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
 fn stale_socket_is_replaced() {
     let t = TempDir::new();
