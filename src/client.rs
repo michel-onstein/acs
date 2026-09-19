@@ -75,6 +75,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     if args.list {
         return crate::list::run(&args);
     }
+    // No session named: pick one on the host just resolved (DESIGN §4.4).
+    if let Err(c) = crate::pick::choose(&mut args) {
+        return ExitCode::from(c);
+    }
     ExitCode::from(run(args))
 }
 
@@ -324,7 +328,7 @@ fn proxy_args(args: &ClientArgs, state: &State, resuming: bool) -> Vec<String> {
             ]
         }
         (None, Target::New) => vec!["_proxy".into(), "--new".into()],
-        (None, Target::Named(name)) => vec![
+        (None, Target::Named(name) | Target::Pick(name)) => vec![
             "_proxy".into(),
             "--session".into(),
             name.clone(),
@@ -347,7 +351,7 @@ fn hello(args: &ClientArgs, state: &State, force: bool) -> Hello {
             .session
             .clone()
             .or_else(|| match &args.target {
-                Target::Named(n) => Some(n.clone()),
+                Target::Named(n) | Target::Pick(n) => Some(n.clone()),
                 Target::New => None,
             })
             .unwrap_or_default(),
@@ -388,7 +392,7 @@ pub fn run(args: ClientArgs) -> u8 {
     let mut state = State {
         host: args.host_name().to_string(),
         session: match &args.target {
-            Target::Named(n) => Some(n.clone()),
+            Target::Named(n) | Target::Pick(n) => Some(n.clone()),
             Target::New => None,
         },
         instance: None,

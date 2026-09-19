@@ -1,7 +1,9 @@
 //! The per-connection proxy, `acs _proxy` (DESIGN §3, §4.3): spawned by sshd,
 //! it finds or starts the session's master, announces `ACS-READY`, checks the
 //! client's HELLO, and then relays bytes both ways until either side closes.
-//! With `--list` it reports every session's STATUS instead.
+//! With `--list` it reports every session's STATUS instead; with
+//! `--kill <name>` it ends that session first (the session menu, DESIGN
+//! §4.4).
 
 use std::ffi::OsString;
 use std::io;
@@ -20,8 +22,13 @@ const STDOUT: RawFd = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum What {
-    Session { name: Option<String>, mode: Mode },
+    Session {
+        name: Option<String>,
+        mode: Mode,
+    },
     List,
+    /// End this session, then list the rest.
+    Kill(String),
 }
 
 fn parse_args(args: &[OsString]) -> Result<What, String> {
@@ -32,6 +39,11 @@ fn parse_args(args: &[OsString]) -> Result<What, String> {
     let mut it = args.iter().map(|a| a.to_string_lossy().into_owned());
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--kill" => {
+                let name = it.next().ok_or("--kill needs a session")?;
+                session::validate_name(&name)?;
+                return Ok(What::Kill(name));
+            }
             "--session" => name = Some(it.next().ok_or("--session needs a value")?),
             "--mode" => {
                 mode = match it.next().as_deref() {
@@ -91,7 +103,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     crate::prune::on_proxy_start(|| live_versions(&dir));
     match what {
-        What::List => list(&dir),
+        What::List => list(&dir, None),
+        What::Kill(name) => list(&dir, Some(&name)),
         What::Session { name, mode } => match session(&dir, name, mode) {
             Ok(code) => code,
             Err(e) => fail(e),
@@ -315,10 +328,16 @@ fn drain(fd: RawFd, buf: &[u8]) -> io::Result<()> {
 }
 
 /// `--list`: one STATUS_REPLY frame per live session; stale sockets are
-/// removed.
-fn list(dir: &SocketDir) -> ExitCode {
+/// removed. `--kill` (`kill`) ends that session first, and sends an ERROR
+/// frame ahead of the list if it could not.
+fn list(dir: &SocketDir, kill: Option<&str>) -> ExitCode {
     if sys::write_all(STDOUT, proto::ready_line().as_bytes()).is_err() {
         return ExitCode::from(1);
+    }
+    if let Some(Err((code, message))) = kill.map(|name| end_session(dir, name)) {
+        if sys::write_all(STDOUT, &Msg::Error { code, message }.to_bytes()).is_err() {
+            return ExitCode::from(1);
+        }
     }
     let names = match dir.sessions() {
         Ok(n) => n,
@@ -349,6 +368,56 @@ fn list(dir: &SocketDir) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// How long `--kill` waits for the session to end: the master's grace
+/// between SIGHUP and SIGKILL, and then some.
+const KILL_WAIT: Duration = Duration::from_secs(10);
+
+/// Ask `name`'s master to end its session, as `x` in the session does, and
+/// wait until it has: the master holds the connection open until it exits.
+/// Only masters of our own uid answer (DESIGN §4.5).
+fn end_session(dir: &SocketDir, name: &str) -> Result<(), (u16, String)> {
+    use std::io::{Read, Write};
+    let path = dir.socket_path(name).map_err(|e| (err::BAD_REQUEST, e))?;
+    let mut s = match UnixStream::connect(&path) {
+        Ok(s) => s,
+        Err(e) if refused(&e) => return Err((err::NO_SESSION, format!("no session '{name}'"))),
+        Err(e) => return Err((err::INTERNAL, format!("connect {}: {e}", path.display()))),
+    };
+    let failed = |e: io::Error| (err::INTERNAL, format!("session '{name}': {e}"));
+    s.write_all(&Msg::Kill.to_bytes()).map_err(failed)?;
+    s.set_read_timeout(Some(KILL_WAIT)).map_err(failed)?;
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                dec.push(&buf[..n]);
+                if let Ok(Some(Msg::Error { code, message })) = dec.next_msg() {
+                    return Err((code, message));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err((
+                    err::INTERNAL,
+                    format!(
+                        "session '{name}' did not end within {} s",
+                        KILL_WAIT.as_secs()
+                    ),
+                ))
+            }
+            Err(e) => return Err(failed(e)),
+        }
+    }
 }
 
 /// Nobody is listening on the socket (or it is gone).
@@ -417,6 +486,9 @@ mod tests {
             })
         );
         assert_eq!(p(&["--list"]), Ok(What::List));
+        assert_eq!(p(&["--kill", "work"]), Ok(What::Kill("work".into())));
+        assert!(p(&["--kill"]).is_err());
+        assert!(p(&["--kill", "../x"]).is_err());
         assert!(p(&["--session", "../x"]).is_err());
         assert!(p(&[]).is_err());
         assert!(p(&["--mode", "sideways", "--session", "a"]).is_err());

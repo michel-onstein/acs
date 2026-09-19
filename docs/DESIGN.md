@@ -234,6 +234,13 @@ parse frames beyond checking the protocol version in the HELLO. `acs _proxy
 attached/detached, the client identity attached (or last attached), created-at,
 idle time, child command, and size. Sockets that
 refuse connections are reported stale and removed — no `ps` parsing.
+`acs _proxy --kill <name>` (the session menu's `x`, §4.4) first sends that
+master `KILL`, as `x` inside the session does, and waits until the master
+has exited — it holds the connection open until then, at most the 3 s kill
+grace and some, 10 s in all — then answers as `--list` with the sessions
+left, after an `ERROR` frame if the session was not there or did not end.
+Only the user's own masters can be reached (the per-uid directory and the
+peer-uid check, §4.5), so nobody else's session can be ended this way.
 
 ### 4.4 Session names and getting back in
 
@@ -251,16 +258,67 @@ know anything:
 
 | Command | Session |
 | --- | --- |
-| `acs <host>` | `main` (or `$ACS_DEFAULT_SESSION`, §4.5) — attach, or create it if absent (as `dsh`) |
+| `acs <host>` | a detached session picked from a menu; with none detached, a new one — `main` (or `$ACS_DEFAULT_SESSION`, §4.5) if that name is free, else as `--new` |
 | `acs <host> <name>` | `<name>` — attach, or create it if absent |
 | `acs <host> --new` | a new session named with the lowest free number: `1`, `2`, … (picked under the directory lock, so two `--new`s never collide) |
 | `acs <host> --list` | list sessions: name, attached/detached, idle time, command |
 | `acs --list` | the same for every host alias at once, with a HOST column (§7.3) |
 
-So the unnamed case is covered two ways: plain `acs <host>` always means
-`main`, which you never have to remember, and `--new` gives short numeric
-names (as tmux does) for when you want a second session without inventing a
-name.
+So the unnamed case is covered two ways: plain `acs <host>` offers what is
+there to get back into, and `--new` gives short numeric names (as tmux
+does) for when you want a second session without inventing a name.
+
+**The session menu.** Plain `acs <host>` first lists the host's sessions
+with the `--list` side call (§4.3) — one ssh round trip more before the
+attach, which dials its own connection as ever (a side call keeps the
+user's ssh multiplexing, the session gets its own; reusing one connection
+for both is not worth a second proxy mode). Then:
+
+- **No session detached** (none at all, or all attached elsewhere): a new
+  session, without a menu — named `main` (or `$ACS_DEFAULT_SESSION`) if no
+  session has that name, otherwise the lowest free number, as `--new`.
+  A host without acs has no sessions; the attach installs it (§8).
+- **Some detached**: a menu (`menu.rs`, a pure state machine from keys to
+  choices; `pick.rs` drives it), drawn on the **alternate screen** so that
+  leaving it — by any way, including a fatal signal or a panic, through
+  the same emergency restore as raw mode (§7) — puts back exactly what the
+  terminal showed:
+
+  ```text
+  acs: detached sessions on devbox
+
+       NAME  STATE     WHO           IDLE  AGE  COMMAND
+  > 1  main  detached  (michel@mbp)  4m    1d   /bin/zsh -l
+    2  work  detached  (michel@mbp)  2h    3d   htop
+    n  new session
+       exit
+
+  1-9, or ↑↓ jk and Enter: attach   .: all   x: end   n: new   Esc: leave
+  ```
+
+| Key | Effect |
+| --- | --- |
+| `1`–`9` | attach that session at once; with more than nine, the rest have no number and are reached with the cursor |
+| ↑ ↓, `k` `j` | move the cursor (it stops at the ends); a short screen scrolls to keep it in view |
+| Enter | attach the session under the cursor; on *new session*, create one (named as above); on *exit*, leave |
+| `n` | create a new session |
+| `.` | show attached sessions too, or hide them again. Picking an attached session asks `session 'x' is attached from alice@laptop — take over? [y/N]`; `y` attaches with `force`, the `--force` path of §4.5 (and `--force` on the command line skips the question) |
+| `x` | end the session under the cursor, after `end session 'x'? y (or x) ends it`: `_proxy --kill` (§4.3), then the menu shows the sessions left and what happened |
+| Esc | leave, exit status 0 — at any point, a question pending or not. A lone ESC waits 100 ms for the rest of an arrow key's sequence (as the session's input does for an incomplete sequence, §6.3), so it is never taken for one |
+| Ctrl-C | leave, exit status 130 |
+
+- **Without a terminal** — stdout not a tty (stdin must be one anyway,
+  §7) — there is no menu and no list call: plain `acs <host>` attaches
+  `main` (or `$ACS_DEFAULT_SESSION`), creating it if absent, as before
+  the menu.
+- The list and the attach reach the **same machine**: an alias
+  (`[user@]<alias>`, §7.3) is resolved once, before the list, and the
+  first connection uses that resolution; only a redial resolves again.
+- A host that cannot be reached, or answers the list with garbage, fails as
+  `acs <host> --list` does (255, or 1), with the same message.
+- A session picked from the menu is attached with `attach-or-create`: if
+  it ended in the meantime, the client says `new session '…'` as it would
+  for a typo.
 
 To keep a session findable, the client says what it did **outside** the
 session's byte stream — on stderr, before raw mode starts or after the
@@ -275,10 +333,10 @@ terminal is restored:
 - Inside the session `ACS_SESSION=<name>` is set, so the shell prompt or
   `echo $ACS_SESSION` can show it.
 
-If you still lose track, `acs <host> --list` tells you, and `acs --list`
-does for every host in the configuration. With exactly one
-session, `acs <host>` is still `main`, not "whatever is there" — the default
-never depends on what else happens to exist.
+If you still lose track, plain `acs <host>` shows what is detached there,
+`acs <host> --list` shows everything, and `acs --list` does for every host
+in the configuration. `acs <host> <name>` never depends on what else
+happens to exist; plain `acs <host>` now does, on purpose (§12, decision 7).
 
 ### 4.5 Multiple users on one host
 
@@ -318,9 +376,12 @@ steals or breaks someone else's session **by accident**:
 - **`--list` shows who** is attached and who created each session, so picking
   another name is easy.
 - **Default name per person** when an account is shared: `ACS_DEFAULT_SESSION`
-  (e.g. set to `$USER` in each person's local shell) replaces `main` as what
-  plain `acs <host>` means. `main` stays the default otherwise, for `dsh`
-  compatibility.
+  (e.g. set to `$USER` in each person's local shell) replaces `main` as the
+  name plain `acs <host>` gives a new session, and as what it attaches
+  without a terminal for the menu (§4.4). `main` stays the default
+  otherwise, for `dsh` compatibility. The menu itself shows every detached
+  session, with who last had each, and asks before taking over an attached
+  one.
 - **Different `acs` versions side by side.** Binaries are installed per
   version (§8), so a colleague with a newer or older client never overwrites
   the binary your sessions run on, and two clients never ping-pong upgrades.
@@ -348,7 +409,7 @@ Length-prefixed, same format on the ssh leg and the unix-socket leg:
 | `RESIZE` | c→m | cols, rows, xpixel, ypixel |
 | `PING` / `PONG` | both | `u64` nonce |
 | `DETACH` | c→m | — |
-| `KILL` | c→m | — |
+| `KILL` | c→m | — (also from `_proxy --kill` before any HELLO: the master ends the session and holds that connection until it exits, §4.3) |
 | `EXIT` | m→c | child wait status |
 | `TAKEOVER` | m→c | — (another client attached) |
 | `STATUS` / `STATUS_REPLY` | proxy↔m | session metadata for `--list` |
@@ -1007,6 +1068,8 @@ src/
   proxy.rs      acs _proxy: connect-or-spawn, relay, --list
   master.rs     acs _master: pty, child, ring, protocol
   list.rs       --list table, for one host or every alias in parallel
+  pick.rs       plain acs <host>: list, then create or run the menu
+  menu.rs       the session menu: keys to choices, and its screen
   config.rs     configuration files: locations, merging, validation
   config_cmd.rs acs config: show, get/set/unset, host list/add/remove
   release.rs    published releases: SHA256SUMS, versions, curl downloads
@@ -1102,7 +1165,8 @@ and **Remote self-install** make it a `dsh` replacement.
 | --- | --- | --- |
 | 1 | Name | `acs`, after the repository |
 | 2 | Remote binary provisioning | Every complete binary, macOS or Linux, carries slim Linux payloads and can install a complete copy on any Linux remote; ELF self-copies (§8.1) |
-| 3 | Reconnect on by default | Yes. Resume after a drop is automatic because the running client knows the session; re-attaching from a new client uses the session name, which always exists — `main` by default, numbered with `--new` (§4.4) |
+| 3 | Reconnect on by default | Yes. Resume after a drop is automatic because the running client knows the session; re-attaching from a new client uses the session name, which always exists — `main` for the first session by default, numbered with `--new`, and picked from a menu by plain `acs <host>` (§4.4, decision 7) |
 | 4 | Takeover vs. mirrored clients | Takeover (§4.2) |
 | 5 | Escape key | Ctrl-] Ctrl-] with a 400 ms window, configurable (§6.2) |
 | 6 | Multiple users per host | Per-uid socket directory with ownership and peer-uid checks; per-version installs; on shared accounts, client identity with confirmed cross-identity takeover (§4.5) |
+| 7 | What plain `acs <host>` attaches | Revisited at the user's request (2026-09-18). It used to mean `main` always, created if absent, so that the default "never depends on what else happens to exist". In use that meant a detached session under another name (`--new`'s `2`, a named one) was only found by `--list` and retyping its name, and `acs <host>` with `main` attached elsewhere took it over (or asked to) instead of giving a fresh shell. Now it lists the sessions first: with none detached it creates one (`main` if free, else numbered), otherwise it shows a menu of the detached ones (§4.4). The cost is one ssh round trip before attaching. The predictable form stays: `acs <host> <name>`, and without a terminal plain `acs <host>` is still `main` |

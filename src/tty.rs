@@ -1,11 +1,12 @@
 //! The client's local terminal (DESIGN §7): raw mode, and getting the
 //! original settings back on every way out — normal return, a fatal signal,
 //! or a panic (which aborts in release builds, so no destructor would run).
+//! The session menu's alternate screen (DESIGN §4.4) is left the same ways.
 
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Once, OnceLock};
 
 use crate::sys;
 
@@ -13,9 +14,20 @@ use crate::sys;
 /// any handler that reads it is installed.
 static SAVED_FD: AtomicI32 = AtomicI32::new(-1);
 static SAVED: OnceLock<libc::termios> = OnceLock::new();
+/// The terminal on which an [`AltScreen`] is showing, or -1.
+static ALT_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// Restore the saved settings. Async-signal-safe: one `tcsetattr`.
+/// Back to the normal screen, with the cursor shown.
+const LEAVE_ALT: &[u8] = b"\x1b[?25h\x1b[?1049l";
+
+/// Restore the saved settings. Async-signal-safe: one `write` for the
+/// screen, one `tcsetattr`.
 fn emergency_restore() {
+    let alt = ALT_FD.swap(-1, Ordering::AcqRel);
+    if alt >= 0 {
+        // SAFETY: write is async-signal-safe; the bytes are static.
+        unsafe { libc::write(alt, LEAVE_ALT.as_ptr().cast(), LEAVE_ALT.len()) };
+    }
     let fd = SAVED_FD.load(Ordering::Acquire);
     if let (true, Some(t)) = (fd >= 0, SAVED.get()) {
         // SAFETY: tcsetattr is async-signal-safe; `t` is immutable once set.
@@ -32,17 +44,44 @@ extern "C" fn on_fatal(sig: libc::c_int) {
 }
 
 /// Install the panic hook and fatal-signal handlers that put the terminal
-/// back. Call once, before entering raw mode.
+/// back, before entering raw mode. The session menu and the session both
+/// call it; the hook is installed only once.
 pub fn install_emergency_restore() -> io::Result<()> {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        emergency_restore();
-        prev(info);
-    }));
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            emergency_restore();
+            prev(info);
+        }));
+    });
     for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGINT] {
         sys::signals::handle(sig, on_fatal as *const () as usize, 0)?;
     }
     Ok(())
+}
+
+/// The alternate screen, with the cursor hidden, for as long as this lives
+/// (the session menu). Leaving it brings back what the terminal showed
+/// before; a fatal signal or a panic leaves it too.
+pub struct AltScreen {
+    fd: RawFd,
+}
+
+impl AltScreen {
+    pub fn enter(fd: RawFd) -> io::Result<AltScreen> {
+        ALT_FD.store(fd, Ordering::Release);
+        sys::write_all(fd, b"\x1b[?1049h\x1b[?25l")?;
+        Ok(AltScreen { fd })
+    }
+}
+
+impl Drop for AltScreen {
+    fn drop(&mut self) {
+        if ALT_FD.swap(-1, Ordering::AcqRel) >= 0 {
+            let _ = sys::write_all(self.fd, LEAVE_ALT);
+        }
+    }
 }
 
 /// Raw mode on a terminal for as long as this lives.

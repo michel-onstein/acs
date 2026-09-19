@@ -21,9 +21,13 @@ fn child_helper() {
     let raw = acs::tty::RawMode::enter(0).unwrap();
     // Only the emergency paths may restore: never run the destructor.
     std::mem::forget(raw);
+    if mode == "menu" {
+        // The session menu's alternate screen.
+        std::mem::forget(acs::tty::AltScreen::enter(1).unwrap());
+    }
     sys::write_all(1, b"RAW\r\n").unwrap();
     match mode.as_str() {
-        "signal" => loop {
+        "signal" | "menu" => loop {
             std::thread::sleep(Duration::from_secs(1));
         },
         "panic" => panic!("boom"),
@@ -92,4 +96,27 @@ fn terminal_restored_after_panic() {
     let status = child.wait().unwrap();
     assert!(!status.success());
     assert!(echo_on(&slave), "terminal left in raw mode after a panic");
+}
+
+#[test]
+fn alternate_screen_left_after_fatal_signal() {
+    let (mut child, master, slave) = spawn_child("menu");
+    wait_for_raw(&master);
+    sys::kill(child.id() as i32, libc::SIGTERM).unwrap();
+    // What the child writes after RAW: the way back to the normal screen.
+    // Read it before waiting: restoring the settings waits for the
+    // terminal to take the output.
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 256];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !seen.ends_with(b"\x1b[?25h\x1b[?1049l") {
+        assert!(Instant::now() < deadline, "not left: {seen:?}");
+        let mut p = [sys::pollfd(master.as_raw_fd(), libc::POLLIN)];
+        if sys::poll(&mut p, 100).unwrap() > 0 {
+            let n = sys::read(master.as_raw_fd(), &mut buf).unwrap();
+            seen.extend_from_slice(&buf[..n]);
+        }
+    }
+    child.wait().unwrap();
+    assert!(echo_on(&slave), "terminal left in raw mode after SIGTERM");
 }

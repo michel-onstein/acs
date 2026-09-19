@@ -230,6 +230,10 @@ enum ConnState {
     Active { next: u64 },
     /// Flush what is queued, then close.
     Closing,
+    /// Asked to end the session from outside it (`_proxy --kill`): held
+    /// open, and deaf, until the master exits, so the asker sees when the
+    /// session is gone.
+    Ending,
 }
 
 struct Conn {
@@ -561,7 +565,7 @@ impl Master {
                 return;
             }
         };
-        if self.conns[i].state == ConnState::Closing {
+        if matches!(self.conns[i].state, ConnState::Closing | ConnState::Ending) {
             // Taken over, detached or refused: whatever it still sends —
             // INPUT, RESIZE, KILL — is no longer for this session (acs-d1v).
             // Reading on lets us see its end of stream.
@@ -584,7 +588,9 @@ impl Master {
                 }
             };
             self.handle(i, msg);
-            if self.conns[i].dead || self.conns[i].state == ConnState::Closing {
+            if self.conns[i].dead
+                || matches!(self.conns[i].state, ConnState::Closing | ConnState::Ending)
+            {
                 break;
             }
         }
@@ -599,6 +605,11 @@ impl Master {
                 let c = &mut self.conns[i];
                 c.send(&Msg::StatusReply(info));
                 c.state = ConnState::Closing;
+            }
+            Msg::Kill if pending => {
+                mlog!("kill requested from outside the session");
+                self.conns[i].state = ConnState::Ending;
+                self.start_kill();
             }
             _ if pending => {
                 let c = &mut self.conns[i];

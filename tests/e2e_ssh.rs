@@ -381,3 +381,50 @@ fn e2e_11_identity_file_from_the_configuration() {
     }
     eprintln!("VERIFIED identity_file (per host over the alias's, and per alias) over ssh");
 }
+
+#[test]
+fn e2e_12_plain_host_picks_a_detached_session_from_the_menu() {
+    let Some(h) = host() else { return };
+    let echo = |name: &str| format!("echo ready-{name}; while read l; do echo got-{name}:$l; done");
+    for name in ["menu-a", "menu-b"] {
+        let mut c = h.client(name, &echo(name), &[]);
+        c.wait_for(&format!("ready-{name}"), T);
+        c.send(&command(b'd'));
+        assert_eq!(c.wait(T), 0);
+    }
+    let mut args = h.ssh_args();
+    args.push("dev@127.0.0.1".into());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut c = Client::spawn(std::path::Path::new(&h.client), &args, &[]);
+    c.wait_for("\x1b[?1049h", T);
+    c.wait_for("acs: detached sessions on dev@127.0.0.1", T);
+    c.wait_for("menu-b ", T);
+    // The number of a session's row, from the last screen drawn.
+    let row = |c: &Client, name: &str| -> usize {
+        let text = c.text();
+        let screen = &text[text.rfind("\x1b[Hacs: ").unwrap()..];
+        let line = screen
+            .split("\r\n")
+            .find(|l| l.contains(&format!(" {name} ")))
+            .unwrap_or_else(|| panic!("no {name} in {screen:?}"));
+        let line = line.trim_start_matches("\x1b[7m");
+        line[2..3].parse().unwrap()
+    };
+    // End menu-b: the cursor down to it, x, y.
+    let b = row(&c, "menu-b");
+    c.send(&vec![b'j'; b - 1]);
+    c.send(b"x");
+    c.wait_for("end session 'menu-b'?", T);
+    c.send(b"y");
+    c.wait_for("session 'menu-b' ended", T);
+    // Attach menu-a by its number.
+    let a = row(&c, "menu-a");
+    c.send(a.to_string().as_bytes());
+    c.wait_for("\x1b[?1049l", T);
+    c.wait_for("\x1b[H\x1b[J", T);
+    c.send(b"hi\r");
+    c.wait_for("got-menu-a:hi", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+    eprintln!("VERIFIED plain acs <host>: menu over ssh, x ends a session, a number attaches");
+}
