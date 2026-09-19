@@ -849,6 +849,8 @@ fn serve(
                 }
                 Msg::Ack { seq } => state.unacked.ack(seq),
                 Msg::Pong(_) => {}
+                // The master checks on us too (DESIGN §5.3, acs-ode).
+                Msg::Ping(n) => Msg::Pong(n).encode(&mut out),
                 Msg::Exit { status } => {
                     link.close();
                     return Outcome::Exit(sys::exit_code(status));

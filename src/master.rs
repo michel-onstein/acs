@@ -13,6 +13,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::proto::{self, err, AttachKind, Decoder, Hello, Mode, Msg, StatusInfo, WinSize};
+use crate::reconnect::{Health, Liveness};
 use crate::resume::{InputDedupe, OutputRing, Read, DEFAULT_RING};
 use crate::session::{self, SocketDir};
 use crate::sys;
@@ -244,6 +245,9 @@ struct Conn {
     identity: String,
     since: u64,
     dead: bool,
+    /// Pings the attached client after silence and gives it up when it
+    /// stays silent (DESIGN §5.3, acs-ode).
+    live: Liveness,
 }
 
 impl Conn {
@@ -404,6 +408,25 @@ impl Master {
             }
             self.pump_output();
 
+            // Ping the attached client after silence, and give up one that
+            // stays silent: a client that vanished without closing (a laptop
+            // powered off, no FIN reaching the host) would otherwise hold
+            // the pty back for good once the ring is full (acs-ode).
+            let mut wake = u64::MAX;
+            for c in &mut self.conns {
+                if !matches!(c.state, ConnState::Active { .. }) || c.dead {
+                    continue;
+                }
+                match c.live.tick(&mut c.out) {
+                    Health::Dead => {
+                        mlog!("the client stopped answering: dropping it");
+                        c.dead = true;
+                    }
+                    Health::Ok => wake = wake.min(c.live.next_deadline_ms()),
+                }
+            }
+            self.conns.retain(|c| !c.dead);
+
             let active = self.active();
             let mut fds = vec![
                 sys::pollfd(self.listener.as_raw_fd(), libc::POLLIN),
@@ -442,6 +465,10 @@ impl Master {
             let mut timeout = self.next_rebind.saturating_duration_since(now);
             if let Some(d) = self.kill_deadline {
                 timeout = timeout.min(d.saturating_duration_since(now));
+            }
+            if wake != u64::MAX {
+                let ms = wake.saturating_sub(sys::now_ms());
+                timeout = timeout.min(Duration::from_millis(ms));
             }
             // While the child is gone but the pty still drains, poll quickly.
             if self.child.as_ref().is_some_and(|c| c.status.is_some()) {
@@ -538,6 +565,7 @@ impl Master {
                         identity: String::new(),
                         since: 0,
                         dead: false,
+                        live: Liveness::new(),
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -565,6 +593,7 @@ impl Master {
                 return;
             }
         };
+        self.conns[i].live.heard();
         if matches!(self.conns[i].state, ConnState::Closing | ConnState::Ending) {
             // Taken over, detached or refused: whatever it still sends —
             // INPUT, RESIZE, KILL — is no longer for this session (acs-d1v).
@@ -715,6 +744,7 @@ impl Master {
         c.identity = h.identity.clone();
         c.since = sys::unix_now();
         c.state = ConnState::Active { next };
+        c.live = Liveness::new();
         c.send(&Msg::Welcome(proto::Welcome {
             proto: proto::PROTO_VERSION,
             session: self.session.clone(),

@@ -276,6 +276,11 @@ impl FrameConn {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(m) = self.dec.next_msg().expect("valid frames") {
+                // Answer the master's PING as a client does (DESIGN §5.3).
+                if let Msg::Ping(n) = m {
+                    let _ = self.try_send(&Msg::Pong(n));
+                    continue;
+                }
                 if let Msg::Data { offset, bytes } = &m {
                     if let Some(n) = self.next_offset {
                         assert_eq!(*offset, n, "DATA frames must be contiguous");
