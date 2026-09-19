@@ -98,6 +98,19 @@ fn a_chatty_login_shell_does_not_break_either_install() {
     c.wait_for("up", T);
 }
 
+/// Regression (acs-vdl): a login banner that is not UTF-8 must not hide the
+/// finisher's `ok` line — reading the reply as a String threw it all away.
+#[test]
+fn a_login_banner_that_is_not_utf8_does_not_fail_the_install() {
+    let remote = Remote::new();
+    remote.login_noise_bytes(b"Welcome to d\xe9vbox \xff\n");
+    let mut c = Client::start(&remote, &args("l"));
+    c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
+    c.wait_for("up", T);
+    assert!(!c.text().contains("unexpected reply"), "{}", c.text());
+    assert!(leftovers(&remote).is_empty(), "{:?}", leftovers(&remote));
+}
+
 /// Regression (acs-14k): a startup file that prints without a trailing
 /// newline must not hide the ACS-NEED or ACS-READY marker.
 #[test]

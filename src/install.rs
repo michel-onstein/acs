@@ -160,8 +160,11 @@ fn side_call(args: &ClientArgs, script: &str, input: &[u8], expect_ok: bool) -> 
         drop(stdin);
         r
     });
-    let mut out = String::new();
-    let _ = child.stdout.take().unwrap().read_to_string(&mut out);
+    // Bytes, not a String: a login banner in Latin-1 or CP437 is not
+    // UTF-8, and read_to_string would throw the whole reply away (acs-vdl).
+    let mut buf = Vec::new();
+    let _ = child.stdout.take().unwrap().read_to_end(&mut buf);
+    let out = String::from_utf8_lossy(&buf);
     let status = child.wait().map_err(|e| e.to_string())?;
     let _ = writer.join();
     if !status.success() {
