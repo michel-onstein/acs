@@ -784,6 +784,15 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                 let (_, hosts) = settings.remove(i);
                 node.value = hosts.value;
                 node.flow = hosts.flow;
+                // The comments of the `hosts:` line move with its value, or
+                // they would be dropped with the line (acs-nau): the lines
+                // above it go above the alias, and its trailing comment
+                // joins the alias's own.
+                node.before.extend(hosts.before);
+                node.comment = match (node.comment.take(), hosts.comment) {
+                    (Some(a), Some(b)) => Some(format!("{a} {b}")),
+                    (a, b) => a.or(b),
+                };
             }
             Ok(format!("removed {key} of {alias}"))
         }
@@ -1048,6 +1057,35 @@ mod tests {
         let mut doc = yaml::parse(src).unwrap();
         edit(&mut doc, &cmd(c))?;
         Ok(yaml::emit(&doc))
+    }
+
+    /// Regression (acs-nau): collapsing an alias back to a plain list of
+    /// hosts kept the value but dropped the `hosts:` line's comments.
+    #[test]
+    fn unsetting_the_last_setting_keeps_the_hosts_comments() {
+        let src = "\
+aliases:
+  d: # dev
+    identity_file: k
+    # the hosts of d
+    hosts: # the list
+      - host: a # at home
+";
+        assert_eq!(
+            apply(src, "host unset d identity_file").unwrap(),
+            "\
+aliases:
+  # the hosts of d
+  d: # dev # the list
+    - host: a # at home
+"
+        );
+        // With no comment on the alias, the hosts' comment becomes its own.
+        let src = "aliases:\n  d:\n    identity_file: k\n    hosts: # the list\n      - host: a\n";
+        assert_eq!(
+            apply(src, "host unset d identity_file").unwrap(),
+            "aliases:\n  d: # the list\n    - host: a\n"
+        );
     }
 
     #[test]
