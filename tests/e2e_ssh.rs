@@ -256,10 +256,17 @@ fn e2e_09_list_shows_the_sessions() {
     let mut args = vec!["list".to_string()];
     args.extend(h.ssh_args());
     args.push("dev@127.0.0.1".into());
-    let out = Command::new(&h.client).args(&args).output().unwrap();
+    // No configuration: not the files of whoever runs the tests.
+    let out = Command::new(&h.client)
+        .args(&args)
+        .env("XDG_CONFIG_HOME", NO_CONFIG)
+        .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+        .output()
+        .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{text}");
-    assert!(text.contains("first"), "{text}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}{err}");
+    assert!(text.contains("first"), "{text}{err}");
     eprintln!("VERIFIED acs list <host> over ssh:\n{text}");
 }
 
@@ -271,7 +278,7 @@ fn e2e_09b_list_without_a_host_asks_every_alias() {
     let dir = acs::testutil::TempDir::new();
     let env = config_env(
         dir.path(),
-        "hosts:\n  box:\n    - host: 127.0.0.1\n      user: dev\n  gone:\n    - host: 192.0.2.1\n",
+        "aliases:\n  box:\n    - host: 127.0.0.1\n      user: dev\n  gone:\n    - host: 192.0.2.1\n",
     );
     let mut args = vec!["list".to_string()];
     args.extend(h.ssh_args());
@@ -305,7 +312,7 @@ fn e2e_10_user_at_alias_logs_in_as_that_user() {
     let cfg = acs::testutil::TempDir::new();
     let env = config_env(
         cfg.path(),
-        "hosts:\n  box:\n    - host: 127.0.0.1\n      user: nobody\n      reachability_check: false\n",
+        "aliases:\n  box:\n    - host: 127.0.0.1\n      user: nobody\n      reachability_check: false\n",
     );
     let mut args = h.ssh_args();
     args.extend(["-v", "dev@box", "alias", "--"].map(String::from));
@@ -337,7 +344,7 @@ fn e2e_11_identity_file_from_the_configuration() {
     let mut env = config_env(
         cfg.path(),
         &format!(
-            "hosts:\n  keyed:\n    identity_file: /nonexistent/acs-key\n    hosts:\n      - {entry}, identity_file: ~/.ssh/id_box}}\n  plain:\n    identity_file: ~/.ssh/id_box\n    hosts: [{entry}}}]\n"
+            "aliases:\n  keyed:\n    identity_file: /nonexistent/acs-key\n    hosts:\n      - {entry}, identity_file: ~/.ssh/id_box}}\n  plain:\n    identity_file: ~/.ssh/id_box\n    hosts: [{entry}}}]\n"
         ),
     );
     env.push(("HOME".into(), home.path().display().to_string()));

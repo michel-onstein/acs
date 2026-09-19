@@ -291,7 +291,7 @@ mod tests {
     }
 
     const TWO: &str = "\
-hosts:
+aliases:
   devbox:
     - host: devbox.lan
     - host: devbox.example.com
@@ -390,7 +390,7 @@ hosts:
     }
 
     const ABC: &str = "\
-hosts:
+aliases:
   abc:
     - host: a
     - host: b
@@ -482,7 +482,7 @@ hosts:
     fn an_entry_without_a_key_takes_the_aliass() {
         let c = config(
             "\
-hosts:
+aliases:
   devbox:
     identity_file: ~/.ssh/id_alias
     hosts:
@@ -579,7 +579,7 @@ hosts:
 
     /// acs-o96: hosts `a`, `b`, `c` with `prefer: true` on the ones named.
     fn preferring(preferred: &[&str], unchecked: &[&str]) -> String {
-        let mut yaml = String::from("hosts:\n  abc:\n");
+        let mut yaml = String::from("aliases:\n  abc:\n");
         for h in ["a", "b", "c"] {
             yaml.push_str(&format!("    - host: {h}\n"));
             if preferred.contains(&h) {
@@ -655,7 +655,7 @@ hosts:
     /// them; `extra` goes into the alias's settings.
     fn home(extra: &str) -> String {
         format!(
-            "hosts:\n  devbox:\n{extra}    hosts:\n      - host: devbox.example.com\n      - host: devbox.lan\n"
+            "aliases:\n  devbox:\n{extra}    hosts:\n      - host: devbox.example.com\n      - host: devbox.lan\n"
         )
     }
 
@@ -747,7 +747,7 @@ hosts:
             "devbox: devbox.lan does not answer ping within 500ms"
         );
         // prefer: true on the other host: the local network still wins.
-        let yaml = "hosts:\n  devbox:\n    prefer_local_network: true\n    hosts:\n      - host: devbox.example.com\n        prefer: true\n      - host: devbox.lan\n";
+        let yaml = "aliases:\n  devbox:\n    prefer_local_network: true\n    hosts:\n      - host: devbox.example.com\n        prefer: true\n      - host: devbox.lan\n";
         let fake = Fake::up(&["devbox.example.com", "devbox.lan"]);
         let (r, _) = located(yaml, &fake, on(&["192.168.1.5/24"], HOME_NAMES, 0));
         assert_eq!(r, Ok("devbox.lan".into()));
@@ -782,7 +782,7 @@ hosts:
     #[test]
     fn the_rank_is_local_network_then_prefer_then_order() {
         let c = config(
-            "hosts:\n  x:\n    - host: a\n    - host: b\n      prefer: true\n    - host: c\n    - host: d\n",
+            "aliases:\n  x:\n    - host: a\n    - host: b\n      prefer: true\n    - host: c\n    - host: d\n",
         );
         let entries = &c.alias("x").unwrap().entries;
         let net = Some(LocalNet::new("192.168.1.5".parse().unwrap(), 24));
@@ -795,7 +795,7 @@ hosts:
     fn the_aliass_own_deadline_is_the_one_used() {
         let yaml = "\
 reachability_timeout: 2s
-hosts:
+aliases:
   quick:
     reachability_timeout: 250ms
     hosts: [{host: a}]
@@ -834,7 +834,7 @@ hosts:
         } else {
             "-W"
         };
-        for (ms, secs) in [(500, 2), (1000, 3), (2500, 4)] {
+        for (ms, secs) in [(1500, 3), (2500, 4), (4000, 6)] {
             assert!(ping_with(p.as_os_str(), "h.lan", Duration::from_millis(ms)));
             assert_eq!(
                 std::fs::read_to_string(&args).unwrap(),

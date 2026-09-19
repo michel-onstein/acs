@@ -118,7 +118,7 @@ fn not_sent_into_a_paste_the_drop_left_open() {
 #[test]
 fn the_setting_the_alias_and_the_environment() {
     let yaml = |global: &str, alias: &str| {
-        format!("{global}hosts:\n  devbox:\n{alias}    hosts:\n      - host: devbox.lan\n")
+        format!("{global}aliases:\n  devbox:\n{alias}    hosts:\n      - host: devbox.lan\n")
     };
     let off = "redraw_on_reconnect: false\n";
     let alias_on = "    redraw_on_reconnect: true\n";

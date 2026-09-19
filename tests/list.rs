@@ -113,7 +113,7 @@ fn list_all(
 }
 
 const EVERY_KIND: &str = "\
-hosts:
+aliases:
   devbox:
     - host: devbox.lan
     - host: devbox.example.com
@@ -224,7 +224,7 @@ fn every_host_answering_exits_0() {
     let pi = Remote::new();
     let ssh = Ssh::new(&[("nas.lan", &nas), ("pi.lan", &pi)]);
     let net = Net::new(&["nas.lan", "pi.lan"]);
-    let config = "hosts:\n  nas:\n    - host: nas.lan\n  pi:\n    - host: pi.lan\n";
+    let config = "aliases:\n  nas:\n    - host: nas.lan\n  pi:\n    - host: pi.lan\n";
     let (code, out, err) = list_all(&ssh, &net, config, &[], &[]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(
@@ -246,7 +246,7 @@ fn every_host_is_asked_with_its_own_key() {
     let ssh = Ssh::new(&[("nas.lan", &nas), ("pi.lan", &pi)]);
     let net = Net::new(&["nas.lan", "pi.lan"]);
     let config = "\
-hosts:
+aliases:
   nas:
     - host: nas.lan
       identity_file: /keys/nas
@@ -291,7 +291,7 @@ fn silent_hosts_are_waited_for_in_parallel() {
     ]);
     let net = Net::new(&["q0", "q1", "q2", "nas.lan"]);
     let config = "\
-hosts:
+aliases:
   q0:
     - host: q0
   q1:
@@ -348,9 +348,9 @@ fn no_configuration_at_all_is_told_apart_from_one_without_aliases() {
     let mut c = Client::spawn(&exe(), &["list"], &[]);
     assert_eq!(c.wait(T), 2);
     c.wait_for(none.trim_end(), T);
-    // A file, even an empty one or one with an empty hosts:, is a
+    // A file, even an empty one or one with an empty aliases:, is a
     // configuration without aliases.
-    for yaml in ["", "hosts:\n", "update_check: false\n"] {
+    for yaml in ["", "aliases:\n", "update_check: false\n"] {
         let cfg = acs::testutil::TempDir::new();
         let env = config_env(cfg.path(), yaml);
         let out = acs_cmd().envs(env).arg("list").output().unwrap();
