@@ -396,9 +396,12 @@ fn acs_list_in_a_terminal_ends_and_creates_on_the_rows_host() {
     c.wait_for("session 'main' ended", T);
     assert!(!e.devbox.session_exists("main"));
     assert!(e.nas.session_exists("work"));
-    let screen = last_screen(&c);
-    assert!(screen.contains("no sessions on devbox"), "{screen:?}");
-    assert!(screen.contains("\x1b[7m> 1  nas"), "{screen:?}");
+    // Wait for the redraw the next key is meant for, rather than reading
+    // whatever screen has arrived by now: the menu re-lists both hosts
+    // after the end, and typing into the screen before it went to the
+    // wrong row (acs-pho).
+    c.wait_for("no sessions on devbox", T);
+    c.wait_for("\x1b[7m> 1  nas", T);
     // n on nas's row: a new numbered session there.
     c.send(b"n");
     c.wait_for("\x1b[?1049l", T);
