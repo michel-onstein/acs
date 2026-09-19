@@ -554,6 +554,13 @@ impl Client {
         }
     }
 
+    /// Wait until a redial has resumed: the status line shown while the link
+    /// was down is taken away on WELCOME (its title popped). Keys typed
+    /// before then are dropped (DESIGN §5.2), so a test types after it.
+    pub fn wait_resumed(&mut self) {
+        self.wait_for("\x1b[23;0t", T);
+    }
+
     /// Change the terminal size (the client gets SIGWINCH).
     pub fn resize(&self, cols: u16, rows: u16) {
         sys::set_winsize(

@@ -93,7 +93,8 @@ enum Lex {
     Csi,
     /// `ESC O` needs one more byte.
     Ss3,
-    /// Inside OSC/DCS/APC/PM/SOS until BEL or ST; `esc` = saw ESC.
+    /// Inside a terminal reply's string — OSC, DCS or APC — until BEL or
+    /// ST, or [`PENDING_MS`] without a byte; `esc` = saw ESC.
     Str {
         esc: bool,
     },
@@ -125,6 +126,8 @@ pub struct Detector {
     seq: Vec<u8>,
     /// When an incomplete sequence started waiting.
     seq_since: Option<u64>,
+    /// When the last byte of a string (`Lex::Str`) arrived.
+    str_last: u64,
     state: State,
 }
 
@@ -135,6 +138,7 @@ impl Detector {
             lex: Lex::Ground,
             seq: Vec::new(),
             seq_since: None,
+            str_last: 0,
             state: State::Idle,
         }
     }
@@ -161,6 +165,13 @@ impl Detector {
     /// Handle expired timers.
     pub fn tick(&mut self, now: u64) -> Output {
         let mut out = Output::default();
+        // A reply's string arrives in a burst; a pause means `ESC ]`, `ESC P`
+        // or `ESC _` was a Meta key (Alt+_ in readline), not a reply, so what
+        // follows is keys again (acs-evv). Its bytes went out as they came,
+        // so nothing is due here and no deadline is needed for it.
+        if matches!(self.lex, Lex::Str { .. }) && now >= self.str_last + PENDING_MS {
+            self.lex = Lex::Ground;
+        }
         if let Some(since) = self.seq_since {
             if now >= since + PENDING_MS {
                 let bytes = std::mem::take(&mut self.seq);
@@ -223,10 +234,15 @@ impl Detector {
                     match b {
                         b'[' => self.lex = Lex::Csi,
                         b'O' => self.lex = Lex::Ss3,
-                        b']' | b'P' | b'_' | b'^' | b'X' => {
+                        // The strings terminals reply with: OSC (colours,
+                        // clipboard), DCS (DECRQSS, XTGETTCAP), APC (kitty
+                        // graphics). PM and SOS carry none: `ESC ^` and
+                        // `ESC X` are Meta keys.
+                        b']' | b'P' | b'_' => {
                             let bytes = std::mem::take(&mut self.seq);
                             self.token(Kind::Passive, bytes, now, &mut out);
                             self.lex = Lex::Str { esc: false };
+                            self.str_last = now;
                         }
                         0x1b => {
                             // ESC ESC: the first was a key on its own.
@@ -282,6 +298,7 @@ impl Detector {
                 }
                 Lex::Str { esc } => {
                     out.forward.push(b);
+                    self.str_last = now;
                     self.lex = match (esc, b) {
                         (_, 0x07) | (true, b'\\') => Lex::Ground,
                         (_, 0x1b) => Lex::Str { esc: true },
@@ -691,6 +708,64 @@ mod tests {
         // An OSC reply carrying 0x1d, a DCS reply, then a real keypress.
         let seq: &[u8] = b"\x1b]11;rgb:\x1d\x1d\x07\x1bP>|kitty\x1d\x1b\\a";
         assert_eq!(run(&[(0, seq)], 0), (seq.to_vec(), None));
+    }
+
+    /// Regression (acs-evv): Alt+_ (readline's yank-last-arg) sends `ESC _`,
+    /// which is also how an APC reply starts. It must not leave the escape
+    /// key unheard until a BEL comes.
+    #[test]
+    fn a_meta_key_that_looks_like_a_string_start_does_not_eat_the_escape() {
+        for meta in [b"\x1b_", b"\x1b]", b"\x1bP", b"\x1b^", b"\x1bX"] {
+            let (fwd, action) = run(
+                &[(0, meta), (5000, &[CB]), (5050, &[CB]), (5100, b"d")],
+                5100,
+            );
+            assert_eq!(action, Some(Action::Detach), "after {meta:?}");
+            assert_eq!(fwd, meta.to_vec(), "after {meta:?}");
+        }
+        // A key right after it, then the command a normal while later.
+        let (_, action) = run(
+            &[
+                (0, b"\x1b_"),
+                (40, b"x"),
+                (1000, &[CB]),
+                (1050, &[CB]),
+                (1100, b"d"),
+            ],
+            1100,
+        );
+        assert_eq!(action, Some(Action::Detach));
+    }
+
+    /// PM and SOS are not strings terminals reply with: `ESC ^` / `ESC X`
+    /// are keys, so a command right after them works (acs-evv).
+    #[test]
+    fn pm_and_sos_introducers_are_keys() {
+        for meta in [b"\x1b^", b"\x1bX"] {
+            let mut input = meta.to_vec();
+            input.extend_from_slice(&[CB, CB, b'd']);
+            assert_eq!(
+                run(&[(0, &input)], 0),
+                (meta.to_vec(), Some(Action::Detach))
+            );
+        }
+    }
+
+    /// A reply split across reads a little apart is still one string: the
+    /// escape byte inside it is not a key press.
+    #[test]
+    fn a_reply_split_across_reads_stays_a_string() {
+        let (fwd, action) = run(
+            &[
+                (0, b"\x1b]52;c;"),
+                (30, &[CB, CB]),
+                (60, b"d\x07"),
+                (70, b"z"),
+            ],
+            70,
+        );
+        assert_eq!(action, None);
+        assert_eq!(fwd, b"\x1b]52;c;\x1d\x1dd\x07z");
     }
 
     #[test]

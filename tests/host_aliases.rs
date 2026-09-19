@@ -206,6 +206,9 @@ fn a_redial_resolves_the_alias_again() {
     );
     remote.wait_connections(2, T);
     // The fake remote is one machine, so the session resumes.
+    // The resume's Ctrl-L, echoed by the session's terminal: typing now
+    // reaches the program (keys typed during the redial are dropped).
+    c.wait_for("^L", T);
     c.send(b"echo back\r");
     c.wait_for("back", T);
     c.send(&command(b'x'));
@@ -224,6 +227,9 @@ fn a_redial_of_user_at_alias_keeps_the_user() {
         T,
     );
     remote.wait_connections(2, T);
+    // The resume's Ctrl-L, echoed by the session's terminal: typing now
+    // reaches the program (keys typed during the redial are dropped).
+    c.wait_for("^L", T);
     c.send(b"echo back\r");
     c.wait_for("back", T);
     // The hints name the host as given, user and all.
@@ -336,6 +342,9 @@ fn a_redial_onto_the_fallback_host_switches_to_its_key() {
     remote.cut_link();
     c.wait_for("devbox: now using devbox.example.com (was devbox.lan)", T);
     remote.wait_connections(2, T);
+    // The resume's Ctrl-L, echoed by the session's terminal: typing now
+    // reaches the program (keys typed during the redial are dropped).
+    c.wait_for("^L", T);
     c.send(b"echo back\r");
     c.wait_for("back", T);
     c.send(&command(b'x'));
