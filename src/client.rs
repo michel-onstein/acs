@@ -764,12 +764,25 @@ fn serve(
                     }
                     match w.kind {
                         AttachKind::Resumed => {}
-                        AttachKind::Fresh | AttachKind::Gap => {
+                        AttachKind::Fresh => {
+                            // Another program: undo the modes the last one
+                            // left on before forgetting them, or leave()
+                            // could not (acs-xk4).
+                            let reset = state.observer.reset_sequence();
+                            if !reset.is_empty() {
+                                let _ = sys::write_all(STDOUT, &reset);
+                            }
                             if !w.created {
                                 // dtach's attach: clear, the program redraws.
                                 let _ = sys::write_all(STDOUT, b"\x1b[H\x1b[J");
                             }
                             state.observer.clear();
+                        }
+                        AttachKind::Gap => {
+                            // The same program, still in its modes: keep
+                            // them for leave(), but not a half-seen sequence.
+                            let _ = sys::write_all(STDOUT, b"\x1b[H\x1b[J");
+                            state.observer.resync();
                         }
                     }
                     state.offset = w.offset;

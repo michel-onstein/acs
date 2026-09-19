@@ -209,6 +209,72 @@ fn output_lost_to_a_small_ring_is_a_gap_and_redraw() {
     }
 }
 
+/// Regression (acs-xk4): the modes a program turned on before a gap are
+/// still reset on a later detach — the gap clears the screen, not what the
+/// client knows of the terminal.
+#[test]
+fn modes_on_before_a_gap_are_reset_on_detach() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_RING", "4096"));
+    env.push(("ACS_BACKOFF_MS", "700"));
+    let mut c = start(
+        &remote,
+        "gapmodes",
+        "printf '\\033[?1049h\\033[?1000;1006h\\033[?2004hup\\n'; \
+         while true; do head -c 2000 /dev/zero | tr '\\0' y; echo; sleep 0.01; done",
+        &env,
+    );
+    c.wait_for("up", T);
+    remote.cut_link();
+    remote.wait_connections(2, T);
+    c.wait_for("\x1b[H\x1b[J", T);
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+    let out = c.text();
+    let tail = &out[out.rfind("\x1b[H\x1b[J").unwrap()..];
+    for reset in ["\x1b[?1000l", "\x1b[?1006l", "\x1b[?2004l", "\x1b[?1049l"] {
+        assert!(tail.contains(reset), "missing {reset:?} after the gap");
+    }
+}
+
+/// Regression (acs-xk4): when the session is another program by the time the
+/// client is back, the old program's modes are reset before it is forgotten.
+#[test]
+fn modes_of_a_restarted_session_are_reset() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_BACKOFF_MS", "3000"));
+    let mut a = start(
+        &remote,
+        "restart",
+        "printf '\\033[?1049h\\033[?1000;1006hTUI'; sleep 1",
+        &env,
+    );
+    a.wait_for("TUI", T);
+    remote.cut_link();
+    // The first program ends while the link is down; another takes its name.
+    let deadline = Instant::now() + T;
+    while remote.session_exists("restart") {
+        assert!(Instant::now() < deadline, "the first program did not end");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut b = start(&remote, "restart", "echo second; sleep 30", &[]);
+    b.wait_for("second", T);
+    b.send(&command(b'd'));
+    assert_eq!(b.wait(T), 0);
+    a.wait_for("the session was restarted", T);
+    let out = a.text();
+    let tail = &out[out.rfind("the session was restarted").unwrap()..];
+    let clear = tail.find("\x1b[H\x1b[J").expect("no clear");
+    for reset in ["\x1b[?1000l", "\x1b[?1006l", "\x1b[?1049l"] {
+        let at = tail
+            .find(reset)
+            .unwrap_or_else(|| panic!("missing {reset:?}"));
+        assert!(at < clear, "{reset:?} after the clear");
+    }
+}
+
 #[test]
 fn a_network_change_redials_at_once() {
     let remote = Remote::installed();

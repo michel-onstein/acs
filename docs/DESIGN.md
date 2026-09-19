@@ -700,7 +700,11 @@ the few mode-setting sequences above and records what is on. It never modifies,
 delays or reorders the stream. On detach, exit, or an abandoned reconnect, the
 client writes the matching resets (for example `CSI ? 1000 l`, `CSI ? 1049 l`,
 `CSI < u`) and restores the original `termios`. On a successful resume it does
-nothing, because the terminal state is still correct.
+nothing, because the terminal state is still correct. A resume after a **gap**
+clears the screen but keeps the recorded modes: the program is the same one,
+still in them, so a later detach still resets them. A **fresh** attach to
+another program (the session was restarted) writes the old program's resets
+before clearing the screen and forgetting them.
 
 ## 7. Client
 

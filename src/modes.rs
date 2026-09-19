@@ -77,6 +77,15 @@ impl ModeObserver {
         *self = Self::default();
     }
 
+    /// Forget where the stream was but keep the modes, after a resume that
+    /// skipped output (a gap): the program is the same and still in its
+    /// modes, but the next byte may start anywhere (acs-xk4).
+    pub fn resync(&mut self) {
+        self.lex = None;
+        self.seq.clear();
+        self.utf8_left = 0;
+    }
+
     /// True when the terminal is believed to be in its default state.
     pub fn is_clean(&self) -> bool {
         self.dec.is_empty()
@@ -380,6 +389,21 @@ mod tests {
         let mut o = ModeObserver::new();
         o.observe(b"\x1b]0;x");
         assert_eq!(o.observe_to_boundary(b"\x07z"), Some(1));
+    }
+
+    /// Regression (acs-xk4): after a gap the modes stay, for leave() to
+    /// reset, but a sequence cut off by the gap is forgotten.
+    #[test]
+    fn resync_keeps_modes_and_drops_a_half_seen_sequence() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[?1049h\x1b[?1000h\x1b]0;half a tit");
+        assert!(!o.at_boundary());
+        o.resync();
+        assert!(o.at_boundary());
+        assert_eq!(o.reset_sequence(), b"\x1b[?1000l\x1b[?1049l\x1b[0m");
+        // What follows is read from the ground, not as the old title.
+        o.observe(b"\x1b[?2004h");
+        assert!(o.reset_sequence().starts_with(b"\x1b[?1000l\x1b[?2004l"));
     }
 
     #[test]
