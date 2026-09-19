@@ -196,7 +196,7 @@ fn an_alias_is_resolved_once_for_the_list_and_the_attach() {
     c.wait_for("> 1  one ", T);
     c.send(b"1");
     attached_to(&mut c, "one");
-    assert_eq!(net.pinged(), ["devbox.lan"]);
+    assert_eq!(net.pinged(), ["devbox.example.com", "devbox.lan"]);
     let dests: Vec<String> = ssh.keys().into_iter().map(|(d, _)| d).collect();
     assert_eq!(
         dests,

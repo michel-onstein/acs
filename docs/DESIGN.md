@@ -703,6 +703,7 @@ install_on_remote: true        # install acs on a host that lacks it (§8)
 update_check: true             # look for a newer release once a week (§7.6)
 command_bell: true             # ring the bell when command mode arms (§6.1)
 redraw_on_reconnect: true      # send Ctrl-L after reconnecting (§5.2)
+reachability_timeout: 500ms    # how long hosts have to answer a ping (§7.3)
 hosts:                         # aliases: acs devbox tries these in order
   devbox:
     - host: devbox.lan
@@ -713,6 +714,7 @@ hosts:                         # aliases: acs devbox tries these in order
   lab:                         # an alias with settings of its own
     identity_file: ~/.ssh/id_lab # the key of every host naming none
     redraw_on_reconnect: false # over the global setting, for this alias
+    reachability_timeout: 2s   # so is this
     hosts:
       - host: lab.lan
 ```
@@ -733,14 +735,19 @@ hosts:                         # aliases: acs devbox tries these in order
   and one entry may be written without the list. How an alias is resolved is
   §7.3.
 - **An alias's own settings**: an alias is a list of entries (or one entry,
-  a mapping with `host`), or a mapping of its settings — `identity_file`
-  and `redraw_on_reconnect` — and its `hosts`, that list. The list form
-  stays the usual one; the mapping is only needed for a setting shared by
-  the entries. A file may give the mapping without `hosts`, to set the key
-  (or `redraw_on_reconnect`) of an alias whose hosts are in the other file,
-  but an alias with no host in either is an error (at its first
-  definition). An `identity_file` is one path, not a list: several keys are
-  a job for `~/.ssh/config`.
+  a mapping with `host`), or a mapping of its settings — `identity_file`,
+  `redraw_on_reconnect` and `reachability_timeout` — and its `hosts`, that
+  list. The list form stays the usual one; the mapping is only needed for a
+  setting shared by the entries. A file may give the mapping without
+  `hosts`, to set the key (or another setting) of an alias whose hosts are
+  in the other file, but an alias with no host in either is an error (at
+  its first definition). An `identity_file` is one path, not a list:
+  several keys are a job for `~/.ssh/config`.
+- **`reachability_timeout`** is a duration: `500ms`, `0.5s`, `2s`, or a
+  bare number of seconds (`0.5`), to the millisecond, from 1 ms to 60 s;
+  anything else is an error. The default is `500ms`, and an alias's own
+  value replaces the global one (§7.3). `acs config` writes it back as
+  `500ms` or `2s`.
 - Only the local client reads the files; `_proxy`, `_master` and `_install`
   never do.
 
@@ -759,12 +766,26 @@ build 490 → 507 KB).
 `acs [user@]<name>`, where `<name>` is a key of `hosts` (§7.2), connects to
 one of the alias's entries instead of `<name>`:
 
-- Entries are tried **in order**. One with `reachability_check: true` (the
-  default) is pinged once — `ping -c 1` with a 2 s deadline, spelled `-t` on
-  macOS and `-W` on Linux (`ACS_PING` names another program, which is how the
-  tests avoid ICMP). The first that answers is used. One with
-  `reachability_check: false` is used without a ping, for hosts that drop
-  ICMP.
+- Entries are chosen **in order**: the first that answers a ping is used. One
+  with `reachability_check: false` is used without a ping, for hosts that
+  drop ICMP, as soon as every entry before it has not answered.
+- The pings run **at once**: every entry with `reachability_check: true`
+  (the default) that could be chosen — those before the first unchecked
+  one — is pinged when the alias is resolved, each from a thread of its
+  own. Entry *k* is taken as soon as it has answered and every checked entry
+  before it has not, so the choice is exactly the one trying them one after
+  another would make, only in at most one deadline instead of one per host.
+  A later host that answers first waits for the earlier ones; `-v` lines
+  and the "tried …" error keep the configured order.
+- **The deadline** is `reachability_timeout` (§7.2): 500 ms by default, the
+  alias's own value over the global one. An answer after it counts as none.
+  acs keeps the deadline itself, to the millisecond, since macOS `ping -t`
+  and BusyBox `-W` take whole seconds (and iputils `-W` fractions only in
+  newer releases): it runs `ping -c 1` with a backstop of its own a second
+  or more past the deadline (`-t` on macOS, `-W` on Linux), and when the
+  deadline passes kills and reaps it. Once a host is chosen the others'
+  pings are not waited for; they end at the deadline. `ACS_PING` names
+  another program, which is how the tests avoid ICMP.
 - The chosen entry becomes the ssh destination: `user@host` if it has a
   `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
 - **`user@<alias>`** goes through the alias the same way — same order, same
@@ -850,11 +871,11 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`); `set` checks the type |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`); `set` checks the type |
 | `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
 | `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check]` | append an entry, so repeated adds give an alias its fallback hosts in order |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
-| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
+| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
 | `path` | the two files and whether they exist |
 
 - Edits go to the local file; `--global` edits the global one (and needs
