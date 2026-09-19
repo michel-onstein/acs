@@ -58,6 +58,9 @@ scripts/version-bump.sh --major     # a new major version (manual only)
 - It reads everything unreleased since the last tag, not only the last
   commit, so a chore landing after a feature does not hide the feature.
 - It is safe to re-run: with nothing unreleased it does nothing.
+- It fetches origin's tags before noting which ones exist, so only the tag it
+  made is published — a checkout whose tags were stale does not publish the
+  releases it was missing all over again.
 - It never touches your checkout: it releases from a throwaway worktree of
   `origin/main` and pushes the commit and tag atomically. Afterwards update
   your `main` with `git pull --ff-only`.
