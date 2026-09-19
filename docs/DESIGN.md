@@ -774,7 +774,7 @@ redraw_on_reconnect: true      # send Ctrl-L after reconnecting (§5.2)
 reachability_timeout: 500ms    # how long hosts have to answer a ping (§7.3)
 persist: false                 # wait for a lost host, pinging it (§5.3)
 reachability_interval: 5s      # how often a lost host is pinged (§5.3)
-hosts:                         # aliases: acs devbox tries these in order
+aliases:                       # acs devbox tries its hosts in order
   devbox:
     - host: devbox.lan
       reachability_check: true # ping once first (the default)
@@ -795,17 +795,22 @@ hosts:                         # aliases: acs devbox tries these in order
 ```
 
 - **Merging**: a setting in the local file replaces the global one — an
-  alias's own settings too; mappings (`hosts`) merge key by key; lists (an
-  alias's hosts) concatenate, global entries first. An empty value (`key:`)
+  alias's own settings too; mappings (`aliases`) merge key by key; lists
+  (an alias's hosts) concatenate, global entries first. An empty value (`key:`)
   sets nothing.
 - **Errors are not defaults**: a malformed file, an unknown key or a value of
   the wrong type stops the client with the file and line
   (`~/.config/acs/config.yaml:3: install_on_remote: expected true or false`).
-  `--help` and `--version` do not read the files.
+  `--help` and `--version` do not read the files. The aliases' key was
+  once `hosts`; a file that still says so is refused with
+  `<file>:<line>: 'hosts' is now 'aliases': rename the key`, not as an
+  unknown key. The words keep one meaning each: `aliases` maps alias names
+  to their definitions, an alias's `hosts` lists its ways to reach it, and
+  each entry's `host` is one address for ssh.
 - **`install_on_remote: false`**: when the prelude reports `ACS-NEED` (§8)
   the client installs nothing; it says which host lacks which version, where
   the setting came from, and exits with the install-failed code (254).
-- `hosts` is parsed and validated: `host` is required, `user`,
+- `aliases` is parsed and validated: `host` is required, `user`,
   `identity_file`, `reachability_check` (default `true`), `prefer`
   (default `false`, §7.3) and `persist` are optional, and one entry may be
   written without the list. How an alias is resolved is §7.3.
@@ -844,7 +849,7 @@ build 490 → 507 KB).
 
 ### 7.3 Host aliases
 
-`acs [user@]<name>`, where `<name>` is a key of `hosts` (§7.2), connects to
+`acs [user@]<name>`, where `<name>` is a key of `aliases` (§7.2), connects to
 one of the alias's entries instead of `<name>`:
 
 - Entries are chosen **in order**: the first that answers a ping is used. One

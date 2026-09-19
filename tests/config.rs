@@ -62,7 +62,7 @@ fn the_local_file_overrides_the_global_one() {
 fn a_malformed_file_is_an_error_naming_file_and_line() {
     let remote = Remote::installed();
     let cfg = TempDir::new();
-    let env = config_env(cfg.path(), "hosts:\n  devbox:\n\t- host: x\n");
+    let env = config_env(cfg.path(), "aliases:\n  devbox:\n\t- host: x\n");
     let out = acs_cmd()
         .envs(env)
         .args(["list", "--transport-cmd", &remote.transport(), "devbox"])

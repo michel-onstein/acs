@@ -44,9 +44,9 @@ alias settings: identity_file <key> (the ssh key of its hosts that name none),
                 reachability_timeout, reachability_interval (over the global setting)
 precedence of the ssh key: -i, then the host's identity_file, then the alias's";
 
-/// Settings `get`/`set`/`unset` know: every top-level key but `hosts`.
+/// Settings `get`/`set`/`unset` know: every top-level key but `aliases`.
 fn scalars() -> impl Iterator<Item = &'static str> {
-    config::KEYS.iter().copied().filter(|k| *k != "hosts")
+    config::KEYS.iter().copied().filter(|k| *k != "aliases")
 }
 
 fn is_scalar(key: &str) -> bool {
@@ -290,7 +290,7 @@ pub fn run(cmd: &Cmd, target: &Path) -> Result<String, Error> {
             let c = Config::load_files(&files)?;
             match (key.as_str(), scalar(&c, key)) {
                 (_, Some((n, _))) => Ok(format!("{}\n", text(&n))),
-                ("hosts", None) => Ok(host_list(&c)),
+                ("aliases", None) => Ok(host_list(&c)),
                 (other, None) => Err(unknown_key(other).into()),
             }
         }
@@ -356,7 +356,7 @@ fn empty_doc() -> Document {
 }
 
 fn unknown_key(k: &str) -> String {
-    let hint = if config::HOST_KEYS.contains(&k) || k.starts_with("hosts.") {
+    let hint = if config::HOST_KEYS.contains(&k) || k.starts_with("aliases.") {
         " (hosts are edited with acs config host add|remove|set|unset)"
     } else {
         ""
@@ -482,7 +482,7 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
     }
     if aliases.is_empty() {
         root.push((
-            "hosts".to_string(),
+            "aliases".to_string(),
             Node {
                 comment: Some("# none".into()),
                 flow: true,
@@ -490,7 +490,7 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
             },
         ));
     } else {
-        root.push(("hosts".to_string(), Node::new(Value::Map(aliases))));
+        root.push(("aliases".to_string(), Node::new(Value::Map(aliases))));
     }
     let mut head = vec!["# acs configuration, merged from:".to_string()];
     for f in files {
@@ -595,7 +595,7 @@ fn defined_in(other: &Path, cmd: &Cmd) -> Option<String> {
     let map = doc.root.value.map()?;
     let find = |k: &str| map.iter().find(|(key, _)| key == k).map(|(_, n)| n);
     let alias = |name: &str| {
-        find("hosts")?
+        find("aliases")?
             .value
             .map()?
             .iter()
@@ -746,7 +746,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
             let map = root_map(doc)?;
             let hi = map
                 .iter()
-                .position(|(k, _)| k == "hosts")
+                .position(|(k, _)| k == "aliases")
                 .ok_or_else(missing)?;
             let aliases = map[hi].1.value.map_mut().ok_or_else(missing)?;
             let ai = aliases
@@ -789,7 +789,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
         }
         Cmd::HostRemove { alias, host } => {
             let map = root_map(doc)?;
-            let Some(hi) = map.iter().position(|(k, _)| k == "hosts") else {
+            let Some(hi) = map.iter().position(|(k, _)| k == "aliases") else {
                 return Err(format!("no alias '{alias}' in this file"));
             };
             let aliases = map[hi]
@@ -853,13 +853,13 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
     }
 }
 
-/// The `hosts` mapping of `doc`, created if missing.
+/// The `aliases` mapping of `doc`, created if missing.
 fn aliases_mut(doc: &mut Document) -> Result<&mut Vec<(String, Node)>, String> {
     let map = root_map(doc)?;
-    let i = match map.iter().position(|(k, _)| k == "hosts") {
+    let i = match map.iter().position(|(k, _)| k == "aliases") {
         Some(i) => i,
         None => {
-            map.push(("hosts".into(), Node::new(Value::Null)));
+            map.push(("aliases".into(), Node::new(Value::Null)));
             map.len() - 1
         }
     };
@@ -871,7 +871,7 @@ fn aliases_mut(doc: &mut Document) -> Result<&mut Vec<(String, Node)>, String> {
     hosts
         .value
         .map_mut()
-        .ok_or_else(|| "'hosts' is not a mapping of aliases; fix it by hand".into())
+        .ok_or_else(|| "'aliases' is not a mapping of aliases; fix it by hand".into())
 }
 
 /// The node of `alias` in `aliases`, added empty if missing.
@@ -938,7 +938,7 @@ fn entry_list<'a>(alias: &str, node: &'a mut Node) -> Result<&'a mut Vec<Node>, 
     match &mut list.value {
         Value::Seq(items) => Ok(items),
         _ => Err(format!(
-            "hosts.{alias} is not a list of hosts; fix it by hand"
+            "aliases.{alias} is not a list of hosts; fix it by hand"
         )),
     }
 }
@@ -1150,10 +1150,10 @@ mod tests {
 
     #[test]
     fn set_replaces_in_place_and_keeps_comments() {
-        let src = "# mine\ninstall_on_remote: true # was on\nhosts:\n  a:\n    - host: x\n";
+        let src = "# mine\ninstall_on_remote: true # was on\naliases:\n  a:\n    - host: x\n";
         assert_eq!(
             apply(src, "set install_on_remote false").unwrap(),
-            "# mine\ninstall_on_remote: false # was on\nhosts:\n  a:\n    - host: x\n"
+            "# mine\ninstall_on_remote: false # was on\naliases:\n  a:\n    - host: x\n"
         );
         // A new setting goes at the end.
         assert_eq!(
@@ -1170,9 +1170,9 @@ mod tests {
 
     #[test]
     fn unset_removes_and_leaves_the_comments_above_for_what_follows() {
-        let src = "install_on_remote: false\n# the hosts\nhosts:\n  a:\n    - host: x\n";
+        let src = "install_on_remote: false\n# the hosts\naliases:\n  a:\n    - host: x\n";
         let out = apply(src, "unset install_on_remote").unwrap();
-        assert_eq!(out, "# the hosts\nhosts:\n  a:\n    - host: x\n");
+        assert_eq!(out, "# the hosts\naliases:\n  a:\n    - host: x\n");
         let e = apply(&out, "unset install_on_remote").unwrap_err();
         assert!(e.contains("not set in this file"), "{e}");
     }
@@ -1182,7 +1182,7 @@ mod tests {
         let out = apply("install_on_remote: true\n", "host add devbox devbox.lan").unwrap();
         assert_eq!(
             out,
-            "install_on_remote: true\nhosts:\n  devbox:\n    - host: devbox.lan\n"
+            "install_on_remote: true\naliases:\n  devbox:\n    - host: devbox.lan\n"
         );
         let out = apply(
             &out,
@@ -1191,7 +1191,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "install_on_remote: true\nhosts:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n      user: me\n      reachability_check: false\n"
+            "install_on_remote: true\naliases:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n      user: me\n      reachability_check: false\n"
         );
         let e = apply(&out, "host add devbox devbox.lan").unwrap_err();
         assert!(e.contains("already a host of devbox"), "{e}");
@@ -1202,30 +1202,30 @@ mod tests {
     #[test]
     fn host_add_turns_a_single_entry_into_a_list() {
         let out = apply(
-            "hosts:\n  nas: {host: nas.lan}\n",
+            "aliases:\n  nas: {host: nas.lan}\n",
             "host add nas nas.example.com",
         )
         .unwrap();
         assert_eq!(
             out,
-            "hosts:\n  nas:\n    - {host: nas.lan}\n    - host: nas.example.com\n"
+            "aliases:\n  nas:\n    - {host: nas.lan}\n    - host: nas.example.com\n"
         );
     }
 
     #[test]
     fn host_remove_one_host_or_the_alias() {
-        let src = "hosts:\n  d:\n    - host: a\n    - host: b\n  e:\n    - host: c\n";
+        let src = "aliases:\n  d:\n    - host: a\n    - host: b\n  e:\n    - host: c\n";
         assert_eq!(
             apply(src, "host remove d a").unwrap(),
-            "hosts:\n  d:\n    - host: b\n  e:\n    - host: c\n"
+            "aliases:\n  d:\n    - host: b\n  e:\n    - host: c\n"
         );
         assert_eq!(
             apply(src, "host remove d").unwrap(),
-            "hosts:\n  e:\n    - host: c\n"
+            "aliases:\n  e:\n    - host: c\n"
         );
-        // The last host takes the alias with it, and the last alias `hosts`.
+        // The last host takes the alias with it, and the last alias `aliases`.
         assert_eq!(
-            apply("hosts:\n  e:\n    - host: c\n", "host remove e c").unwrap(),
+            apply("aliases:\n  e:\n    - host: c\n", "host remove e c").unwrap(),
             ""
         );
         let e = apply(src, "host remove d zz").unwrap_err();
@@ -1238,7 +1238,7 @@ mod tests {
     fn host_add_with_a_key() {
         assert_eq!(
             apply("", "host add d a --user me --identity-file ~/.ssh/id_a").unwrap(),
-            "hosts:\n  d:\n    - host: a\n      user: me\n      identity_file: ~/.ssh/id_a\n"
+            "aliases:\n  d:\n    - host: a\n      user: me\n      identity_file: ~/.ssh/id_a\n"
         );
         let mut doc = yaml::parse("").unwrap();
         let msg = edit(&mut doc, &cmd("host add d a --identity-file /k")).unwrap();
@@ -1247,11 +1247,11 @@ mod tests {
 
     #[test]
     fn host_set_moves_the_hosts_under_the_alias_and_unset_moves_them_back() {
-        let src = "hosts:\n  # the dev box\n  d: # mine\n    - host: a\n    - host: b\n";
+        let src = "aliases:\n  # the dev box\n  d: # mine\n    - host: a\n    - host: b\n";
         let set = apply(src, "host set d identity_file ~/.ssh/id_d").unwrap();
         assert_eq!(
             set,
-            "hosts:\n  # the dev box\n  d: # mine\n    identity_file: ~/.ssh/id_d\n    hosts:\n      - host: a\n      - host: b\n"
+            "aliases:\n  # the dev box\n  d: # mine\n    identity_file: ~/.ssh/id_d\n    hosts:\n      - host: a\n      - host: b\n"
         );
         // Set again: replaced in place.
         assert_eq!(
@@ -1266,7 +1266,7 @@ mod tests {
         );
         assert_eq!(
             apply(&set, "host remove d a").unwrap(),
-            "hosts:\n  # the dev box\n  d: # mine\n    identity_file: ~/.ssh/id_d\n    hosts:\n      - host: b\n"
+            "aliases:\n  # the dev box\n  d: # mine\n    identity_file: ~/.ssh/id_d\n    hosts:\n      - host: b\n"
         );
         // The last host takes the alias, key and all.
         assert_eq!(
@@ -1291,11 +1291,11 @@ mod tests {
                 value: "false".into()
             }
         );
-        let src = "hosts:\n  d:\n    - host: a\n";
+        let src = "aliases:\n  d:\n    - host: a\n";
         let set = apply(src, "host set d redraw_on_reconnect FALSE").unwrap();
         assert_eq!(
             set,
-            "hosts:\n  d:\n    redraw_on_reconnect: false\n    hosts:\n      - host: a\n"
+            "aliases:\n  d:\n    redraw_on_reconnect: false\n    hosts:\n      - host: a\n"
         );
         let e = apply(src, "host set d redraw_on_reconnect off").unwrap_err();
         assert!(
@@ -1306,11 +1306,11 @@ mod tests {
         let both = apply(&set, "host set d identity_file /k").unwrap();
         assert_eq!(
             both,
-            "hosts:\n  d:\n    identity_file: /k\n    redraw_on_reconnect: false\n    hosts:\n      - host: a\n"
+            "aliases:\n  d:\n    identity_file: /k\n    redraw_on_reconnect: false\n    hosts:\n      - host: a\n"
         );
         assert_eq!(
             apply(&both, "host unset d redraw_on_reconnect").unwrap(),
-            "hosts:\n  d:\n    identity_file: /k\n    hosts:\n      - host: a\n"
+            "aliases:\n  d:\n    identity_file: /k\n    hosts:\n      - host: a\n"
         );
         // The last setting gone, the alias is its list of hosts again.
         assert_eq!(
@@ -1329,21 +1329,21 @@ mod tests {
         // One entry without a list becomes the alias's first host.
         assert_eq!(
             apply(
-                "hosts:\n  nas: {host: nas.lan}\n",
+                "aliases:\n  nas: {host: nas.lan}\n",
                 "host set nas identity_file k"
             )
             .unwrap(),
-            "hosts:\n  nas:\n    identity_file: k\n    hosts:\n      - {host: nas.lan}\n"
+            "aliases:\n  nas:\n    identity_file: k\n    hosts:\n      - {host: nas.lan}\n"
         );
         // An alias whose hosts are in the other file: the key alone.
         let only = apply("update_check: false\n", "host set d identity_file k").unwrap();
         assert_eq!(
             only,
-            "update_check: false\nhosts:\n  d:\n    identity_file: k\n"
+            "update_check: false\naliases:\n  d:\n    identity_file: k\n"
         );
         let doc = yaml::parse(&only).unwrap();
         Config::default().apply(Path::new("x"), &doc.root).unwrap();
-        // Unsetting it takes the alias, and an empty `hosts`, too.
+        // Unsetting it takes the alias, and an empty `aliases`, too.
         let mut doc = yaml::parse(&only).unwrap();
         let msg = edit(&mut doc, &cmd("host unset d identity_file")).unwrap();
         assert_eq!(yaml::emit(&doc), "update_check: false\n");
@@ -1351,7 +1351,7 @@ mod tests {
         // Adding a host to it gives it `hosts`.
         assert_eq!(
             apply(&only, "host add d a").unwrap(),
-            "update_check: false\nhosts:\n  d:\n    identity_file: k\n    hosts:\n      - host: a\n"
+            "update_check: false\naliases:\n  d:\n    identity_file: k\n    hosts:\n      - host: a\n"
         );
     }
 
@@ -1361,7 +1361,7 @@ mod tests {
         let f = dir.path().join("c.yaml");
         std::fs::write(
             &f,
-            "hosts:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n      user: me\n      reachability_check: false\n  lab:\n    identity_file: /k/lab\n    hosts:\n      - host: lab1\n        identity_file: /k/lab1\n      - host: lab2\n",
+            "aliases:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n      user: me\n      reachability_check: false\n  lab:\n    identity_file: /k/lab\n    hosts:\n      - host: lab1\n        identity_file: /k/lab1\n      - host: lab2\n",
         )
         .unwrap();
         let c = Config::load_files(std::slice::from_ref(&f)).unwrap();
@@ -1400,7 +1400,7 @@ mod tests {
         let dir = crate::testutil::TempDir::new();
         let g = dir.path().join("g.yaml");
         let l = dir.path().join("l.yaml");
-        std::fs::write(&l, "hosts:\n  d:\n    - host: a\n      user: me\n").unwrap();
+        std::fs::write(&l, "aliases:\n  d:\n    - host: a\n      user: me\n").unwrap();
         let files = [g, l.clone()];
         let c = Config::load_files(&files).unwrap();
         let out = show(&c, &files);
@@ -1423,8 +1423,8 @@ mod tests {
         let dir = crate::testutil::TempDir::new();
         let g = dir.path().join("g.yaml");
         let l = dir.path().join("l.yaml");
-        std::fs::write(&g, "hosts:\n  d:\n    identity_file: /etc/k\n    hosts:\n      - host: a\n        identity_file: ~/.ssh/a\n").unwrap();
-        std::fs::write(&l, "hosts:\n  d:\n    identity_file: ~/.ssh/d\n").unwrap();
+        std::fs::write(&g, "aliases:\n  d:\n    identity_file: /etc/k\n    hosts:\n      - host: a\n        identity_file: ~/.ssh/a\n").unwrap();
+        std::fs::write(&l, "aliases:\n  d:\n    identity_file: ~/.ssh/d\n").unwrap();
         let files = [g.clone(), l.clone()];
         let c = Config::load_files(&files).unwrap();
         let out = show(&c, &files);
@@ -1453,7 +1453,7 @@ mod tests {
         std::fs::write(&g, "redraw_on_reconnect: false\n").unwrap();
         std::fs::write(
             &l,
-            "hosts:\n  d:\n    redraw_on_reconnect: true\n    hosts:\n      - host: a\n  e:\n    - host: b\n",
+            "aliases:\n  d:\n    redraw_on_reconnect: true\n    hosts:\n      - host: a\n  e:\n    - host: b\n",
         )
         .unwrap();
         let files = [g.clone(), l.clone()];
@@ -1539,16 +1539,16 @@ mod tests {
         );
         let e = apply("", "set reachability_interval 10ms").unwrap_err();
         assert!(e.contains("at least 100ms"), "{e}");
-        let src = "hosts:\n  d:\n    - host: a\n";
+        let src = "aliases:\n  d:\n    - host: a\n";
         let set = apply(src, "host set d persist true").unwrap();
         let set = apply(&set, "host set d reachability_interval 30s").unwrap();
         assert_eq!(
             set,
-            "hosts:\n  d:\n    reachability_interval: 30s\n    persist: true\n    hosts:\n      - host: a\n"
+            "aliases:\n  d:\n    reachability_interval: 30s\n    persist: true\n    hosts:\n      - host: a\n"
         );
         assert_eq!(
             apply(src, "host add d b --persist").unwrap(),
-            "hosts:\n  d:\n    - host: a\n    - host: b\n      persist: true\n"
+            "aliases:\n  d:\n    - host: a\n    - host: b\n      persist: true\n"
         );
         // Shown with the rest, and read back the same.
         let dir = crate::testutil::TempDir::new();
@@ -1573,11 +1573,11 @@ mod tests {
     /// tried, preferred first.
     #[test]
     fn prefer_is_added_validated_and_listed_in_trial_order() {
-        let src = "hosts:\n  d:\n    - host: a\n";
+        let src = "aliases:\n  d:\n    - host: a\n";
         let added = apply(src, "host add d b --prefer").unwrap();
         assert_eq!(
             added,
-            "hosts:\n  d:\n    - host: a\n    - host: b\n      prefer: true\n"
+            "aliases:\n  d:\n    - host: a\n    - host: b\n      prefer: true\n"
         );
         let dir = crate::testutil::TempDir::new();
         let f = dir.path().join("l.yaml");
@@ -1594,7 +1594,7 @@ mod tests {
             lines[2].starts_with("d      a     -     ping "),
             "{lines:?}"
         );
-        std::fs::write(&f, "hosts:\n  d:\n    - host: a\n      prefer: yes\n").unwrap();
+        std::fs::write(&f, "aliases:\n  d:\n    - host: a\n      prefer: yes\n").unwrap();
         let e = Config::load_files(&[f]).unwrap_err();
         assert!(
             e.contains("prefer: expected true or false, found 'yes' (line 4)"),
@@ -1612,13 +1612,13 @@ mod tests {
         let e = apply("", "set prefer_local_network maybe").unwrap_err();
         assert!(e.contains("true or false"), "{e}");
         let set = apply(
-            "hosts:\n  d:\n    - host: a\n",
+            "aliases:\n  d:\n    - host: a\n",
             "host set d prefer_local_network true",
         )
         .unwrap();
         assert_eq!(
             set,
-            "hosts:\n  d:\n    prefer_local_network: true\n    hosts:\n      - host: a\n"
+            "aliases:\n  d:\n    prefer_local_network: true\n    hosts:\n      - host: a\n"
         );
         let dir = crate::testutil::TempDir::new();
         let f = dir.path().join("l.yaml");
@@ -1634,11 +1634,11 @@ mod tests {
 
     #[test]
     fn host_set_reachability_timeout_on_an_alias() {
-        let src = "hosts:\n  d:\n    - host: a\n";
+        let src = "aliases:\n  d:\n    - host: a\n";
         let set = apply(src, "host set d reachability_timeout 100ms").unwrap();
         assert_eq!(
             set,
-            "hosts:\n  d:\n    reachability_timeout: 100ms\n    hosts:\n      - host: a\n"
+            "aliases:\n  d:\n    reachability_timeout: 100ms\n    hosts:\n      - host: a\n"
         );
         let e = apply(src, "host set d reachability_timeout 0").unwrap_err();
         assert!(e.contains("reachability_timeout: '0' is too short"), "{e}");
@@ -1656,7 +1656,7 @@ mod tests {
         std::fs::write(&g, "").unwrap();
         std::fs::write(
             &l,
-            "hosts:\n  d:\n    reachability_timeout: 1.5\n    hosts:\n      - host: a\n",
+            "aliases:\n  d:\n    reachability_timeout: 1.5\n    hosts:\n      - host: a\n",
         )
         .unwrap();
         let files = [g.clone(), l.clone()];

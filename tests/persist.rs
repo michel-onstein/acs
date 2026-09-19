@@ -35,7 +35,7 @@ fn until(what: &str, f: impl Fn() -> bool) {
 
 const ALIAS: &str = "\
 reachability_interval: 200ms
-hosts:
+aliases:
   devbox:
     - host: devbox.lan
 ";
@@ -109,7 +109,7 @@ fn an_unchecked_host_keeps_the_dial_backoff() {
     let remote = Remote::installed();
     let net = Net::new(&[]);
     let env = net.env(
-        "persist: true\nhosts:\n  devbox:\n    - host: devbox.lan\n      reachability_check: false\n",
+        "persist: true\naliases:\n  devbox:\n    - host: devbox.lan\n      reachability_check: false\n",
     );
     let mut env = refs(&env);
     env.extend([("ACS_PING_MS", "200"), ("ACS_BACKOFF_MS", "100")]);

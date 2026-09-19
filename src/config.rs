@@ -3,7 +3,7 @@
 //! (local, default `~/.config/acs/config.yaml`). Either may be missing.
 //!
 //! Merging: a setting in the local file replaces the global one (an alias's
-//! own settings too); mappings (`hosts`) merge key by key; lists (an
+//! own settings too); mappings (`aliases`) merge key by key; lists (an
 //! alias's hosts) concatenate, global entries first. An empty value (`key:`)
 //! sets nothing.
 //!
@@ -155,7 +155,7 @@ pub const KEYS: &[&str] = &[
     "persist",
     "reachability_interval",
     "prefer_local_network",
-    "hosts",
+    "aliases",
 ];
 
 /// The settings that are true or false.
@@ -270,7 +270,7 @@ impl Config {
     /// name a host.
     pub fn check(&self) -> Result<(), String> {
         match self.hosts.iter().find(|a| a.entries.is_empty()) {
-            Some(a) => Err(format!("{}: hosts.{}: no hosts listed", a.origin, a.name)),
+            Some(a) => Err(format!("{}: aliases.{}: no hosts listed", a.origin, a.name)),
             None => Ok(()),
         }
     }
@@ -315,12 +315,12 @@ impl Config {
                         origin: Some(at(node)),
                     }
                 }
-                "hosts" => {
+                "aliases" => {
                     let aliases = node.value.map().ok_or_else(|| {
                         fail(
                             node,
                             format!(
-                                "hosts: expected a mapping of alias names, found {}",
+                                "aliases: expected a mapping of alias names, found {}",
                                 node.value.kind()
                             ),
                         )
@@ -349,6 +349,13 @@ impl Config {
                         alias.entries.extend(entries);
                         settings.merge_into(alias);
                     }
+                }
+                // Renamed (acs-msy): say so rather than call it unknown.
+                "hosts" => {
+                    return Err(fail(
+                        node,
+                        "'hosts' is now 'aliases': rename the key".into(),
+                    ))
                 }
                 other => {
                     return Err(fail(
@@ -658,7 +665,7 @@ fn alias_parts(
     node: &Node,
     at: &dyn Fn(&Node) -> Origin,
 ) -> Result<(Vec<HostEntry>, AliasSettings), String> {
-    let fail = |n: &Node, msg: String| format!("{}: hosts.{name}: {msg}", at(n));
+    let fail = |n: &Node, msg: String| format!("{}: aliases.{name}: {msg}", at(n));
     let mut settings = AliasSettings::default();
     let list = match &node.value {
         Value::Map(m) if !m.iter().any(|(k, _)| k == "host") => {
@@ -867,8 +874,8 @@ mod tests {
 
     #[test]
     fn host_maps_merge_and_lists_concatenate() {
-        let g = "hosts:\n  devbox:\n    - host: devbox.lan\n  nas:\n    - host: nas.lan\n      reachability_check: false\n";
-        let l = "hosts:\n  devbox:\n    - host: devbox.example.com\n      user: me\n  pi:\n    host: pi.lan\n";
+        let g = "aliases:\n  devbox:\n    - host: devbox.lan\n  nas:\n    - host: nas.lan\n      reachability_check: false\n";
+        let l = "aliases:\n  devbox:\n    - host: devbox.example.com\n      user: me\n  pi:\n    host: pi.lan\n";
         let c = load(g, l).unwrap();
         assert_eq!(
             hosts(&c, "devbox"),
@@ -897,32 +904,37 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, hosts)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, aliases)",
             ),
-            ("hosts: [a]\n", ":1: hosts: expected a mapping"),
+            ("aliases: [a]\n", ":1: aliases: expected a mapping"),
+            // acs-msy: the old name of the key says what it is now.
             (
-                "hosts:\n  d: foo\n",
-                ":2: hosts.d: expected a list of hosts",
-            ),
-            (
-                "hosts:\n  d:\n    - user: me\n",
-                ":3: hosts.d: a host entry needs 'host: <name>'",
+                "command_bell: false\nhosts:\n  d:\n    - host: a\n",
+                ":2: 'hosts' is now 'aliases': rename the key",
             ),
             (
-                "hosts:\n  d:\n    - host: a\n      port: 22\n",
-                ":3: hosts.d: unknown key 'port'",
+                "aliases:\n  d: foo\n",
+                ":2: aliases.d: expected a list of hosts",
             ),
             (
-                "hosts:\n  d:\n    - host: me@a\n",
-                ":3: hosts.d: host: bad host name",
+                "aliases:\n  d:\n    - user: me\n",
+                ":3: aliases.d: a host entry needs 'host: <name>'",
             ),
             (
-                "hosts:\n  d:\n    - host: a\n      reachability_check: 1\n",
+                "aliases:\n  d:\n    - host: a\n      port: 22\n",
+                ":3: aliases.d: unknown key 'port'",
+            ),
+            (
+                "aliases:\n  d:\n    - host: me@a\n",
+                ":3: aliases.d: host: bad host name",
+            ),
+            (
+                "aliases:\n  d:\n    - host: a\n      reachability_check: 1\n",
                 "reachability_check: expected true or false, found '1' (line 4)",
             ),
-            ("hosts:\n  d: []\n", ":2: hosts.d: no hosts listed"),
+            ("aliases:\n  d: []\n", ":2: aliases.d: no hosts listed"),
             (
-                "hosts:\n  a@b:\n    - host: x\n",
+                "aliases:\n  a@b:\n    - host: x\n",
                 ":2: bad alias name 'a@b'",
             ),
             ("- 1\n", ":1: expected settings as 'key: value' lines"),
@@ -945,7 +957,7 @@ mod tests {
     #[test]
     fn identity_files_at_the_alias_and_the_entry() {
         let l = "\
-hosts:
+aliases:
   devbox:
     identity_file: ~/.ssh/id_devbox
     hosts:
@@ -983,9 +995,9 @@ hosts:
 
     #[test]
     fn the_local_alias_identity_replaces_the_global_one() {
-        let g = "hosts:\n  devbox:\n    identity_file: /etc/key\n    hosts:\n      - host: devbox.lan\n";
+        let g = "aliases:\n  devbox:\n    identity_file: /etc/key\n    hosts:\n      - host: devbox.lan\n";
         // A file may set only the alias's key, over another file's hosts.
-        let l = "hosts:\n  devbox:\n    identity_file: ~/.ssh/mine\n";
+        let l = "aliases:\n  devbox:\n    identity_file: ~/.ssh/mine\n";
         let c = load(g, l).unwrap();
         let d = c.alias("devbox").unwrap();
         assert_eq!(
@@ -996,12 +1008,12 @@ hosts:
         assert!(d.origin.file.ends_with("global.yaml"));
 
         // An empty value sets nothing; a list adds hosts and keeps the key.
-        let c = load(g, "hosts:\n  devbox:\n    identity_file:\n").unwrap();
+        let c = load(g, "aliases:\n  devbox:\n    identity_file:\n").unwrap();
         assert_eq!(
             identity(&c.alias("devbox").unwrap().identity_file).as_deref(),
             Some("/etc/key@global.yaml:3")
         );
-        let c = load(g, "hosts:\n  devbox:\n    - host: devbox.example.com\n").unwrap();
+        let c = load(g, "aliases:\n  devbox:\n    - host: devbox.example.com\n").unwrap();
         assert_eq!(
             c.alias("devbox")
                 .unwrap()
@@ -1016,18 +1028,18 @@ hosts:
 
     #[test]
     fn an_alias_needs_a_host_in_some_file() {
-        let e = load("", "hosts:\n  devbox:\n    identity_file: ~/.ssh/k\n").unwrap_err();
+        let e = load("", "aliases:\n  devbox:\n    identity_file: ~/.ssh/k\n").unwrap_err();
         assert!(
-            e.contains("local.yaml:2: hosts.devbox: no hosts listed"),
+            e.contains("local.yaml:2: aliases.devbox: no hosts listed"),
             "{e}"
         );
         let e = load(
             "",
-            "hosts:\n  devbox:\n    identity_file: k\n    hosts: []\n",
+            "aliases:\n  devbox:\n    identity_file: k\n    hosts: []\n",
         )
         .unwrap_err();
         assert!(
-            e.contains("local.yaml:4: hosts.devbox: no hosts listed"),
+            e.contains("local.yaml:4: aliases.devbox: no hosts listed"),
             "{e}"
         );
     }
@@ -1036,24 +1048,24 @@ hosts:
     fn identity_file_errors_name_the_file_and_line() {
         let cases: &[(&str, &str)] = &[
             (
-                "hosts:\n  d:\n    identity_file: [a, b]\n    hosts:\n      - host: a\n",
-                ":3: hosts.d: identity_file: expected a file path, found a list",
+                "aliases:\n  d:\n    identity_file: [a, b]\n    hosts:\n      - host: a\n",
+                ":3: aliases.d: identity_file: expected a file path, found a list",
             ),
             (
-                "hosts:\n  d:\n    identity_file: \"\"\n",
-                ":3: hosts.d: identity_file: expected a file path, found an empty string",
+                "aliases:\n  d:\n    identity_file: \"\"\n",
+                ":3: aliases.d: identity_file: expected a file path, found an empty string",
             ),
             (
-                "hosts:\n  d:\n    user: me\n",
-                ":3: hosts.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, hosts; a single host entry needs 'host: <name>')",
+                "aliases:\n  d:\n    user: me\n",
+                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, hosts; a single host entry needs 'host: <name>')",
             ),
             (
-                "hosts:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
-                ":3: hosts.d: identity_file: expected a file path, found a mapping (line 4)",
+                "aliases:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
+                ":3: aliases.d: identity_file: expected a file path, found a mapping (line 4)",
             ),
             (
-                "hosts:\n  d:\n    hosts: x\n",
-                ":3: hosts.d: expected a list of hosts",
+                "aliases:\n  d:\n    hosts: x\n",
+                ":3: aliases.d: expected a list of hosts",
             ),
         ];
         for (src, want) in cases {
@@ -1069,12 +1081,12 @@ hosts:
             format!("{}@{line}", s.value)
         };
         // Nothing set: on.
-        let c = load("", "hosts:\n  d:\n    - host: a\n").unwrap();
+        let c = load("", "aliases:\n  d:\n    - host: a\n").unwrap();
         assert_eq!(at(c.redraw_on_reconnect_for(Some("d"))), "true@0");
         assert_eq!(at(c.redraw_on_reconnect_for(None)), "true@0");
 
-        let g = "redraw_on_reconnect: false\nhosts:\n  d:\n    - host: a\n  e:\n    - host: b\n";
-        let l = "hosts:\n  d:\n    redraw_on_reconnect: true\n";
+        let g = "redraw_on_reconnect: false\naliases:\n  d:\n    - host: a\n  e:\n    - host: b\n";
+        let l = "aliases:\n  d:\n    redraw_on_reconnect: true\n";
         let c = load(g, l).unwrap();
         // The alias's own setting wins, as `user@<alias>` too; an alias
         // without one, a plain host and an unknown name take the global one.
@@ -1097,20 +1109,20 @@ hosts:
 
         // The local file's alias setting replaces the global file's; an
         // empty value sets nothing.
-        let g = "hosts:\n  d:\n    redraw_on_reconnect: false\n    hosts: [{host: a}]\n";
-        let c = load(g, "hosts:\n  d:\n    redraw_on_reconnect: true\n").unwrap();
+        let g = "aliases:\n  d:\n    redraw_on_reconnect: false\n    hosts: [{host: a}]\n";
+        let c = load(g, "aliases:\n  d:\n    redraw_on_reconnect: true\n").unwrap();
         assert_eq!(at(c.redraw_on_reconnect_for(Some("d"))), "true@3");
-        let c = load(g, "hosts:\n  d:\n    redraw_on_reconnect:\n").unwrap();
+        let c = load(g, "aliases:\n  d:\n    redraw_on_reconnect:\n").unwrap();
         assert_eq!(at(c.redraw_on_reconnect_for(Some("d"))), "false@3");
 
         let e = load(
             "",
-            "hosts:\n  d:\n    redraw_on_reconnect: 0\n    hosts: [{host: a}]\n",
+            "aliases:\n  d:\n    redraw_on_reconnect: 0\n    hosts: [{host: a}]\n",
         )
         .unwrap_err();
         assert!(
             e.contains(
-                "local.yaml:3: hosts.d: redraw_on_reconnect: expected true or false, found '0'"
+                "local.yaml:3: aliases.d: redraw_on_reconnect: expected true or false, found '0'"
             ),
             "{e}"
         );
@@ -1133,12 +1145,12 @@ hosts:
 
     #[test]
     fn persist_at_every_level_and_reachability_interval() {
-        let c = load("", "hosts:\n  a: [{host: a1}]\n").unwrap();
+        let c = load("", "aliases:\n  a: [{host: a1}]\n").unwrap();
         assert!(!c.persist.value);
         assert_eq!(c.reachability_interval.value, Duration::from_secs(5));
         let c = load(
             "persist: true\nreachability_interval: 10s\n",
-            "hosts:\n  a:\n    persist: false\n    reachability_interval: 1s\n    hosts:\n      - host: a1\n        persist: true\n      - host: a2\n",
+            "aliases:\n  a:\n    persist: false\n    reachability_interval: 1s\n    hosts:\n      - host: a1\n        persist: true\n      - host: a2\n",
         )
         .unwrap();
         let a = c.alias("a").unwrap();
@@ -1174,7 +1186,7 @@ hosts:
             ),
             ("persist: yes\n", "persist: expected true or false"),
             (
-                "hosts:\n  d:\n    - host: a\n      persist: 1\n",
+                "aliases:\n  d:\n    - host: a\n      persist: 1\n",
                 "persist: expected true or false, found '1' (line 4)",
             ),
         ] {
@@ -1189,11 +1201,11 @@ hosts:
 
     #[test]
     fn reachability_timeout_globally_and_per_alias() {
-        let c = load("", "hosts:\n  a: [{host: a1}]\n").unwrap();
+        let c = load("", "aliases:\n  a: [{host: a1}]\n").unwrap();
         assert_eq!(c.reachability_timeout.value, Duration::from_millis(500));
         assert_eq!(c.reachability_timeout.origin, None);
         let c = load(
-            "reachability_timeout: 2s\nhosts:\n  a:\n    reachability_timeout: 250ms\n    hosts: [{host: a1}]\n  b: [{host: b1}]\n",
+            "reachability_timeout: 2s\naliases:\n  a:\n    reachability_timeout: 250ms\n    hosts: [{host: a1}]\n  b: [{host: b1}]\n",
             "reachability_timeout: 1.5\n",
         )
         .unwrap();
@@ -1208,8 +1220,8 @@ hosts:
         assert_eq!(b.value, Duration::from_millis(1500));
         // Set on an alias whose hosts are in the other file.
         let c = load(
-            "hosts:\n  a: [{host: a1}]\n",
-            "hosts:\n  a:\n    reachability_timeout: 3s\n",
+            "aliases:\n  a: [{host: a1}]\n",
+            "aliases:\n  a:\n    reachability_timeout: 3s\n",
         )
         .unwrap();
         let a = c.alias("a").unwrap();
@@ -1267,8 +1279,8 @@ hosts:
                 ":1: reachability_timeout: expected a duration such as 500ms or 2s, found a list",
             ),
             (
-                "hosts:\n  d:\n    reachability_timeout: 0ms\n    hosts: [{host: a}]\n",
-                ":3: hosts.d: reachability_timeout: '0ms' is too short: at least 1ms",
+                "aliases:\n  d:\n    reachability_timeout: 0ms\n    hosts: [{host: a}]\n",
+                ":3: aliases.d: reachability_timeout: '0ms' is too short: at least 1ms",
             ),
         ] {
             let e = load("", local).unwrap_err();

@@ -1013,7 +1013,7 @@ mod tests {
             "\
 persist: true
 reachability_interval: 7s
-hosts:
+aliases:
   off:
     persist: false
     reachability_interval: 300ms

@@ -96,7 +96,7 @@ fn host_add_list_and_remove() {
     );
     assert_eq!(
         std::fs::read_to_string(h.local()).unwrap(),
-        "hosts:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n      user: me\n      reachability_check: false\n"
+        "aliases:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n      user: me\n      reachability_check: false\n"
     );
     let list = h.ok(&["config", "host", "list"]);
     let lines: Vec<&str> = list.lines().collect();
@@ -140,7 +140,7 @@ fn set_get_unset_keep_the_rest_of_the_file() {
     std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
     std::fs::write(
         h.local(),
-        "# my settings\ninstall_on_remote: true   # for now\n\nhosts:\n    nas:   # 4-space indent\n        - host: nas.lan\n",
+        "# my settings\ninstall_on_remote: true   # for now\n\naliases:\n    nas:   # 4-space indent\n        - host: nas.lan\n",
     )
     .unwrap();
     assert_eq!(h.ok(&["config", "get", "install_on_remote"]), "true\n");
@@ -149,13 +149,13 @@ fn set_get_unset_keep_the_rest_of_the_file() {
     // Comments, blank lines and order survive; indentation becomes 2.
     assert_eq!(
         std::fs::read_to_string(h.local()).unwrap(),
-        "# my settings\ninstall_on_remote: false # for now\n\nhosts:\n  nas: # 4-space indent\n    - host: nas.lan\n"
+        "# my settings\ninstall_on_remote: false # for now\n\naliases:\n  nas: # 4-space indent\n    - host: nas.lan\n"
     );
     h.ok(&["config", "unset", "install_on_remote"]);
     assert_eq!(h.ok(&["config", "get", "install_on_remote"]), "true\n");
     assert_eq!(
         std::fs::read_to_string(h.local()).unwrap(),
-        "# my settings\n\nhosts:\n  nas: # 4-space indent\n    - host: nas.lan\n"
+        "# my settings\n\naliases:\n  nas: # 4-space indent\n    - host: nas.lan\n"
     );
 }
 
@@ -210,7 +210,7 @@ fn global_edits_and_merged_views() {
     h.ok(&["config", "host", "add", "devbox", "a.lan"]);
     assert_eq!(
         std::fs::read_to_string(h.global()).unwrap(),
-        "install_on_remote: false\nhosts:\n  devbox:\n    - host: b.lan\n"
+        "install_on_remote: false\naliases:\n  devbox:\n    - host: b.lan\n"
     );
     assert_eq!(h.ok(&["config", "get", "install_on_remote"]), "false\n");
 
@@ -290,7 +290,7 @@ fn identity_files_for_a_host_and_for_an_alias() {
     );
     assert_eq!(
         std::fs::read_to_string(h.local()).unwrap(),
-        "hosts:\n  devbox:\n    identity_file: ~/.ssh/id_devbox\n"
+        "aliases:\n  devbox:\n    identity_file: ~/.ssh/id_devbox\n"
     );
 
     // Each host with the key it is reached with.
@@ -315,7 +315,7 @@ fn identity_files_for_a_host_and_for_an_alias() {
     h.fails(
         &["config", "--global", "host", "remove", "devbox"],
         2,
-        "config.yaml:2: hosts.devbox: no hosts listed once this edit is made (not saved)",
+        "config.yaml:2: aliases.devbox: no hosts listed once this edit is made (not saved)",
     );
     assert!(std::fs::read_to_string(h.global())
         .unwrap()
@@ -353,7 +353,7 @@ fn redraw_on_reconnect_globally_and_for_an_alias() {
     );
     assert_eq!(
         std::fs::read_to_string(h.local()).unwrap(),
-        "redraw_on_reconnect: false\nhosts:\n  devbox:\n    redraw_on_reconnect: true\n    hosts:\n      - host: devbox.lan\n"
+        "redraw_on_reconnect: false\naliases:\n  devbox:\n    redraw_on_reconnect: true\n    hosts:\n      - host: devbox.lan\n"
     );
     let show = h.ok(&["config", "show"]);
     let l = "~/.config/acs/config.yaml";
@@ -383,7 +383,7 @@ fn redraw_on_reconnect_globally_and_for_an_alias() {
     h.ok(&["config", "unset", "redraw_on_reconnect"]);
     assert_eq!(
         std::fs::read_to_string(h.local()).unwrap(),
-        "hosts:\n  devbox:\n    - host: devbox.lan\n"
+        "aliases:\n  devbox:\n    - host: devbox.lan\n"
     );
 }
 
@@ -393,18 +393,18 @@ fn an_alias_with_a_key_but_no_hosts_is_an_error() {
     std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
     std::fs::write(
         h.local(),
-        "hosts:\n  devbox:\n    identity_file: ~/.ssh/k\n",
+        "aliases:\n  devbox:\n    identity_file: ~/.ssh/k\n",
     )
     .unwrap();
     h.fails(
         &["config", "show"],
         2,
-        "config.yaml:2: hosts.devbox: no hosts listed",
+        "config.yaml:2: aliases.devbox: no hosts listed",
     );
     // The client refuses it too, before any ssh.
     let (code, _, err) = h.run(&["devbox"]);
     assert_eq!(code, 2, "{err}");
-    assert!(err.contains("hosts.devbox: no hosts listed"), "{err}");
+    assert!(err.contains("aliases.devbox: no hosts listed"), "{err}");
 }
 
 #[test]

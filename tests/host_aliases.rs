@@ -8,7 +8,7 @@ mod common;
 use common::*;
 
 const CONFIG: &str = "\
-hosts:
+aliases:
   devbox:
     - host: devbox.lan
     - host: devbox.example.com
@@ -84,7 +84,7 @@ fn a_host_slower_than_the_deadline_is_passed_over() {
     net.set_slow(&["devbox.lan"]);
     let config = "\
 reachability_timeout: 20s
-hosts:
+aliases:
   devbox:
     reachability_timeout: 5s
     hosts:
@@ -236,7 +236,7 @@ fn a_redial_of_user_at_alias_keeps_the_user() {
 
 /// devbox's first host has its own key; the second takes the alias's.
 const KEYED: &str = "\
-hosts:
+aliases:
   devbox:
     identity_file: /keys/devbox
     hosts:

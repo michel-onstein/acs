@@ -48,7 +48,14 @@ fn attached_to(c: &mut Client, name: &str) {
 /// The last screen the menu drew.
 fn last_screen(c: &Client) -> String {
     let text = c.text();
-    text[text.rfind("\x1b[Hacs: ").expect("no menu drawn")..].to_string()
+    // The last one drawn in full: a redraw may be read half-way, so skip
+    // one that has not reached its closing erase yet.
+    let mut screens: Vec<&str> = text.split("\x1b[Hacs: ").skip(1).collect();
+    if screens.last().is_some_and(|s| !s.contains("\x1b[J")) && screens.len() > 1 {
+        screens.pop();
+    }
+    let last = screens.last().expect("no menu drawn");
+    format!("\x1b[Hacs: {last}")
 }
 
 #[test]
@@ -188,7 +195,7 @@ fn an_alias_is_resolved_once_for_the_list_and_the_attach() {
     let ssh = Ssh::new(&[("you@devbox.lan", &remote)]);
     let net = Net::new(&["devbox.lan", "devbox.example.com"]);
     let env =
-        net.env("hosts:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n");
+        net.env("aliases:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n");
     let path = ssh.path().display().to_string();
     let mut c = Client::spawn(&exe(), &["--ssh", &path, "you@devbox"], &refs(&env));
     c.wait_for("\x1b[?1049h", T);
@@ -295,7 +302,7 @@ fn without_a_terminal_for_the_menu_it_attaches_main() {
 // ---- acs list in a terminal: every host (acs-uxj) ---------------------------
 
 const TWO_HOSTS: &str = "\
-hosts:
+aliases:
   devbox:
     - host: devbox.lan
   nas:

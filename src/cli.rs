@@ -48,7 +48,7 @@ environment: ACS_DEFAULT_SESSION ACS_IDENTITY ACS_ESCAPE_KEY ACS_ESCAPE_TIMEOUT_
              ACS_COMMAND_BELL ACS_PERSIST ACS_SSH ACS_SOCKET_DIR
 
 configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml;
-               the <host> of [user@]<host> may be an alias defined there (hosts:)";
+               the <host> of [user@]<host> may be an alias defined there (aliases:)";
 
 /// Which session the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]

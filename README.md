@@ -240,7 +240,7 @@ update_check: false        # never look for a newer release (default: true)
 command_bell: false        # no bell when Ctrl-] Ctrl-] arms (default: true)
 redraw_on_reconnect: true  # Ctrl-L after reconnecting (default: true)
 reachability_timeout: 1s   # how long hosts have to answer a ping (default: 500ms)
-hosts:
+aliases:
   devbox:                  # acs devbox
     - host: devbox.lan     # at home: used if it answers a ping
     - host: devbox.example.com
@@ -276,7 +276,7 @@ into it (`host unset` of its last setting turns it back into a list).
 | `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
 | `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
-| `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer` and `persist` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`) and its `hosts` |
+| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer` and `persist` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`) and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
