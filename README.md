@@ -182,6 +182,21 @@ disconnected a status line shows at the bottom of the screen, typed keys are
 dropped, and Ctrl-] Ctrl-] `d` still detaches. `--no-reconnect` exits
 instead.
 
+### Never giving up on a host
+
+acs gives up (exit 255) where there is no session to keep: the host
+cannot be reached at the start, or the link drops before the session was
+attached. With `--persist` (or `persist: true` in the configuration, or
+`ACS_PERSIST=1`) it never gives up on a host: it pings it every 5 seconds
+(`reachability_interval`) and dials as soon as it answers — at the start as
+after a drop, where the ping replaces the backoff. It pings an alias's
+hosts as it does to choose one, and a plain host itself; an alias whose
+hosts all have `reachability_check: false` cannot be pinged and keeps the
+backoff. Before the session exists, Ctrl-C gives up; after, Ctrl-] Ctrl-]
+`d` detaches as usual. `persist` can be set globally, on an alias, or on
+one of its hosts (the host's wins over the alias's, which wins over the
+global one); `--persist` wins over all of them.
+
 ### Ctrl-L after reconnecting
 
 Whenever acs attaches to a session that was already running — resuming
@@ -250,6 +265,8 @@ hosts:
 | `command_bell` | ring the terminal bell when Ctrl-] Ctrl-] arms command mode (default `true`; `ACS_COMMAND_BELL` overrides it) |
 | `redraw_on_reconnect` | send Ctrl-L after reconnecting to a session (default `true`); an alias's own value wins, and `ACS_REDRAW_ON_RECONNECT` over both |
 | `reachability_timeout` | how long an alias's hosts have to answer a ping: `500ms`, `0.5s`, `2s`, up to `60s` (default `500ms`); an alias's own value wins |
+| `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
+| `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file` and `reachability_check` (default `true`) — or to a mapping of the alias's own `identity_file`, `redraw_on_reconnect` and `reachability_timeout` and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
@@ -330,12 +347,15 @@ acs config host set lab identity_file ~/.ssh/id_lab   # the alias's key
 acs config host unset lab identity_file
 acs config host set lab redraw_on_reconnect false     # no Ctrl-L for lab
 acs config host set lab reachability_timeout 2s       # lab's hosts may take 2 s
+acs config host set lab persist true                  # never give up on lab
+acs config host add nas nas.lan --persist             # nor on this host of nas
 acs config host list                                  # aliases, hosts and keys
 acs config host remove devbox devbox.lan              # one host, or the alias
 acs config set install_on_remote false
 acs config set update_check false                     # no weekly release check
 acs config set command_bell false                     # no bell for command mode
 acs config set redraw_on_reconnect false              # no Ctrl-L on reconnect
+acs config set reachability_interval 10s              # ping a lost host every 10 s
 acs config set reachability_timeout 250ms             # pings must answer within 250 ms
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default
@@ -358,6 +378,7 @@ reached as `user@config`.
 | `ACS_ESCAPE_TIMEOUT_MS` | window for the double press (default 400) |
 | `ACS_COMMAND_BELL` | `0`: no bell when command mode arms; `1`: a bell even if the configuration turns it off |
 | `ACS_REDRAW_ON_RECONNECT` | `0`: no Ctrl-L after reconnecting; `1`: a Ctrl-L even if the configuration (global or the alias's) turns it off |
+| `ACS_PERSIST` | `1`: never give up on a lost host (as `--persist`); `0`: give up as by default, whatever the configuration says |
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
