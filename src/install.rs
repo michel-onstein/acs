@@ -291,7 +291,7 @@ fn finish(f: &Finish) -> Result<(), String> {
 }
 
 fn write_exe(path: &Path, parts: &[&[u8]]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -301,7 +301,11 @@ fn write_exe(path: &Path, parts: &[&[u8]]) -> Result<(), String> {
     for p in parts {
         f.write_all(p).map_err(|e| e.to_string())?;
     }
-    f.sync_all().map_err(|e| e.to_string())
+    f.sync_all().map_err(|e| e.to_string())?;
+    // The mode above is masked by the remote's umask (077 leaves 0700), so
+    // set it for real, as the self-copy path does (acs-28b).
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn rename(from: &Path, to: &Path) -> Result<(), String> {
