@@ -90,6 +90,9 @@ pub struct Alias {
     /// Keep waiting for a lost host; `None` leaves it to the global
     /// setting.
     pub persist: Option<Setting<bool>>,
+    /// Try first the hosts on a network this machine is on; `None` leaves
+    /// it to the global setting.
+    pub prefer_local_network: Option<Setting<bool>>,
     /// How often to ping a lost host while waiting; `None` leaves it to the
     /// global setting.
     pub reachability_interval: Option<Setting<Duration>>,
@@ -114,6 +117,9 @@ pub struct Config {
     /// Keep waiting for a lost host, dialling once it answers a ping
     /// (default false; DESIGN §5.3).
     pub persist: Setting<bool>,
+    /// Try an alias's hosts on a network this machine is on first (default
+    /// false; DESIGN §7.3).
+    pub prefer_local_network: Setting<bool>,
     /// How often a lost host is pinged while waiting (default 5 s).
     pub reachability_interval: Setting<Duration>,
     /// Aliases in the order first defined, each with its hosts in order.
@@ -131,6 +137,7 @@ impl Default for Config {
             redraw_on_reconnect: Setting::default(true),
             reachability_timeout: Setting::default(DEFAULT_REACHABILITY_TIMEOUT),
             persist: Setting::default(false),
+            prefer_local_network: Setting::default(false),
             reachability_interval: Setting::default(DEFAULT_REACHABILITY_INTERVAL),
             hosts: Vec::new(),
             files: Vec::new(),
@@ -147,6 +154,7 @@ pub const KEYS: &[&str] = &[
     "reachability_timeout",
     "persist",
     "reachability_interval",
+    "prefer_local_network",
     "hosts",
 ];
 
@@ -157,6 +165,7 @@ pub const BOOLS: &[&str] = &[
     "command_bell",
     "redraw_on_reconnect",
     "persist",
+    "prefer_local_network",
 ];
 
 /// Every key of a host entry.
@@ -177,11 +186,12 @@ pub const ALIAS_KEYS: &[&str] = &[
     "reachability_timeout",
     "persist",
     "reachability_interval",
+    "prefer_local_network",
     "hosts",
 ];
 
 /// The alias settings that are true or false.
-pub const ALIAS_BOOLS: &[&str] = &["redraw_on_reconnect", "persist"];
+pub const ALIAS_BOOLS: &[&str] = &["redraw_on_reconnect", "persist", "prefer_local_network"];
 
 /// The settings, global or an alias's, that are a duration.
 pub const DURATIONS: &[&str] = &["reachability_timeout", "reachability_interval"];
@@ -328,6 +338,7 @@ impl Config {
                                     redraw_on_reconnect: None,
                                     reachability_timeout: None,
                                     persist: None,
+                                    prefer_local_network: None,
                                     reachability_interval: None,
                                     origin: at(n),
                                 });
@@ -358,6 +369,7 @@ impl Config {
             "command_bell" => Some(&self.command_bell),
             "redraw_on_reconnect" => Some(&self.redraw_on_reconnect),
             "persist" => Some(&self.persist),
+            "prefer_local_network" => Some(&self.prefer_local_network),
             _ => None,
         }
     }
@@ -369,6 +381,7 @@ impl Config {
             "command_bell" => Some(&mut self.command_bell),
             "redraw_on_reconnect" => Some(&mut self.redraw_on_reconnect),
             "persist" => Some(&mut self.persist),
+            "prefer_local_network" => Some(&mut self.prefer_local_network),
             _ => None,
         }
     }
@@ -437,6 +450,15 @@ impl Config {
             .and_then(|e| e.persist.as_ref())
             .or_else(|| alias.and_then(|a| a.persist.as_ref()))
             .unwrap_or(&self.persist)
+    }
+
+    /// `prefer_local_network` for `alias`: its own setting, else the global
+    /// one.
+    pub fn prefer_local_network_for<'a>(&'a self, alias: &'a Alias) -> &'a Setting<bool> {
+        alias
+            .prefer_local_network
+            .as_ref()
+            .unwrap_or(&self.prefer_local_network)
     }
 }
 
@@ -591,6 +613,7 @@ struct AliasSettings {
     reachability_timeout: Option<Setting<Duration>>,
     persist: Option<Setting<bool>>,
     reachability_interval: Option<Setting<Duration>>,
+    prefer_local_network: Option<Setting<bool>>,
 }
 
 impl AliasSettings {
@@ -598,6 +621,7 @@ impl AliasSettings {
         match key {
             "redraw_on_reconnect" => &mut self.redraw_on_reconnect,
             "persist" => &mut self.persist,
+            "prefer_local_network" => &mut self.prefer_local_network,
             other => unreachable!("not an alias bool: {other}"),
         }
     }
@@ -621,6 +645,7 @@ impl AliasSettings {
         over(&mut alias.redraw_on_reconnect, self.redraw_on_reconnect);
         over(&mut alias.reachability_timeout, self.reachability_timeout);
         over(&mut alias.persist, self.persist);
+        over(&mut alias.prefer_local_network, self.prefer_local_network);
         over(&mut alias.reachability_interval, self.reachability_interval);
     }
 }
@@ -872,7 +897,7 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, hosts)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, hosts)",
             ),
             ("hosts: [a]\n", ":1: hosts: expected a mapping"),
             (
@@ -1020,7 +1045,7 @@ hosts:
             ),
             (
                 "hosts:\n  d:\n    user: me\n",
-                ":3: hosts.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, hosts; a single host entry needs 'host: <name>')",
+                ":3: hosts.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, hosts; a single host entry needs 'host: <name>')",
             ),
             (
                 "hosts:\n  d:\n    - host: a\n      identity_file: {k: v}\n",

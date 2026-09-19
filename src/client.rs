@@ -195,6 +195,7 @@ pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
         name,
         &args.config,
         std::sync::Arc::new(crate::alias::ping),
+        &crate::netmatch::system,
         &mut |m| {
             if verbose {
                 note(&m)

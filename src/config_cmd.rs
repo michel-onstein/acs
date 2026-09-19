@@ -35,9 +35,12 @@ settings: install_on_remote, update_check, command_bell, redraw_on_reconnect,
           persist (true|false: keep waiting for a lost host; default false),
           reachability_timeout (how long an alias's hosts have to answer a ping:
           500ms, 0.5s, 2s; default 500ms),
-          reachability_interval (how often a lost host is pinged; default 5s)
+          reachability_interval (how often a lost host is pinged; default 5s),
+          prefer_local_network (true|false: try an alias's hosts on a network
+          this machine is on first; default false)
 alias settings: identity_file <key> (the ssh key of its hosts that name none),
-                redraw_on_reconnect, persist (true|false, over the global setting),
+                redraw_on_reconnect, persist, prefer_local_network
+                (true|false, over the global setting),
                 reachability_timeout, reachability_interval (over the global setting)
 precedence of the ssh key: -i, then the host's identity_file, then the alias's";
 
@@ -455,14 +458,19 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
                 ));
             }
         }
-        if let Some(p) = &a.persist {
-            settings.push((
-                "persist".to_string(),
-                Node {
-                    comment: Some(from(&p.origin)),
-                    ..Node::bool(p.value)
-                },
-            ));
+        for (key, b) in [
+            ("persist", &a.persist),
+            ("prefer_local_network", &a.prefer_local_network),
+        ] {
+            if let Some(p) = b {
+                settings.push((
+                    key.to_string(),
+                    Node {
+                        comment: Some(from(&p.origin)),
+                        ..Node::bool(p.value)
+                    },
+                ));
+            }
         }
         let node = if settings.is_empty() {
             list
@@ -1311,7 +1319,7 @@ mod tests {
         );
         let e = parse(&args("host set d command_bell false")).unwrap_err();
         assert!(
-            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval)"),
+            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network)"),
             "{e}"
         );
     }
@@ -1515,7 +1523,7 @@ mod tests {
         );
         let e = apply("", "set nope 1").unwrap_err();
         assert!(
-            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval)"),
+            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network)"),
             "{e}"
         );
     }
@@ -1592,6 +1600,36 @@ mod tests {
             e.contains("prefer: expected true or false, found 'yes' (line 4)"),
             "{e}"
         );
+    }
+
+    /// acs-sia: prefer_local_network, global and per alias, typed and shown.
+    #[test]
+    fn prefer_local_network_is_global_and_per_alias() {
+        assert_eq!(
+            apply("", "set prefer_local_network true").unwrap(),
+            "prefer_local_network: true\n"
+        );
+        let e = apply("", "set prefer_local_network maybe").unwrap_err();
+        assert!(e.contains("true or false"), "{e}");
+        let set = apply(
+            "hosts:\n  d:\n    - host: a\n",
+            "host set d prefer_local_network true",
+        )
+        .unwrap();
+        assert_eq!(
+            set,
+            "hosts:\n  d:\n    prefer_local_network: true\n    hosts:\n      - host: a\n"
+        );
+        let dir = crate::testutil::TempDir::new();
+        let f = dir.path().join("l.yaml");
+        std::fs::write(&f, format!("prefer_local_network: false\n{set}")).unwrap();
+        let c = Config::load_files(std::slice::from_ref(&f)).unwrap();
+        let d = c.alias("d").unwrap();
+        assert!(c.prefer_local_network_for(d).value);
+        assert!(!c.prefer_local_network.value);
+        let out = show(&c, &[dir.path().join("none.yaml"), f]);
+        assert!(out.contains("prefer_local_network: false # "), "{out}");
+        assert!(out.contains("    prefer_local_network: true # "), "{out}");
     }
 
     #[test]
