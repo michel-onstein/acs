@@ -61,19 +61,25 @@ impl Net {
         let n = Net {
             dir: TempDir::new(),
         };
-        let ping = n.ping();
-        std::fs::write(
-            &ping,
+        let body = |ipv4_only: bool| {
+            // macOS ping is IPv4-only: it exits 68 (EX_NOHOST) for an IPv6
+            // address, and ping6 answers for those instead (acs-4pv).
+            let refuse = match ipv4_only {
+                true => "case \"$h\" in *:*) exit 68 ;; esac\n",
+                false => "",
+            };
             format!(
-                "#!/bin/sh\nfor h; do :; done\necho \"$h\" >> '{log}'\nif grep -qx \"$h\" '{slow}'; then sleep 30; fi\ngrep -qx \"$h\" '{up}'\n",
+                "#!/bin/sh\nfor h; do :; done\necho \"$h\" >> '{log}'\n{refuse}if grep -qx \"$h\" '{slow}'; then sleep 30; fi\ngrep -qx \"$h\" '{up}'\n",
                 log = n.pinged_file().display(),
                 slow = n.slow_file().display(),
                 up = n.up_file().display()
-            ),
-        )
-        .unwrap();
+            )
+        };
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&ping, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (path, ipv4_only) in [(n.ping(), true), (n.ping6(), false)] {
+            std::fs::write(&path, body(ipv4_only)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         n.set_up(up);
         n.set_slow(&[]);
         n
@@ -92,6 +98,10 @@ impl Net {
 
     fn ping(&self) -> PathBuf {
         self.dir.path().join("ping")
+    }
+
+    fn ping6(&self) -> PathBuf {
+        self.dir.path().join("ping6")
     }
 
     fn up_file(&self) -> PathBuf {
@@ -132,6 +142,7 @@ impl Net {
         };
         let mut env = config_env(self.dir.path(), &config);
         env.push(("ACS_PING".into(), self.ping().display().to_string()));
+        env.push(("ACS_PING6".into(), self.ping6().display().to_string()));
         env
     }
 }

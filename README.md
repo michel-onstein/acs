@@ -285,7 +285,8 @@ A mistake in a file stops acs with the file and line, for example
 
 `acs devbox` with the file above uses `devbox.lan` if it answers a ping,
 otherwise `michel@devbox.example.com` if that one does. An entry with
-`reachability_check: false` is used without a ping. The hosts are pinged
+`reachability_check: false` is used without a ping. An IPv6 host is pinged
+with `ping6` where the system's `ping` cannot reach one (macOS). The hosts are pinged
 all at once, and the order in the file still decides: an earlier host that
 answers within `reachability_timeout` wins over a later one that answered
 first, so choosing takes at most that long however many hosts there are.
