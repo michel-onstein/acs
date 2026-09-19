@@ -349,7 +349,7 @@ fn ended(menu: &mut Menu, h: usize, name: &str, a: Listing) -> String {
 pub fn every_host(args: &ClientArgs) -> u8 {
     let names: Vec<String> = args.config.hosts.iter().map(|a| a.name.clone()).collect();
     if names.is_empty() {
-        eprintln!("acs: {}", list::NO_ALIASES);
+        eprintln!("acs: {}", list::no_aliases(&args.config));
         return code::USAGE;
     }
     let (wake_r, wake_w) = match sys::pipe() {

@@ -58,7 +58,7 @@ pub fn run(args: &ClientArgs) -> ExitCode {
 pub fn run_all(args: &ClientArgs) -> ExitCode {
     let aliases: Vec<&str> = args.config.hosts.iter().map(|a| a.name.as_str()).collect();
     if aliases.is_empty() {
-        eprintln!("acs: {NO_ALIASES}");
+        eprintln!("acs: {}", no_aliases(&args.config));
         return ExitCode::from(code::USAGE);
     }
     // Nobody can type a password into several ssh at once (Call::Batch), so
@@ -99,8 +99,20 @@ pub fn run_all(args: &ClientArgs) -> ExitCode {
     }
 }
 
-/// Why `acs list` without a host has nothing to ask.
-pub(crate) const NO_ALIASES: &str = "no host aliases in the configuration: list one host with acs list <host>, or add an alias with acs config host add <alias> <host>";
+/// Why `acs list` without a host has nothing to ask: no configuration file
+/// at all (naming where it looked), or one that defines no alias.
+pub(crate) fn no_aliases(config: &crate::config::Config) -> String {
+    let what = if config.files.is_empty() {
+        format!(
+            "no configuration (looked for {} and {})",
+            crate::config_cmd::pretty(&crate::config::global_path()),
+            crate::config_cmd::pretty(&crate::config::local_path())
+        )
+    } else {
+        "no host aliases in the configuration".to_string()
+    };
+    format!("{what}: list one host with acs list <host>, or add an alias with acs config host add <alias> <host>")
+}
 
 /// Resolve `alias` and ask the host it stands for now, in BatchMode.
 pub(crate) fn ask(

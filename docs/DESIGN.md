@@ -936,7 +936,12 @@ acs: lab: no host for 'lab' is reachable (tried lab.lan)
 - **Exit status**: 0 when every host answered — one without acs answered,
   as it does for `acs list <host>` — and the unreachable code (255) when
   any did not. With no aliases configured there is nothing to list: it says
-  how to add one and exits with the usage code (2).
+  how to add one and exits with the usage code (2) — from the table and
+  from the menu alike. It tells two cases apart: no configuration file at
+  all (`no configuration (looked for /etc/acs/config.yaml and
+  ~/.config/acs/config.yaml)`, the two paths §7.2 reads), and a file,
+  empty or not, that defines no alias (`no host aliases in the
+  configuration`).
 - **Spawns are serialized** (`sys::spawn`): without `pipe2` (macOS) the
   standard library marks a child's pipes close-on-exec only after creating
   them, and a child another thread forks in between would hold one host's

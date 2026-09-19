@@ -334,7 +334,8 @@ that is down or slow only costs its own line — on stderr, after at most 30 s
 255 when any did not. Several ssh cannot ask for passwords on one terminal,
 so these calls run with ssh's `BatchMode`: list a host that needs a password
 on its own, with `acs list <alias>`. With no aliases configured, it says so
-and exits with 2.
+— or, with no configuration file at all, that there is none and where it
+looked — and exits with 2.
 
 ### Editing it from the command line
 
