@@ -36,10 +36,16 @@ pub mod code {
     pub const UNREACHABLE: u8 = 255;
 }
 
-/// Entry point of the client (arguments after the program name).
-pub fn main(args: &[OsString]) -> ExitCode {
+/// Entry point of the client: `args` after the program name, or with
+/// `list` (`acs list`, DESIGN §7.3) after that word.
+pub fn main(args: &[OsString], list: bool) -> ExitCode {
     let default = std::env::var("ACS_DEFAULT_SESSION").ok();
-    let parsed = match cli::parse(args.iter().cloned(), default.as_deref()) {
+    let parsed = if list {
+        cli::parse_list(args.iter().cloned())
+    } else {
+        cli::parse(args.iter().cloned(), default.as_deref())
+    };
+    let parsed = match parsed {
         Ok(p) => p,
         Err(e) => {
             eprintln!("acs: {e}");

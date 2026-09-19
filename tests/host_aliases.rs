@@ -154,7 +154,7 @@ fn list_resolves_the_alias_too() {
     let net = Net::new(&[]);
     let out = acs_cmd()
         .envs(net.env(CONFIG))
-        .args(["--transport-cmd", &remote.transport(), "devbox", "--list"])
+        .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(255));
@@ -163,7 +163,7 @@ fn list_resolves_the_alias_too() {
     net.set_up(&["devbox.lan"]);
     let out = acs_cmd()
         .envs(net.env(CONFIG))
-        .args(["--transport-cmd", &remote.transport(), "devbox", "--list"])
+        .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
@@ -356,9 +356,10 @@ fn list_uses_the_chosen_hosts_key() {
     let out = output_of(
         acs_cmd()
             .envs(net.env(KEYED))
+            .arg("list")
             .arg("--ssh")
             .arg(ssh.path())
-            .args(["devbox", "--list"]),
+            .arg("devbox"),
     );
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert_eq!(ssh.keys(), [key("devbox.example.com", &["/keys/devbox"])]);

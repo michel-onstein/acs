@@ -1,10 +1,15 @@
 //! Client command line (DESIGN §4.4, §7, §7.1), compatible with `dsh`:
 //!
 //! ```text
-//! acs [ssh options] [user@]<host> [session] [-l|--list] [--new]
+//! acs [ssh options] [user@]<host> [session] [--new]
 //!     [--no-reconnect] [--force] [-v] [-- command...]
-//! acs [ssh options] -l|--list [-v]
+//! acs list [ssh options] [-v] [[user@]<host>]
 //! ```
+//!
+//! `list` is a reserved first argument, as `config` and `upgrade` are
+//! (DESIGN §7.4): a host called `list` is reached as `user@list` or with an
+//! option before it. Listing is a command, not an option: `-l`/`--list` are
+//! refused with a pointer to `acs list`.
 
 use std::ffi::OsString;
 
@@ -16,13 +21,11 @@ pub const USAGE: &str = "\
 usage: acs [ssh options] [user@]<host>             pick a detached session from a menu, or create one
        acs [ssh options] [user@]<host> <session>   attach, or create
        acs [ssh options] [user@]<host> --new       create a new numbered session
-       acs [ssh options] [user@]<host> --list      list sessions on <host>
-       acs [ssh options] --list                    list sessions on every host alias (hosts:)
+       acs list [ssh options] [[user@]<host>]      list sessions on <host>, or on every host alias
        acs config ...                            read and edit the configuration (acs config --help)
        acs upgrade [--version X.Y.Z] [--check]   replace this acs with the latest release
 
 options:
-  -l, --list          list sessions on the host, or without one on every alias
       --new           create a session named with the lowest free number
       --no-reconnect  exit when the connection drops instead of redialling
       --force         take over a session attached by someone else
@@ -86,7 +89,7 @@ impl ClientArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
     Run(Box<ClientArgs>),
-    /// `--list` without a host: every alias in the configuration (DESIGN
+    /// `acs list` without a host: every alias in the configuration (DESIGN
     /// §7.3). The transport has no destination; each alias supplies one.
     ListAll(Box<ClientArgs>),
     Help,
@@ -99,12 +102,27 @@ pub fn parse<I>(args: I, default_session: Option<&str>) -> Result<Parsed, String
 where
     I: IntoIterator<Item = OsString>,
 {
+    parse_as(args, default_session, false)
+}
+
+/// Parse `acs list`'s arguments (after `list`): the ssh options, `-v`, and
+/// at most a host; `list` is set.
+pub fn parse_list<I>(args: I) -> Result<Parsed, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    parse_as(args, None, true)
+}
+
+fn parse_as<I>(args: I, default_session: Option<&str>, list: bool) -> Result<Parsed, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
     use lexopt::prelude::*;
 
     let mut p = lexopt::Parser::from_args(args);
     let mut user_opts: Vec<OsString> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
-    let mut list = false;
     let mut new = false;
     let mut reconnect = true;
     let mut force = false;
@@ -138,7 +156,14 @@ where
                 user_opts.push(format!("-{c}").into());
                 user_opts.push(v);
             }
-            Short('l') | Long("list") => list = true,
+            // Listing is the `acs list` command; ssh's -l <login> was never
+            // taken.
+            Short('l') | Long("list") => {
+                return Err(
+                    "no option --list: list sessions with acs list [<host>] (and for a login name, use user@host or -o User=<login>)"
+                        .into(),
+                )
+            }
             Long("new") => new = true,
             Long("no-reconnect") => reconnect = false,
             // dsh's redial flag: reconnecting is the default now.
@@ -161,7 +186,7 @@ where
     }
 
     let mut positionals = positionals.into_iter();
-    // Only `--list` goes without a host: it then lists every alias.
+    // Only `acs list` goes without a host: it then lists every alias.
     let host = positionals.next();
     match &host {
         None if !list => return Err("need a host (see acs --help)".into()),
@@ -174,13 +199,10 @@ where
     }
 
     if list && (session.is_some() || new) {
-        return Err(
-            "--list takes no session name and no --new (ssh's -l <login> is not supported: use user@host or -o User=<login>)"
-                .into(),
-        );
+        return Err("acs list takes at most a host: no session name and no --new".into());
     }
     if list && !command.is_empty() {
-        return Err("--list takes no command".into());
+        return Err("acs list takes no command".into());
     }
     if new && session.is_some() {
         return Err("--new picks the session name itself; give either --new or a name".into());
@@ -256,20 +278,23 @@ mod tests {
         ] {
             assert!(run(args).unwrap().reconnect);
         }
-
-        let a = run(&["devbox", "--list"]).unwrap();
-        assert!(a.list);
-        assert!(run(&["-l", "devbox"]).unwrap().list);
+        assert!(!run(&["devbox"]).unwrap().list);
     }
 
+    fn list(args: &[&str]) -> Result<Parsed, String> {
+        parse_list(args.iter().map(OsString::from))
+    }
+
+    /// acs-m0l: `acs list` (the word itself is taken off by the role
+    /// dispatch, lib.rs) lists every alias, `acs list <host>` one host.
     #[test]
-    fn list_without_a_host_lists_every_alias() {
-        for args in [&["--list"][..], &["-l"], &["-p", "2222", "-v", "--list"]] {
-            match parse(args.iter().map(OsString::from), None).unwrap() {
+    fn acs_list_lists_every_alias_or_one_host() {
+        for args in [&[][..], &["-p", "2222", "-v"], &["-v", "-p2222"]] {
+            match list(args).unwrap() {
                 Parsed::ListAll(a) => {
                     assert!(a.list);
                     assert_eq!(a.transport.destination, "");
-                    if args.len() > 1 {
+                    if !args.is_empty() {
                         assert_eq!(opts(&a), ["-p", "2222"]);
                         assert_eq!(a.verbose, 1);
                     }
@@ -277,8 +302,42 @@ mod tests {
                 other => panic!("{args:?}: {other:?}"),
             }
         }
-        // With a host it is that host only.
-        assert!(run(&["--list", "devbox"]).unwrap().list);
+        for args in [&["devbox"][..], &["-i", "k", "devbox", "-v"]] {
+            match list(args).unwrap() {
+                Parsed::Run(a) => {
+                    assert!(a.list);
+                    assert_eq!(a.transport.destination, "devbox");
+                }
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+        // A host called `list`, listed: `acs list list`, or `acs list me@list`.
+        match list(&["list"]).unwrap() {
+            Parsed::Run(a) => assert_eq!(a.transport.destination, "list"),
+            other => panic!("{other:?}"),
+        }
+        // Reached as a session host, behind an option or as user@list.
+        for args in [&["-v", "list"][..], &["me@list", "work"]] {
+            let a = run(args).unwrap();
+            assert!(!a.list);
+            assert!(a.transport.destination.ends_with("list"), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn listing_is_a_command_not_an_option() {
+        for args in [
+            &["--list"][..],
+            &["-l"],
+            &["devbox", "--list"],
+            &["-l", "devbox"],
+            &["-p", "2222", "-v", "--list"],
+        ] {
+            let e = parse(args.iter().map(OsString::from), None).unwrap_err();
+            assert!(e.contains("acs list [<host>]"), "{args:?}: {e}");
+        }
+        let e = list(&["-l", "bob", "devbox"]).unwrap_err();
+        assert!(e.contains("user@host"), "{e}");
     }
 
     #[test]
@@ -344,15 +403,10 @@ mod tests {
         let cases: &[(&[&str], &str)] = &[
             (&[], "need a host"),
             (&["--new"], "need a host"),
-            (&["--list", "--new"], "--list takes no session"),
-            (&["--list", "--", "ls"], "no command"),
             (&["h", "a", "b"], "too many arguments"),
             (&["h", "bad name"], "bad session name"),
-            (&["h", "x", "--list"], "--list takes no session"),
             (&["-l", "bob", "host"], "user@host"),
-            (&["h", "--new", "--list"], "--list takes no session"),
             (&["h", "x", "--new"], "--new picks"),
-            (&["h", "--list", "--", "ls"], "no command"),
             (&["-q", "h"], "unknown option -q"),
             (&["--bogus", "h"], "unknown option --bogus"),
             (&["-i"], "missing argument"),
@@ -360,6 +414,18 @@ mod tests {
         for (args, want) in cases {
             let e = run(args).unwrap_err();
             assert!(e.contains(want), "{args:?}: {e}");
+        }
+        let list_cases: &[(&[&str], &str)] = &[
+            (&["--new"], "acs list takes at most a host"),
+            (&["h", "x"], "acs list takes at most a host"),
+            (&["h", "--new"], "acs list takes at most a host"),
+            (&["--", "ls"], "acs list takes no command"),
+            (&["h", "--", "ls"], "acs list takes no command"),
+            (&["h", "x", "y"], "too many arguments"),
+        ];
+        for (args, want) in list_cases {
+            let e = list(args).unwrap_err();
+            assert!(e.contains(want), "list {args:?}: {e}");
         }
     }
 

@@ -425,17 +425,18 @@ fn an_unwritable_global_file_says_to_use_sudo() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Reserved words (`config`, `upgrade`, `list`) only as the very first
+/// argument: a host of that name is reachable with a user or an option
+/// before it — here listed, as `acs list <host>`.
 #[test]
 fn a_host_called_config_is_reachable_with_a_user_or_an_option_first() {
     let remote = Remote::installed();
+    let t = remote.transport();
     for args in [
-        vec!["--transport-cmd", &remote.transport(), "config", "--list"],
-        vec![
-            "--transport-cmd",
-            &remote.transport(),
-            "me@config",
-            "--list",
-        ],
+        vec!["list", "--transport-cmd", &t, "config"],
+        vec!["list", "--transport-cmd", &t, "me@config"],
+        vec!["list", "--transport-cmd", &t, "list"],
+        vec!["list", "--transport-cmd", &t, "me@list"],
     ] {
         let out = acs_cmd().args(&args).output().unwrap();
         assert!(out.status.success(), "{args:?}");

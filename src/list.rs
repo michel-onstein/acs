@@ -1,5 +1,5 @@
-//! `acs <host> --list` (DESIGN §4.3): ask the remote proxy for every
-//! session's STATUS and print a table. `acs --list` asks every alias in the
+//! `acs list <host>` (DESIGN §4.3): ask the remote proxy for every
+//! session's STATUS and print a table. `acs list` asks every alias in the
 //! configuration at once (DESIGN §7.3).
 
 use std::os::fd::AsRawFd;
@@ -52,14 +52,14 @@ pub fn run(args: &ClientArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `acs --list`: every alias, each resolved as a connection would be
+/// `acs list`: every alias, each resolved as a connection would be
 /// (DESIGN §7.3) and asked in parallel, so a slow or dead host holds up
 /// only its own line. Exits 0 if every host answered, 255 if any did not.
 pub fn run_all(args: &ClientArgs) -> ExitCode {
     let aliases: Vec<&str> = args.config.hosts.iter().map(|a| a.name.as_str()).collect();
     if aliases.is_empty() {
         eprintln!(
-            "acs: no host aliases in the configuration: list one host with acs <host> --list, or add an alias with acs config host add <alias> <host>"
+            "acs: no host aliases in the configuration: list one host with acs list <host>, or add an alias with acs config host add <alias> <host>"
         );
         return ExitCode::from(code::USAGE);
     }
@@ -252,7 +252,7 @@ fn table_lines(head: &[&str], rows: &[Vec<String>]) -> Vec<String> {
     out
 }
 
-/// The `--list` table of `sessions` as lines without their `\n`: the
+/// The `acs list` table of `sessions` as lines without their `\n`: the
 /// heading first (the session menu, DESIGN §4.4).
 pub(crate) fn lines(sessions: &[StatusInfo], now: u64) -> Vec<String> {
     let rows: Vec<Vec<String>> = sessions.iter().map(|s| cells(s, now)).collect();
@@ -265,7 +265,7 @@ pub(crate) fn lines(sessions: &[StatusInfo], now: u64) -> Vec<String> {
         .collect()
 }
 
-/// The table `acs <host> --list` prints.
+/// The table `acs list <host>` prints.
 pub fn render(host: &str, sessions: &[StatusInfo], now: u64) -> String {
     if sessions.is_empty() {
         return format!("no sessions on {host}\n");
@@ -274,7 +274,7 @@ pub fn render(host: &str, sessions: &[StatusInfo], now: u64) -> String {
     table(&HEAD, &rows)
 }
 
-/// The table `acs --list` prints: the sessions of every host that has any,
+/// The table `acs list` prints: the sessions of every host that has any,
 /// under a HOST column; empty if none has.
 pub fn render_all(hosts: &[(&str, Vec<StatusInfo>)], now: u64) -> String {
     let rows: Vec<Vec<String>> = hosts

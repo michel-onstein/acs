@@ -139,8 +139,8 @@ lives in the master and the client.
   makes it explicit).
 - `ControlMaster=no`, `ControlPath=none`: the session gets its own TCP
   connection, so a reconnect never waits on a dead multiplexer; the session
-  menu rides that connection too (§4.4). Side commands (`--list`, install)
-  keep using the user's multiplexing; `acs --list` on
+  menu rides that connection too (§4.4). Side commands (`acs list`, install)
+  keep using the user's multiplexing; `acs list` on
   every alias adds `BatchMode=yes` and `ConnectTimeout=10` (§7.3).
 - `ServerAliveInterval=0`: liveness is ours (§5.3), much faster than ssh's.
 - `ConnectTimeout=10`: a redial into a dead network fails fast and the
@@ -275,8 +275,8 @@ know anything:
 | `acs <host>` | a detached session picked from a menu; with none detached, a new one — `main` (or `$ACS_DEFAULT_SESSION`, §4.5) if that name is free, else as `--new` |
 | `acs <host> <name>` | `<name>` — attach, or create it if absent |
 | `acs <host> --new` | a new session named with the lowest free number: `1`, `2`, … (picked under the directory lock, so two `--new`s never collide) |
-| `acs <host> --list` | list sessions: name, attached/detached, idle time, command |
-| `acs --list` | the same for every host alias at once, with a HOST column (§7.3) |
+| `acs list <host>` | list sessions: name, attached/detached, idle time, command |
+| `acs list` | the same for every host alias at once, with a HOST column (§7.3) |
 
 So the unnamed case is covered two ways: plain `acs <host>` offers what is
 there to get back into, and `--new` gives short numeric names (as tmux
@@ -286,7 +286,7 @@ does) for when you want a second session without inventing a name.
 with `_proxy --pick` (§4.3) and gets the host's sessions on it first. The
 menu, ending sessions with `x`, and the attach all go over that one
 connection: one ssh handshake (and one hardware-key touch) from the list to
-the session, where a separate `--list` side call used to cost a second
+the session, where a separate `_proxy --list` side call used to cost a second
 (decision 8). Then:
 
 - **No session detached** (none at all, or all attached elsewhere): a new
@@ -334,7 +334,7 @@ the session, where a separate `--list` side call used to cost a second
   (`[user@]<alias>`, §7.3) is resolved once, before the list, and the
   first connection uses that resolution; only a redial resolves again.
 - A host that cannot be reached, or answers the list with garbage, fails as
-  `acs <host> --list` does (255, or 1), with the same message. The first
+  `acs list <host>` does (255, or 1), with the same message. The first
   connection's deadlines (§5.3) apply: to its marker, then to each list.
 - A host **without acs** answers the pick call with `ACS-NEED`, as any
   call: the client closes it and attaches `main` (or the default name) by
@@ -355,7 +355,7 @@ terminal is restored:
 
 - When it **creates** a session (by `--new` or because the name did not exist):
   `acs: new session 'mian' on devbox`. A typo in a name therefore shows up
-  immediately instead of as a mystery session in a later `--list`.
+  immediately instead of as a mystery session in a later `acs list`.
 - When it **ends without the session ending** (detach, takeover, reconnect
   abandoned with `d`):
   `acs: detached from devbox/2 — reattach with: acs devbox 2`.
@@ -363,7 +363,7 @@ terminal is restored:
   `echo $ACS_SESSION` can show it.
 
 If you still lose track, plain `acs <host>` shows what is detached there,
-`acs <host> --list` shows everything, and `acs --list` does for every host
+`acs list <host>` shows everything, and `acs list` does for every host
 in the configuration. `acs <host> <name>` never depends on what else
 happens to exist; plain `acs <host>` now does, on purpose (§12, decision 7).
 
@@ -402,7 +402,7 @@ steals or breaks someone else's session **by accident**:
   `--force` skips the question; without a terminal the attach fails. The same
   identity (your own dropped connection, your own second terminal) takes over
   silently as before.
-- **`--list` shows who** is attached and who created each session, so picking
+- **`acs list` shows who** is attached and who created each session, so picking
   another name is easy.
 - **Default name per person** when an account is shared: `ACS_DEFAULT_SESSION`
   (e.g. set to `$USER` in each person's local shell) replaces `main` as the
@@ -441,7 +441,7 @@ Length-prefixed, same format on the ssh leg and the unix-socket leg:
 | `KILL` | c→m | — (also from the proxy for the menu's `END_SESSION`, before any HELLO: the master ends the session and holds that connection until it exits, §4.3) |
 | `EXIT` | m→c | child wait status |
 | `TAKEOVER` | m→c | — (another client attached) |
-| `STATUS` / `STATUS_REPLY` | proxy↔m, proxy→c | session metadata for `--list` and the session menu |
+| `STATUS` / `STATUS_REPLY` | proxy↔m, proxy→c | session metadata for `acs list` and the session menu |
 | `ERROR` | m→c | code, message |
 | `END_SESSION` | c→proxy | session name: end it, then list again (`_proxy --pick`, §4.3) |
 | `LIST_END` | proxy→c | — the `STATUS_REPLY` frames before it are the whole list (`_proxy --pick`) |
@@ -677,9 +677,13 @@ nothing, because the terminal state is still correct.
 ## 7. Client
 
 - Argument parsing matches `dsh`: `acs [ssh options] [user@]<host> [session]
-  [-l|--list] [--new] [--no-reconnect] [-- command…]` (§4.4, §7.1). `-r` is
-  accepted and ignored, since reconnecting is the default. `--list` is the
-  one form without a host: it then lists every alias (§7.3).
+  [--new] [--no-reconnect] [-- command…]` (§4.4, §7.1). `-r` is accepted and
+  ignored, since reconnecting is the default.
+- **Listing is a command**: `acs list [ssh options] [-v] [[user@]<host>]`
+  lists one host's sessions, or without a host every alias's (§7.3). `list`
+  is a reserved first argument, as `config` and `upgrade` are (§7.4), and
+  the ssh options come after it. `dsh`'s `-l`/`--list` are gone: either is
+  a usage error pointing to `acs list` (decision 9).
 - `cfmakeraw`-equivalent `termios` (dtach's flags), restored on every exit
   path: normal, signal (`SIGHUP`, `SIGTERM`, `SIGINT` before raw mode), and
   panic (`panic = "abort"` plus a restore in a drop guard and a signal handler).
@@ -694,7 +698,7 @@ nothing, because the terminal state is still correct.
 
 A handful of ssh's own options are accepted with ssh's spelling and meaning,
 and passed **verbatim** to every ssh call `acs` makes — the session transport,
-reconnects, `--list` and remote install — so a host reachable as
+reconnects, `acs list` and remote install — so a host reachable as
 `ssh -i ~/.ssh/id_work -p 2222 me@box` is reachable as
 `acs -i ~/.ssh/id_work -p 2222 me@box`:
 
@@ -707,8 +711,9 @@ reconnects, `--list` and remote install — so a host reachable as
 | `-o <option=value>` | any ssh config option; repeatable (e.g. `-o IdentitiesOnly=yes` to use **only** the `-i` key rather than the agent's keys first) |
 | `[user@]host` | login name in the destination, as with ssh |
 
-- **`-l` stays `--list`**, as in `dsh`; ssh's `-l <login>` is not accepted.
-  The login name goes in `user@host` or `-o User=<login>`.
+- **No `-l`**: ssh's `-l <login>` is not accepted (and `dsh`'s `-l`, its
+  `--list`, is now `acs list`). The login name goes in `user@host` or
+  `-o User=<login>`.
 - `acs` does not interpret these values (a `~` in `-i` is expanded by ssh, as
   usual). `ACS_SSH` or `--ssh <path>` picks the ssh binary; default is `ssh`
   on `PATH`.
@@ -843,7 +848,7 @@ one of the alias's entries instead of `<name>`:
   it, as `<alias>` or `user@<alias>`; `ACS_REDRAW_ON_RECONNECT` still wins.
 - **None answers**: the client names every host it tried and exits with the
   unreachable code (255) without calling ssh.
-- It applies to every ssh call — the session, `--list`, install — since they
+- It applies to every ssh call — the session, `acs list`, install — since they
   share one destination and key. `-v` says which entry was chosen and why.
 - **Redial**: a reconnect (§5.3) resolves the alias again, so after a network
   change the client reaches the host through whichever address answers now.
@@ -862,7 +867,7 @@ one of the alias's entries instead of `<name>`:
   `Host devbox` in play, list it in the alias (`- host: devbox`): an entry's
   `host` goes to ssh as is and is never itself resolved as an alias.
 
-**Every alias at once.** `acs [ssh options] --list` without a host lists the
+**Every alias at once.** `acs list [ssh options]` without a host lists the
 sessions on every alias of the configuration (`list.rs`):
 
 ```text
@@ -875,22 +880,22 @@ acs: lab: no host for 'lab' is reachable (tried lab.lan)
 ```
 
 - Each alias is resolved as above, pings and fallbacks included, and asked
-  with the same `_proxy --list` side call as `acs <alias> --list`. The
+  with the same `_proxy --list` side call as `acs list <alias>`. The
   aliases are asked **in parallel**, a thread each, so a slow or dead host
   holds up only its own line; each has the redial's answer limit (§5.3:
   30 s, `ACS_DIAL_TIMEOUT_MS`) for the whole exchange, not only for the
-  marker. (`acs <host> --list` bounds its whole exchange the same way, with
+  marker. (`acs list <host>` bounds its whole exchange the same way, with
   the first connection's 120 s.)
 - **No prompts**: several ssh cannot share the terminal for a password or a
   host key, so these calls put `-o BatchMode=yes -o ConnectTimeout=10`
   before the user's options (`ssh::BATCH_OPTS`). A host that needs a
-  password fails here and is listed on its own with `acs <alias> --list`.
+  password fails here and is listed on its own with `acs list <alias>`.
 - **Output**: one table with the alias in a HOST column, in configuration
   order, then a line for each alias with no sessions or without acs of this
   version, on stdout. An alias that could not be asked gets an
   `acs: <alias>: <why>` line on stderr, not a failed command.
 - **Exit status**: 0 when every host answered — one without acs answered,
-  as it does for `acs <host> --list` — and the unreachable code (255) when
+  as it does for `acs list <host>` — and the unreachable code (255) when
   any did not. With no aliases configured there is nothing to list: it says
   how to add one and exits with the usage code (2).
 - **Spawns are serialized** (`sys::spawn`): without `pipe2` (macOS) the
@@ -925,9 +930,10 @@ their YAML shape:
   alias that has no host yet says to add one first.
 - Removing something that lives in the other file fails with a pointer to it
   (`it is set in /etc/acs/config.yaml:1 (use --global)`).
-- `config` is a reserved **first** argument (as is `upgrade`, §7.5). A host
-  literally called `config` is reached as `user@config`, or with any option
-  before it (`acs -p 22 config`).
+- `config` is a reserved **first** argument (as are `upgrade`, §7.5, and
+  `list`, §7). A host literally called `config` (or `upgrade`, or `list`) is
+  reached as `user@config`, or with any option before it
+  (`acs -p 22 config`); `acs list list` lists a host called `list`.
 
 ### 7.5 `acs upgrade`
 
@@ -981,7 +987,7 @@ The client looks for a newer release **at most once a week** and says so:
 acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
 ```
 
-- **Only the local client** checks, when it starts a session or `--list`;
+- **Only the local client** checks, when it starts a session or `acs list`;
   `_proxy`, `_master`, `_install`, `acs config` and `acs upgrade` never do.
 - **It never delays connecting.** When the last check is 7 days old (or in
   the future: the clock went back), the client records the time, starts
@@ -1160,7 +1166,7 @@ src/
   session.rs    session names, per-uid socket directory, locks
   proxy.rs      acs _proxy: connect-or-spawn, relay, --list
   master.rs     acs _master: pty, child, ring, protocol
-  list.rs       --list table, for one host or every alias in parallel
+  list.rs       `acs list` table, for one host or every alias in parallel
   pick.rs       plain acs <host>: list, then create or run the menu
   menu.rs       the session menu: keys to choices, and its screen
   config.rs     configuration files: locations, merging, validation
@@ -1189,7 +1195,7 @@ scripts/        verify.sh, test_linux.sh, e2e_ssh.sh
   observer on sequences split at every byte boundary; the ssh argv builder
   (session calls put the transport options first; the user's
   `-i`/`-p`/`-J`/`-F`/`-o` follow in order and are identical for session,
-  `--list` and install calls).
+  `acs list` and install calls).
 - **Integration** (no ssh): `--transport-cmd` makes the client exec
   `acs _proxy …` locally instead of `ssh host acs _proxy …`. Tests start a
   session running a deterministic producer, kill the transport mid-stream,
@@ -1234,7 +1240,7 @@ flowchart TD
     P1 & P5 --> M1[Master lifecycle]
     M1 & P1 & P2 --> M2[Master protocol]
     P1 & P5 & M1 --> X1[Proxy]
-    M2 & X1 --> X2["--list"]
+    M2 & X1 --> X2["acs list"]
     X1 & M2 & P6 --> T1[Test harness]
     T1 & C1 & P3 & P4 & P6 & P7 --> C2[Client session]
     C2 & P2 --> C3[Reconnect + resume]
@@ -1262,5 +1268,6 @@ and **Remote self-install** make it a `dsh` replacement.
 | 4 | Takeover vs. mirrored clients | Takeover (§4.2) |
 | 5 | Escape key | Ctrl-] Ctrl-] with a 400 ms window, configurable (§6.2) |
 | 6 | Multiple users per host | Per-uid socket directory with ownership and peer-uid checks; per-version installs; on shared accounts, client identity with confirmed cross-identity takeover (§4.5) |
-| 7 | What plain `acs <host>` attaches | Revisited at the user's request (2026-09-18). It used to mean `main` always, created if absent, so that the default "never depends on what else happens to exist". In use that meant a detached session under another name (`--new`'s `2`, a named one) was only found by `--list` and retyping its name, and `acs <host>` with `main` attached elsewhere took it over (or asked to) instead of giving a fresh shell. Now it lists the sessions first: with none detached it creates one (`main` if free, else numbered), otherwise it shows a menu of the detached ones (§4.4). The list costs no second connection since decision 8. The predictable form stays: `acs <host> <name>`, and without a terminal plain `acs <host>` is still `main` |
-| 8 | One connection for the session menu and the attach | Revisited at the user's request (2026-09-19). The menu first listed with a `--list` side call and the attach dialed its own connection, since "reusing one connection for both is not worth a second proxy mode". In use the second full ssh handshake (TCP, key exchange, auth) cost a few hundred ms before every plain `acs <host>`, more through a jump host, and a hardware key needed two touches. The session call cannot share a multiplexed connection (it opts out on purpose, §3), so the fix is the proxy mode after all: `_proxy --pick` lists, ends sessions and then relays the session the client's HELLO names, on one connection (§4.3, §4.4) |
+| 7 | What plain `acs <host>` attaches | Revisited at the user's request (2026-09-18). It used to mean `main` always, created if absent, so that the default "never depends on what else happens to exist". In use that meant a detached session under another name (`--new`'s `2`, a named one) was only found by `acs list` and retyping its name, and `acs <host>` with `main` attached elsewhere took it over (or asked to) instead of giving a fresh shell. Now it lists the sessions first: with none detached it creates one (`main` if free, else numbered), otherwise it shows a menu of the detached ones (§4.4). The list costs no second connection since decision 8. The predictable form stays: `acs <host> <name>`, and without a terminal plain `acs <host>` is still `main` |
+| 8 | One connection for the session menu and the attach | Revisited at the user's request (2026-09-19). The menu first listed with a `_proxy --list` side call and the attach dialed its own connection, since "reusing one connection for both is not worth a second proxy mode". In use the second full ssh handshake (TCP, key exchange, auth) cost a few hundred ms before every plain `acs <host>`, more through a jump host, and a hardware key needed two touches. The session call cannot share a multiplexed connection (it opts out on purpose, §3), so the fix is the proxy mode after all: `_proxy --pick` lists, ends sessions and then relays the session the client's HELLO names, on one connection (§4.3, §4.4) |
+| 9 | Listing: an option or a command | Revisited at the user's request (2026-09-19). Listing was `dsh`'s `-l`/`--list` option, and without a host it listed every alias — an option doing a whole-program action, as a command would. Now it is the command `acs list [<host>]`, beside `acs config` and `acs upgrade`: one host with a host, every alias without. The per-host form moved too rather than staying `acs <host> --list`, so that listing has one spelling. `list` is reserved as a first argument (a host of that name: `user@list`, an option first, or `acs list list`), and `-l`/`--list` are removed outright, with a usage error pointing to `acs list` — acs has no compatibility contract to keep yet (§7, §7.4) |

@@ -253,13 +253,14 @@ fn e2e_08_frozen_host_is_detected_and_resumed() {
 #[test]
 fn e2e_09_list_shows_the_sessions() {
     let Some(h) = host() else { return };
-    let mut args = h.ssh_args();
-    args.extend(["dev@127.0.0.1".into(), "--list".into()]);
+    let mut args = vec!["list".to_string()];
+    args.extend(h.ssh_args());
+    args.push("dev@127.0.0.1".into());
     let out = Command::new(&h.client).args(&args).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{text}");
     assert!(text.contains("first"), "{text}");
-    eprintln!("VERIFIED --list over ssh:\n{text}");
+    eprintln!("VERIFIED acs list <host> over ssh:\n{text}");
 }
 
 #[test]
@@ -272,8 +273,8 @@ fn e2e_09b_list_without_a_host_asks_every_alias() {
         dir.path(),
         "hosts:\n  box:\n    - host: 127.0.0.1\n      user: dev\n  gone:\n    - host: 192.0.2.1\n",
     );
-    let mut args = h.ssh_args();
-    args.push("--list".into());
+    let mut args = vec!["list".to_string()];
+    args.extend(h.ssh_args());
     let out = Command::new(&h.client)
         .args(&args)
         .envs(env)
@@ -294,7 +295,7 @@ fn e2e_09b_list_without_a_host_asks_every_alias() {
         err.contains("acs: gone: no host for 'gone' is reachable"),
         "{err}"
     );
-    eprintln!("VERIFIED acs --list over ssh (BatchMode):\n{text}{err}");
+    eprintln!("VERIFIED acs list over ssh (BatchMode):\n{text}{err}");
 }
 
 #[test]

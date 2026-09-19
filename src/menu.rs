@@ -268,7 +268,7 @@ impl Menu {
     }
 
     /// The whole screen, for a terminal `cols` wide and `height` high: a
-    /// title; the sessions as `--list` shows them, the first nine numbered;
+    /// title; the sessions as `acs list` shows them, the first nine numbered;
     /// the new-session and exit rows; the keys; the note. The cursor's row
     /// is marked and reversed, in a bar as wide as the widest row of the
     /// list, so it keeps its width as it moves; the rows scroll to keep it
@@ -359,7 +359,7 @@ fn clip(s: &str, cols: usize) -> &str {
 /// Columns a character takes in a terminal, as `wcwidth` has it for the
 /// common cases: none for combining marks, zero-width characters and
 /// variation selectors; two for East Asian wide and fullwidth characters
-/// and emoji; one otherwise. A session's command (from `--list`) may hold
+/// and emoji; one otherwise. A session's command (from `acs list`) may hold
 /// any of them.
 fn char_width(c: char) -> usize {
     match c as u32 {
