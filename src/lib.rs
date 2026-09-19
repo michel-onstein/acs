@@ -15,6 +15,7 @@ pub mod list;
 pub mod master;
 pub mod menu;
 pub mod modes;
+pub mod netmatch;
 pub mod netwatch;
 pub mod payload;
 pub mod pick;

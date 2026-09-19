@@ -267,6 +267,7 @@ hosts:
 | `reachability_timeout` | how long an alias's hosts have to answer a ping: `500ms`, `0.5s`, `2s`, up to `60s` (default `500ms`); an alias's own value wins |
 | `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
 | `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
+| `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
 | `hosts` | aliases: each name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer` and `persist` — or to a mapping of the alias's own `identity_file`, `redraw_on_reconnect` and `reachability_timeout` and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
@@ -283,7 +284,11 @@ first, so choosing takes at most that long however many hosts there are.
 `prefer: true` on an entry puts it ahead of the others: when it answers it
 is used even if an earlier host answered too (several preferred entries go
 by order among themselves), which also lets your own file name the primary
-host of an alias whose other hosts are in the global file. Without a
+host of an alias whose other hosts are in the global file. With
+`prefer_local_network: true`, a host whose address is on one of this
+machine's networks goes first of all: at home on 192.168.1.0/24,
+`devbox.lan` (192.168.1.20) is used before `devbox.example.com` wherever
+it is listed — as long as it answers its ping. Without a
 `user`, your `~/.ssh/config` picks the login name. If no entry
 answers, acs lists the hosts it tried and exits with 255. `-v` shows which
 entry was chosen and why.
@@ -362,6 +367,7 @@ acs config set update_check false                     # no weekly release check
 acs config set command_bell false                     # no bell for command mode
 acs config set redraw_on_reconnect false              # no Ctrl-L on reconnect
 acs config set reachability_interval 10s              # ping a lost host every 10 s
+acs config host set devbox prefer_local_network true  # devbox.lan first at home
 acs config set reachability_timeout 250ms             # pings must answer within 250 ms
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default

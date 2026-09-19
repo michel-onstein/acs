@@ -1,6 +1,8 @@
 //! Host aliases (DESIGN §7.3): `acs [user@]<alias>` connects to the first of
 //! the alias's configured hosts that answers a ping, or that is not checked.
-//! The hosts are pinged at once, and the configured order decides.
+//! The hosts are pinged at once, and their rank decides: on a network this
+//! machine is on (`prefer_local_network`), then `prefer: true`, then the
+//! configured order.
 
 use std::ffi::OsStr;
 use std::process::{Command, Stdio};
@@ -8,6 +10,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use crate::config::{format_timeout, Alias, Config, HostEntry};
+use crate::netmatch::{self, LocalNet, Network};
 
 /// Whether a host answers a ping within the deadline given. Shared with the
 /// threads that ping an alias's hosts at once.
@@ -18,12 +21,15 @@ pub type Reachable = dyn Fn(&str, Duration) -> bool + Send + Sync;
 ///
 /// `user@<alias>` goes through the alias as that user: the chosen entry's
 /// `user` is the given one, whatever the entry says. An entry without an
-/// `identity_file` takes the alias's. `reachable` pings one host; `log`
-/// receives why each entry was taken or skipped.
+/// `identity_file` takes the alias's. `reachable` pings one host; `network`
+/// gives this machine's networks and a resolver, asked only when the alias
+/// has `prefer_local_network`; `log` receives why each entry was taken or
+/// skipped.
 pub fn resolve(
     name: &str,
     config: &Config,
     reachable: Arc<Reachable>,
+    network: &dyn Fn() -> Network,
     log: &mut dyn FnMut(String),
 ) -> Result<Option<HostEntry>, String> {
     let (user, alias) = split_user(name);
@@ -34,7 +40,12 @@ pub fn resolve(
         log(format!("{name}: logging in as {u}, from the command line"));
     }
     let timeout = config.reachability_timeout_for(alias).value;
-    pick(name, alias, user, timeout, reachable, log).map(Some)
+    let network = config
+        .prefer_local_network_for(alias)
+        .value
+        .then(network)
+        .filter(|n| !n.local.is_empty());
+    pick(name, alias, user, timeout, reachable, network, log).map(Some)
 }
 
 /// `user@host` as its login name and host, split at the last `@` as ssh
@@ -46,19 +57,23 @@ pub fn split_user(name: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// The entry to use: the entries ranked (preferred first, [`ranked`]),
-/// every checked host that could be chosen is pinged at once, and host k is
-/// taken as soon as it has answered and every one before it has not — what
+/// The entry to use. The entries are ranked ([`rank`]); every checked host
+/// that could be chosen is pinged at once, and the k-th ranked host is taken
+/// as soon as it has answered and every one ranked before it has not — what
 /// trying them one after another would choose, in at most one `timeout`.
+/// With `network`, the host names are resolved meanwhile, by the same
+/// deadline, to rank the hosts on this machine's networks first; every
+/// checked host is pinged then, since the rank is known only once they are.
 fn pick(
     name: &str,
     alias: &Alias,
     user: Option<&str>,
     timeout: Duration,
     reachable: Arc<Reachable>,
+    network: Option<Network>,
     log: &mut dyn FnMut(String),
 ) -> Result<HostEntry, String> {
-    let mut entries: Vec<HostEntry> = alias
+    let entries: Vec<HostEntry> = alias
         .entries
         .iter()
         .map(|e| HostEntry {
@@ -70,36 +85,66 @@ fn pick(
             ..e.clone()
         })
         .collect();
-    // Tried in rank order: preferred hosts first.
-    entries = ranked(&entries).into_iter().cloned().collect();
-    // Nothing after an unchecked host can be chosen, so nothing there is
-    // pinged.
-    if let Some(i) = entries.iter().position(|e| !e.reachability_check) {
-        entries.truncate(i + 1);
-    }
     let deadline = Instant::now() + timeout;
     let (tx, rx) = mpsc::channel();
-    for (i, e) in entries.iter().enumerate() {
-        if e.reachability_check {
-            let (tx, host, reachable) = (tx.clone(), e.host.clone(), Arc::clone(&reachable));
-            // Not joined: once a host is chosen nobody waits for the others,
-            // whose pings give up at the deadline by themselves.
-            std::thread::spawn(move || {
-                let _ = tx.send((i, reachable(&host, timeout)));
-            });
+    let ping = |i: usize| {
+        let (tx, host, reachable) = (tx.clone(), entries[i].host.clone(), Arc::clone(&reachable));
+        // Not joined: once a host is chosen nobody waits for the others,
+        // whose pings give up at the deadline by themselves.
+        std::thread::spawn(move || {
+            let _ = tx.send((i, reachable(&host, timeout)));
+        });
+    };
+    // Nothing ranked after an unchecked host can be chosen, so nothing
+    // there is pinged.
+    let candidates = |order: Vec<usize>| -> Vec<usize> {
+        match order.iter().position(|&i| !entries[i].reachability_check) {
+            Some(p) => order[..=p].to_vec(),
+            None => order,
         }
-    }
+    };
+    let (order, on_net) = match network {
+        None => {
+            let order = candidates(rank(&entries, &[]));
+            for &i in &order {
+                if entries[i].reachability_check {
+                    ping(i);
+                }
+            }
+            (order, vec![None; entries.len()])
+        }
+        Some(n) => {
+            for (i, e) in entries.iter().enumerate() {
+                if e.reachability_check {
+                    ping(i);
+                }
+            }
+            let on_net = locate(&entries, &n, deadline);
+            for (e, net) in entries.iter().zip(&on_net) {
+                if let Some(net) = net {
+                    log(format!("{name}: {} is on the local network {net}", e.host));
+                }
+            }
+            (candidates(rank(&entries, &on_net)), on_net)
+        }
+    };
     drop(tx);
     let mut answered = vec![None; entries.len()];
     let mut tried = Vec::new();
-    for (i, e) in entries.iter().enumerate() {
+    for &i in &order {
+        let e = &entries[i];
         let dest = e.destination();
-        let preferred = if e.prefer { ", preferred" } else { "" };
+        let mut why: Vec<String> = Vec::new();
+        if let Some(net) = on_net[i] {
+            why.push(format!("on {net}"));
+        }
+        if e.prefer {
+            why.push("preferred".into());
+        }
         if !e.reachability_check {
-            log(format!(
-                "{name}: using {dest} (reachability_check is off{preferred}, {})",
-                e.origin
-            ));
+            why.insert(0, "reachability_check is off".into());
+            why.push(e.origin.to_string());
+            log(format!("{name}: using {dest} ({})", why.join(", ")));
             return Ok(e.clone());
         }
         // An answer after the deadline counts as none.
@@ -111,7 +156,10 @@ fn pick(
             }
         }
         if answered[i] == Some(true) {
-            let why = if e.prefer { " (preferred)" } else { "" };
+            let why = match why.is_empty() {
+                true => String::new(),
+                false => format!(" ({})", why.join(", ")),
+            };
             log(format!(
                 "{name}: {} answers ping, using {dest}{why}",
                 e.host
@@ -131,12 +179,50 @@ fn pick(
     ))
 }
 
-/// An alias's entries in the order they are tried (DESIGN §7.3): those with
-/// `prefer: true` first, then the rest, each in configured order.
+/// The local network each entry's host is on, if any: every name resolved
+/// at once by `network`'s resolver, those not resolved by `deadline`
+/// counting as on none.
+fn locate(entries: &[HostEntry], network: &Network, deadline: Instant) -> Vec<Option<LocalNet>> {
+    let (tx, rx) = mpsc::channel();
+    let left = deadline.saturating_duration_since(Instant::now());
+    for (i, e) in entries.iter().enumerate() {
+        let (tx, host, resolve) = (tx.clone(), e.host.clone(), Arc::clone(&network.resolve));
+        std::thread::spawn(move || {
+            let _ = tx.send((i, resolve(&host, left)));
+        });
+    }
+    drop(tx);
+    let mut on_net = vec![None; entries.len()];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((i, addrs)) => on_net[i] = netmatch::matching(&network.local, &addrs),
+            Err(_) => break,
+        }
+    }
+    on_net
+}
+
+/// The indices of `entries` in the order they are tried: those on a local
+/// network (`on_net`, empty for none) first, then those with
+/// `prefer: true`, then the rest — each group in configured order.
+fn rank(entries: &[HostEntry], on_net: &[Option<LocalNet>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| {
+        let local = on_net.get(i).is_some_and(|n| n.is_some());
+        (!local, !entries[i].prefer)
+    });
+    order
+}
+
+/// An alias's entries in the order they are tried when no local network is
+/// looked at (DESIGN §7.3): those with `prefer: true` first, then the rest,
+/// each in configured order.
 pub fn ranked(entries: &[HostEntry]) -> Vec<&HostEntry> {
-    let mut v: Vec<&HostEntry> = entries.iter().collect();
-    v.sort_by_key(|e| !e.prefer);
-    v
+    rank(entries, &[])
+        .into_iter()
+        .map(|i| &entries[i])
+        .collect()
 }
 
 /// Ping `host` once, waiting at most `deadline` for the answer (`ACS_PING`
@@ -187,6 +273,15 @@ mod tests {
     use super::*;
     use crate::testutil::TempDir;
     use std::sync::Mutex;
+
+    /// No local network and no resolver: what the aliases without
+    /// `prefer_local_network` never ask for.
+    fn no_network() -> Network {
+        Network {
+            local: Vec::new(),
+            resolve: Arc::new(|_: &str, _: Duration| Vec::new()),
+        }
+    }
 
     fn config(yaml: &str) -> Config {
         let dir = TempDir::new();
@@ -271,7 +366,9 @@ hosts:
         let c = config(TWO);
         let fake = Fake::up(up);
         let mut log = Vec::new();
-        let r = resolve(name, &c, fake.reachable(), &mut |m| log.push(m));
+        let r = resolve(name, &c, fake.reachable(), &no_network, &mut |m| {
+            log.push(m)
+        });
         (r.map(|e| e.map(|e| e.destination())), fake.pinged(), log)
     }
 
@@ -285,7 +382,9 @@ hosts:
         let c = config(yaml);
         let mut log = Vec::new();
         let start = Instant::now();
-        let r = resolve(name, &c, fake.reachable(), &mut |m| log.push(m));
+        let r = resolve(name, &c, fake.reachable(), &no_network, &mut |m| {
+            log.push(m)
+        });
         let took = start.elapsed();
         (r.map(|e| e.unwrap().destination()), log, took)
     }
@@ -395,7 +494,7 @@ hosts:
 ",
         );
         let key = |name: &str, up: &[&str]| {
-            resolve(name, &c, Fake::up(up).reachable(), &mut |_| {})
+            resolve(name, &c, Fake::up(up).reachable(), &no_network, &mut |_| {})
                 .unwrap()
                 .unwrap()
                 .identity_file
@@ -548,6 +647,148 @@ hosts:
             .map(|e| e.host.as_str())
             .collect();
         assert_eq!(ranked, ["b", "c", "a"]);
+    }
+
+    // ---- prefer_local_network (acs-sia) ------------------------------------
+
+    /// devbox.example.com first, devbox.lan second, as a home alias lists
+    /// them; `extra` goes into the alias's settings.
+    fn home(extra: &str) -> String {
+        format!(
+            "hosts:\n  devbox:\n{extra}    hosts:\n      - host: devbox.example.com\n      - host: devbox.lan\n"
+        )
+    }
+
+    /// This machine on `local` (`addr/prefix`), and a resolver answering
+    /// `names` after `delay_ms`.
+    fn on(local: &[&str], names: &[(&str, &str)], delay_ms: u64) -> Network {
+        let local = local
+            .iter()
+            .map(|s| {
+                let (a, p) = s.split_once('/').unwrap();
+                LocalNet::new(a.parse().unwrap(), p.parse().unwrap())
+            })
+            .collect();
+        let names: Vec<(String, std::net::IpAddr)> = names
+            .iter()
+            .map(|(n, a)| (n.to_string(), a.parse().unwrap()))
+            .collect();
+        Network {
+            local,
+            resolve: Arc::new(move |host: &str, _| {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                names
+                    .iter()
+                    .filter(|(n, _)| n == host)
+                    .map(|(_, a)| *a)
+                    .collect()
+            }),
+        }
+    }
+
+    /// Resolve `devbox` in `yaml` with every host answering as `fake` says
+    /// and `network` as this machine's; the destination and the log.
+    fn located(
+        yaml: &str,
+        fake: &Arc<Fake>,
+        network: Network,
+    ) -> (Result<String, String>, Vec<String>) {
+        let c = config(yaml);
+        let mut log = Vec::new();
+        let network = std::sync::Mutex::new(Some(network));
+        let r = resolve(
+            "devbox",
+            &c,
+            fake.reachable(),
+            &|| network.lock().unwrap().take().expect("asked twice"),
+            &mut |m| log.push(m),
+        );
+        (r.map(|e| e.unwrap().destination()), log)
+    }
+
+    const HOME_NAMES: &[(&str, &str)] = &[
+        ("devbox.lan", "192.168.1.20"),
+        ("devbox.lan", "fd00:1::20"),
+        ("devbox.example.com", "203.0.113.9"),
+    ];
+
+    #[test]
+    fn a_host_on_a_local_network_goes_first_in_either_family() {
+        let yaml = home("    prefer_local_network: true\n");
+        let both = || Fake::up(&["devbox.example.com", "devbox.lan"]);
+        // IPv4: at home on 192.168.1.0/24, devbox.lan (listed second) it is.
+        let (r, log) = located(&yaml, &both(), on(&["192.168.1.5/24"], HOME_NAMES, 0));
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert_eq!(
+            log,
+            [
+                "devbox: devbox.lan is on the local network 192.168.1.0/24",
+                "devbox: devbox.lan answers ping, using devbox.lan (on 192.168.1.0/24)",
+            ]
+        );
+        // IPv6 alone matches too.
+        let (r, log) = located(&yaml, &both(), on(&["fd00:1::5/64"], HOME_NAMES, 0));
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert!(log[1].ends_with("(on fd00:1::/64)"), "{log:?}");
+        // Elsewhere, on no network of theirs: the configured order.
+        let (r, _) = located(&yaml, &both(), on(&["10.0.0.5/24"], HOME_NAMES, 0));
+        assert_eq!(r, Ok("devbox.example.com".into()));
+    }
+
+    #[test]
+    fn a_local_host_must_still_answer_and_beats_a_preferred_one() {
+        let yaml = home("    prefer_local_network: true\n");
+        // On the network but not answering: the next in rank.
+        let fake = Fake::up(&["devbox.example.com"]);
+        let (r, log) = located(&yaml, &fake, on(&["192.168.1.5/24"], HOME_NAMES, 0));
+        assert_eq!(r, Ok("devbox.example.com".into()));
+        assert_eq!(
+            log[1],
+            "devbox: devbox.lan does not answer ping within 500ms"
+        );
+        // prefer: true on the other host: the local network still wins.
+        let yaml = "hosts:\n  devbox:\n    prefer_local_network: true\n    hosts:\n      - host: devbox.example.com\n        prefer: true\n      - host: devbox.lan\n";
+        let fake = Fake::up(&["devbox.example.com", "devbox.lan"]);
+        let (r, _) = located(yaml, &fake, on(&["192.168.1.5/24"], HOME_NAMES, 0));
+        assert_eq!(r, Ok("devbox.lan".into()));
+    }
+
+    #[test]
+    fn without_the_setting_or_with_a_slow_resolver_the_order_decides() {
+        let fake = Fake::up(&["devbox.example.com", "devbox.lan"]);
+        // Off: the network is never asked for (it would panic).
+        let c = config(&home(""));
+        let r = resolve(
+            "devbox",
+            &c,
+            fake.reachable(),
+            &|| panic!("the network was asked for"),
+            &mut |_| {},
+        );
+        assert_eq!(r.unwrap().unwrap().destination(), "devbox.example.com");
+        // On, but the names resolve only after the 100ms deadline: no match,
+        // and the choice still takes one deadline, not more.
+        let yaml = home("    prefer_local_network: true\n    reachability_timeout: 100ms\n");
+        let start = Instant::now();
+        let (r, _) = located(&yaml, &fake, on(&["192.168.1.5/24"], HOME_NAMES, 1000));
+        assert_eq!(r, Ok("devbox.example.com".into()));
+        assert!(
+            start.elapsed() < Duration::from_millis(800),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_rank_is_local_network_then_prefer_then_order() {
+        let c = config(
+            "hosts:\n  x:\n    - host: a\n    - host: b\n      prefer: true\n    - host: c\n    - host: d\n",
+        );
+        let entries = &c.alias("x").unwrap().entries;
+        let net = Some(LocalNet::new("192.168.1.5".parse().unwrap(), 24));
+        assert_eq!(rank(entries, &[]), [1, 0, 2, 3]);
+        assert_eq!(rank(entries, &[None, None, None, net]), [3, 1, 0, 2]);
+        assert_eq!(rank(entries, &[None, net, net, None]), [1, 2, 0, 3]);
     }
 
     #[test]
