@@ -81,6 +81,18 @@ pub=${key%.pub}.pub
     echo "no public half at $pub to check the signature against" >&2
     exit 1
 }
+# Nothing chosen by hand: sign through ssh-agent when it holds this key.
+# ssh-keygen reads a passphrase from /dev/tty, so signing with the private
+# half of a protected key needs a terminal and a release run without one
+# would stall on the prompt (or, with no askpass, fail). Naming the public
+# half makes ssh-keygen ask the agent instead, which needs nothing.
+if [ -z "${ACS_SIGNING_KEY:-}" ]; then
+    want=$(ssh-keygen -lf "$pub" | awk '{print $2}')
+    if ssh-add -l 2>/dev/null | awk '{print $2}' | grep -qxF "$want"; then
+        key=$pub
+        echo "== signing key is in ssh-agent"
+    fi
+fi
 echo "== signing SHA256SUMS"
 ssh-keygen -Y sign -q -n acs-release -f "$key" "$work/assets/SHA256SUMS"
 printf 'releases@acs namespaces="acs-release" %s\n' "$(cat "$pub")" > "$work/allowed_signers"
