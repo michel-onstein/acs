@@ -271,3 +271,108 @@ fn old_unused_versions_are_pruned_at_proxy_start() {
     assert!(age.as_secs() < 3600, "{age:?}");
     assert!(root.join(".pruned").exists());
 }
+
+/// acs-4km: the shell checks the upload before it is made executable, so a
+/// binary swapped in after the `cat` never runs. Drives the generated
+/// script the way the remote's `sh` would.
+#[test]
+fn the_upload_is_checked_by_the_shell_before_it_can_run() {
+    let t = acs::testutil::TempDir::new();
+    let file = t.path().join("acs.new.abcd");
+    std::fs::write(&file, b"the real acs").unwrap();
+    let want = acs::sha256::hex(&acs::sha256::digest(b"the real acs"));
+    let quoted = format!("'{}'", file.display());
+
+    // The honest upload passes and the script carries on.
+    let script = format!("{} echo passed", acs::install::check_upload(&quoted, &want));
+    let out = output_of(Command::new("/bin/sh").arg("-c").arg(&script));
+    assert!(
+        out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("passed"));
+
+    // Someone replaces the file between the cat and the exec.
+    std::fs::write(&file, b"not the real acs").unwrap();
+    let out = output_of(Command::new("/bin/sh").arg("-c").arg(&script));
+    assert!(!out.status.success(), "a swapped binary was accepted");
+    assert_eq!(out.status.code(), Some(5));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("does not match the checksum"), "{err}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("passed"));
+    // And it is gone, so nothing can exec it later.
+    assert!(!file.exists(), "the rejected upload was left behind");
+}
+
+/// acs-4km: a host with no way to hash says so, and still refuses to run
+/// what it could not check.
+#[test]
+fn a_host_with_no_checksum_tool_refuses_the_install() {
+    let t = acs::testutil::TempDir::new();
+    let file = t.path().join("acs.new.abcd");
+    std::fs::write(&file, b"x").unwrap();
+    let quoted = format!("'{}'", file.display());
+    let script = format!(
+        "{} echo passed",
+        acs::install::check_upload(&quoted, &acs::sha256::hex(&acs::sha256::digest(b"x")))
+    );
+    // An empty PATH leaves sha256sum, shasum and openssl all unfindable.
+    let out = output_of(
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", "/nonexistent"),
+    );
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no sha256sum, shasum or openssl"));
+    // It never got as far as `echo passed`, so the file was never made
+    // executable and never ran — which is the property that matters. (The
+    // cleanup `rm` cannot run either with this PATH; the leftover is inert.)
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("passed"));
+}
+
+/// acs-4km: the payload trailer is checked against the digest the client
+/// computed, not merely parsed. A well-formed blob is not necessarily ours.
+#[test]
+fn finisher_rejects_a_payload_blob_that_does_not_match() {
+    let remote = Remote::new();
+    let dir = remote
+        .home()
+        .join(format!(".local/share/acs/{}", acs::VERSION));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = dir.join("acs.new.00ff");
+    std::fs::copy(exe(), &tmp).unwrap();
+    let slim = acs::sha256::hex(&acs::sha256::digest(&std::fs::read(&tmp).unwrap()));
+    let mut child = Command::new(&tmp)
+        .args([
+            "_install",
+            "--finish",
+            "--token",
+            "00ff",
+            "--slim-sha256",
+            &slim,
+            "--blob-sha256",
+            &"0".repeat(64),
+            "--payloads",
+        ])
+        .env("HOME", remote.home())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"not the payload set we sent")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("checksum") || err.contains("corrupt"), "{err}");
+    assert!(!dir.join("acs").exists(), "a bad blob was installed");
+}

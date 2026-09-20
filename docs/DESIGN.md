@@ -1335,12 +1335,28 @@ Linux, busybox included), in two ssh calls that may use the user's
 multiplexed connection:
 
 ```sh
-# 1: unpack the slim binary; stdin is gz(slim_r) from P
-d=~/.local/share/acs/0.3.1; mkdir -p $d && gzip -dc > $d/acs.new.<token> && chmod 755 $d/acs.new.<token>
-# 2: stdin is P; append it as a trailer, check the SHA-256 the client
-#    computed, then rename over $d/acs and repoint ~/.local/bin/acs
-$d/acs.new.<token> _install --finish --sha256 <digest>
+# 1: unpack the slim binary; stdin is gz(slim_r) from P. The shell checks
+#    the SHA-256 the client computed BEFORE the file is made executable.
+d=~/.local/share/acs/0.3.1; mkdir -p $d && gzip -dc > $d/acs.new.<token>
+got=$({ sha256sum $d/acs.new.<token> || shasum -a 256 … || openssl dgst … ; } | …)
+[ "$got" = <digest> ] || { rm -f $d/acs.new.<token>; exit 5; }
+chmod 755 $d/acs.new.<token>
+# 2: stdin is P; check P against its own digest, append it as a trailer,
+#    then rename over $d/acs and repoint ~/.local/bin/acs
+$d/acs.new.<token> _install --finish --slim-sha256 <digest> --blob-sha256 <digest>
 ```
+
+**The shell does the checking, not the uploaded binary** (acs-4km). The
+digest used to be verified by `_install --finish` itself, which hashes its
+own `current_exe()` — no check at all, since a substituted binary simply
+skips it and prints the `ok` line that is all the client looks for. Anyone
+who could replace the file between the `cat` and the `exec` — a second
+person on a shared account, a remote whose `$HOME` others can write, a
+compromised sshd — had their code run as the user, and then installed at the
+path every later connection execs. A host with none of `sha256sum`, `shasum`
+or `openssl` refuses the install rather than running something unchecked.
+The payload trailer is checked against its own digest too: parsing it only
+says it is well formed, not that it is ours.
 
 Step 2 is skipped in case 1 (the file sent is already complete, and step 1
 then uses `cat` rather than `gzip -dc`). `<token>` is random per install, so
