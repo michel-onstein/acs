@@ -277,19 +277,25 @@ aliases:
 
 #[test]
 fn silent_hosts_are_waited_for_in_parallel() {
-    // Two say nothing at all, one starts acs and then says nothing.
-    let quiet: Vec<Remote> = (0..3).map(|_| Remote::installed()).collect();
-    quiet[0].silence(Some(""));
-    quiet[1].silence(Some(""));
-    quiet[2].silence(Some(&acs::proto::ready_line()));
+    // Four say nothing at all, one starts acs and then says nothing. Five
+    // rather than three so the gap between asking them at once and asking
+    // them one after another is wide enough to see on a loaded machine
+    // (acs-kip): serial would be 30 s, parallel is one dial plus startup.
+    let quiet: Vec<Remote> = (0..5).map(|_| Remote::installed()).collect();
+    for q in &quiet[..4] {
+        q.silence(Some(""));
+    }
+    quiet[4].silence(Some(&acs::proto::ready_line()));
     let nas = Remote::installed();
     let ssh = Ssh::new(&[
         ("q0", &quiet[0]),
         ("q1", &quiet[1]),
         ("q2", &quiet[2]),
+        ("q3", &quiet[3]),
+        ("q4", &quiet[4]),
         ("nas.lan", &nas),
     ]);
-    let net = Net::new(&["q0", "q1", "q2", "nas.lan"]);
+    let net = Net::new(&["q0", "q1", "q2", "q3", "q4", "nas.lan"]);
     let config = "\
 aliases:
   q0:
@@ -298,6 +304,10 @@ aliases:
     - host: q1
   q2:
     - host: q2
+  q3:
+    - host: q3
+  q4:
+    - host: q4
   nas:
     - host: nas.lan
 ";
@@ -305,11 +315,13 @@ aliases:
     let limit = [("ACS_DIAL_TIMEOUT_MS", "6000")];
     let t0 = Instant::now();
     let (code, out, err) = list_all(&ssh, &net, config, &[], &limit);
-    // One after another would take 18 s.
+    // One after another would take 30 s. Half of that still shows they
+    // were asked at once, and leaves room for a busy machine to be slow
+    // about starting five fake hosts (acs-kip).
     assert!(t0.elapsed() < Duration::from_secs(15), "{:?}", t0.elapsed());
     assert_eq!(code, 255);
     assert_eq!(out, "no sessions on nas\n", "{err}");
-    for q in ["q0", "q1", "q2"] {
+    for q in ["q0", "q1", "q2", "q3", "q4"] {
         assert!(
             err.contains(&format!("acs: {q}: no answer from {q} within 6 s")),
             "{err}"

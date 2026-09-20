@@ -244,7 +244,11 @@ fn ctrl_c_during_a_redial_clears_the_status_line() {
     remote.cut_link();
     c.wait_for("\x1b[22;0t", T);
     remote.wait_connections(2, T);
-    std::thread::sleep(Duration::from_millis(300));
+    // Ctrl-C is only the interrupt once the client has left raw mode for
+    // the dial. Waiting for that rather than sleeping on it: 300 ms is
+    // plenty on an idle machine and not always enough on a loaded one
+    // (acs-kip).
+    c.wait_until("the client is in cooked mode", |c| c.echo_on(), T);
     c.send(b"\x03");
     c.wait(T);
     let text = c.text();

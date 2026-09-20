@@ -13,7 +13,13 @@ use std::time::{Duration, Instant};
 use acs::sys;
 use acs::testutil::TempDir;
 
-pub const T: Duration = Duration::from_secs(15);
+/// The deadline test helpers wait to. Generous on purpose (acs-kip): the
+/// whole suite runs its targets in parallel, so a laptop building and
+/// running two dozen binaries at once takes many times longer over any one
+/// step than an idle machine does. A test that truly hangs still fails,
+/// only later; one that merely lost the CPU for a second does not, and a
+/// gate that cries wolf teaches people to re-run rather than to read.
+pub const T: Duration = Duration::from_secs(30);
 
 /// A directory that does not exist: the client finds no configuration file
 /// unless a test gives it one.
@@ -570,6 +576,21 @@ impl Client {
     /// Type bytes.
     pub fn send(&self, bytes: &[u8]) {
         sys::write_all(self.pty.as_raw_fd(), bytes).unwrap();
+    }
+
+    /// Wait until `ready` holds, or fail at the deadline. For the moments
+    /// where a test needs the client to have *reached* a state rather than
+    /// to have been given time to (acs-kip).
+    pub fn wait_until(&self, what: &str, mut ready: impl FnMut(&Self) -> bool, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !ready(self) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting until {what}; output so far:\n{}",
+                self.text()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Everything the client wrote to its terminal so far.

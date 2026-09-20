@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use acs::proto::{AttachKind, Mode, Msg, Resume, Welcome};
 use acs::testutil::{hello, FrameConn, TempDir};
 
-const T: Duration = Duration::from_secs(10);
+/// As `common::T`, which this file cannot reach: generous, because the
+/// suite runs its targets in parallel (acs-kip).
+const T: Duration = Duration::from_secs(30);
 
 fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_acs"))

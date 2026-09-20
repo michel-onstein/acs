@@ -8,7 +8,9 @@ use std::time::Duration;
 use acs::proto::{err, Marker, Mode, Msg, PROTO_VERSION};
 use acs::testutil::{hello, FrameConn, TempDir};
 
-const T: Duration = Duration::from_secs(10);
+/// As `common::T`, which this file cannot reach: generous, because the
+/// suite runs its targets in parallel (acs-kip).
+const T: Duration = Duration::from_secs(30);
 
 struct Proxy {
     conn: FrameConn,
