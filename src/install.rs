@@ -10,8 +10,10 @@
 //!   build to the remote's `gzip -dc`, then run the new binary's
 //!   `_install --finish` with the payload set on stdin, which appends it.
 //!
-//! Either way `_install --finish` checks the SHA-256 the client computed,
-//! renames the file into place atomically and repoints `~/.local/bin/acs`.
+//! Either way the **remote shell** checks the SHA-256 the client computed
+//! before the upload is made executable (acs-4km), and `_install --finish`
+//! then renames the file into place atomically and repoints
+//! `~/.local/bin/acs`.
 //! A running executable cannot be written to on Linux (ETXTBSY), so the
 //! finisher writes a new file instead of appending to itself.
 
@@ -122,25 +124,56 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
     match plan {
         Plan::SelfCopy { data } => {
             let digest = sha256::hex(&sha256::digest(&data));
+            let check = check_upload(&tmp, &digest);
             let script = format!(
-                "set -e; mkdir -p {dir}; cat > {tmp}; chmod 755 {tmp}; exec {tmp} _install --finish --token {token} --sha256 {digest}"
+                "set -e; mkdir -p {dir}; cat > {tmp}; {check} chmod 755 {tmp}; exec {tmp} _install --finish --token {token} --sha256 {digest}"
             );
             side_call(args, &script, &data, true)?;
         }
         Plan::Payload { gz, blob, digest } => {
             let slim_digest = sha256::hex(&digest);
+            let blob_digest = sha256::hex(&sha256::digest(&blob));
+            let check = check_upload(&tmp, &slim_digest);
             let script = format!(
-                "set -e; command -v gzip >/dev/null || {{ echo 'acs: the remote has no gzip' >&2; exit 3; }}; mkdir -p {dir}; gzip -dc > {tmp}; chmod 755 {tmp}"
+                "set -e; command -v gzip >/dev/null || {{ echo 'acs: the remote has no gzip' >&2; exit 3; }}; mkdir -p {dir}; gzip -dc > {tmp}; {check} chmod 755 {tmp}"
             );
             side_call(args, &script, &gz, false)?;
             let script = format!(
-                "exec {tmp} _install --finish --token {token} --slim-sha256 {slim_digest} --payloads"
+                "exec {tmp} _install --finish --token {token} --slim-sha256 {slim_digest} --blob-sha256 {blob_digest} --payloads"
             );
             side_call(args, &script, &blob, true)?;
         }
     }
     note(&format!("installed acs {v} on {host}"));
     Ok(())
+}
+
+/// Shell that checks the uploaded `file` against `want` **before** the file
+/// is made executable or run (acs-4km).
+///
+/// The digest used to be checked by the uploaded binary itself, which is no
+/// check at all: a substituted binary skips it and prints `ok`, which is all
+/// the client looks for. Anyone who could replace the file between the `cat`
+/// and the `exec` — a second person on a shared account, a remote whose
+/// `$HOME` others can write — had their code run, and then installed where
+/// every later connection execs it.
+///
+/// So the *remote shell* checks it, with whichever of the three usual tools
+/// the host has. A host with none of them cannot be installed onto this way,
+/// and says so rather than running something unchecked. The hash is pulled
+/// out by shape (64 hex characters) so the differing output formats of
+/// `sha256sum`, `shasum` and `openssl dgst` all work.
+pub fn check_upload(file: &str, want: &str) -> String {
+    format!(
+        "got=$({{ sha256sum {file} || shasum -a 256 {file} || openssl dgst -sha256 {file}; }} \
+         2>/dev/null | sed -n 's/.*\\([0-9a-f]\\{{64\\}}\\).*/\\1/p' | head -n 1) || true; \
+         [ -n \"$got\" ] || {{ rm -f {file}; \
+         echo 'acs: the remote has no sha256sum, shasum or openssl to check the upload' >&2; \
+         exit 4; }}; \
+         [ \"$got\" = {want} ] || {{ rm -f {file}; \
+         echo 'acs: the uploaded acs does not match the checksum the client computed' >&2; \
+         exit 5; }}; "
+    )
 }
 
 /// Run `script` on the host with `input` on stdin. With `expect_ok` the
@@ -185,6 +218,10 @@ struct Finish {
     token: String,
     sha256: Option<String>,
     slim_sha256: Option<String>,
+    /// Digest of the payload trailer that arrives on stdin (acs-4km). The
+    /// blob used to be accepted on the strength of parsing, which only says
+    /// it is well formed, not that it is ours.
+    blob_sha256: Option<String>,
     payloads: bool,
 }
 
@@ -193,6 +230,7 @@ fn parse_finish(args: &[OsString]) -> Result<Finish, String> {
         token: String::new(),
         sha256: None,
         slim_sha256: None,
+        blob_sha256: None,
         payloads: false,
     };
     let mut finish = false;
@@ -204,6 +242,9 @@ fn parse_finish(args: &[OsString]) -> Result<Finish, String> {
             "--sha256" => f.sha256 = Some(it.next().ok_or("--sha256 needs a value")?),
             "--slim-sha256" => {
                 f.slim_sha256 = Some(it.next().ok_or("--slim-sha256 needs a value")?)
+            }
+            "--blob-sha256" => {
+                f.blob_sha256 = Some(it.next().ok_or("--blob-sha256 needs a value")?)
             }
             "--payloads" => f.payloads = true,
             other => return Err(format!("unexpected argument {other}")),
@@ -260,6 +301,12 @@ fn finish(f: &Finish) -> Result<(), String> {
         io::stdin()
             .read_to_end(&mut blob)
             .map_err(|e| e.to_string())?;
+        if let Some(want) = &f.blob_sha256 {
+            if &sha256::hex(&sha256::digest(&blob)) != want {
+                let _ = std::fs::remove_file(&me);
+                return Err("the payload set does not match its checksum".into());
+            }
+        }
         if Payloads::parse(&blob).is_none() {
             let _ = std::fs::remove_file(&me);
             return Err("the payload set is corrupt".into());
