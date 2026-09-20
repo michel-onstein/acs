@@ -94,7 +94,7 @@ separate repository — so you can check one against the other rather than
 trusting only the copy that came with the download:
 
 ```text
-ACS_RELEASE_KEY_PLACEHOLDER
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILbxQW5C9X7CdwcQ4bab0gsQi4Evk2xfgmI/972dlHCb acs release signing
 ```
 
 To check a release by hand:

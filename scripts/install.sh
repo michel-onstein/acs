@@ -91,7 +91,7 @@ fi
 # cannot run it cannot run acs -- and the key below is the public half of
 # the key that signs acs releases. It is in the binary too, and in the
 # Homebrew tap, which is a repository of its own to check it against.
-release_key="ACS_RELEASE_KEY_PLACEHOLDER"
+release_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILbxQW5C9X7CdwcQ4bab0gsQi4Evk2xfgmI/972dlHCb acs release signing"
 command -v ssh-keygen >/dev/null 2>&1 ||
     die "need ssh-keygen to check the release signature (it comes with ssh, which acs requires)"
 

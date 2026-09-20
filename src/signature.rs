@@ -26,7 +26,8 @@ use std::process::{Command, Stdio};
 /// Also published in the Homebrew tap, which is a repository of its own:
 /// someone who wants to check this key against a second source, rather
 /// than trusting the binary that carries it, has one.
-pub const RELEASE_KEY: &str = "";
+pub const RELEASE_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILbxQW5C9X7CdwcQ4bab0gsQi4Evk2xfgmI/972dlHCb acs release signing";
 
 /// The principal this key signs as, in the allowed-signers file and as
 /// `-I` when verifying.
