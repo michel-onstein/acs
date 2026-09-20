@@ -95,13 +95,24 @@ else
 fi
 fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" ||
     die "cannot download $base/SHA256SUMS${want:+ (is $want a release?)}"
-line=$(grep -E "^[0-9a-f]{64} [ *]?acs-[^ ]+-$target\\.tar\\.gz\$" "$tmp/SHA256SUMS" | head -n 1 || true)
+# The version is X.Y.Z and nothing else (acs-g3j). The old pattern took
+# [^ ]+ for the whole name, which allows / and .., so a SHA256SUMS from a
+# channel under someone else's control could name a version that walks out
+# of $tmp and out of $lib -- and $lib is written as root in the root
+# branch. The Rust side has always been this strict; the two now agree.
+line=$(grep -E "^[0-9a-f]{64} [ *]?acs-[0-9]+\\.[0-9]+\\.[0-9]+-$target\\.tar\\.gz\$" "$tmp/SHA256SUMS" | head -n 1 || true)
 [ -n "$line" ] || die "the release has no build for $target"
 sum=${line%% *}
 file=${line##* }
 file=${file#\*}
 version=${file#acs-}
 version=${version%-"$target".tar.gz}
+# Belt and braces: whatever the grep let through, this is a version.
+case "$version" in
+    *[!0-9.]* | *..* | .* | *. | "")
+        die "the release names a version that is not X.Y.Z: $version"
+        ;;
+esac
 if [ -n "$want" ] && [ "$version" != "$want" ]; then
     die "asked for $want, but the release holds $version"
 fi
