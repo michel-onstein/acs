@@ -216,19 +216,24 @@ const HEAD: [&str; 6] = ["NAME", "STATE", "WHO", "IDLE", "AGE", "COMMAND"];
 
 /// One session's cells, in the order of [`HEAD`].
 fn cells(s: &StatusInfo, now: u64) -> Vec<String> {
+    // Every field here was chosen by the remote host, and the table is
+    // acs's own interface rather than the session's byte stream, so none of
+    // it may steer the terminal (acs-w1z). The name is validated on the way
+    // in (`proto`), the identity and the command have no grammar at all.
+    let safe = crate::safe::display;
     vec![
-        s.name.clone(),
+        safe(&s.name),
         if s.attached { "attached" } else { "detached" }.to_string(),
         if s.identity.is_empty() {
             "-".to_string()
         } else if s.attached {
-            s.identity.clone()
+            safe(&s.identity)
         } else {
-            format!("({})", s.identity)
+            format!("({})", safe(&s.identity))
         },
         span(s.idle_secs),
         span(now.saturating_sub(s.created_at)),
-        s.command.clone(),
+        safe(&s.command),
     ]
 }
 
@@ -416,5 +421,46 @@ mod tests {
         );
         assert_eq!(render_all(&[("nas", vec![])], now), "");
         assert_eq!(render_all(&[], now), "");
+    }
+
+    /// acs-w1z: a host that answers a listing with escape sequences in the
+    /// fields it chose must not be able to draw on the terminal. The table
+    /// is acs's own output, not the session's byte stream.
+    #[test]
+    fn a_hostile_listing_cannot_steer_the_terminal() {
+        let now = 1_000_000;
+        // A name good enough for the grammar, an identity and a command
+        // that are not: a cursor move, a line erase and a title set.
+        let hostile = info(
+            "main",
+            true,
+            "root@trusted\x1b[1A\x1b[2K",
+            0,
+            now,
+            "sh\x1b]0;owned\x07",
+        );
+        let out = render("devbox", std::slice::from_ref(&hostile), now);
+        assert!(!out.contains('\x1b'), "escape survived: {out:?}");
+        assert!(!out.contains('\x07'), "bell survived: {out:?}");
+        assert!(!out.contains('\r'), "carriage return survived: {out:?}");
+        // The text is still there, only its teeth are gone.
+        assert!(out.contains("root@trusted?[1A?[2K"), "{out}");
+        assert!(out.contains("sh?]0;owned?"), "{out}");
+        // And the same through the every-host table.
+        let all = render_all(&[("devbox", vec![hostile])], now);
+        assert!(!all.contains('\x1b'), "escape survived: {all:?}");
+    }
+
+    /// acs-w1z: one field cannot push the rest of the row off the screen.
+    #[test]
+    fn an_enormous_field_is_capped() {
+        let now = 1_000_000;
+        let out = render(
+            "devbox",
+            &[info("main", false, &"w".repeat(50_000), 0, now, "sh")],
+            now,
+        );
+        assert!(out.len() < 2_000, "row not capped: {} bytes", out.len());
+        assert!(out.contains('…'));
     }
 }

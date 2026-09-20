@@ -400,10 +400,17 @@ pub fn ask_takeover(state: &mut State, identity: &str, since: u64) -> bool {
         ));
         return false;
     }
-    let question = format!(
-        "acs: session '{name}' on {} is attached from {identity} since {} — take over? [y/N] ",
-        state.host,
-        sys::local_hhmm(since)
+    // The identity comes from whoever is attached and is asserted, not
+    // checked. This is a security question, so it must read as acs wrote
+    // it: an identity that erases the line and prints its own question
+    // would collect a "y" for something else entirely (acs-w1z).
+    let question = crate::safe::display_max(
+        &format!(
+            "acs: session '{name}' on {} is attached from {identity} since {} — take over? [y/N] ",
+            state.host,
+            sys::local_hhmm(since)
+        ),
+        4 * crate::safe::MAX_FIELD,
     );
     // Keys typed before the question are not its answer (acs-qty).
     let _ = sys::flush_input(0);

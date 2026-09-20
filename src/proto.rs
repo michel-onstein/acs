@@ -278,6 +278,18 @@ impl<'a> R<'a> {
     fn str(&mut self, what: &'static str) -> Result<String, ProtoError> {
         String::from_utf8(self.bytes(what)?).map_err(|_| ProtoError::BadUtf8)
     }
+    /// A session name, held to the grammar of DESIGN §4.1 on the way in as
+    /// well as on the way out (acs-w1z). Both ends run the same version, so
+    /// an honest peer never sends anything else; a name that breaks the
+    /// grammar is a malformed frame, exactly as bad UTF-8 is, and the
+    /// client refuses it rather than printing it or handing it back.
+    fn name(&mut self, what: &'static str) -> Result<String, ProtoError> {
+        let s = self.str(what)?;
+        match crate::session::validate_name(&s) {
+            Ok(()) => Ok(s),
+            Err(_) => Err(ProtoError::BadValue(what)),
+        }
+    }
     fn bool(&mut self, what: &'static str) -> Result<bool, ProtoError> {
         match self.u8(what)? {
             0 => Ok(false),
@@ -475,7 +487,7 @@ impl Msg {
             }
             ty::WELCOME => Msg::Welcome(Welcome {
                 proto: r.u16("proto")?,
-                session: r.str("session")?,
+                session: r.name("session")?,
                 instance: r.u64("instance")?,
                 offset: r.u64("offset")?,
                 created: r.bool("created")?,
@@ -515,7 +527,7 @@ impl Msg {
             ty::TAKEOVER => Msg::Takeover,
             ty::STATUS => Msg::Status,
             ty::STATUS_REPLY => Msg::StatusReply(StatusInfo {
-                name: r.str("name")?,
+                name: r.name("name")?,
                 attached: r.bool("attached")?,
                 identity: r.str("identity")?,
                 creator: r.str("creator")?,
@@ -878,11 +890,66 @@ mod tests {
         assert_eq!(d.next_msg(), Err(ProtoError::Truncated("seq")));
     }
 
+    /// acs-w1z: a session name is held to the grammar of DESIGN §4.1 on
+    /// the way in too, so a hostile remote cannot hand the client a name
+    /// full of escapes to print, or to pass back in a reattach line.
+    #[test]
+    fn a_session_name_that_breaks_the_grammar_is_refused() {
+        for bad in [
+            "main\x1b[2J",
+            "",
+            "../etc",
+            "-rf",
+            "with space",
+            "\u{202e}gnol",
+        ] {
+            let frame = Msg::Welcome(Welcome {
+                proto: 1,
+                session: bad.into(),
+                instance: 1,
+                offset: 1,
+                created: false,
+                kind: AttachKind::Fresh,
+                input_seq: 0,
+            })
+            .to_bytes();
+            let mut d = Decoder::new();
+            d.push(&frame);
+            assert_eq!(
+                d.next_msg(),
+                Err(ProtoError::BadValue("session")),
+                "accepted {bad:?}"
+            );
+        }
+        // And in a listing, where it would be drawn into the menu.
+        let mut s = StatusInfo {
+            name: "main\x1b[1A".into(),
+            attached: false,
+            identity: String::new(),
+            creator: String::new(),
+            created_at: 0,
+            idle_secs: 0,
+            command: String::new(),
+            size: WinSize::default(),
+            version: String::new(),
+            pid: 1,
+        };
+        let mut d = Decoder::new();
+        d.push(&Msg::StatusReply(s.clone()).to_bytes());
+        assert_eq!(d.next_msg(), Err(ProtoError::BadValue("name")));
+        // The honest one still decodes.
+        s.name = "main".into();
+        let mut d = Decoder::new();
+        d.push(&Msg::StatusReply(s.clone()).to_bytes());
+        assert_eq!(d.next_msg(), Ok(Some(Msg::StatusReply(s))));
+    }
+
     #[test]
     fn bad_enum_and_utf8_values_are_errors() {
+        // A real name: the session is checked before the kind is (acs-w1z).
         let mut frame = Msg::Welcome(Welcome {
             proto: 1,
-            session: String::new(),
+            session: "main".into(),
             instance: 1,
             offset: 1,
             created: false,

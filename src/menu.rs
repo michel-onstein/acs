@@ -454,7 +454,14 @@ impl Menu {
             if i > 0 {
                 out.push_str("\r\n");
             }
-            let text = clip(text, cols);
+            // Rows, and the note under them, are built from names and
+            // identities the remote chose. The menu is acs's own drawing,
+            // so nothing in a line may move the cursor or erase a
+            // neighbour: a row that redraws the rows around it is a row the
+            // user attaches to, or ends, by mistake (acs-w1z). Clipping
+            // below is by width and would not stop it.
+            let text = crate::safe::display_max(text, cols.max(crate::safe::MAX_FIELD));
+            let text = clip(&text, cols);
             if *here {
                 let pad = bar.saturating_sub(width(text));
                 out.push_str(&format!("\x1b[7m{text}{:pad$}\x1b[0m", ""));

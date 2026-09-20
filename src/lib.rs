@@ -25,6 +25,7 @@ pub mod prune;
 pub mod reconnect;
 pub mod release;
 pub mod resume;
+pub mod safe;
 pub mod session;
 pub mod sha256;
 pub mod ssh;
