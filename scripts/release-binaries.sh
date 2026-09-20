@@ -66,14 +66,24 @@ cargo xtask formula --version "$version" --sums "$work/assets/SHA256SUMS" --out 
 # said it should be; acs and install.sh check this signature against a key
 # they carry before believing either. No key, no release: a release without
 # a signature is one every client refuses.
+# ACS_SIGNING_KEY may name either half of the pair. The private half makes
+# ssh-keygen prompt for its passphrase, which needs a terminal; naming the
+# public half signs through ssh-agent instead, so a passphrase-protected
+# key can be used unattended once it is loaded
+# (ssh-add --apple-use-keychain ~/.ssh/acs-release).
 key=${ACS_SIGNING_KEY:-$HOME/.ssh/acs-release}
+pub=${key%.pub}.pub
 [ -f "$key" ] || {
     echo "no release signing key at $key (set ACS_SIGNING_KEY)" >&2
     exit 1
 }
+[ -f "$pub" ] || {
+    echo "no public half at $pub to check the signature against" >&2
+    exit 1
+}
 echo "== signing SHA256SUMS"
 ssh-keygen -Y sign -q -n acs-release -f "$key" "$work/assets/SHA256SUMS"
-printf 'releases@acs namespaces="acs-release" %s\n' "$(cat "$key.pub")" > "$work/allowed_signers"
+printf 'releases@acs namespaces="acs-release" %s\n' "$(cat "$pub")" > "$work/allowed_signers"
 ssh-keygen -Y verify -f "$work/allowed_signers" -I releases@acs -n acs-release \
     -s "$work/assets/SHA256SUMS.sig" < "$work/assets/SHA256SUMS" >/dev/null || {
     echo "the signature just made does not verify; not publishing" >&2
