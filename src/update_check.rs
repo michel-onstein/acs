@@ -33,6 +33,9 @@ pub struct State {
     pub latest: Option<String>,
     /// The version the last message was about.
     pub shown: Option<String>,
+    /// A check was answered with a release *older* than one already seen,
+    /// and has not been mentioned yet (acs-2zj).
+    pub regressed: Option<String>,
 }
 
 impl State {
@@ -46,6 +49,7 @@ impl State {
             let v = v.trim();
             let version = || release::parse_version(v).map(|_| v.to_string());
             match k.trim() {
+                "regressed" => s.regressed = version(),
                 "checked" => s.checked = v.parse().unwrap_or(0),
                 "latest" => s.latest = version(),
                 "shown" => s.shown = version(),
@@ -63,6 +67,9 @@ impl State {
         if let Some(v) = &self.shown {
             out.push_str(&format!("shown={v}\n"));
         }
+        if let Some(v) = &self.regressed {
+            out.push_str(&format!("regressed={v}\n"));
+        }
         out
     }
 
@@ -75,6 +82,25 @@ impl State {
     /// The message to show for `current`, if a newer release is known and
     /// was not shown yet; records it as shown. `upgrade` is the command that
     /// upgrades this acs (`upgrade::command`).
+    /// The freeze warning, once (acs-2zj).
+    ///
+    /// `decide` already refuses to install an older release, so a rollback
+    /// is blocked. What was not covered is the quieter version: a channel,
+    /// or a stale mirror, that keeps serving an **old but genuine**
+    /// `SHA256SUMS` for ever. Every check then agrees there is nothing
+    /// newer, the weekly message never comes, and the user sits on a
+    /// version with a known hole believing they are current. Silence is
+    /// exactly what an attacker wants here, so going backwards is said out
+    /// loud.
+    pub fn take_warning(&mut self) -> Option<String> {
+        let went_back = self.regressed.take()?;
+        let known = self.latest.clone()?;
+        Some(format!(
+            "the release channel now offers {went_back}, older than the {known} it offered before — \
+             it may be stale or tampered with; check where ACS_RELEASES_URL points"
+        ))
+    }
+
     pub fn take_message(&mut self, current: &str, upgrade: &str) -> Option<String> {
         let latest = self.latest.clone()?;
         let newer = release::compare(&latest, current) == Some(std::cmp::Ordering::Greater);
@@ -137,6 +163,9 @@ pub fn on_client_start(config: &Config) {
     let Some(path) = state_path() else { return };
     let mut state = read(&path);
     let before = state.clone();
+    if let Some(w) = state.take_warning() {
+        eprintln!("acs: {w}");
+    }
     if let Some(msg) = state.take_message(crate::VERSION, crate::upgrade::command()) {
         eprintln!("acs: {msg}");
     }
@@ -201,7 +230,17 @@ pub fn check_main() -> ExitCode {
         Ok(asset) => {
             // Re-read: a client may have written `shown` meanwhile.
             let mut state = read(&path);
-            state.latest = Some(asset.version);
+            // Keep the newest release ever seen, and say so when a check
+            // offers something older (acs-2zj).
+            let older = state.latest.as_deref().is_some_and(|known| {
+                release::compare(&asset.version, known) == Some(std::cmp::Ordering::Less)
+            });
+            if older {
+                state.regressed = Some(asset.version);
+            } else {
+                state.latest = Some(asset.version);
+                state.regressed = None;
+            }
             if state.checked == 0 {
                 state.checked = crate::sys::unix_now();
             }
@@ -216,12 +255,63 @@ pub fn check_main() -> ExitCode {
 mod tests {
     use super::*;
 
+    /// acs-2zj: a rollback is already refused, but the quiet version was
+    /// not covered. A channel, or a stale mirror, that keeps serving an old
+    /// but genuine SHA256SUMS for ever leaves every check agreeing there is
+    /// nothing newer — so the message never comes and the user sits on a
+    /// version with a known hole believing they are current. Silence is
+    /// what an attacker wants, so going backwards is said out loud.
+    #[test]
+    fn a_channel_that_goes_backwards_is_not_silent() {
+        let mut s = State {
+            checked: 1,
+            latest: Some("0.9.0".into()),
+            shown: None,
+            regressed: Some("0.3.0".into()),
+        };
+        let w = s.take_warning().expect("a warning");
+        assert!(w.contains("0.3.0"), "{w}");
+        assert!(w.contains("0.9.0"), "{w}");
+        assert!(w.contains("ACS_RELEASES_URL"), "{w}");
+        // Once only, so it does not become noise on every start.
+        assert_eq!(s.take_warning(), None);
+        // The newer version it already knew about is kept, so the upgrade
+        // message still points at the real one.
+        assert_eq!(s.latest.as_deref(), Some("0.9.0"));
+
+        // Nothing to say when the channel is behaving.
+        let mut ok = State {
+            checked: 1,
+            latest: Some("0.9.0".into()),
+            shown: None,
+            regressed: None,
+        };
+        assert_eq!(ok.take_warning(), None);
+    }
+
+    /// acs-2zj: and it survives a round trip through the cache file, since
+    /// the check that notices and the client that reports it are different
+    /// processes.
+    #[test]
+    fn a_regression_survives_the_state_file() {
+        let s = State {
+            checked: 7,
+            latest: Some("0.9.0".into()),
+            shown: None,
+            regressed: Some("0.3.0".into()),
+        };
+        let back = State::parse(&s.format());
+        assert_eq!(back.regressed.as_deref(), Some("0.3.0"));
+        assert_eq!(back.latest.as_deref(), Some("0.9.0"));
+    }
+
     #[test]
     fn state_round_trips_and_tolerates_garbage() {
         let s = State {
             checked: 1_700_000_000,
             latest: Some("0.3.0".into()),
             shown: Some("0.2.5".into()),
+            regressed: None,
         };
         assert_eq!(State::parse(&s.format()), s);
         assert_eq!(
@@ -229,7 +319,8 @@ mod tests {
             State {
                 checked: 0,
                 latest: None,
-                shown: Some("0.1.0".into())
+                shown: Some("0.1.0".into()),
+                regressed: None,
             }
         );
         assert_eq!(State::parse(""), State::default());

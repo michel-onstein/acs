@@ -209,3 +209,33 @@ fn the_state_file_defaults_under_home() {
     let file: &Path = &home.path().join(".local/state/acs/update-check");
     assert!(file.exists(), "no {}", file.display());
 }
+
+/// acs-2zj: a channel serving an old but genuine SHA256SUMS for ever keeps
+/// every check agreeing there is nothing newer, so the upgrade message
+/// never comes and the user sits on a version with a known hole believing
+/// they are current. Going backwards is said out loud instead.
+#[test]
+fn a_release_channel_that_goes_backwards_is_reported() {
+    let s = Setup::new();
+    // The state already knows about a much newer release.
+    s.write_state(&format!("checked={}\nlatest=9.9.9\n", now() - 8 * 86_400));
+    // The channel now offers something far older.
+    s.server.release("0.0.1", b"old", true, false);
+
+    // The check runs in the background and notices.
+    let _ = s.start(&[]);
+    s.wait_state("regressed=0.0.1");
+
+    // The next start says so, once, and still knows the newer version.
+    let err = s.start(&[]);
+    assert!(err.contains("older than"), "no warning: {err}");
+    assert!(err.contains("0.0.1"), "{err}");
+    assert!(err.contains("9.9.9"), "{err}");
+    let again = s.start(&[]);
+    assert!(!again.contains("older than"), "warned twice: {again}");
+    assert!(
+        s.read_state().contains("latest=9.9.9"),
+        "{}",
+        s.read_state()
+    );
+}
