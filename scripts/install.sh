@@ -84,6 +84,17 @@ else
     die "need sha256sum, shasum or openssl to check the download"
 fi
 
+# The checksums are signed, and the signature is checked before they are
+# read (acs-o9v): they and the archives come from the same place, so
+# unsigned they prove only that an archive matches what that place said.
+# ssh-keygen does the checking -- acs is an ssh tool, so a machine that
+# cannot run it cannot run acs -- and the key below is the public half of
+# the key that signs acs releases. It is in the binary too, and in the
+# Homebrew tap, which is a repository of its own to check it against.
+release_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILbxQW5C9X7CdwcQ4bab0gsQi4Evk2xfgmI/972dlHCb acs release signing"
+command -v ssh-keygen >/dev/null 2>&1 ||
+    die "need ssh-keygen to check the release signature (it comes with ssh, which acs requires)"
+
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/acs-install.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
@@ -95,6 +106,12 @@ else
 fi
 fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" ||
     die "cannot download $base/SHA256SUMS${want:+ (is $want a release?)}"
+fetch "$base/SHA256SUMS.sig" "$tmp/SHA256SUMS.sig" ||
+    die "the release has no signature for SHA256SUMS ($base/SHA256SUMS.sig)"
+printf 'releases@acs namespaces="acs-release" %s\n' "$release_key" > "$tmp/allowed_signers"
+ssh-keygen -Y verify -f "$tmp/allowed_signers" -I releases@acs -n acs-release \
+    -s "$tmp/SHA256SUMS.sig" < "$tmp/SHA256SUMS" >/dev/null 2>&1 ||
+    die "the release's SHA256SUMS is not signed by the acs release key; nothing was installed"
 # The version is X.Y.Z and nothing else (acs-g3j). The old pattern took
 # [^ ]+ for the whole name, which allows / and .., so a SHA256SUMS from a
 # channel under someone else's control could name a version that walks out

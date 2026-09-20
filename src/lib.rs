@@ -28,6 +28,7 @@ pub mod resume;
 pub mod safe;
 pub mod session;
 pub mod sha256;
+pub mod signature;
 pub mod ssh;
 pub mod sys;
 #[doc(hidden)]

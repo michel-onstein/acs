@@ -27,7 +27,8 @@ Intel, Linux x86_64 and aarch64), checks it against the release's
 so a client of the same version finds acs already there when it connects
 to this machine. It says how to add the directory to your `PATH` if it is
 not on it, and running it again upgrades in place. It needs `curl` or
-`wget`, and `sha256sum`, `shasum` or `openssl`.
+`wget`, `sha256sum`, `shasum` or `openssl`, and `ssh-keygen` (which comes
+with the ssh acs needs anyway).
 
 | Variable | Meaning |
 | --- | --- |
@@ -72,10 +73,39 @@ copy of itself (same OS and CPU).
 ### Upgrade
 
 ```sh
-acs upgrade            # the latest release, checked against its SHA256SUMS
+acs upgrade            # the latest release, checked against its signed SHA256SUMS
 acs upgrade --check    # only say whether there is a newer one
 acs upgrade --version 0.2.0   # that release, even an older one
 ```
+
+### Release signatures
+
+A release's `SHA256SUMS` is signed, and both the installer and `acs
+upgrade` check the signature against a key they carry **before** they read
+a checksum out of it — a checksum served from the same place as the
+archive proves only that the two agree with each other. Signing is
+`ssh-keygen -Y` in the `acs-release` namespace, so no extra tool is
+needed. A missing signature, one that does not verify, or a missing
+`ssh-keygen` stops the install or upgrade; nothing is unpacked or run.
+
+The public key is below and in the binary, and it is published in the
+[Homebrew tap](https://github.com/michel-onstein/homebrew-acs) — a
+separate repository — so you can check one against the other rather than
+trusting only the copy that came with the download:
+
+```text
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILbxQW5C9X7CdwcQ4bab0gsQi4Evk2xfgmI/972dlHCb acs release signing
+```
+
+To check a release by hand:
+
+```sh
+printf 'releases@acs namespaces="acs-release" %s\n' "$(cat acs-release.pub)" > allowed
+ssh-keygen -Y verify -f allowed -I releases@acs -n acs-release \
+    -s SHA256SUMS.sig < SHA256SUMS
+```
+
+### How the upgrade replaces the binary
 
 acs replaces itself in place (a link like `~/.local/bin/acs` is pointed at
 the new version); if its directory is not yours, it says to use

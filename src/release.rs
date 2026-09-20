@@ -309,6 +309,20 @@ pub fn lookup(
         }
         _ => e,
     })?;
+    // The checksums are believed only once they are signed by the release
+    // key (acs-o9v): they and the archives come from the same place, so
+    // unsigned they prove only that the archive matches what that place
+    // said. Checked here, at the one point both `acs upgrade` and the
+    // weekly update check pass through, and before anything is parsed out
+    // of the file — let alone downloaded or run.
+    let sig = tmp.join("SHA256SUMS.sig");
+    fetch(&crate::signature::signature_of(&url), &sig, timeout_secs).map_err(|_| {
+        format!(
+            "the release has no signature for SHA256SUMS ({})",
+            crate::signature::signature_of(&url)
+        )
+    })?;
+    crate::signature::verify(base, &dest, &sig, tmp)?;
     let sums = std::fs::read_to_string(&dest).map_err(|e| format!("{url}: {e}"))?;
     let asset = find_asset(&sums, target)
         .ok_or_else(|| format!("the release has no build for {target}"))?;

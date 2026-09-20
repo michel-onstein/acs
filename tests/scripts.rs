@@ -289,3 +289,46 @@ fn the_installer_takes_only_an_x_y_z_version_from_the_sums() {
         assert!(!check(bad), "accepted {bad}");
     }
 }
+
+/// acs-o9v: the installer carries the same release key as the binary, and
+/// checks the signature before it reads the checksums. Two copies of a key
+/// drift; this is the guard against that.
+#[test]
+fn the_installer_carries_the_same_release_key_and_checks_before_reading() {
+    let script =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
+            .unwrap();
+    let key = script
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("release_key="))
+        .expect("the installer names a release key")
+        .trim_matches('"')
+        .to_string();
+    assert_eq!(
+        key,
+        acs::signature::RELEASE_KEY,
+        "the installer's release key is not the one built into acs"
+    );
+    // The identity and the namespace must match too, or a signature this
+    // binary accepts is one the installer rejects.
+    assert!(
+        script.contains(&format!("-I {}", acs::signature::IDENTITY)),
+        "the installer does not verify as {}",
+        acs::signature::IDENTITY
+    );
+    assert!(
+        script.contains(&format!("-n {}", acs::signature::NAMESPACE)),
+        "the installer does not verify in the {} namespace",
+        acs::signature::NAMESPACE
+    );
+    // The check comes before the checksums are read: the grep that picks the
+    // archive out must sit after the ssh-keygen that verifies them.
+    let verify = script.find("ssh-keygen -Y verify").expect("a verify");
+    let read = script
+        .find("grep -E \"^[0-9a-f]{64}")
+        .expect("the sums grep");
+    assert!(
+        verify < read,
+        "the installer reads SHA256SUMS before checking its signature"
+    );
+}

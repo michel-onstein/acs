@@ -36,6 +36,10 @@ fn upgrade(
             .arg("--allow-insecure-url")
             .args(args)
             .env("ACS_RELEASES_URL", &server.url)
+            // The server signs its releases with a key of its own, which
+            // acs honours only because the channel is not the default one
+            // (acs-o9v).
+            .env("ACS_RELEASE_KEY", server.release_key())
             .env("HOME", home)
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
     );
@@ -129,6 +133,50 @@ fn a_checksum_mismatch_changes_nothing() {
     assert_eq!(std::fs::read(&acs).unwrap(), std::fs::read(exe()).unwrap());
 }
 
+/// acs-o9v: the checksums are believed only when the release key signed
+/// them. Both halves of the attack the signature is for — a release whose
+/// files were replaced by someone who could write to it, and one published
+/// with no signature at all — are refused before anything is downloaded,
+/// unpacked or run.
+#[test]
+fn a_release_not_signed_by_the_release_key_is_refused() {
+    // Signed, but by a key that is not ours.
+    let d = TempDir::new();
+    let server = ReleaseServer::start();
+    server.release(NEW, &ReleaseServer::fake_acs(NEW), true, false);
+    server.sign_with_another_key();
+    let acs = plain_copy(d.path());
+    let (code, _, err) = upgrade(&acs, d.path(), &server, &[]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("is not signed by the acs release key"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&acs).unwrap(), std::fs::read(exe()).unwrap());
+    // The archive was never fetched: the refusal comes before the download.
+    assert!(
+        !server.hits().iter().any(|h| h.ends_with(".tar.gz")),
+        "{:?}",
+        server.hits()
+    );
+
+    // Published with no signature.
+    let d = TempDir::new();
+    let server = ReleaseServer::start();
+    server.release(NEW, &ReleaseServer::fake_acs(NEW), true, false);
+    server.remove("/latest/download/SHA256SUMS.sig");
+    let acs = plain_copy(d.path());
+    let (code, _, err) = upgrade(&acs, d.path(), &server, &[]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("no signature for SHA256SUMS"), "{err}");
+    assert_eq!(std::fs::read(&acs).unwrap(), std::fs::read(exe()).unwrap());
+    assert!(
+        !server.hits().iter().any(|h| h.ends_with(".tar.gz")),
+        "{:?}",
+        server.hits()
+    );
+}
+
 #[test]
 fn already_current_or_newer_does_nothing() {
     let d = TempDir::new();
@@ -180,7 +228,15 @@ fn check_only_reports() {
         )
     );
     assert_eq!(std::fs::read(&acs).unwrap(), std::fs::read(exe()).unwrap());
-    assert_eq!(server.hits(), ["/latest/download/SHA256SUMS"]);
+    assert_eq!(
+        server.hits(),
+        // The signature is fetched too, and checked before the sums
+        // are read (acs-o9v).
+        [
+            "/latest/download/SHA256SUMS",
+            "/latest/download/SHA256SUMS.sig"
+        ]
+    );
 }
 
 #[test]
@@ -231,7 +287,15 @@ fn an_unwritable_directory_says_to_use_sudo_before_downloading() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(code, 1);
     assert!(err.contains("re-run with sudo: sudo acs upgrade"), "{err}");
-    assert_eq!(server.hits(), ["/latest/download/SHA256SUMS"]);
+    assert_eq!(
+        server.hits(),
+        // The signature is fetched too, and checked before the sums
+        // are read (acs-o9v).
+        [
+            "/latest/download/SHA256SUMS",
+            "/latest/download/SHA256SUMS.sig"
+        ]
+    );
     assert_eq!(std::fs::read(&acs).unwrap(), std::fs::read(exe()).unwrap());
 }
 
