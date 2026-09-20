@@ -870,3 +870,84 @@ fn an_input_sequence_that_cannot_fit_is_refused_and_the_session_lives() {
     });
     c.wait_output("got:alive", T);
 }
+
+/// acs-ovq: an empty identity is unknown, not a name. It used to
+/// short-circuit the takeover comparison, so a client that simply left
+/// ACS_IDENTITY unset disabled the question for everybody: while it was
+/// attached, anyone took the session silently.
+#[test]
+fn an_empty_identity_does_not_disable_the_takeover_question() {
+    let t = TempDir::new();
+    // The attached client names nobody.
+    let (mut anon, _) = start(
+        t.path(),
+        "e",
+        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        "",
+    );
+    anon.wait_output("armed", T);
+
+    // Someone else must still be asked.
+    let mut b = FrameConn::connect(&sock(t.path(), "e")).unwrap();
+    b.send(&Msg::Hello(hello("e", Mode::Attach, "bob@desk")));
+    assert!(
+        matches!(b.recv_control(T), Some(Msg::Busy { .. })),
+        "an unnamed client let the session be taken silently"
+    );
+
+    // And a second nameless client does not count as the same person.
+    let mut c = FrameConn::connect(&sock(t.path(), "e")).unwrap();
+    c.send(&Msg::Hello(hello("e", Mode::Attach, "")));
+    assert!(
+        matches!(c.recv_control(T), Some(Msg::Busy { .. })),
+        "two unnamed clients were taken for one person"
+    );
+}
+
+/// acs-ovq: the shared-account model draws no boundary, which is a fair
+/// trade — but it left no record either. Every attach, takeover and kill
+/// is now written beside the socket, whatever the debug logging is set to.
+#[test]
+fn every_attach_takeover_and_kill_leaves_a_trace() {
+    let t = TempDir::new();
+    let trail = t.path().join("tr.log");
+    let (mut alice, _) = start(
+        t.path(),
+        "tr",
+        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        "alice@laptop",
+    );
+    alice.wait_output("armed", T);
+
+    // Refused, then agreed.
+    let mut bob = FrameConn::connect(&sock(t.path(), "tr")).unwrap();
+    bob.send(&Msg::Hello(hello("tr", Mode::Attach, "bob@desk")));
+    assert!(matches!(bob.recv_control(T), Some(Msg::Busy { .. })));
+    let mut h = hello("tr", Mode::Attach, "bob@desk");
+    h.force = true;
+    bob.send(&Msg::Hello(h));
+    assert!(matches!(bob.recv_control(T), Some(Msg::Welcome(_))));
+    bob.send(&Msg::Kill {
+        identity: "bob@desk".into(),
+        force: true,
+    });
+    let _ = wait_exit(&mut bob);
+
+    let text = std::fs::read_to_string(&trail).expect("a trail beside the socket");
+    for want in [
+        "create identity=alice@laptop",
+        "attach-refused identity=bob@desk",
+        "takeover identity=bob@desk",
+        "kill identity=bob@desk",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    // It names the kernel's view of who they are, not only their claim.
+    assert!(
+        text.contains(&format!("uid={}", acs::sys::getuid())),
+        "{text}"
+    );
+    // Readable only by its owner.
+    let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&trail).unwrap());
+    assert_eq!(mode & 0o077, 0, "the trail is readable by others: {mode:o}");
+}

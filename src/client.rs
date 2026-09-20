@@ -234,14 +234,20 @@ pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
 }
 
 /// Who we are, for the master's takeover decisions (DESIGN §4.5).
+///
+/// Bounded and control-free before it leaves (acs-ovq): this ends up in
+/// another person's terminal, in `acs list` and in the session's trail.
+/// The master holds it to the same rule on the way in — this side is a
+/// courtesy, not the check.
 pub fn identity() -> String {
-    std::env::var("ACS_IDENTITY")
+    let set = std::env::var("ACS_IDENTITY")
         .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let user = sys::user_name(sys::getuid()).unwrap_or_else(|| "user".into());
-            format!("{user}@{}", sys::hostname())
-        })
+        .map(|s| crate::safe::display_max(s.trim(), 128))
+        .filter(|s| !s.is_empty());
+    set.unwrap_or_else(|| {
+        let user = sys::user_name(sys::getuid()).unwrap_or_else(|| "user".into());
+        crate::safe::display_max(&format!("{user}@{}", sys::hostname()), 128)
+    })
 }
 
 pub(crate) fn escape_config() -> keys::Config {
