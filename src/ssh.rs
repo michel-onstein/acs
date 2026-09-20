@@ -165,9 +165,29 @@ pub fn remote_candidates(version: &str) -> [String; 2] {
 pub fn prelude(version: &str, args: &[&str]) -> String {
     let args: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
     let [home, system] = remote_candidates(version);
+    // Before exec'ing anything, check it is ours and that nobody else can
+    // write it or the directory holding it (acs-08m). The path is fixed and
+    // acs runs it on every single connection, so on a host where `$HOME` or
+    // `~/.local/share` is group-writable — umask 002 with a shared group,
+    // which lab and appliance images still ship — another local user plants
+    // a binary there once and owns every later session.
+    //
+    // `ls -ldn` rather than `test -O`, which is not POSIX and is missing
+    // from dash: field 1 is the mode string, where character 6 is group
+    // write and character 9 is other write, and field 3 is the numeric
+    // owner.
     format!(
-        "for b in {home} {system}; do \
-         if [ -x \"$b\" ]; then exec \"$b\" {args}; fi; \
+        "u=$(id -u); \
+         acs_safe() {{ \
+         [ -e \"$1\" ] || return 1; \
+         set -- \"$1\" $(ls -ldn \"$1\" 2>/dev/null); \
+         case \"$2\" in ?????w*|????????w*) return 1;; esac; \
+         [ \"$4\" = \"$u\" ]; }}; \
+         for b in {home} {system}; do \
+         if [ -x \"$b\" ]; then \
+         if acs_safe \"$b\" && acs_safe \"$(dirname \"$b\")\"; then exec \"$b\" {args}; fi; \
+         printf 'acs: refusing to run %s: it or its directory is writable by others, or not yours\\n' \"$b\" >&2; \
+         fi; \
          done; \
          printf '\\nACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"",
         args = args.join(" ")
@@ -197,6 +217,7 @@ pub fn display_argv(argv: &[OsString]) -> String {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+    use std::os::unix::fs::PermissionsExt;
 
     fn t() -> Transport {
         Transport {
@@ -371,6 +392,63 @@ mod tests {
             .output()
             .unwrap();
         String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// acs-08m: the prelude execs a fixed path on every connection. On a
+    /// host where `$HOME` or `~/.local/share` is group-writable — umask 002
+    /// with a shared group, which lab and appliance images still ship —
+    /// another local user plants a binary there once and owns every later
+    /// session. So it is checked before it is run.
+    #[test]
+    fn a_binary_others_could_have_written_is_not_run() {
+        let home = TempDir::new();
+        let dir = home.path().join(".local/share/acs/9.9.9");
+        std::fs::create_dir_all(&dir).unwrap();
+        let acs = dir.join("acs");
+        std::fs::write(&acs, "#!/bin/sh\necho RAN\n").unwrap();
+
+        let run = || {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(prelude("9.9.9", &["--version"]))
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+
+        // Ours, and private: it runs.
+        std::fs::set_permissions(&acs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (out, _) = run();
+        assert!(out.contains("RAN"), "an honest binary was not run: {out}");
+
+        // Writable by the group: refused, and said so.
+        std::fs::set_permissions(&acs, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let (out, err) = run();
+        assert!(!out.contains("RAN"), "a group-writable binary was run");
+        assert!(out.contains("ACS-NEED"), "no marker after refusing: {out}");
+        assert!(err.contains("refusing to run"), "no reason given: {err}");
+
+        // Writable by anyone: refused.
+        std::fs::set_permissions(&acs, std::fs::Permissions::from_mode(0o707)).unwrap();
+        assert!(!run().0.contains("RAN"), "a world-writable binary was run");
+
+        // The binary is fine, but its directory is not.
+        std::fs::set_permissions(&acs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let (out, err) = run();
+        assert!(
+            !out.contains("RAN"),
+            "a binary in a shared directory was run"
+        );
+        assert!(err.contains("refusing to run"), "{err}");
+
+        // Put it back so the temporary directory can be removed.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// acs-ciz: the version reaches the remote shell inside double quotes,
