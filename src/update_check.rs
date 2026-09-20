@@ -184,7 +184,19 @@ pub fn check_main() -> ExitCode {
         return ExitCode::from(1);
     }
     let target = release::archive_target(crate::payload::OWN_TARGET);
-    let found = release::lookup(&release::releases_url(), None, &target, &tmp, TIMEOUT_SECS);
+    // This check only reads SHA256SUMS to compare version numbers: it
+    // downloads nothing and runs nothing, so the scheme is not load-bearing
+    // here and a plain mirror is allowed (acs-95w). `acs upgrade`, which
+    // does execute what it fetches, is strict. The privilege rule still
+    // applies, so a check under sudo reads the real releases.
+    let base = match release::releases_url(true) {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return ExitCode::from(1);
+        }
+    };
+    let found = release::lookup(&base, None, &target, &tmp, TIMEOUT_SECS);
     let _ = std::fs::remove_dir_all(&tmp);
     match found {
         Ok(asset) => {

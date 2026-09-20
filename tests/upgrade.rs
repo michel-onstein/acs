@@ -31,6 +31,9 @@ fn upgrade(
     let out = output_of(
         Command::new(path)
             .arg("upgrade")
+            // The test server speaks http, which acs-95w refuses without
+            // an explicit say-so on the command line.
+            .arg("--allow-insecure-url")
             .args(args)
             .env("ACS_RELEASES_URL", &server.url)
             .env("HOME", home)
@@ -289,4 +292,27 @@ fn a_missing_release_or_no_network_is_explained() {
     let (code, _, err) = upgrade(&acs, d.path(), &server, &["--version", "latest"]);
     assert_eq!(code, 2);
     assert!(err.contains("X.Y.Z"), "{err}");
+}
+
+/// acs-95w: without the flag, `acs upgrade` refuses a releases URL it
+/// cannot authenticate rather than downloading and running what it finds.
+#[test]
+fn an_insecure_releases_url_is_refused_without_the_flag() {
+    let t = TempDir::new();
+    let server = ReleaseServer::start();
+    server.release(NEW, &ReleaseServer::fake_acs(NEW), true, false);
+    let bin = t.path().join("acs");
+    std::fs::copy(exe(), &bin).unwrap();
+    let out = output_of(
+        Command::new(&bin)
+            .arg("upgrade")
+            .arg("--check")
+            .env("ACS_RELEASES_URL", &server.url)
+            .env("HOME", t.path())
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+    );
+    assert!(!out.status.success(), "an http mirror was accepted");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot be authenticated"), "{err}");
+    assert!(err.contains("--allow-insecure-url"), "{err}");
 }

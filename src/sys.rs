@@ -30,6 +30,19 @@ pub fn getuid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+pub fn geteuid() -> u32 {
+    // SAFETY: geteuid cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Whether this process is running with an effective user other than the
+/// one who started it — `sudo`, or a setuid binary. Environment variables
+/// then come from one user and the privileges from another, so anything
+/// that decides what gets executed must not read them (acs-95w).
+pub fn privileges_dropped() -> bool {
+    getuid() != geteuid()
+}
+
 pub fn getpid() -> u32 {
     // SAFETY: getpid cannot fail.
     unsafe { libc::getpid() as u32 }

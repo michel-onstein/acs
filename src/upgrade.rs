@@ -26,19 +26,27 @@ use std::process::{Command, ExitCode};
 use crate::release::{self, Asset};
 
 pub const USAGE: &str = "\
-usage: acs upgrade [--version X.Y.Z] [--check]
+usage: acs upgrade [--version X.Y.Z] [--check] [--allow-insecure-url]
 
 Replace this acs with the latest release from GitHub (checked against the
 release's SHA256SUMS). Remote hosts get the new version on the next connect.
 
-  --version X.Y.Z  install that release, even an older one
-  --check          only say whether a newer release exists";
+  --version X.Y.Z       install that release, even an older one
+  --check               only say whether a newer release exists
+  --allow-insecure-url  accept an ACS_RELEASES_URL that is not https, which
+                        cannot be authenticated (the sums travel with the
+                        payload). ACS_RELEASES_URL is ignored altogether
+                        when the real and effective user differ.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Opts {
     pub version: Option<String>,
     pub check: bool,
     pub help: bool,
+    /// Accept an `ACS_RELEASES_URL` that is not https (acs-95w). A command
+    /// line flag on purpose: an environment variable would be set by
+    /// whoever set the URL.
+    pub allow_insecure_url: bool,
 }
 
 pub fn parse(args: &[OsString]) -> Result<Opts, String> {
@@ -47,6 +55,7 @@ pub fn parse(args: &[OsString]) -> Result<Opts, String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--check" => o.check = true,
+            "--allow-insecure-url" => o.allow_insecure_url = true,
             "--version" | "-V" => o.version = Some(it.next().ok_or("--version needs X.Y.Z")?),
             s if s.starts_with("--version=") => o.version = Some(s[10..].to_string()),
             "-h" | "--help" => o.help = true,
@@ -265,7 +274,7 @@ pub fn run(opts: &Opts) -> Result<String, Error> {
         )));
     }
     let target = release::archive_target(crate::payload::OWN_TARGET);
-    let base = release::releases_url();
+    let base = release::releases_url(opts.allow_insecure_url).map_err(Error::Failed)?;
     let tmp = Scratch::new()?;
     let asset = release::lookup(&base, opts.version.as_deref(), &target, &tmp.0, 30)?;
     let v = asset.version.clone();

@@ -436,7 +436,7 @@ reached as `user@config`.
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |
-| `ACS_RELEASES_URL` | where `acs upgrade` and the update check look for releases (default GitHub) |
+| `ACS_RELEASES_URL` | where `acs upgrade` and the update check look for releases (default GitHub). Must be `https`, since what is fetched is checked only against sums from the same place and is then run; `acs upgrade --allow-insecure-url` accepts another scheme. Ignored altogether when the real and effective user differ, so a `sudo` upgrade is not steered by the environment |
 | `ACS_NO_UPDATE_CHECK` | `1`: never look for a newer release |
 | `XDG_STATE_HOME` | where the update check keeps its state (default `~/.local/state`) |
 

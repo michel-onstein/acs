@@ -12,14 +12,81 @@ use std::cmp::Ordering;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// Where releases are published (`ACS_RELEASES_URL` overrides it).
-pub fn releases_url() -> String {
-    std::env::var("ACS_RELEASES_URL")
+/// Where releases are published when nothing overrides it.
+pub const DEFAULT_RELEASES_URL: &str = "https://github.com/michel-onstein/acs/releases";
+
+/// Where releases are published, with `ACS_RELEASES_URL` honoured only
+/// where it is safe to (acs-95w).
+///
+/// What is downloaded from here is checked against a `SHA256SUMS` fetched
+/// from the same place and is then **run**, so whoever chooses this string
+/// chooses what acs executes. Two limits:
+///
+/// - **Not across a privilege boundary.** Under `sudo -E`, a sudoers
+///   `env_keep`, or anything else that leaves the real and effective uid
+///   different, the variable is ignored outright. An attacker who can seed
+///   the environment of a privileged run must not thereby choose the
+///   binary that run installs.
+/// - **https only**, unless the caller was told otherwise on the *command
+///   line*. `http://` and `file://` bypass integrity checking entirely,
+///   since the sums travel with the payload. The opt-out is deliberately
+///   not an environment variable: whoever can set the URL could set that
+///   too, and the check would be worth nothing.
+pub fn releases_url(allow_insecure: bool) -> Result<String, String> {
+    let set = std::env::var("ACS_RELEASES_URL")
         .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://github.com/michel-onstein/acs/releases".into())
-        .trim_end_matches('/')
-        .to_string()
+        .filter(|v| !v.is_empty());
+    let (url, warning) = choose_releases_url(
+        set.as_deref(),
+        crate::sys::privileges_dropped(),
+        allow_insecure,
+    )?;
+    if let Some(w) = warning {
+        eprintln!("acs: {w}");
+    }
+    Ok(url)
+}
+
+/// The decision [`releases_url`] makes, without reading the environment or
+/// the process's uids, so both branches can be tested.
+///
+/// Returns the base to use and, where the override was dropped, what to say
+/// about it.
+pub fn choose_releases_url(
+    set: Option<&str>,
+    privileges_dropped: bool,
+    allow_insecure: bool,
+) -> Result<(String, Option<String>), String> {
+    let Some(url) = set.filter(|v| !v.is_empty()) else {
+        return Ok((DEFAULT_RELEASES_URL.to_string(), None));
+    };
+    if privileges_dropped {
+        return Ok((
+            DEFAULT_RELEASES_URL.to_string(),
+            Some(format!(
+                "ignoring ACS_RELEASES_URL: the real and effective user differ, \
+                 so releases come from {DEFAULT_RELEASES_URL}"
+            )),
+        ));
+    }
+    if !url.starts_with("https://") && !allow_insecure {
+        return Err(format!(
+            "ACS_RELEASES_URL is {}, which cannot be authenticated: what is downloaded is checked \
+             against a SHA256SUMS from the same place, and then run. Use https://, or pass \
+             --allow-insecure-url to accept it.",
+            scheme_of(url)
+        ));
+    }
+    Ok((url.trim_end_matches('/').to_string(), None))
+}
+
+/// The scheme of `url` for an error message, or the whole string when it
+/// has none.
+fn scheme_of(url: &str) -> &str {
+    match url.split_once("://") {
+        Some((s, _)) => s,
+        None => url,
+    }
 }
 
 /// The release archive target for this build: Linux builds are published
@@ -260,6 +327,71 @@ pub fn lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-95w: what `ACS_RELEASES_URL` names is downloaded, checked only
+    /// against sums fetched from the same place, and then run. A scheme
+    /// that cannot be authenticated therefore needs an explicit say-so.
+    #[test]
+    fn a_releases_url_that_cannot_be_authenticated_needs_the_flag() {
+        // Unset, or empty: the published releases, over https.
+        assert_eq!(
+            choose_releases_url(None, false, false).unwrap(),
+            (DEFAULT_RELEASES_URL.to_string(), None)
+        );
+        assert_eq!(
+            choose_releases_url(Some(""), false, false).unwrap(),
+            (DEFAULT_RELEASES_URL.to_string(), None)
+        );
+
+        for bad in [
+            "http://mirror.example/releases",
+            "file:///tmp/mirror",
+            "ftp://mirror.example",
+            "/tmp/mirror",
+        ] {
+            let e = choose_releases_url(Some(bad), false, false).unwrap_err();
+            assert!(e.contains("cannot be authenticated"), "{bad}: {e}");
+            assert!(e.contains("--allow-insecure-url"), "{bad}: {e}");
+            // With the flag it is taken, trailing slash trimmed.
+            let (url, warn) = choose_releases_url(Some(bad), false, true).unwrap();
+            assert_eq!(url, bad.trim_end_matches('/'));
+            assert_eq!(warn, None);
+        }
+
+        // https needs no flag.
+        let (url, warn) =
+            choose_releases_url(Some("https://mirror.example/r/"), false, false).unwrap();
+        assert_eq!(url, "https://mirror.example/r");
+        assert_eq!(warn, None);
+    }
+
+    /// acs-95w: across a privilege boundary the variable is ignored
+    /// outright — with the flag, with https, with anything. Whoever seeds
+    /// the environment of a sudo run must not choose what it installs.
+    #[test]
+    fn a_releases_url_is_ignored_when_the_real_and_effective_user_differ() {
+        for (set, allow) in [
+            ("http://mirror.example", false),
+            ("http://mirror.example", true),
+            ("file:///tmp/mirror", true),
+            ("https://mirror.example", false),
+        ] {
+            let (url, warn) = choose_releases_url(Some(set), true, allow).unwrap();
+            assert_eq!(url, DEFAULT_RELEASES_URL, "{set} was honoured under sudo");
+            let warn = warn.expect("the user is told the setting was dropped");
+            assert!(warn.contains("ignoring ACS_RELEASES_URL"), "{warn}");
+        }
+    }
+
+    /// acs-95w: the error names the scheme, so the reader can see which
+    /// part of their setting is the problem.
+    #[test]
+    fn the_insecure_url_error_names_the_scheme() {
+        let e = choose_releases_url(Some("http://mirror.example"), false, false).unwrap_err();
+        assert!(e.contains("is http,"), "{e}");
+        let e = choose_releases_url(Some("file:///tmp/x"), false, false).unwrap_err();
+        assert!(e.contains("is file,"), "{e}");
+    }
 
     const SUMS: &str = "\
 1561565a626eb353fb2f0035ffddad3b508450ca49d049bd3af92d03fc0d40c9  acs-0.2.0-aarch64-apple-darwin.tar.gz

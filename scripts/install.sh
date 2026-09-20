@@ -16,10 +16,31 @@
 # Environment:
 #   ACS_VERSION=X.Y.Z     install that release instead of the latest
 #   ACS_INSTALL_DIR=DIR   put the binary itself in DIR (no versioned layout)
-#   ACS_RELEASES_URL=URL  where releases are (default: the GitHub releases)
+#   ACS_RELEASES_URL=URL  where releases are (default: the GitHub releases).
+#                         Must be https unless ACS_ALLOW_INSECURE_URL=1, and
+#                         it is ignored when running through sudo (acs-95w).
+#   ACS_ALLOW_INSECURE_URL=1  accept a releases URL that is not https
 set -eu
 
-releases=${ACS_RELEASES_URL:-https://github.com/michel-onstein/acs/releases}
+default_releases=https://github.com/michel-onstein/acs/releases
+releases=${ACS_RELEASES_URL:-$default_releases}
+# What is fetched from here is checked only against a SHA256SUMS from the
+# same place, and is then installed and run. So: not across a privilege
+# boundary, and not over a scheme that cannot be authenticated (acs-95w).
+if [ -n "${ACS_RELEASES_URL:-}" ] && [ -n "${SUDO_USER:-}" ]; then
+    printf 'acs-install: ignoring ACS_RELEASES_URL under sudo\n' >&2
+    releases=$default_releases
+fi
+case "$releases" in
+    https://*) ;;
+    *)
+        if [ "${ACS_ALLOW_INSECURE_URL:-}" != 1 ]; then
+            printf 'acs-install: error: %s\n' \
+                "ACS_RELEASES_URL is not https, which cannot be authenticated; set ACS_ALLOW_INSECURE_URL=1 to accept it" >&2
+            exit 1
+        fi
+        ;;
+esac
 want=${ACS_VERSION:-}
 want=${want#v}
 
