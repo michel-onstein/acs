@@ -95,3 +95,38 @@ fn default_session_comes_from_the_environment() {
     );
     c.wait_for("new session 'michel' on devbox", T);
 }
+
+/// acs-y5r: agreeing to take a session is about whoever was attached at
+/// the time. It is spent by that attach, so a redial later — which may
+/// find somebody else entirely — asks again rather than throwing them out
+/// without a word.
+#[test]
+fn a_granted_takeover_is_not_reused_on_a_later_redial() {
+    let remote = Remote::installed();
+    let mut alice = client(&remote, "alice@laptop", &[]);
+    alice.wait_for("up", T);
+
+    // Bob takes it, agreeing once. A long backoff keeps him in the wait
+    // after his link is cut, so Carol is reliably there when he redials.
+    let mut bob = Client::start_env(
+        &remote,
+        &[&["devbox", "main", "--force"][..], CMD].concat(),
+        &[("ACS_IDENTITY", "bob@desk"), ("ACS_BACKOFF_MS", "3000")],
+    );
+    assert_eq!(alice.wait(T), 3);
+    bob.send(b"mine\r");
+    bob.wait_for(&got("mine"), T);
+
+    // The link drops, and Carol attaches to the session Bob left behind.
+    remote.cut_link();
+    let mut carol = client(&remote, "carol@pi", &[]);
+    // A fresh attach clears the screen; typing before that is dropped.
+    carol.wait_for("\x1b[H\x1b[J", T);
+    carol.send(b"hers\r");
+    carol.wait_for("got:", T);
+
+    // Bob comes back and is asked, rather than silently taking it from
+    // Carol on the strength of an agreement about Alice.
+    bob.wait_for("take over? [y/N] ", T);
+    drop(carol);
+}

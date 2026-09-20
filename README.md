@@ -231,8 +231,11 @@ to a session someone else is attached to asks first:
 acs: session 'main' on devbox is attached from alice@laptop since 10:02 — take over? [y/N]
 ```
 
-`--force` skips the question. `ACS_DEFAULT_SESSION` gives each person their
-own name instead of `main` for the session a plain `acs host` creates.
+`--force` skips the question, for that attach. Agreeing to take a session is
+about whoever holds it at the time, so it is not reused: if the link later
+drops and the redial finds somebody else attached, acs asks again.
+`ACS_DEFAULT_SESSION` gives each person their own name instead of `main` for
+the session a plain `acs host` creates.
 
 ## Configuration
 
