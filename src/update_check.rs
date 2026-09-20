@@ -113,8 +113,11 @@ fn write(path: &Path, s: &State) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let tmp = dir.join(format!(".update-check.{}", crate::sys::getpid()));
-    if std::fs::write(&tmp, s.format()).is_ok() && std::fs::rename(&tmp, path).is_err() {
+    // Unpredictable, and created by us or not at all (acs-721).
+    let tmp = dir.join(format!(".update-check.{}", crate::sys::random_token()));
+    let written = crate::sys::create_new(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, s.format().as_bytes()));
+    if written.is_ok() && std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -175,11 +178,7 @@ pub fn check_main() -> ExitCode {
     let Some(path) = state_path() else {
         return ExitCode::from(1);
     };
-    let tmp = std::env::temp_dir().join(format!(
-        "acs-update-check.{}.{:08x}",
-        crate::sys::getpid(),
-        crate::sys::random_u64() as u32
-    ));
+    let tmp = std::env::temp_dir().join(format!("acs-update-check.{}", crate::sys::random_token()));
     if std::fs::create_dir(&tmp).is_err() {
         return ExitCode::from(1);
     }

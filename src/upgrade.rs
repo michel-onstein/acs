@@ -245,11 +245,7 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Result<Scratch, String> {
-        let p = std::env::temp_dir().join(format!(
-            "acs-upgrade.{}.{:08x}",
-            crate::sys::getpid(),
-            crate::sys::random_u64() as u32
-        ));
+        let p = std::env::temp_dir().join(format!("acs-upgrade.{}", crate::sys::random_token()));
         std::fs::create_dir(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         Ok(Scratch(p))
     }
@@ -337,8 +333,8 @@ pub fn run(opts: &Opts) -> Result<String, Error> {
 
 /// Fail early, before downloading, if `dir` cannot take a new file.
 fn check_writable(dir: &Path) -> Result<(), Error> {
-    let probe = dir.join(format!(".acs-upgrade.{}", crate::sys::getpid()));
-    match std::fs::File::create(&probe) {
+    let probe = dir.join(format!(".acs-upgrade.{}", crate::sys::random_token()));
+    match crate::sys::create_new(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
             Ok(())
@@ -419,16 +415,21 @@ impl Staged {
         use std::os::unix::fs::PermissionsExt;
         let dir = to.parent().ok_or("no directory to install into")?;
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let tmp = dir.join(format!(
-            ".acs.upgrade.{:08x}",
-            crate::sys::random_u64() as u32
-        ));
-        std::fs::copy(from, &tmp)
-            .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)))
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                format!("cannot install {}: {e}", to.display())
-            })?;
+        // Created by us, or not at all: `fs::copy` opens the destination
+        // with create-and-truncate, which follows a symlink planted at
+        // that name and writes through to whatever it points at — as root,
+        // when the user was told to re-run under sudo (acs-721).
+        let tmp = dir.join(format!(".acs.upgrade.{}", crate::sys::random_token()));
+        (|| -> std::io::Result<()> {
+            let mut out = crate::sys::create_new(&tmp)?;
+            let mut src = std::fs::File::open(from)?;
+            std::io::copy(&mut src, &mut out)?;
+            out.set_permissions(std::fs::Permissions::from_mode(mode))
+        })()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("cannot install {}: {e}", to.display())
+        })?;
         Ok(Staged {
             tmp,
             committed: false,
@@ -459,7 +460,7 @@ impl Drop for Staged {
 /// Point the symlink `link` at `target`, atomically.
 fn relink(target: &Path, link: &Path) -> Result<(), String> {
     let dir = link.parent().ok_or("no directory for the link")?;
-    let tmp = dir.join(format!(".acs.link.{:08x}", crate::sys::random_u64() as u32));
+    let tmp = dir.join(format!(".acs.link.{}", crate::sys::random_token()));
     std::os::unix::fs::symlink(target, &tmp)
         .and_then(|_| std::fs::rename(&tmp, link))
         .map_err(|e| {
