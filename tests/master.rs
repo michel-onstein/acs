@@ -951,3 +951,63 @@ fn every_attach_takeover_and_kill_leaves_a_trace() {
     let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&trail).unwrap());
     assert_eq!(mode & 0o077, 0, "the trail is readable by others: {mode:o}");
 }
+
+/// acs-aps: a session outlives the ssh login that made it, and everyone
+/// who attaches later used to inherit that login's environment — including
+/// SSH_AUTH_SOCK, so a second person's shell signed with the creator's
+/// forwarded agent. None of it can be kept true for a shell with many
+/// attachers over time, so none of it is passed on.
+#[test]
+fn the_session_shell_does_not_inherit_the_creating_logins_environment() {
+    let t = TempDir::new();
+    let env = [
+        ("SSH_AUTH_SOCK", "/tmp/alices-agent"),
+        ("SSH_CONNECTION", "10.0.0.1 51000 10.0.0.2 22"),
+        ("SSH_CLIENT", "10.0.0.1 51000 22"),
+        ("SSH_TTY", "/dev/pts/9"),
+        ("DISPLAY", ":12"),
+        ("XAUTHORITY", "/home/alice/.Xauthority"),
+        ("KRB5CCNAME", "FILE:/tmp/krb5cc_alice"),
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1/bus"),
+        ("XDG_SESSION_ID", "7"),
+        ("SSH_AGENT_PID", "4242"),
+    ];
+    let (mut c, _) = start_env(
+        t.path(),
+        "env",
+        &[
+            "/bin/sh",
+            "-c",
+            "echo armed; while read l; do eval \"printf 'got:%s\\\\n' \\\"\\$$l\\\"\"; done",
+        ],
+        "me",
+        &env,
+    );
+    c.wait_output("armed", T);
+    for (k, _) in env {
+        c.send(&Msg::Input {
+            seq: 0,
+            bytes: format!("{k}\r").into_bytes(),
+        });
+    }
+    // The shell prints one line per name; every one must be empty.
+    c.wait_output("got:", T);
+    std::thread::sleep(Duration::from_millis(400));
+    let text = String::from_utf8_lossy(&c.output).into_owned();
+    for (k, v) in env {
+        assert!(!text.contains(v), "{k} survived into the session: {text}");
+    }
+
+    // What a session does need is still there.
+    let mut d = FrameConn::connect(&sock(t.path(), "env")).unwrap();
+    d.send(&Msg::Hello(hello("env", Mode::Attach, "me")));
+    let w = match d.recv_control(T) {
+        Some(Msg::Welcome(w)) => w,
+        other => panic!("expected WELCOME, got {other:?}"),
+    };
+    d.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"ACS_SESSION\r".to_vec(),
+    });
+    d.wait_output("got:env", T);
+}

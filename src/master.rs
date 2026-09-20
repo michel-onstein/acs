@@ -903,7 +903,42 @@ impl Master {
         cmd.current_dir(&home)
             .env("ACS_SESSION", &self.session)
             .env_remove("ACS_SOCKET_DIR")
-            .env_remove("ACS_MASTER_LOG");
+            .env_remove("ACS_MASTER_LOG")
+            .env_remove("ACS_RING")
+            .env_remove("ACS_MASTER_REBIND_MS");
+        // The session outlives the ssh login that created it, and everyone
+        // who attaches later inherits that login's environment (acs-aps).
+        // Two problems, both invisible:
+        //
+        // - `SSH_AUTH_SOCK` points at the *creator's* forwarded agent. Bob
+        //   attaches to a session Alice created with forwarding on, and his
+        //   shell signs with Alice's keys for as long as her connection
+        //   lives. Same uid, so nothing is escalated that `/proc` would not
+        //   have given him — but acs hands it over without anyone asking.
+        // - The rest are simply wrong for everyone but the creator:
+        //   `SSH_CONNECTION` and `SSH_CLIENT` name her laptop, `DISPLAY`
+        //   her screen.
+        //
+        // None can be kept accurate, because there is one shell and many
+        // attachers over time, so none is passed on. A session is not a
+        // login. Anyone who wants an agent in there can export one.
+        for stale in [
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "SSH_ORIGINAL_COMMAND",
+            "KRB5CCNAME",
+            "DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_SESSION_ID",
+            "XDG_SESSION_TYPE",
+            "XDG_SESSION_CLASS",
+        ] {
+            cmd.env_remove(stale);
+        }
         if h.term.is_empty() {
             cmd.env("TERM", "xterm-256color");
         } else {
