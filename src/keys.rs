@@ -65,6 +65,12 @@ pub struct Output {
 
 /// How long an incomplete escape sequence is held before being sent as is.
 const PENDING_MS: u64 = 100;
+
+/// Longest string (OSC, DCS, APC) the detector will stay inside. The
+/// replies acs's own sequences draw are a handful of bytes; a clipboard
+/// read can be larger, so this is generous, but it is not unbounded
+/// (acs-55v).
+const MAX_STR: usize = 64 * 1024;
 const MAX_SEQ: usize = 64;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -128,6 +134,9 @@ pub struct Detector {
     seq_since: Option<u64>,
     /// When the last byte of a string (`Lex::Str`) arrived.
     str_last: u64,
+    /// Bytes taken by the string being lexed, held to [`MAX_STR`] so a
+    /// remote cannot keep the detector inside one (acs-55v).
+    str_bytes: usize,
     state: State,
 }
 
@@ -139,6 +148,7 @@ impl Detector {
             seq: Vec::new(),
             seq_since: None,
             str_last: 0,
+            str_bytes: 0,
             state: State::Idle,
         }
     }
@@ -243,6 +253,7 @@ impl Detector {
                             self.token(Kind::Passive, bytes, now, &mut out);
                             self.lex = Lex::Str { esc: false };
                             self.str_last = now;
+                            self.str_bytes = 0;
                         }
                         0x1b => {
                             // ESC ESC: the first was a key on its own.
@@ -299,8 +310,17 @@ impl Detector {
                 Lex::Str { esc } => {
                     out.forward.push(b);
                     self.str_last = now;
+                    self.str_bytes += 1;
                     self.lex = match (esc, b) {
                         (_, 0x07) | (true, b'\\') => Lex::Ground,
+                        // Long enough to be no terminal reply acs asked
+                        // for. The idle timeout above frees a Meta key
+                        // that was mistaken for a string, but only once
+                        // the bytes stop; a remote that keeps them coming
+                        // would otherwise hold the detector here for as
+                        // long as it liked, and Ctrl-] Ctrl-] d would be
+                        // forwarded to it instead of detaching (acs-55v).
+                        _ if self.str_bytes >= MAX_STR => Lex::Ground,
                         (_, 0x1b) => Lex::Str { esc: true },
                         _ => Lex::Str { esc: false },
                     };
@@ -735,6 +755,48 @@ mod tests {
             1100,
         );
         assert_eq!(action, Some(Action::Detach));
+    }
+
+    /// acs-55v: the idle timeout frees a Meta key that was taken for a
+    /// string, but only once the bytes stop. A remote that keeps them
+    /// coming — a huge clipboard set with OSC 52 and read back in a loop —
+    /// would otherwise hold the detector inside the string for as long as
+    /// it liked, so Ctrl-] Ctrl-] d went to it instead of detaching, and
+    /// the session could not be left without killing the terminal.
+    #[test]
+    fn an_unending_string_cannot_swallow_the_command_key() {
+        let mut d = Detector::new(Config::default());
+        // An OSC that never terminates, arriving without a pause.
+        let mut t = 0;
+        d.feed(b"\x1b]52;c;", t);
+        for _ in 0..(MAX_STR / 1024 + 2) {
+            t += 1;
+            d.feed(&vec![b'A'; 1024], t);
+        }
+        // The command key is heard again, with no gap in the stream.
+        t += 1;
+        let o = d.feed(&[CB], t);
+        assert!(o.forward.is_empty(), "the escape was forwarded: {o:?}");
+        t += 1;
+        d.feed(&[CB], t);
+        t += 1;
+        let o = d.feed(b"d", t);
+        assert_eq!(o.action, Some(Action::Detach));
+    }
+
+    /// acs-55v: a reply of an ordinary size is still read as one, so the
+    /// cap does not break what the string state is for.
+    #[test]
+    fn an_ordinary_reply_is_still_taken_as_a_string() {
+        let mut d = Detector::new(Config::default());
+        let reply = b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07";
+        let o = d.feed(reply, 0);
+        assert_eq!(o.forward, reply.to_vec());
+        assert_eq!(o.action, None);
+        // And the command key works right after it, with no pause.
+        d.feed(&[CB], 1);
+        d.feed(&[CB], 2);
+        assert_eq!(d.feed(b"d", 3).action, Some(Action::Detach));
     }
 
     /// PM and SOS are not strings terminals reply with: `ESC ^` / `ESC X`
