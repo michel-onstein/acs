@@ -1011,3 +1011,28 @@ fn the_session_shell_does_not_inherit_the_creating_logins_environment() {
     });
     d.wait_output("got:env", T);
 }
+
+/// acs-hjk: the socket used to be created at 0777 masked by whatever umask
+/// the master inherited, leaving the 0700 directory and the peer-uid check
+/// as the only controls. It is created 0600 now, so a permissive umask
+/// does not leave the peer check standing on its own.
+#[test]
+fn the_socket_is_created_private_whatever_the_umask() {
+    let t = TempDir::new();
+    // Under the ordinary umask of 022 an unguarded bind gives 0755.
+    let (mut c, _) = start(
+        t.path(),
+        "priv",
+        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        "me",
+    );
+    c.wait_output("armed", T);
+    let mode =
+        std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(sock(t.path(), "priv")).unwrap());
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "the socket is {:o}, not 0600",
+        mode & 0o777
+    );
+}

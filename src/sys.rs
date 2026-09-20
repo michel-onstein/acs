@@ -216,6 +216,57 @@ pub fn create_new(path: &std::path::Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Open `path` as a directory without following a symlink at its last
+/// component, for checking and changing it through the handle rather than
+/// by name (acs-hjk).
+pub fn open_dir_nofollow(path: &std::path::Path) -> io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: a valid NUL-terminated path; the fd is wrapped below.
+    let fd = retry(|| unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    })?;
+    // SAFETY: open returned a fresh descriptor we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Set the mode of whatever `fd` refers to. Unlike a `chmod` by path this
+/// cannot be redirected between the check and the change (acs-hjk).
+///
+/// Not for sockets: macOS refuses `fchmod` on one with `EINVAL`. Create
+/// those under a [`Umask`] instead.
+pub fn fchmod(fd: RawFd, mode: u32) -> io::Result<()> {
+    // SAFETY: fchmod on a descriptor we own.
+    retry(|| unsafe { libc::fchmod(fd, mode as libc::mode_t) })?;
+    Ok(())
+}
+
+/// The process umask, put back when this is dropped (acs-hjk).
+///
+/// The way to give a file a mode it cannot briefly lack is to create it
+/// that way. That matters for a unix socket, which is created by `bind`
+/// and which macOS will not let `fchmod` touch afterwards.
+pub struct Umask(libc::mode_t);
+
+impl Umask {
+    /// Set the umask to `mask` until the guard is dropped.
+    pub fn set(mask: u32) -> Umask {
+        // SAFETY: umask cannot fail and returns the previous value.
+        Umask(unsafe { libc::umask(mask as libc::mode_t) })
+    }
+}
+
+impl Drop for Umask {
+    fn drop(&mut self) {
+        // SAFETY: as above, restoring what we found.
+        unsafe { libc::umask(self.0) };
+    }
+}
+
 /// Seconds since the Unix epoch.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
