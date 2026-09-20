@@ -122,15 +122,36 @@ chmod 755 "$new"
 
 # Copy to a temporary name next to the destination, then rename over it,
 # so the path is never missing or half-written.
+# An unguessable suffix for the temporary names below (acs-721). $$ is the
+# process id, which anyone can guess: this script tells the user to re-run
+# it as root into /usr/local, where a non-root user can often create files,
+# and a name planted there ahead of us would be written through.
+rand() {
+    if [ -r /dev/urandom ]; then
+        od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
+    fi
+}
+tag=$(rand)
+[ -n "$tag" ] || tag="$$.$(date +%s)"
+
 place() { # place <source> <destination>
-    cp "$1" "$2.new.$$"
-    chmod 755 "$2.new.$$"
-    mv -f "$2.new.$$" "$2"
+    # install creates the destination itself rather than writing through
+    # whatever may be sitting at that name.
+    rm -f "$2.new.$tag"
+    if command -v install >/dev/null 2>&1; then
+        install -m 755 "$1" "$2.new.$tag"
+    else
+        cp "$1" "$2.new.$tag"
+        chmod 755 "$2.new.$tag"
+    fi
+    mv -f "$2.new.$tag" "$2"
 }
 
 link() { # link <target> <link>
-    ln -s "$1" "$2.new.$$"
-    mv -f "$2.new.$$" "$2"
+    # ln -s fails rather than following a name already there.
+    rm -f "$2.new.$tag"
+    ln -s "$1" "$2.new.$tag"
+    mv -f "$2.new.$tag" "$2"
 }
 
 if [ -n "${ACS_INSTALL_DIR:-}" ]; then

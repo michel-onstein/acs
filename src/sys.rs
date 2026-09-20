@@ -191,6 +191,31 @@ pub fn random_u64() -> u64 {
     u64::from_ne_bytes(b)
 }
 
+/// A name nobody can predict, for a temporary file or directory: 16 hex
+/// characters of `/dev/urandom` (acs-721).
+///
+/// The process id was used for some of these, which anyone can guess. That
+/// matters because `acs upgrade` and the installer tell the user to re-run
+/// under `sudo` into `/usr/local/bin` and `/usr/local/lib/acs`, which on
+/// Intel Homebrew and hand-managed hosts are routinely writable by a
+/// non-root user: pre-creating the temp name as a symlink turns the
+/// root-run write into an overwrite of whatever it points at.
+pub fn random_token() -> String {
+    format!("{:016x}", random_u64())
+}
+
+/// Create `path` for writing, failing if anything is already there.
+///
+/// `create_new` is `O_CREAT|O_EXCL`, which refuses to follow a symlink at
+/// the final component, so a name planted ahead of us is an error rather
+/// than a write through to its target (acs-721).
+pub fn create_new(path: &std::path::Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
 /// Seconds since the Unix epoch.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -643,6 +668,49 @@ pub mod signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-721: a temporary name planted ahead of us must be an error, not
+    /// a write through to whatever it points at. `acs upgrade` and the
+    /// installer both tell the user to re-run under sudo into directories
+    /// a non-root user can often write, so this would be an arbitrary
+    /// overwrite as root.
+    #[test]
+    fn create_new_refuses_a_name_that_is_already_there() {
+        let t = crate::testutil::TempDir::new();
+        let secret = t.path().join("precious");
+        std::fs::write(&secret, b"do not touch").unwrap();
+
+        // A symlink waiting at the name we are about to use.
+        let planted = t.path().join(".acs.upgrade.deadbeef");
+        std::os::unix::fs::symlink(&secret, &planted).unwrap();
+        let e = create_new(&planted).expect_err("wrote through a planted symlink");
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&secret).unwrap(), b"do not touch");
+
+        // A plain file in the way is refused just the same.
+        let taken = t.path().join(".acs.upgrade.cafe");
+        std::fs::write(&taken, b"someone else's").unwrap();
+        assert_eq!(
+            create_new(&taken).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&taken).unwrap(), b"someone else's");
+
+        // And a free name works.
+        let fresh = t.path().join(format!(".acs.upgrade.{}", random_token()));
+        create_new(&fresh).expect("a free name");
+        assert!(fresh.exists());
+    }
+
+    /// acs-721: the names are not guessable, and not the process id.
+    #[test]
+    fn a_random_token_is_wide_and_not_the_pid() {
+        let a = random_token();
+        assert_eq!(a.len(), 16, "{a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, random_token(), "twice the same token");
+        assert!(!a.contains(&getpid().to_string()), "{a} carries the pid");
+    }
 
     #[test]
     fn current_user_has_a_name() {

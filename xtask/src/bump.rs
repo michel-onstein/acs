@@ -414,7 +414,9 @@ fn release(
         );
         return Ok(());
     }
-    let tmp = std::env::temp_dir().join(format!("acs-release-{}-{}", std::process::id(), new));
+    // Unguessable: /tmp is shared, and a name anyone can predict can be
+    // planted ahead of us (acs-721).
+    let tmp = std::env::temp_dir().join(format!("acs-release-{new}-{}", random_tag()));
     let tmp_s = tmp.to_string_lossy().into_owned();
     git(&o.repo, &["worktree", "add", "--detach", &tmp_s, head])?;
     let result = (|| -> Result<(), String> {
@@ -509,6 +511,26 @@ pub fn main(args: &[String]) -> Result<(), String> {
         return Err("--level none makes no release".into());
     }
     run(&o)
+}
+
+/// Sixteen hex characters from `/dev/urandom`, for a temporary name in the
+/// shared `/tmp` (acs-721). Falls back to the clock if it cannot be read.
+fn random_tag() -> String {
+    use std::io::Read;
+    let mut b = [0u8; 8];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .is_ok()
+    {
+        return b.iter().map(|x| format!("{x:02x}")).collect();
+    }
+    format!(
+        "{:016x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    )
 }
 
 #[cfg(test)]
