@@ -12,6 +12,23 @@ use crate::proto::{Decoder, Marker, Msg, StatusInfo};
 use crate::ssh::{self, Call};
 use crate::sys;
 
+/// How many sessions one host may report. A frame can be a megabyte, so an
+/// unbounded list is a host filling the client's memory rather than
+/// answering; no real host has anywhere near this many (acs-rip).
+pub(crate) const MAX_SESSIONS: usize = 1024;
+
+/// Add one reported session to a listing, refusing a host that reports
+/// more than [`MAX_SESSIONS`] (acs-rip).
+pub(crate) fn push_session(sessions: &mut Vec<StatusInfo>, s: StatusInfo) -> Result<(), Failure> {
+    if sessions.len() >= MAX_SESSIONS {
+        return Err(Failure::BadReply(format!(
+            "more than {MAX_SESSIONS} sessions in one listing"
+        )));
+    }
+    sessions.push(s);
+    Ok(())
+}
+
 /// Why a host's sessions could not be listed.
 #[derive(Debug)]
 pub(crate) enum Failure {
@@ -159,7 +176,10 @@ pub(crate) fn query(
     loop {
         match dec.next_msg() {
             Ok(Some(Msg::StatusReply(s))) => {
-                sessions.push(s);
+                if let Err(f) = push_session(&mut sessions, s) {
+                    link.close();
+                    return Err(f);
+                }
                 continue;
             }
             Ok(Some(_)) => continue,
@@ -341,6 +361,26 @@ pub fn render_all(hosts: &[(&str, Vec<StatusInfo>)], now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-rip: one frame is bounded at a megabyte, but the *number* of
+    /// them was not, so a host could answer a listing forever and fill the
+    /// client's memory. No real host has a thousand sessions.
+    #[test]
+    fn a_host_cannot_report_an_unbounded_number_of_sessions() {
+        let mut sessions = Vec::new();
+        for i in 0..MAX_SESSIONS {
+            push_session(&mut sessions, StatusInfo::default())
+                .unwrap_or_else(|_| panic!("refused an honest session at {i}"));
+        }
+        let e = push_session(&mut sessions, StatusInfo::default()).unwrap_err();
+        assert!(
+            matches!(&e, Failure::BadReply(m) if m.contains("more than")),
+            "{e:?}"
+        );
+        assert_eq!(sessions.len(), MAX_SESSIONS, "the refused one was kept");
+        // And it is reported as a bad reply, not as an unreachable host.
+        assert_eq!(e.code(), code::ERROR);
+    }
 
     fn info(
         name: &str,

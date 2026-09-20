@@ -176,6 +176,11 @@ pub fn check_upload(file: &str, want: &str) -> String {
     )
 }
 
+/// How much of the remote's answer to an install call is read. The reply
+/// is one `ok` line under a login banner; anything past this is a host
+/// filling memory rather than answering (acs-rip).
+const MAX_REPLY: usize = 256 * 1024;
+
 /// Run `script` on the host with `input` on stdin. With `expect_ok` the
 /// finisher must print its `ok` line; without, the exit status alone
 /// decides — stdout may hold login-shell noise either way (DESIGN §3).
@@ -195,8 +200,15 @@ fn side_call(args: &ClientArgs, script: &str, input: &[u8], expect_ok: bool) -> 
     });
     // Bytes, not a String: a login banner in Latin-1 or CP437 is not
     // UTF-8, and read_to_string would throw the whole reply away (acs-vdl).
+    // Bounded: the finisher answers with one short line, so a host that
+    // streams instead is not answering, and reading it to the end would
+    // let it grow the client until the machine gives out (acs-rip).
     let mut buf = Vec::new();
-    let _ = child.stdout.take().unwrap().read_to_end(&mut buf);
+    let mut stdout = child.stdout.take().unwrap();
+    let _ = std::io::copy(
+        &mut (&mut stdout).take(MAX_REPLY as u64),
+        &mut io::Cursor::new(&mut buf),
+    );
     let out = String::from_utf8_lossy(&buf);
     let status = child.wait().map_err(|e| e.to_string())?;
     let _ = writer.join();

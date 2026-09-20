@@ -654,12 +654,23 @@ pub enum Marker {
 
 /// Finds the marker line in a stream that may start with arbitrary noise from
 /// shell startup files (DESIGN §3). The marker must start a line.
+/// Longest line the scanner will hold while looking for a marker. A marker
+/// is `ACS-READY <n>` or `ACS-NEED <os> <arch>`, so this is enormously more
+/// than one needs; past it the line cannot be a marker (acs-rip).
+const MAX_MARKER_LINE: usize = 8 * 1024;
+
+/// How much of what came before the marker is kept for `-v`.
+const MAX_NOISE: usize = 64 * 1024;
+
 #[derive(Default)]
 pub struct MarkerScanner {
     buf: Vec<u8>,
     line_start: usize,
     /// Everything before the marker, for `-v` diagnostics.
     pub noise: Vec<u8>,
+    /// Inside a line too long to be a marker: drop bytes until the next
+    /// newline starts a line that could be one (acs-rip).
+    skipping: bool,
 }
 
 impl MarkerScanner {
@@ -675,6 +686,22 @@ impl MarkerScanner {
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Option<Marker> {
+        // Still swallowing an overlong line: nothing can match until the
+        // newline that ends it (acs-rip).
+        let mut bytes = bytes;
+        if self.skipping {
+            match bytes.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    self.add_noise(&bytes[..=i]);
+                    bytes = &bytes[i + 1..];
+                    self.skipping = false;
+                }
+                None => {
+                    self.add_noise(bytes);
+                    return None;
+                }
+            }
+        }
         self.buf.extend_from_slice(bytes);
         while let Some(nl) = self.buf[self.line_start..].iter().position(|&b| b == b'\n') {
             let end = self.line_start + nl;
@@ -696,15 +723,31 @@ impl MarkerScanner {
         }
         // Keep memory bounded on a chatty login: retain the unfinished line only.
         if self.line_start > 0 {
-            self.noise.extend_from_slice(&self.buf[..self.line_start]);
-            self.buf.drain(..self.line_start);
+            let done: Vec<u8> = self.buf.drain(..self.line_start).collect();
+            self.add_noise(&done);
             self.line_start = 0;
         }
-        if self.noise.len() > 64 * 1024 {
-            let cut = self.noise.len() - 64 * 1024;
-            self.noise.drain(..cut);
+        // And on a hostile one. Draining only at a newline left the whole
+        // reply in memory when the host sent none, for as long as the dial
+        // allows — two minutes on a first connection, gigabytes on a fast
+        // link. A marker is one short line, so anything this long is not
+        // one: let it go and wait for the next line (acs-rip).
+        if self.buf.len() > MAX_MARKER_LINE {
+            let over = std::mem::take(&mut self.buf);
+            self.add_noise(&over);
+            self.line_start = 0;
+            self.skipping = true;
         }
         None
+    }
+
+    /// Add to what is kept for `-v`, holding it to [`MAX_NOISE`].
+    fn add_noise(&mut self, bytes: &[u8]) {
+        self.noise.extend_from_slice(bytes);
+        if self.noise.len() > MAX_NOISE {
+            let cut = self.noise.len() - MAX_NOISE;
+            self.noise.drain(..cut);
+        }
     }
 }
 
@@ -904,6 +947,48 @@ mod tests {
         hdr.extend_from_slice(&((MAX_FRAME as u32) + 1).to_be_bytes());
         d.push(&hdr);
         assert_eq!(d.next_msg(), Err(ProtoError::TooLarge(MAX_FRAME + 1)));
+    }
+
+    /// acs-rip: a host that never sends a newline used to grow the
+    /// scanner without limit for the whole dial window — two minutes on a
+    /// first connection, gigabytes on a fast link. A marker is one short
+    /// line, so an overlong one is dropped and the next line still counts.
+    #[test]
+    fn a_reply_without_newlines_cannot_grow_without_limit() {
+        let mut sc = MarkerScanner::new();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..200 {
+            assert!(sc.push(&chunk).is_none());
+            assert!(
+                sc.buf.len() <= MAX_MARKER_LINE,
+                "held {} bytes of one line",
+                sc.buf.len()
+            );
+            assert!(
+                sc.noise.len() <= MAX_NOISE,
+                "kept {} of noise",
+                sc.noise.len()
+            );
+        }
+        // Over 12 MB sent, and the marker after it is still found.
+        let m = sc.push(b"\nACS-READY 1\nrest");
+        assert!(
+            matches!(&m, Some(Marker::Ready { proto: 1, rest }) if rest == b"rest"),
+            "{m:?}"
+        );
+    }
+
+    /// acs-rip: dropping an overlong line must not let its *middle* look
+    /// like the start of one, or garbage could pose as the marker.
+    #[test]
+    fn a_marker_inside_an_overlong_line_is_not_a_marker() {
+        let mut sc = MarkerScanner::new();
+        assert!(sc.push(&vec![b'x'; MAX_MARKER_LINE + 10]).is_none());
+        // Still inside that line: this is not the start of a new one.
+        assert!(sc.push(b"ACS-READY 1\n").is_none());
+        // The newline above ended the overlong line; now one counts.
+        let m = sc.push(b"ACS-READY 1\n");
+        assert!(matches!(m, Some(Marker::Ready { proto: 1, .. })), "{m:?}");
     }
 
     #[test]
