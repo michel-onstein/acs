@@ -141,7 +141,14 @@ pub enum Msg {
     Ping(u64),
     Pong(u64),
     Detach,
-    Kill,
+    /// End the session. Carries who is asking and whether they have agreed
+    /// to take it from whoever holds it, because ending a session is as
+    /// large a step as taking it over and goes through the same gate
+    /// (acs-fbo).
+    Kill {
+        identity: String,
+        force: bool,
+    },
     /// Child wait status as returned by `waitpid`.
     Exit {
         status: i32,
@@ -154,9 +161,13 @@ pub enum Msg {
         message: String,
     },
     /// Client → `_proxy --pick`: end this session, then send the list
-    /// again (the session menu, DESIGN §4.4).
+    /// again (the session menu, DESIGN §4.4). Carries who is asking and
+    /// whether they have already agreed to take the session from whoever
+    /// holds it, because the proxy attaches before it kills (acs-fbo).
     EndSession {
         name: String,
+        identity: String,
+        force: bool,
     },
     /// `_proxy --pick` → client: the STATUS_REPLY frames before it are the
     /// whole list.
@@ -395,7 +406,11 @@ impl Msg {
                     ty::PONG
                 }
                 Msg::Detach => ty::DETACH,
-                Msg::Kill => ty::KILL,
+                Msg::Kill { identity, force } => {
+                    w.str(identity);
+                    w.u8(*force as u8);
+                    ty::KILL
+                }
                 Msg::Exit { status } => {
                     w.i32(*status);
                     ty::EXIT
@@ -420,8 +435,14 @@ impl Msg {
                     w.str(message);
                     ty::ERROR
                 }
-                Msg::EndSession { name } => {
+                Msg::EndSession {
+                    name,
+                    identity,
+                    force,
+                } => {
                     w.str(name);
+                    w.str(identity);
+                    w.u8(*force as u8);
                     ty::END_SESSION
                 }
                 Msg::ListEnd => ty::LIST_END,
@@ -520,7 +541,10 @@ impl Msg {
             ty::PING => Msg::Ping(r.u64("nonce")?),
             ty::PONG => Msg::Pong(r.u64("nonce")?),
             ty::DETACH => Msg::Detach,
-            ty::KILL => Msg::Kill,
+            ty::KILL => Msg::Kill {
+                identity: r.str("identity")?,
+                force: r.bool("force")?,
+            },
             ty::EXIT => Msg::Exit {
                 status: r.i32("status")?,
             },
@@ -543,7 +567,9 @@ impl Msg {
                 message: r.str("message")?,
             },
             ty::END_SESSION => Msg::EndSession {
-                name: r.str("name")?,
+                name: r.name("name")?,
+                identity: r.str("identity")?,
+                force: r.bool("force")?,
             },
             ty::LIST_END => Msg::ListEnd,
             other => return Err(ProtoError::UnknownType(other)),
@@ -774,7 +800,10 @@ mod tests {
             Msg::Ping(5),
             Msg::Pong(5),
             Msg::Detach,
-            Msg::Kill,
+            Msg::Kill {
+                identity: "me@here".into(),
+                force: false,
+            },
             Msg::Exit { status: -1 },
             Msg::Takeover,
             Msg::Status,
@@ -796,6 +825,8 @@ mod tests {
             },
             Msg::EndSession {
                 name: "work".into(),
+                identity: "me@here".into(),
+                force: true,
             },
             Msg::ListEnd,
         ]
@@ -881,9 +912,11 @@ mod tests {
         d.push(&[200, 0, 0, 0, 0]);
         assert_eq!(d.next_msg(), Err(ProtoError::UnknownType(200)));
 
+        // DETACH carries nothing, so any payload at all is trailing.
+        // (KILL used to stand here; it carries an identity now, acs-fbo.)
         let mut d = Decoder::new();
-        d.push(&[ty::KILL, 0, 0, 0, 1, 9]);
-        assert_eq!(d.next_msg(), Err(ProtoError::Trailing(ty::KILL)));
+        d.push(&[ty::DETACH, 0, 0, 0, 1, 9]);
+        assert_eq!(d.next_msg(), Err(ProtoError::Trailing(ty::DETACH)));
 
         let mut d = Decoder::new();
         d.push(&[ty::ACK, 0, 0, 0, 2, 0, 0]);

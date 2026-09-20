@@ -231,9 +231,9 @@ enum ConnState {
     Active { next: u64 },
     /// Flush what is queued, then close.
     Closing,
-    /// Asked to end the session from outside it (`_proxy --kill`): held
-    /// open, and deaf, until the master exits, so the asker sees when the
-    /// session is gone.
+    /// Asked to end the session from outside it (an authorized KILL before
+    /// any HELLO): held open, and deaf, until the master exits, so the
+    /// asker sees when the session is gone.
     Ending,
 }
 
@@ -642,8 +642,33 @@ impl Master {
                 c.send(&Msg::StatusReply(info));
                 c.state = ConnState::Closing;
             }
-            Msg::Kill if pending => {
-                mlog!("kill requested from outside the session");
+            // A KILL from outside the session says who is asking, and is
+            // held to the rule a takeover is held to (acs-fbo): a session
+            // another identity is attached to answers BUSY unless the asker
+            // has already agreed to take it from them. Before this, a five
+            // byte frame from any process of this uid ended any session,
+            // and a connection that had just been *refused* with BUSY could
+            // destroy the very session it was denied. It does not attach on
+            // the way — that would send the attached client TAKEOVER, and
+            // the session is about to end, not change hands.
+            Msg::Kill { identity, force } if pending => {
+                if let Some(a) = self.active() {
+                    let other = &self.conns[a];
+                    if !force && !other.identity.is_empty() && other.identity != identity {
+                        mlog!(
+                            "kill from {identity} refused: {} is attached",
+                            other.identity
+                        );
+                        let busy = Msg::Busy {
+                            identity: other.identity.clone(),
+                            since: other.since,
+                        };
+                        // Stay pending: the asker may agree and retry.
+                        self.conns[i].send(&busy);
+                        return;
+                    }
+                }
+                mlog!("kill requested from outside the session by {identity}");
                 self.conns[i].state = ConnState::Ending;
                 self.start_kill();
             }
@@ -671,8 +696,8 @@ impl Master {
                 mlog!("client detached");
                 self.conns[i].state = ConnState::Closing;
             }
-            Msg::Kill => {
-                mlog!("kill requested");
+            Msg::Kill { identity, .. } => {
+                mlog!("kill requested by the attached client {identity}");
                 self.start_kill();
             }
             other => mlog!("ignoring unexpected {other:?}"),

@@ -313,12 +313,20 @@ fn pick_lists_ends_on_request_and_attaches_what_the_hello_names() {
     let mut first = names(&pick_list(&mut p));
     first.sort();
     assert_eq!(first, ["a", "b"]);
-    p.conn.send(&Msg::EndSession { name: "a".into() });
+    p.conn.send(&Msg::EndSession {
+        name: "a".into(),
+        identity: "me".into(),
+        force: false,
+    });
     assert_eq!(names(&pick_list(&mut p)), ["b"]);
     assert!(matches!(a.conn.recv_control(T), Some(Msg::Exit { .. })));
     assert!(!t.path().join("a.sock").exists());
     // Ending one that is not there says so, and lists again.
-    p.conn.send(&Msg::EndSession { name: "a".into() });
+    p.conn.send(&Msg::EndSession {
+        name: "a".into(),
+        identity: "me".into(),
+        force: false,
+    });
     let again = pick_list(&mut p);
     assert!(
         matches!(&again[..], [Msg::Error { code, message }, Msg::StatusReply(s)]

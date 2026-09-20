@@ -243,8 +243,17 @@ connection. After `ACS-READY` it sends the list as `--list` does, one
 `STATUS_REPLY` per session, closed by `LIST_END`, since the connection
 stays open. It then reads the client's frames:
 
-- `END_SESSION <name>` (the menu's `x`): it sends that master `KILL`, as
-  `x` inside the session does, and waits until the master has exited — it
+- `END_SESSION <name, identity, force>` (the menu's `x`): it sends that
+  master `KILL`, as `x` inside the session does, **carrying the identity
+  and `force` the frame brought** (acs-fbo). Ending a session is as large a
+  step as taking it over, so it goes through the same gate: a session
+  another identity is attached to answers `BUSY`, which becomes an `ERROR`
+  naming them rather than a dead session. Before that, a five-byte frame
+  from any process of this uid ended any session, and a connection that had
+  just been refused with `BUSY` could destroy the very session it was
+  denied. It does **not** attach on the way — that would send the attached
+  client `TAKEOVER`, and the session is about to end, not change hands. It
+  then waits until the master has exited — it
   holds the connection open until then, at most the 3 s kill grace and
   some, 10 s in all — then sends the list again, after an `ERROR` frame if
   the session was not there or did not end. Only the user's own masters can
@@ -454,7 +463,7 @@ Length-prefixed, same format on the ssh leg and the unix-socket leg:
 | `RESIZE` | c→m | cols, rows, xpixel, ypixel |
 | `PING` / `PONG` | both | `u64` nonce |
 | `DETACH` | c→m | — |
-| `KILL` | c→m | — (also from the proxy for the menu's `END_SESSION`, before any HELLO: the master ends the session and holds that connection until it exits, §4.3) |
+| `KILL` | c→m | identity, `force` (acs-fbo). From the attached client, or from the proxy for the menu's `END_SESSION` before any HELLO; either way a session another identity is attached to answers `BUSY` unless `force`, and the master holds an outside killer's connection until it exits (§4.3) |
 | `EXIT` | m→c | child wait status |
 | `TAKEOVER` | m→c | — (another client attached) |
 | `STATUS` / `STATUS_REPLY` | proxy↔m, proxy→c | session metadata for `acs list` and the session menu |

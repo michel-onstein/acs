@@ -972,7 +972,14 @@ fn serve(
                 return Outcome::Exit(code::DETACHED);
             }
             Some(Action::Exit) => {
-                Msg::Kill.encode(&mut out);
+                // This connection is the attached one, so the master lets
+                // the kill through on that ground; the identity goes along
+                // to name who asked (acs-fbo).
+                Msg::Kill {
+                    identity: identity(),
+                    force: true,
+                }
+                .encode(&mut out);
                 exiting = true;
             }
             None => {}

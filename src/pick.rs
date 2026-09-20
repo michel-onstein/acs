@@ -124,6 +124,8 @@ fn open_pick(
         dec,
         timeout,
         lost: false,
+        identity: client::identity(),
+        force: args.force,
     };
     match pick.list() {
         Ok(a) => Ok(Some((pick, a.sessions))),
@@ -142,6 +144,11 @@ struct Pick {
     timeout: Duration,
     /// The connection failed while the menu was up: the attach dials anew.
     lost: bool,
+    /// Who is at the menu, and whether they have already said they will
+    /// take a session from whoever holds it: END_SESSION carries both, so
+    /// the master can judge a kill as it judges a takeover (acs-fbo).
+    identity: String,
+    force: bool,
 }
 
 /// One list from the proxy: every session's STATUS, and the message of an
@@ -199,9 +206,16 @@ impl Pick {
         }
     }
 
-    /// End `name` on the host and read the list that answers it.
+    /// End `name` on the host and read the list that answers it. Says who
+    /// is asking: the proxy attaches before it kills, so the master holds
+    /// the request to the same rule a takeover gets (acs-fbo).
     fn end(&mut self, name: &str) -> Result<Listing, Failure> {
-        let frame = Msg::EndSession { name: name.into() }.to_bytes();
+        let frame = Msg::EndSession {
+            name: name.into(),
+            identity: self.identity.clone(),
+            force: self.force,
+        }
+        .to_bytes();
         sys::write_all(self.link.to_fd().as_raw_fd(), &frame)
             .map_err(|e| Failure::Unreachable(e.to_string()))?;
         self.list()
