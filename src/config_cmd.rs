@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::config::{self, Config, HostEntry};
+use crate::netmatch::LocalNet;
 use crate::yaml::{self, Document, Node, Value};
 
 pub const USAGE: &str = "\
@@ -37,11 +38,14 @@ settings: install_on_remote, update_check, command_bell, redraw_on_reconnect,
           500ms, 0.5s, 2s; default 500ms),
           reachability_interval (how often a lost host is pinged; default 5s),
           prefer_local_network (true|false: try an alias's hosts on a network
-          this machine is on first; default false)
+          this machine is on first; default false),
+          local_networks (networks counted as local on top of this machine's
+          own, separated by commas: 172.16.0.0/16, fd00::/48; default none)
 alias settings: identity_file <key> (the ssh key of its hosts that name none),
                 redraw_on_reconnect, persist, prefer_local_network
                 (true|false, over the global setting),
-                reachability_timeout, reachability_interval (over the global setting)
+                reachability_timeout, reachability_interval, local_networks
+                (over the global setting)
 precedence of the ssh key: -i, then the host's identity_file, then the alias's";
 
 /// Settings `get`/`set`/`unset` know: every top-level key but `aliases`.
@@ -58,11 +62,24 @@ fn scalar(c: &Config, key: &str) -> Option<(Node, Option<config::Origin>)> {
     if let Some(s) = c.bool_setting(key) {
         return Some((Node::bool(s.value), s.origin.clone()));
     }
+    if let Some(s) = c.networks_setting(key) {
+        return Some((networks_node(&s.value), s.origin.clone()));
+    }
     let s = c.duration_setting(key)?;
     Some((
         Node::string(&config::format_timeout(s.value)),
         s.origin.clone(),
     ))
+}
+
+/// A list of networks as a one-line YAML list: `[172.16.0.0/16, fd00::/48]`
+/// (acs-c9d).
+fn networks_node(nets: &[LocalNet]) -> Node {
+    let items = nets.iter().map(|n| Node::string(&n.to_string())).collect();
+    Node {
+        flow: true,
+        ..Node::new(Value::Seq(items))
+    }
 }
 
 /// `value` as the node for setting `key`, global or an alias's, checked
@@ -73,6 +90,9 @@ fn typed(key: &str, value: &str) -> Result<Node, String> {
     } else if config::DURATIONS.contains(&key) {
         let d = config::parse_duration(key, value).map_err(|e| format!("{key}: {e}"))?;
         Ok(Node::string(&config::format_timeout(d)))
+    } else if config::NETWORKS.contains(&key) {
+        let nets = config::parse_networks(value).map_err(|e| format!("{key}: {e}"))?;
+        Ok(networks_node(&nets))
     } else {
         Ok(Node::string(value))
     }
@@ -83,6 +103,15 @@ fn text(n: &Node) -> &str {
     match &n.value {
         Value::Scalar(s) => &s.text,
         _ => "",
+    }
+}
+
+/// A setting's value on one line, as `get` prints it and `set` reports it:
+/// a scalar as written, a list of networks separated by commas (acs-c9d).
+fn value_text(n: &Node) -> String {
+    match &n.value {
+        Value::Seq(items) => items.iter().map(text).collect::<Vec<_>>().join(", "),
+        _ => text(n).to_string(),
     }
 }
 
@@ -289,7 +318,7 @@ pub fn run(cmd: &Cmd, target: &Path) -> Result<String, Error> {
         Cmd::Get(key) => {
             let c = Config::load_files(&files)?;
             match (key.as_str(), scalar(&c, key)) {
-                (_, Some((n, _))) => Ok(format!("{}\n", text(&n))),
+                (_, Some((n, _))) => Ok(format!("{}\n", value_text(&n))),
                 ("aliases", None) => Ok(host_list(&c)),
                 (other, None) => Err(unknown_key(other).into()),
             }
@@ -471,6 +500,15 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
                     },
                 ));
             }
+        }
+        if let Some(n) = &a.local_networks {
+            settings.push((
+                "local_networks".to_string(),
+                Node {
+                    comment: Some(from(&n.origin)),
+                    ..networks_node(&n.value)
+                },
+            ));
         }
         let node = if settings.is_empty() {
             list
@@ -658,12 +696,12 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                 return Err(unknown_key(key));
             }
             let node = typed(key, value)?;
-            let shown = text(&node).to_string();
+            let shown = value_text(&node);
             let map = root_map(doc)?;
             match map.iter_mut().find(|(k, _)| k == key) {
                 Some((_, n)) => {
+                    n.flow = node.flow;
                     n.value = node.value;
-                    n.flow = false;
                 }
                 None => map.push((key.clone(), node)),
             }
@@ -729,12 +767,12 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
         Cmd::HostSet { alias, key, value } => {
             config::validate_alias(alias)?;
             let new = typed(key, value)?;
-            let shown = text(&new).to_string();
+            let shown = value_text(&new);
             let settings = alias_form(alias_node(aliases_mut(doc)?, alias));
             match settings.iter_mut().find(|(k, _)| k == key) {
                 Some((_, n)) => {
+                    n.flow = new.flow;
                     n.value = new.value;
-                    n.flow = false;
                 }
                 // Settings go before the hosts.
                 None => settings.insert(0, (key.clone(), new)),
@@ -1364,7 +1402,7 @@ aliases:
         );
         let e = parse(&args("host set d command_bell false")).unwrap_err();
         assert!(
-            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network)"),
+            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_networks)"),
             "{e}"
         );
     }
@@ -1568,7 +1606,7 @@ aliases:
         );
         let e = apply("", "set nope 1").unwrap_err();
         assert!(
-            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network)"),
+            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_networks)"),
             "{e}"
         );
     }
@@ -1733,5 +1771,82 @@ aliases:
         );
         let (n, origin) = scalar(&c, "reachability_timeout").unwrap();
         assert_eq!((text(&n), origin), ("500ms", None));
+    }
+
+    /// acs-c9d: the first list-valued setting — set, get, show and read
+    /// back, globally and per alias.
+    #[test]
+    fn local_networks_is_set_shown_and_read_back_as_a_list() {
+        assert_eq!(
+            apply("", "set local_networks 172.16.0.0/16,fd00::/48").unwrap(),
+            "local_networks: [172.16.0.0/16, fd00::/48]\n"
+        );
+        // Quoted, with a space after the comma, reads the same.
+        assert_eq!(
+            typed("local_networks", "172.16.0.0/16, fd00::/48").unwrap(),
+            typed("local_networks", "172.16.0.0/16,fd00::/48").unwrap()
+        );
+        // Written masked, whatever address of the network was given.
+        assert_eq!(
+            apply("", "set local_networks 172.16.8.2/16").unwrap(),
+            "local_networks: [172.16.0.0/16]\n"
+        );
+        // A bad network is refused before anything is written.
+        let e = apply("", "set local_networks 172.16.0.0").unwrap_err();
+        assert!(e.contains("local_networks: expected a network"), "{e}");
+        let e = apply("", "set local_networks 10.0.0.0/8,::/0").unwrap_err();
+        assert!(e.contains("a /0 network is every address"), "{e}");
+        // Setting it again replaces the list; unset takes it away.
+        let set = apply(
+            "local_networks: [10.0.0.0/8]\n",
+            "set local_networks fd00::/48",
+        )
+        .unwrap();
+        assert_eq!(set, "local_networks: [fd00::/48]\n");
+        assert_eq!(apply(&set, "unset local_networks").unwrap(), "");
+        // On an alias, beside its prefer_local_network.
+        let src = "aliases:\n  d:\n    - host: a\n";
+        let on_alias = apply(src, "host set d local_networks 172.16.0.0/16").unwrap();
+        assert_eq!(
+            on_alias,
+            "aliases:\n  d:\n    local_networks: [172.16.0.0/16]\n    hosts:\n      - host: a\n"
+        );
+        assert_eq!(
+            apply(&on_alias, "host unset d local_networks").unwrap(),
+            src
+        );
+        // show names its origin, get prints it as set takes it, and what
+        // show wrote reads back the same.
+        let dir = crate::testutil::TempDir::new();
+        let g = dir.path().join("g.yaml");
+        let l = dir.path().join("l.yaml");
+        std::fs::write(&g, "").unwrap();
+        std::fs::write(&l, format!("local_networks: [10.0.0.0/8]\n{on_alias}")).unwrap();
+        let files = [g, l.clone()];
+        let c = Config::load_files(&files).unwrap();
+        let out = show(&c, &files);
+        assert!(
+            out.contains(&format!(
+                "local_networks: [10.0.0.0/8] # {}:1\n",
+                l.display()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("    local_networks: [172.16.0.0/16] # "),
+            "{out}"
+        );
+        let doc = yaml::parse(&out).unwrap();
+        let mut again = Config::default();
+        again.apply(Path::new("x"), &doc.root).unwrap();
+        assert_eq!(again.local_networks.value, c.local_networks.value);
+        let nets = |c: &Config| c.alias("d").unwrap().local_networks.clone().unwrap().value;
+        assert_eq!(nets(&again), nets(&c));
+        let (n, _) = scalar(&c, "local_networks").unwrap();
+        assert_eq!(value_text(&n), "10.0.0.0/8");
+        // Nothing set: an empty list, from the default.
+        let none = Config::default();
+        let (n, origin) = scalar(&none, "local_networks").unwrap();
+        assert_eq!((value_text(&n).as_str(), origin), ("", None));
     }
 }

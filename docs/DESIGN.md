@@ -836,6 +836,8 @@ aliases:                       # acs devbox tries its hosts in order
     persist: true              # and this, unless an entry says otherwise
     reachability_interval: 30s # and this
     prefer_local_network: true # hosts on this machine's networks first
+    local_networks:            # counted as local besides this machine's own
+      - 172.16.0.0/16
     hosts:
       - host: lab.lan
 ```
@@ -863,8 +865,8 @@ aliases:                       # acs devbox tries its hosts in order
 - **An alias's own settings**: an alias is a list of entries (or one entry,
   a mapping with `host`), or a mapping of its settings — `identity_file`,
   `redraw_on_reconnect`, `reachability_timeout`, `persist`,
-  `reachability_interval` and `prefer_local_network` — and its `hosts`,
-  that list. The list form
+  `reachability_interval`, `prefer_local_network` and `local_networks` —
+  and its `hosts`, that list. The list form
   stays the usual one; the mapping is only needed for a setting shared by
   the entries. A file may give the mapping without
   `hosts`, to set the key (or another setting) of an alias whose hosts are
@@ -939,6 +941,25 @@ one of the alias's entries instead of `<name>`:
     network 192.168.1.0/24`) and says it when the host is used.
   - A redial resolves the alias again (below), so after a network change
     the match is made against the networks the machine is on then.
+  - **`local_networks`** (acs-c9d) adds networks to the ones the interfaces
+    give, in CIDR form — `172.16.0.0/16`, `fd00::/48` — because an
+    interface's prefix is narrower than a site: from 172.16.1.65/24 a host
+    at 172.16.8.2 is on another network, although both are at the same
+    site. With `172.16.0.0/16` configured it matches. The setting is a
+    list, written as a YAML sequence or as one value separated by commas;
+    the address in an entry need not be the network's own, the prefix
+    deciding (`172.16.8.2/16` is `172.16.0.0/16`, which is how it is
+    written back). It resolves as `prefer_local_network` does — the
+    alias's list, else the global one — so an alias's list **replaces**
+    the global one rather than adding to it, and an empty list counts no
+    configured network for that alias. A network that is not in CIDR form,
+    is a /0, or is loopback, link-local or unspecified is a configuration
+    error naming the file and line (`LocalNet::parse`). The networks are
+    used for the ranking only, so they do nothing unless
+    `prefer_local_network` is on — and they come **after** the machine's
+    own, so a host on both is reported as on the interface's network, the
+    narrower of the two. With no usable network from the interfaces at all,
+    the configured ones are enough on their own.
 - The pings run **at once**: every entry with `reachability_check: true`
   (the default) that could be chosen — those before the first unchecked
   one — is pinged when the alias is resolved, each from a thread of its
@@ -1089,11 +1110,11 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`); `set` checks the type |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`, `local_networks`); `set` checks the type. A list setting is given as one value separated by commas (`acs config set local_networks 172.16.0.0/16,fd00::/48`) and shown the same way |
 | `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
 | `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check] [--prefer] [--persist]` | append an entry, so repeated adds give an alias its fallback hosts in order |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
-| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
+| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false`, `local_networks <net>,<net>` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
 | `path` | the two files and whether they exist |
 
 - Edits go to the local file; `--global` edits the global one (and needs
@@ -1361,7 +1382,8 @@ src/
   upgrade.rs    acs upgrade: replace this binary with a newer release
   update_check.rs  weekly check for a newer release (_update-check)
   alias.rs      host aliases: ping check and fallback hosts
-  netmatch.rs   the machine's networks and a host's addresses, for prefer_local_network
+  netmatch.rs   the machine's and the configured networks, and a host's
+                addresses, for prefer_local_network
   yaml.rs       the YAML subset those files use, parsed and written back
   install.rs    remote self-install and _install --finish
   payload.rs    payload set format, ELF trailer, Mach-O embed
