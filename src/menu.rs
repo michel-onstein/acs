@@ -310,8 +310,10 @@ impl Menu {
                 }
             }
             Key::Byte(b'.') => self.keep_cursor(|m| m.all = !m.all),
-            Key::Byte(b'x') => {
-                if let Row::Session(h, i) = rows[self.cursor] {
+            // acs-7zb: x and n act on the row under the cursor, so off one
+            // they act on they do nothing but say what they would need.
+            Key::Byte(b'x') => match rows[self.cursor] {
+                Row::Session(h, i) => {
                     let s = self.sessions(h)[i].clone();
                     let whose = match s.attached {
                         true => format!(", attached from {},", s.identity),
@@ -324,14 +326,16 @@ impl Menu {
                     );
                     self.ask = Some(Ask::Kill(h, s.name.clone()));
                 }
-            }
+                _ => self.note = "x ends the session under the cursor".into(),
+            },
             Key::Byte(b'n') => match (self.every, rows[self.cursor]) {
-                (false, _) => return Some(Choice::New { host: 0 }),
+                (false, Row::Session(..) | Row::New) => return Some(Choice::New { host: 0 }),
                 (true, Row::Session(host, _)) => return Some(Choice::New { host }),
                 (true, _) => {
                     self.note =
                         "n makes a new session on the host of the session under the cursor".into()
                 }
+                (false, _) => self.note = "the 'new session' row above makes a new session".into(),
             },
             _ => {}
         }
@@ -443,14 +447,7 @@ impl Menu {
             lines.extend(info.into_iter().map(|l| (format!("     {l}"), false)));
         }
         lines.push((String::new(), false));
-        lines.push((
-            format!(
-                "1-9, or ↑↓ jk and Enter: attach   .: {}   x: end   n: new{}   Esc: leave",
-                if self.all { "detached only" } else { "all" },
-                if self.every { " there" } else { "" }
-            ),
-            false,
-        ));
+        lines.push((self.keys(&rows), false));
         lines.push((self.note.clone(), false));
         let mut out = String::from("\x1b[H");
         for (i, (text, here)) in lines.iter().enumerate() {
@@ -468,6 +465,55 @@ impl Menu {
         }
         out.push_str("\x1b[J");
         out
+    }
+
+    /// The key bar at the foot (acs-7zb): only the keys that act on the row
+    /// under the cursor, so that x and n are not offered where they do
+    /// nothing, and Enter is named for what it does there.
+    fn keys(&self, rows: &[Row]) -> String {
+        let shown = if self.all { "detached only" } else { "all" };
+        let mut keys: Vec<String> = Vec::new();
+        match rows[self.cursor] {
+            // Every key acts here, so the bar reads as it always has.
+            Row::Session(..) => {
+                keys.push("1-9, or ↑↓ jk and Enter: attach".into());
+                keys.push(format!(".: {shown}"));
+                keys.push("x: end".into());
+                keys.push(format!("n: new{}", self.there()));
+            }
+            Row::New => {
+                if rows.iter().any(|r| matches!(r, Row::Session(..))) {
+                    keys.push("1-9: attach".into());
+                }
+                keys.push("↑↓ jk: move".into());
+                keys.push("Enter or n: new session".into());
+                keys.push(format!(".: {shown}"));
+            }
+            Row::Exit => {
+                if rows.iter().any(|r| matches!(r, Row::Session(..))) {
+                    keys.push("1-9: attach".into());
+                }
+                if rows.len() > 1 {
+                    keys.push("↑↓ jk: move".into());
+                }
+                keys.push(format!(".: {shown}"));
+                keys.push("Enter or Esc: leave".into());
+            }
+        }
+        if !matches!(rows[self.cursor], Row::Exit) {
+            keys.push("Esc: leave".into());
+        }
+        keys.join("   ")
+    }
+
+    /// ` there` for `n` in the menu of every host, where the new session is
+    /// made on the host of the session under the cursor; nothing in the
+    /// menu of one.
+    fn there(&self) -> &'static str {
+        match self.every {
+            true => " there",
+            false => "",
+        }
     }
 
     /// In the menu of every host, a line for each host without a row shown,
@@ -622,6 +668,75 @@ mod tests {
         m.feed(b"jj", 0);
         assert_eq!(m.feed(b"\r", 0), Some(Choice::New { host: 0 }));
         assert_eq!(menu().feed(b"n", 0), Some(Choice::New { host: 0 }));
+        // n on the new-session row makes one too: it is that row's key.
+        let mut m = menu();
+        m.feed(b"jj", 0);
+        assert_eq!(m.feed(b"n", 0), Some(Choice::New { host: 0 }));
+    }
+
+    /// The key bar the menu draws at the foot: the line before the note.
+    fn key_bar(m: &Menu) -> String {
+        let screen = m.render("devbox", 0, 200, 30);
+        let lines: Vec<String> = screen
+            .split("\r\n")
+            .map(|l| {
+                let l = l.replace("\x1b[H", "").replace("\x1b[7m", "");
+                l.split('\x1b').next().unwrap().to_string()
+            })
+            .collect();
+        lines[lines.len() - 2].clone()
+    }
+
+    /// acs-7zb: the bar names only the keys that act on the row under the
+    /// cursor — no x or n on the new-session and exit rows, and Enter named
+    /// for what it does there.
+    #[test]
+    fn the_key_bar_offers_only_the_keys_for_the_row_under_the_cursor() {
+        // A session row: every key acts, and the bar reads as it always has.
+        assert_eq!(
+            key_bar(&menu()),
+            "1-9, or ↑↓ jk and Enter: attach   .: all   x: end   n: new   Esc: leave"
+        );
+        // The new-session row: no x, and Enter is the row's own action.
+        let mut m = menu();
+        m.feed(b"jj", 0);
+        assert_eq!(
+            key_bar(&m),
+            "1-9: attach   ↑↓ jk: move   Enter or n: new session   .: all   Esc: leave"
+        );
+        // The exit row: neither x nor n.
+        let mut m = menu();
+        m.feed(b"jjj", 0);
+        assert_eq!(
+            key_bar(&m),
+            "1-9: attach   ↑↓ jk: move   .: all   Enter or Esc: leave"
+        );
+        // The menu of every host before any host answers is the exit row
+        // alone: nothing to attach and nowhere to move either.
+        assert_eq!(key_bar(&every()), ".: all   Enter or Esc: leave");
+    }
+
+    /// acs-7zb: on the exit row n does not make a session and x does not
+    /// ask; each only says what it would act on, and nothing else changes.
+    #[test]
+    fn n_and_x_do_nothing_on_the_exit_row() {
+        /// The screen down to the blank line under the rows.
+        fn rows(m: &Menu) -> Vec<String> {
+            let screen = m.render("devbox", 0, 200, 30);
+            screen.split("\r\n").take(8).map(String::from).collect()
+        }
+        let mut m = menu();
+        m.feed(b"jjj", 0);
+        let before = rows(&m);
+        assert_eq!(m.feed(b"n", 0), None);
+        assert_eq!(m.cursor, 3);
+        assert_eq!(m.note, "the 'new session' row above makes a new session");
+        assert_eq!(m.feed(b"x", 0), None);
+        assert!(m.ask.is_none());
+        assert_eq!(m.note, "x ends the session under the cursor");
+        assert_eq!(rows(&m), before);
+        // Enter on the row still leaves.
+        assert_eq!(m.feed(b"\r", 0), Some(Choice::Leave(0)));
     }
 
     #[test]

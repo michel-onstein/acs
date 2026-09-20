@@ -135,10 +135,18 @@ acs: detached sessions on devbox
 | --- | --- |
 | `1`–`9` | attach that session (more than nine: the rest by cursor) |
 | ↑ ↓ or `k` `j`, then Enter | attach the session under the cursor, or pick *new session* or *exit* |
-| `n` | create a new session |
+| `n` | create a new session (on a session row, or on *new session*) |
 | `.` | show attached sessions too; taking one over asks first (`--force` does not) |
 | `x` | end the session under the cursor, after a `y` (or a second `x`) |
 | Esc | leave the menu (Ctrl-C too) |
+
+The bar names only the keys that act on the row under the cursor, so `x`
+and `n` are not offered on *new session* or *exit*, and Enter is named for
+what it does there:
+
+```text
+1-9: attach   ↑↓ jk: move   .: all   Enter or Esc: leave
+```
 
 The list, the menu's `x` and the attach share one ssh connection, so a
 plain `acs host` logs in once (one touch of a hardware key), and `acs -v

@@ -318,14 +318,27 @@ the session, where a separate `_proxy --list` side call used to cost a second
   (or the terminal, if narrower), so it keeps its width from row to row;
   widths are in terminal columns, a wide character counting two.
 
+  The key bar at the foot (`menu.rs` `keys`, acs-7zb) names **only the
+  keys that act on the row under the cursor**, and names Enter for what it
+  does there. A session row reads as above; *new session* and *exit* drop
+  `x` and `n`, which do nothing there:
+
+  ```text
+  1-9: attach   ↑↓ jk: move   Enter or n: new session   .: all   Esc: leave
+  1-9: attach   ↑↓ jk: move   .: all   Enter or Esc: leave
+  ```
+
+  `1-9` is dropped when no session is listed, and `↑↓ jk` when *exit* is
+  the only row — the menu of every host before any host answers.
+
 | Key | Effect |
 | --- | --- |
 | `1`–`9` | attach that session at once; with more than nine, the rest have no number and are reached with the cursor |
 | ↑ ↓, `k` `j` | move the cursor (it stops at the ends); a short screen scrolls to keep it in view |
 | Enter | attach the session under the cursor; on *new session*, create one (named as above); on *exit*, leave |
-| `n` | create a new session |
+| `n` | create a new session — on a session row (its host, in the menu of every host), or on *new session*. Elsewhere it does nothing but say where it acts |
 | `.` | show attached sessions too, or hide them again. Picking an attached session asks `session 'x' is attached from alice@laptop — take over? [y/N]`; `y` attaches with `force`, the `--force` path of §4.5 (and `--force` on the command line skips the question) |
-| `x` | end the session under the cursor, after `end session 'x'? y (or x) ends it`: `END_SESSION` on the menu's connection (§4.3), then the menu shows the sessions left and what happened |
+| `x` | end the session under the cursor, after `end session 'x'? y (or x) ends it`: `END_SESSION` on the menu's connection (§4.3), then the menu shows the sessions left and what happened. Off a session row it does nothing but say what it ends |
 | Esc | leave, exit status 0 — at any point, a question pending or not. A lone ESC waits 100 ms for the rest of an arrow key's sequence (as the session's input does for an incomplete sequence, §6.3), so it is never taken for one |
 | Ctrl-C | leave, exit status 130 |
 
