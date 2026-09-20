@@ -106,6 +106,44 @@ fn an_install_is_0755_under_a_restrictive_umask() {
     }
 }
 
+/// Regression (acs-iws): the install made its directory with a bare
+/// `mkdir -p`, so `umask 002` left it 0775 — and the prelude's acs-08m check
+/// then refused to exec the binary acs had just installed there ("refusing
+/// to run …: it or its directory is writable by others", exit 254). The
+/// install succeeded and every connection after it failed.
+///
+/// Both directories acs makes are 0755 now, whatever the umask, and the
+/// session comes up.
+#[test]
+fn an_install_under_a_group_writable_umask_still_runs() {
+    for payloads in [false, true] {
+        let remote = Remote::new();
+        remote.remote_umask("002");
+        let mut c = if payloads {
+            remote.fake_uname("Linux", "x86_64");
+            let (client, _, _) = complete_client(remote.root.path(), "x86_64-unknown-linux-musl");
+            Client::start_exe(&client, &remote, &args("u"), &[])
+        } else {
+            Client::start(&remote, &args("u"))
+        };
+        c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
+        // The session comes up: nothing refused the freshly installed binary.
+        c.wait_for("up", T);
+        let binary = remote.installed_binary(acs::VERSION);
+        let version_dir = binary.parent().unwrap();
+        let acs_dir = version_dir.parent().unwrap();
+        for d in [acs_dir, version_dir] {
+            let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "{} (payload path: {payloads})", d.display());
+        }
+        assert_eq!(
+            std::fs::metadata(&binary).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "payload path: {payloads}"
+        );
+    }
+}
+
 /// Regression (acs-q9t): login-shell noise on stdout must not fail the
 /// payload upload step, which prints nothing of its own.
 #[test]

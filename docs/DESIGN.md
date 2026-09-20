@@ -1384,7 +1384,8 @@ multiplexed connection:
 ```sh
 # 1: unpack the slim binary; stdin is gz(slim_r) from P. The shell checks
 #    the SHA-256 the client computed BEFORE the file is made executable.
-d=~/.local/share/acs/0.3.1; mkdir -p $d && gzip -dc > $d/acs.new.<token>
+umask 022; d=~/.local/share/acs/0.3.1; mkdir -p $d; chmod 755 ~/.local/share/acs $d
+gzip -dc > $d/acs.new.<token>
 got=$({ sha256sum $d/acs.new.<token> || shasum -a 256 … || openssl dgst … ; } | …)
 [ "$got" = <digest> ] || { rm -f $d/acs.new.<token>; exit 5; }
 chmod 755 $d/acs.new.<token>
@@ -1392,6 +1393,19 @@ chmod 755 $d/acs.new.<token>
 #    then rename over $d/acs and repoint ~/.local/bin/acs
 $d/acs.new.<token> _install --finish --slim-sha256 <digest> --blob-sha256 <digest>
 ```
+
+**The directories acs makes carry a mode of their own** (acs-iws), not
+whatever the remote's umask leaves. The prelude refuses to exec a binary
+whose directory is writable by group or other (§7.1, acs-08m), and a bare
+`mkdir -p` under the `umask 002` that lab and appliance images still ship
+makes it 0775 — so acs installed into a directory it then refused to run
+from, the install reporting success and the next connection exiting 254.
+The `umask 022` covers the parents `mkdir -p` creates on a fresh host
+(`~/.local`, `~/.local/share`); the `chmod` sets the two directories acs
+owns, which also heals one an earlier version left group-writable. Neither
+touches `$HOME`, `~/.local` or `~/.local/share` where they already exist:
+acs did not make them, and the prelude does not look at them. The binary's
+own mode is set past the umask already (acs-28b).
 
 **The shell does the checking, not the uploaded binary** (acs-4km). The
 digest used to be verified by `_install --finish` itself, which hashes its

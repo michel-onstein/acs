@@ -119,14 +119,16 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
     ));
     let token = format!("{:016x}", crate::sys::random_u64());
     let v = crate::VERSION;
-    let dir = format!("\"$HOME\"/.local/share/acs/{}", sh_quote(v));
+    let acs_dir = "\"$HOME\"/.local/share/acs";
+    let dir = format!("{acs_dir}/{}", sh_quote(v));
     let tmp = format!("{dir}/acs.new.{token}");
+    let make_dir = make_dir(acs_dir, &dir);
     match plan {
         Plan::SelfCopy { data } => {
             let digest = sha256::hex(&sha256::digest(&data));
             let check = check_upload(&tmp, &digest);
             let script = format!(
-                "set -e; mkdir -p {dir}; cat > {tmp}; {check} chmod 755 {tmp}; exec {tmp} _install --finish --token {token} --sha256 {digest}"
+                "set -e; {make_dir} cat > {tmp}; {check} chmod 755 {tmp}; exec {tmp} _install --finish --token {token} --sha256 {digest}"
             );
             side_call(args, &script, &data, true)?;
         }
@@ -135,7 +137,7 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
             let blob_digest = sha256::hex(&sha256::digest(&blob));
             let check = check_upload(&tmp, &slim_digest);
             let script = format!(
-                "set -e; command -v gzip >/dev/null || {{ echo 'acs: the remote has no gzip' >&2; exit 3; }}; mkdir -p {dir}; gzip -dc > {tmp}; {check} chmod 755 {tmp}"
+                "set -e; command -v gzip >/dev/null || {{ echo 'acs: the remote has no gzip' >&2; exit 3; }}; {make_dir} gzip -dc > {tmp}; {check} chmod 755 {tmp}"
             );
             side_call(args, &script, &gz, false)?;
             let script = format!(
@@ -146,6 +148,25 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
     }
     note(&format!("installed acs {v} on {host}"));
     Ok(())
+}
+
+/// The fragment that makes the directory acs installs into, with a mode of
+/// its own rather than whatever the remote's umask leaves (acs-iws).
+///
+/// The prelude refuses to exec a binary whose directory is writable by group
+/// or other (acs-08m, `ssh.rs`). A bare `mkdir -p` under the `umask 002`
+/// that lab and appliance images still ship makes that directory 0775, so
+/// acs installed into a directory it then refused to run from: the install
+/// said it had succeeded and the very next connection exited 254.
+///
+/// `umask 022` covers the parents `mkdir -p` creates on a fresh host
+/// (`~/.local`, `~/.local/share`); the `chmod` sets the two directories acs
+/// owns, which also heals an install an earlier version left group-writable.
+/// Neither touches `$HOME`, `~/.local` or `~/.local/share` when they already
+/// exist — acs did not make them, and the prelude does not look at them.
+/// The binary's own mode is set past the umask already (acs-28b).
+fn make_dir(acs_dir: &str, dir: &str) -> String {
+    format!("umask 022; mkdir -p {dir}; chmod 755 {acs_dir} {dir};")
 }
 
 /// Shell that checks the uploaded `file` against `want` **before** the file
