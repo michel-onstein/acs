@@ -352,7 +352,10 @@ fn kill_escalates_to_sigkill_for_a_group_ignoring_sighup() {
     );
     a.wait_output("armed", T);
     let t0 = Instant::now();
-    a.send(&Msg::Kill);
+    a.send(&Msg::Kill {
+        identity: "me".into(),
+        force: true,
+    });
     let status = wait_exit(&mut a);
     assert!(
         t0.elapsed() >= Duration::from_millis(2500),
@@ -374,7 +377,10 @@ fn kill_ends_a_normal_session_quickly() {
     );
     a.wait_output("armed", T);
     let t0 = Instant::now();
-    a.send(&Msg::Kill);
+    a.send(&Msg::Kill {
+        identity: "me".into(),
+        force: true,
+    });
     let status = wait_exit(&mut a);
     assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     assert_eq!(acs::sys::exit_code(status), 128 + libc::SIGHUP as u8);
@@ -713,7 +719,10 @@ fn a_taken_over_client_is_not_listened_to() {
         xpixel: 0,
         ypixel: 0,
     }));
-    let _ = a.try_send(&Msg::Kill);
+    let _ = a.try_send(&Msg::Kill {
+        identity: "me".into(),
+        force: true,
+    });
     drop(a);
     std::thread::sleep(Duration::from_millis(300));
     // The session lives, and the new client's first input counts.
@@ -725,4 +734,92 @@ fn a_taken_over_client_is_not_listened_to() {
     let out = String::from_utf8_lossy(&b.output).into_owned();
     assert!(!out.contains("got:evil"), "{out:?}");
     assert!(acs::testutil::session_pid(&sock(t.path(), "to")).is_ok());
+}
+
+/// acs-fbo: a KILL that has not said who it is gets nowhere, and a
+/// connection the master has just refused with BUSY cannot destroy the very
+/// session it was denied. Before this, five bytes on the socket did it.
+#[test]
+fn a_kill_from_outside_is_refused_while_someone_else_is_attached() {
+    let t = TempDir::new();
+    let (mut alice, _) = start(
+        t.path(),
+        "s",
+        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        "alice@laptop",
+    );
+    alice.wait_output("armed", T);
+
+    // Someone else asks to attach and is told the session is taken.
+    let mut bob = FrameConn::connect(&sock(t.path(), "s")).unwrap();
+    bob.send(&Msg::Hello(hello("s", Mode::Attach, "bob@desk")));
+    assert!(
+        matches!(bob.recv_control(T), Some(Msg::Busy { identity, .. }) if identity == "alice@laptop")
+    );
+
+    // On that same refused connection, a kill is refused the same way.
+    bob.send(&Msg::Kill {
+        identity: "bob@desk".into(),
+        force: false,
+    });
+    assert!(
+        matches!(bob.recv_control(T), Some(Msg::Busy { identity, .. }) if identity == "alice@laptop"),
+        "a refused client ended the session it was denied"
+    );
+
+    // An anonymous kill is refused too: it names nobody, so it is nobody.
+    let mut anon = FrameConn::connect(&sock(t.path(), "s")).unwrap();
+    anon.send(&Msg::Kill {
+        identity: String::new(),
+        force: false,
+    });
+    assert!(matches!(anon.recv_control(T), Some(Msg::Busy { .. })));
+
+    // Alice's session is still there, and still hers.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(sock(t.path(), "s").exists(), "the session was ended");
+    alice.send(&Msg::Input {
+        seq: 0,
+        bytes: b"echo alive\r".to_vec(),
+    });
+    alice.wait_output("alive", T);
+}
+
+/// acs-fbo: agreeing to take the session ends it, as `--force` does for a
+/// takeover, and the asker's connection is held until the master is gone.
+#[test]
+fn a_kill_from_outside_goes_through_with_force_or_the_same_identity() {
+    let t = TempDir::new();
+    let (mut alice, _) = start(
+        t.path(),
+        "s",
+        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        "alice@laptop",
+    );
+    alice.wait_output("armed", T);
+
+    let mut bob = FrameConn::connect(&sock(t.path(), "s")).unwrap();
+    bob.send(&Msg::Kill {
+        identity: "bob@desk".into(),
+        force: true,
+    });
+    // Held open until the session is really gone, then closed.
+    assert!(bob.closed(T), "the killer's connection was not held");
+    wait_gone(&sock(t.path(), "s"));
+
+    // And a second terminal of the same person needs no force.
+    let (mut me, _) = start(
+        t.path(),
+        "s2",
+        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        "alice@laptop",
+    );
+    me.wait_output("armed", T);
+    let mut other = FrameConn::connect(&sock(t.path(), "s2")).unwrap();
+    other.send(&Msg::Kill {
+        identity: "alice@laptop".into(),
+        force: false,
+    });
+    assert!(other.closed(T));
+    wait_gone(&sock(t.path(), "s2"));
 }

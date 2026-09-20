@@ -213,7 +213,11 @@ fn pick(dir: &SocketDir) -> Result<ExitCode, String> {
         match next_from_client(&mut dec)? {
             // Leaving the menu closes the connection.
             None => return Ok(ExitCode::SUCCESS),
-            Some(Msg::EndSession { name }) => send_list(dir, Some(&name))?,
+            Some(Msg::EndSession {
+                name,
+                identity,
+                force,
+            }) => send_list(dir, Some((&name, &identity, force)))?,
             Some(Msg::Hello(h)) => break h,
             Some(other) => {
                 return reply_err(
@@ -415,9 +419,11 @@ fn list(dir: &SocketDir) -> ExitCode {
 /// connection stays open. With `kill` (END_SESSION, the menu's `x`) that
 /// session is ended first, and an ERROR goes ahead of the list if it could
 /// not be.
-fn send_list(dir: &SocketDir, kill: Option<&str>) -> Result<(), String> {
+fn send_list(dir: &SocketDir, kill: Option<(&str, &str, bool)>) -> Result<(), String> {
     let mut out = Vec::new();
-    if let Some(Err((code, message))) = kill.map(|name| end_session(dir, name)) {
+    if let Some(Err((code, message))) =
+        kill.map(|(name, identity, force)| end_session(dir, name, identity, force))
+    {
         Msg::Error { code, message }.encode(&mut out);
     }
     sys::write_all(STDOUT, &out).map_err(|e| e.to_string())?;
@@ -461,7 +467,12 @@ const KILL_WAIT: Duration = Duration::from_secs(10);
 /// Ask `name`'s master to end its session, as `x` in the session does, and
 /// wait until it has: the master holds the connection open until it exits.
 /// Only masters of our own uid answer (DESIGN §4.5).
-fn end_session(dir: &SocketDir, name: &str) -> Result<(), (u16, String)> {
+fn end_session(
+    dir: &SocketDir,
+    name: &str,
+    identity: &str,
+    force: bool,
+) -> Result<(), (u16, String)> {
     use std::io::{Read, Write};
     let path = dir.socket_path(name).map_err(|e| (err::BAD_REQUEST, e))?;
     let mut s = match UnixStream::connect(&path) {
@@ -470,7 +481,17 @@ fn end_session(dir: &SocketDir, name: &str) -> Result<(), (u16, String)> {
         Err(e) => return Err((err::INTERNAL, format!("connect {}: {e}", path.display()))),
     };
     let failed = |e: io::Error| (err::INTERNAL, format!("session '{name}': {e}"));
-    s.write_all(&Msg::Kill.to_bytes()).map_err(failed)?;
+    // The KILL says who is asking (acs-fbo). The master refuses an
+    // anonymous one, and refuses this one too when another identity is
+    // attached and the asker has not already agreed to take the session
+    // from them — the same gate a takeover goes through. It does not
+    // attach on the way: that would send the attached client TAKEOVER,
+    // and the session is about to end, not change hands.
+    let kill = Msg::Kill {
+        identity: identity.to_string(),
+        force,
+    };
+    s.write_all(&kill.to_bytes()).map_err(failed)?;
     s.set_read_timeout(Some(KILL_WAIT)).map_err(failed)?;
     let mut dec = Decoder::new();
     let mut buf = [0u8; 4096];
