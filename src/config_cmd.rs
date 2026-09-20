@@ -1065,11 +1065,24 @@ fn write(path: &Path, doc: &Document) -> Result<(), Error> {
         Error::Io(format!("cannot write {}: {e}{hint}", what.display()))
     };
     std::fs::create_dir_all(dir).map_err(|e| io(e, dir))?;
-    let tmp = dir.join(format!(
-        ".config.yaml.{:08x}",
-        crate::sys::random_u64() as u32
-    ));
-    std::fs::write(&tmp, &text).map_err(|e| io(e, path))?;
+    let tmp = dir.join(format!(".config.yaml.{}", crate::sys::random_token()));
+    // Created 0600, then widened to match an existing file (acs-q4f).
+    // `fs::write` used the process umask, typically 0644, and the mode was
+    // copied only afterwards — so a brand new configuration stayed
+    // world-readable for good. It holds no secret, but it is an inventory
+    // of the user's hosts, login names and key paths, which is not
+    // everybody's business on a shared machine.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| io(e, path))?;
+        f.write_all(text.as_bytes()).map_err(|e| io(e, path))?;
+    }
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
@@ -1082,6 +1095,29 @@ fn write(path: &Path, doc: &Document) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-q4f: a configuration acs creates is private. It used to be
+    /// written at the process umask, typically 0644, with the mode copied
+    /// on only afterwards — so a brand new one stayed world-readable for
+    /// good. It holds no secret, but it is an inventory of the user's
+    /// hosts, login names and key paths.
+    #[test]
+    fn a_configuration_acs_creates_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = crate::testutil::TempDir::new();
+        let path = t.path().join("config.yaml");
+
+        let doc = crate::yaml::parse("update_check: false\n").unwrap();
+        write(&path, &doc).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "a new config is {:o}", mode & 0o777);
+
+        // An existing file keeps the mode its owner chose, wider or not.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write(&path, &doc).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640, "the file's own mode was not kept");
+    }
 
     fn args(s: &str) -> Vec<OsString> {
         s.split_whitespace().map(OsString::from).collect()
