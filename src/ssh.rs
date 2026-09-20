@@ -142,10 +142,21 @@ pub fn sh_quote(s: &str) -> String {
 }
 
 /// Where the remote side looks for the binary of exactly `version`.
+///
+/// The version is quoted like every other value that reaches the remote
+/// shell (acs-ciz). It sits inside double quotes in [`prelude`], where `$`,
+/// a backtick and a backslash are all still live, so an unquoted one would
+/// be command execution for any caller that ever passed something other
+/// than the compile-time constant — and nothing in the signature says it
+/// may not.
 pub fn remote_candidates(version: &str) -> [String; 2] {
+    let v = sh_quote(version);
     [
-        format!("$HOME/.local/share/acs/{version}/acs"),
-        format!("/usr/local/lib/acs/{version}/acs"),
+        // `$HOME` is quoted on its own so a home with a space still works,
+        // and the rest is already shell-safe, so the caller must not wrap
+        // these in quotes again — that would make the quoting literal.
+        format!("\"$HOME\"/.local/share/acs/{v}/acs"),
+        format!("/usr/local/lib/acs/{v}/acs"),
     ]
 }
 
@@ -155,7 +166,7 @@ pub fn prelude(version: &str, args: &[&str]) -> String {
     let args: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
     let [home, system] = remote_candidates(version);
     format!(
-        "for b in \"{home}\" \"{system}\"; do \
+        "for b in {home} {system}; do \
          if [ -x \"$b\" ]; then exec \"$b\" {args}; fi; \
          done; \
          printf '\\nACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"",
@@ -360,6 +371,38 @@ mod tests {
             .output()
             .unwrap();
         String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// acs-ciz: the version reaches the remote shell inside double quotes,
+    /// where `$`, a backtick and a backslash are still live. Every other
+    /// value there is quoted; this one was not, so any future caller
+    /// passing something other than the compile-time constant would have
+    /// been command execution on the remote.
+    #[test]
+    fn a_hostile_version_cannot_run_a_command_on_the_remote() {
+        let home = TempDir::new();
+        for bad in [
+            "0.1.0\"; touch pwned; \"",
+            "$(touch pwned)",
+            "`touch pwned`",
+            "0.1.0/../../../tmp",
+        ] {
+            let script = prelude(bad, &["--version"]);
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                !home.path().join("pwned").exists(),
+                "{bad:?} ran a command: {script}"
+            );
+            // It simply finds nothing and says so, as any other unknown
+            // version would.
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(said.contains("ACS-NEED"), "{bad:?}: {said}");
+        }
     }
 
     #[test]
