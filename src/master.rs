@@ -352,7 +352,18 @@ fn pty_drained(fd: RawFd) -> bool {
 }
 
 fn bind(path: &Path) -> io::Result<(UnixListener, (u64, u64))> {
-    let l = UnixListener::bind(path)?;
+    // The socket used to land at 0777 masked by whatever umask the master
+    // inherited, and nothing narrowed it afterwards: the 0700 directory and
+    // the peer-uid check on every accept were the only controls. Both hold,
+    // so this is depth rather than a hole — but a permissive umask should
+    // not leave the peer check standing on its own (acs-hjk).
+    //
+    // Created 0600 rather than chmod'd to it: there is then no instant when
+    // it is anything else, and macOS refuses `fchmod` on a socket anyway.
+    let l = {
+        let _mask = sys::Umask::set(0o177);
+        UnixListener::bind(path)?
+    };
     l.set_nonblocking(true)?;
     let m = std::fs::metadata(path)?;
     Ok((l, (m.dev(), m.ino())))

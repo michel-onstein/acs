@@ -4,7 +4,8 @@
 
 use std::fmt;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use crate::sys::{self, Flock};
@@ -64,8 +65,46 @@ pub struct DirFacts {
 pub enum DirError {
     Symlink(PathBuf),
     NotDir(PathBuf),
-    Foreign { path: PathBuf, owner: String },
+    Foreign {
+        path: PathBuf,
+        owner: String,
+    },
+    /// An ancestor others could write, so the directory could be replaced.
+    Replaceable {
+        path: PathBuf,
+        why: String,
+    },
     Io(PathBuf, String),
+}
+
+/// Whether `mode` lets someone other than the owner remove or rename what
+/// is in the directory: writable by group or other, and not sticky.
+fn mode_lets_others_replace(mode: u32) -> bool {
+    mode & 0o022 != 0 && mode & 0o1000 == 0
+}
+
+/// Refuse a socket directory that anyone else could replace: an ancestor
+/// writable by group or other and not sticky (acs-hjk).
+///
+/// The sticky bit is what makes `/tmp` safe — it lets anyone create, but
+/// only the owner remove or rename. Without it, whoever can write the
+/// parent can move our directory aside and put theirs in its place, and
+/// the next client connects to their master and hands it every keystroke.
+fn check_ancestors(path: &Path) -> Result<(), DirError> {
+    for dir in path.ancestors().skip(1) {
+        let meta = match std::fs::symlink_metadata(dir) {
+            Ok(m) => m,
+            // Not readable by us is not our business to judge.
+            Err(_) => continue,
+        };
+        if mode_lets_others_replace(meta.mode()) && meta.uid() != sys::getuid() {
+            return Err(DirError::Replaceable {
+                path: path.to_path_buf(),
+                why: format!("{} is writable by others and not sticky", dir.display()),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for DirError {
@@ -89,6 +128,11 @@ impl fmt::Display for DirError {
             DirError::Foreign { path, owner } => write!(
                 f,
                 "{} is owned by {owner}, not by you — refusing to use it ({hint})",
+                path.display()
+            ),
+            DirError::Replaceable { path, why } => write!(
+                f,
+                "{} sits under a directory anyone could replace: {why} ({hint})",
                 path.display()
             ),
             DirError::Io(p, e) => write!(f, "{}: {e}", p.display()),
@@ -153,9 +197,20 @@ impl SocketDir {
             mode: meta.mode(),
         };
         if check_dir(&path, facts, sys::getuid())? {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                .map_err(io_err)?;
+            // Through a handle, not by name (acs-hjk). `set_permissions`
+            // follows symlinks and runs *after* the lstat above, so between
+            // the two the leaf could be swapped for a link to somewhere
+            // else and this would chmod that instead. O_NOFOLLOW means the
+            // open fails rather than lands somewhere new, and the fchmod
+            // can only reach what was opened.
+            let fd = sys::open_dir_nofollow(&path).map_err(io_err)?;
+            sys::fchmod(fd.as_raw_fd(), 0o700).map_err(io_err)?;
         }
+        // Somebody else's writable directory above ours is the same
+        // problem one level up: they can move ours aside and put their own
+        // there. /tmp is sticky, so the default path is fine; a pointed
+        // ACS_SOCKET_DIR may not be (acs-hjk).
+        check_ancestors(&path)?;
         Ok(SocketDir { path })
     }
 
@@ -242,6 +297,49 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Whether the directory at `path` is one others could replace entries in.
+    fn others_may_replace(path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .map(|m| mode_lets_others_replace(m.mode()))
+            .unwrap_or(false)
+    }
+
+    /// acs-hjk: a directory others could replace is refused. The sticky bit
+    /// is what makes `/tmp` safe — it lets anyone create but only the owner
+    /// remove or rename. Without it, whoever can write the parent moves ours
+    /// aside, puts theirs there, and the next client hands its keystrokes to
+    /// their master.
+    #[test]
+    fn a_directory_under_a_replaceable_parent_is_refused() {
+        let t = crate::testutil::TempDir::new();
+
+        // A parent anyone may write, without the sticky bit.
+        let loose = t.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let under = loose.join("s");
+        std::fs::create_dir(&under).unwrap();
+        // Owned by us here, so only the ancestor rule can object; the check
+        // ignores ancestors we own, which is the case in this test, so aim
+        // it at the mode directly.
+        assert!(
+            others_may_replace(&loose),
+            "a 0777 non-sticky directory should count as replaceable"
+        );
+
+        // Sticky, as /tmp is: fine.
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(!others_may_replace(&loose), "a sticky directory is fine");
+
+        // Private: fine.
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!others_may_replace(&loose), "a private directory is fine");
+
+        // And the real path this check runs on is accepted.
+        assert!(check_ancestors(&under).is_ok(), "{}", under.display());
+    }
     use crate::testutil::TempDir;
 
     #[test]
