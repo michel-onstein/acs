@@ -106,7 +106,7 @@ esac
 EOF
         chmod 755 "$fakebin/wget"
     fi
-    run ACS_RELEASES_URL="file://$t/mirror" ACS_VERSION="$new" ACS_INSTALL_DIR="$t/tampered"
+    run ACS_RELEASES_URL="file://$t/mirror" ACS_ALLOW_INSECURE_URL=1 ACS_VERSION="$new" ACS_INSTALL_DIR="$t/tampered"
     rm -f "$fakebin/wget"
     expect_fail "checksum"
     expect_out "checksum" "checksum mismatch for acs-$new-"
