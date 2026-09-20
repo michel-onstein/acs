@@ -1417,7 +1417,8 @@ aliases:
     }
 
     /// acs-c9d: `local_networks` globally and on an alias, in every form it
-    /// is written, with the local file replacing the global list.
+    /// is written -- including a single network with no list around it --
+    /// with the local file replacing the global list.
     #[test]
     fn local_networks_read_as_a_list_globally_and_per_alias() {
         let net = |s: &str| LocalNet::parse(s).unwrap();
@@ -1435,6 +1436,21 @@ aliases:
                 "{text:?}"
             );
             assert_eq!(c.local_networks.origin.unwrap().line, 1, "{text:?}");
+        }
+        // One network needs no list around it: a plain scalar is split on
+        // commas, and a lone network has none. IPv6 bare is the case worth
+        // pinning -- the address is mostly colons, which YAML gives no
+        // meaning unless one is followed by a space.
+        for (text, want) in [
+            ("local_networks: 172.16.0.0/16\n", "172.16.0.0/16"),
+            ("local_networks: \"172.16.0.0/16\"\n", "172.16.0.0/16"),
+            ("local_networks: [172.16.0.0/16]\n", "172.16.0.0/16"),
+            ("local_networks:\n  - 172.16.0.0/16\n", "172.16.0.0/16"),
+            ("local_networks: fd00::/48\n", "fd00::/48"),
+            ("local_networks: 'fd00::/48'\n", "fd00::/48"),
+        ] {
+            let c = load("", text).unwrap();
+            assert_eq!(c.local_networks.value, [net(want)], "{text:?}");
         }
         // Nothing set: none, and no origin.
         let c = load("", "").unwrap();
@@ -1462,6 +1478,19 @@ aliases:
         assert_eq!(of("d"), [net("172.16.0.0/16")]);
         assert_eq!(of("e"), [net("10.0.0.0/8")]);
         assert!(of("f").is_empty());
+        // An alias takes the single-scalar form too, and it still replaces
+        // the global list rather than adding to it.
+        let c = load(
+            "",
+            "local_networks: 10.0.0.0/8\n\
+             aliases:\n  \
+               d:\n    local_networks: 172.16.0.0/16\n    hosts: [{host: a}]\n  \
+               e:\n    hosts: [{host: b}]\n",
+        )
+        .unwrap();
+        let of = |a: &str| c.local_networks_for(c.alias(a).unwrap()).value.clone();
+        assert_eq!(of("d"), [net("172.16.0.0/16")]);
+        assert_eq!(of("e"), [net("10.0.0.0/8")]);
         // An empty value sets nothing, as any setting's does.
         let c = load("local_networks: [10.0.0.0/8]\n", "local_networks:\n").unwrap();
         assert_eq!(c.local_networks.value, [net("10.0.0.0/8")]);
