@@ -419,7 +419,22 @@ steals or breaks someone else's session **by accident**:
 - **Client identity.** `HELLO` carries a display identity,
   `<local user>@<local hostname>` (for example `michel@mbp`), overridable with
   `ACS_IDENTITY`. The master records it for the attached client and for the
-  session's creator.
+  session's creator. It is asserted, never checked, so the master holds it to
+  128 characters and strips anything that could steer a terminal before
+  storing it (acs-ovq, acs-w1z) — it ends up in someone else's `acs list`.
+  An **empty** identity is *unknown*, and matches nothing: not another
+  name, and not another empty one. It used to short-circuit the comparison,
+  so a client that simply left `ACS_IDENTITY` unset turned the question off
+  for everyone — while it was attached, anyone took the session silently and
+  `acs list` showed a dash where a name belongs.
+- **Every attach, takeover and kill leaves a trace** (acs-ovq), in
+  `<session>.log` beside the socket in the per-uid `0700` directory, written
+  `0600` and never read back by acs. One line each: the time, what happened,
+  the identity that asked, and the uid and pid the kernel reports. This model
+  draws no security boundary inside one account, which is a fair trade — but
+  it left no record either, and a boundary one chooses not to draw is a
+  different thing from one nobody can see across. The line is written
+  whatever `ACS_MASTER_LOG` is set to; the debug log is for debugging.
 - **Takeover across identities needs confirmation.** If the session is attached
   by a different identity, the master answers `BUSY{identity, since}` instead
   of `WELCOME`, and the client asks on the terminal:

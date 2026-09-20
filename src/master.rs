@@ -237,6 +237,27 @@ enum ConnState {
     Ending,
 }
 
+/// Whether two identities are the same person, for the purpose of taking a
+/// session over without asking (acs-ovq).
+///
+/// An empty identity is *unknown*, not a name, so it matches nothing — not
+/// even another empty one. It used to short-circuit the comparison, which
+/// meant a client that simply sent no identity disabled the question for
+/// everybody: while it was attached, anyone took the session silently, and
+/// `acs list` showed a dash where a name belongs. The one thing DESIGN §4.5
+/// asks of this mechanism is that nobody takes someone else's session by
+/// accident, and that did not survive leaving a variable unset.
+fn same_person(a: &str, b: &str) -> bool {
+    !a.is_empty() && a == b
+}
+
+/// An identity as it may be stored and shown: it is asserted by the client
+/// and never checked, so it is held to a length and stripped of anything
+/// that could steer a terminal (acs-ovq, acs-w1z).
+fn clean_identity(identity: &str) -> String {
+    crate::safe::display_max(identity.trim(), 128)
+}
+
 struct Conn {
     stream: UnixStream,
     dec: Decoder,
@@ -652,9 +673,10 @@ impl Master {
             // the way — that would send the attached client TAKEOVER, and
             // the session is about to end, not change hands.
             Msg::Kill { identity, force } if pending => {
+                let identity = clean_identity(&identity);
                 if let Some(a) = self.active() {
                     let other = &self.conns[a];
-                    if !force && !other.identity.is_empty() && other.identity != identity {
+                    if !force && !same_person(&other.identity, &identity) {
                         mlog!(
                             "kill from {identity} refused: {} is attached",
                             other.identity
@@ -664,11 +686,13 @@ impl Master {
                             since: other.since,
                         };
                         // Stay pending: the asker may agree and retry.
+                        self.trail("kill-refused", &identity);
                         self.conns[i].send(&busy);
                         return;
                     }
                 }
                 mlog!("kill requested from outside the session by {identity}");
+                self.trail("kill", &identity);
                 self.conns[i].state = ConnState::Ending;
                 self.start_kill();
             }
@@ -708,13 +732,60 @@ impl Master {
             }
             Msg::Kill { identity, .. } => {
                 mlog!("kill requested by the attached client {identity}");
+                self.trail("kill", &clean_identity(&identity));
                 self.start_kill();
             }
             other => mlog!("ignoring unexpected {other:?}"),
         }
     }
 
+    /// Append one line to the session's trail (acs-ovq).
+    ///
+    /// DESIGN §4.5 declares no security boundary inside one Unix account,
+    /// and that is a fair trade — but it left *no record either*. Anyone on
+    /// the account could attach as somebody else, or end a session, and the
+    /// only trace was an `mlog!` that writes nothing unless a debug
+    /// variable happens to be set. A boundary one chooses not to draw is
+    /// different from one nobody can see across, so this is written
+    /// unconditionally: who asked, what they did, and the uid the kernel
+    /// says they are.
+    ///
+    /// It lives beside the socket, in the per-uid directory that is already
+    /// 0700, and is never read back by acs — the directory scan only looks
+    /// at `*.sock`. Failures are ignored: a session must not end because a
+    /// disk is full.
+    fn trail(&self, what: &str, identity: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = self.sock_path.with_extension("log");
+        let who = match identity.is_empty() {
+            true => "-".to_string(),
+            false => identity.to_string(),
+        };
+        let line = format!(
+            "{} {what} identity={who} uid={} pid={}\n",
+            sys::unix_now(),
+            sys::getuid(),
+            sys::getpid()
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
     fn hello(&mut self, i: usize, h: Hello) {
+        // Asserted by the client and never checked, so bound it and strip
+        // anything that could steer a terminal before it is stored, shown
+        // or written to the trail (acs-ovq).
+        let h = Hello {
+            identity: clean_identity(&h.identity),
+            ..h
+        };
         let reject = |c: &mut Conn, code: u16, message: String| {
             c.send(&Msg::Error { code, message });
             c.state = ConnState::Closing;
@@ -747,16 +818,18 @@ impl Master {
         if let Some(a) = self.active() {
             if a != i {
                 let other = &self.conns[a];
-                if !h.force && !other.identity.is_empty() && other.identity != h.identity {
+                if !h.force && !same_person(&other.identity, &h.identity) {
                     let busy = Msg::Busy {
                         identity: other.identity.clone(),
                         since: other.since,
                     };
                     // Stay pending: the client may retry with `force`.
+                    self.trail("attach-refused", &h.identity);
                     self.conns[i].send(&busy);
                     return;
                 }
                 mlog!("takeover by {}", h.identity);
+                self.trail("takeover", &h.identity);
                 let old = &mut self.conns[a];
                 old.send(&Msg::Takeover);
                 old.state = ConnState::Closing;
@@ -798,6 +871,7 @@ impl Master {
             kind,
             input_seq,
         }));
+        self.trail(if created { "create" } else { "attach" }, &h.identity);
         self.last_identity = h.identity;
         self.last_activity = Instant::now();
         // Fresh or gap: the client cleared its screen, so force a redraw
