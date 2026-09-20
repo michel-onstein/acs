@@ -681,7 +681,17 @@ impl Master {
                 c.state = ConnState::Closing;
             }
             Msg::Input { seq, bytes } => {
-                let new = self.input.accept(seq, &bytes);
+                // A sequence whose end does not fit in a u64 is not a
+                // sequence: treat the frame as malformed (acs-hpf).
+                let Some(new) = self.input.accept(seq, &bytes) else {
+                    let c = &mut self.conns[i];
+                    c.send(&Msg::Error {
+                        code: err::BAD_REQUEST,
+                        message: "input sequence out of range".into(),
+                    });
+                    c.state = ConnState::Closing;
+                    return;
+                };
                 if !new.is_empty() {
                     self.pty_in.extend_from_slice(new);
                     self.last_activity = Instant::now();

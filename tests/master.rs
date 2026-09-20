@@ -823,3 +823,50 @@ fn a_kill_from_outside_goes_through_with_force_or_the_same_identity() {
     assert!(other.closed(T));
     wait_gone(&sock(t.path(), "s2"));
 }
+
+/// acs-hpf: an INPUT frame whose sequence cannot be one is a malformed
+/// frame, not a reason to poison the master's counter or abort it.
+#[test]
+fn an_input_sequence_that_cannot_fit_is_refused_and_the_session_lives() {
+    let t = TempDir::new();
+    let (mut a, _) = start(
+        t.path(),
+        "ovf",
+        &[
+            "/bin/sh",
+            "-c",
+            "echo armed; while read l; do echo got:$l; done",
+        ],
+        "me",
+    );
+    a.wait_output("armed", T);
+
+    // A second connection sends the hostile frame, so the first keeps its
+    // place and we can see the session survive.
+    let mut b = FrameConn::connect(&sock(t.path(), "ovf")).unwrap();
+    b.send(&Msg::Hello(hello("ovf", Mode::Attach, "me")));
+    assert!(matches!(b.recv_control(T), Some(Msg::Welcome(_))));
+    b.send(&Msg::Input {
+        seq: u64::MAX,
+        bytes: b"boom".to_vec(),
+    });
+    match b.recv_control(T) {
+        Some(Msg::Error { code, .. }) => assert_eq!(code, acs::proto::err::BAD_REQUEST),
+        other => panic!("expected an ERROR, got {other:?}"),
+    }
+
+    // The master is still there and still working.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(sock(t.path(), "ovf").exists(), "the master died");
+    let mut c = FrameConn::connect(&sock(t.path(), "ovf")).unwrap();
+    c.send(&Msg::Hello(hello("ovf", Mode::Attach, "me")));
+    let w = match c.recv_control(T) {
+        Some(Msg::Welcome(w)) => w,
+        other => panic!("expected WELCOME, got {other:?}"),
+    };
+    c.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"alive\r".to_vec(),
+    });
+    c.wait_output("got:alive", T);
+}
