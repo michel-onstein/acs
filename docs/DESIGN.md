@@ -470,6 +470,25 @@ Pty bytes are carried as opaque payload and written verbatim; framing is
 invisible to the terminal. That is the unfiltered guarantee, restated in wire
 terms.
 
+**It covers the session's stream, and nothing else.** The strings acs draws
+its *own* interface from — a session name, the identity attached to it, the
+command it runs, the message of an `ERROR` frame — were chosen by the remote
+host, and the listing, the session menu, the takeover question and every
+`acs:` note are acs's drawing rather than the program's output. Printed raw,
+one of them can move the cursor and erase its neighbours, so the row read as
+`trusted-host  main  detached` need not be the row the cursor is on, and
+`acs list` asks *every* alias, including hosts the user never meant to open a
+session on. A sequence the terminal answers is worse still: the reply lands on
+the client's stdin and becomes input to whichever session is attached next.
+
+So every such string passes through `safe::display` (`src/safe.rs`) on its way
+to the terminal, which replaces the C0 and C1 controls and the bidirectional
+overrides with `?` and caps the field's length. Clipping by display width is
+not enough on its own: `ESC` is one column wide, and truncation can cut a
+sequence in half. Session names are held to the grammar of §4.1 on the way
+**in** as well as out, so a `WELCOME` or `STATUS_REPLY` carrying anything else
+is a malformed frame and is refused, exactly as bad UTF-8 is.
+
 ### 5.2 Resume
 
 ```mermaid

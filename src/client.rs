@@ -292,6 +292,11 @@ fn env_switch(env: Option<&str>, config: bool) -> bool {
 /// Print a message on the terminal outside the session's byte stream.
 /// Works in raw mode too (explicit `\r\n`).
 pub fn note(msg: &str) {
+    // Notes carry remote text (a session name, an identity, the message of
+    // an ERROR frame), so nothing printed here may steer the terminal
+    // (acs-w1z). The message is one line; the cap is generous enough for
+    // the longest of them.
+    let msg = crate::safe::display_max(msg, 4 * crate::safe::MAX_FIELD);
     let _ = sys::write_all(2, format!("acs: {msg}\r\n").as_bytes());
 }
 
