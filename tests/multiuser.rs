@@ -11,7 +11,9 @@ use std::time::Duration;
 use acs::proto::{Marker, Mode, Msg};
 use acs::testutil::{hello, FrameConn};
 
-const T: Duration = Duration::from_secs(15);
+/// As `common::T`, which this file cannot reach: generous, because the
+/// suite runs its targets in parallel (acs-kip).
+const T: Duration = Duration::from_secs(30);
 const PEER_ENV: &str = "ACS_PEER_HELPER_SOCKET";
 
 fn enabled() -> bool {
