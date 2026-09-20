@@ -229,3 +229,63 @@ fn version_bump_without_a_new_tag_releases_nothing() {
         "{log:?}"
     );
 }
+
+/// acs-g3j: the installer takes the version out of `SHA256SUMS`, and the
+/// old pattern allowed `/` and `..` anywhere in the archive name. A
+/// channel under someone else's control could therefore name a version
+/// that walks out of the temporary directory and out of `$lib` — which the
+/// root branch writes as root. The Rust side was always strict; the two
+/// now agree.
+#[test]
+fn the_installer_takes_only_an_x_y_z_version_from_the_sums() {
+    let t = TempDir::new();
+    let script =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
+            .unwrap();
+    // The line the script greps SHA256SUMS with, lifted from the script so
+    // the test cannot drift from it.
+    let pattern = script
+        .lines()
+        .find(|l| l.contains("grep -E") && l.contains("SHA256SUMS"))
+        .expect("the sums grep");
+    let pattern = pattern
+        .split('"')
+        .nth(1)
+        .expect("the quoted pattern")
+        // Undo what the shell would do to the double-quoted string before
+        // grep ever sees it.
+        .replace("\\\\", "\\")
+        .replace("\\$", "$")
+        .replace("$target", "x86_64-unknown-linux-musl");
+
+    let sums = t.path().join("SHA256SUMS");
+    let hash = "0".repeat(64);
+    let check = |name: &str| {
+        std::fs::write(&sums, format!("{hash}  {name}\n")).unwrap();
+        let out = Command::new("grep")
+            .arg("-E")
+            .arg(&pattern)
+            .arg(&sums)
+            .output()
+            .unwrap();
+        out.status.success()
+    };
+
+    assert!(
+        check("acs-1.2.3-x86_64-unknown-linux-musl.tar.gz"),
+        "a real release"
+    );
+    assert!(
+        check("acs-0.11.3-x86_64-unknown-linux-musl.tar.gz"),
+        "a real release"
+    );
+    for bad in [
+        "acs-1.0/../../../etc/cron.d/x-x86_64-unknown-linux-musl.tar.gz",
+        "acs-1.0/2.3-x86_64-unknown-linux-musl.tar.gz",
+        "acs-1.2.3-rc1-x86_64-unknown-linux-musl.tar.gz",
+        "acs-1.2-x86_64-unknown-linux-musl.tar.gz",
+        "acs-..-x86_64-unknown-linux-musl.tar.gz",
+    ] {
+        assert!(!check(bad), "accepted {bad}");
+    }
+}
