@@ -756,10 +756,15 @@ Rules:
   reports and focus events are forwarded at once and do not break a pending
   double tap. Inside a reply's string — OSC, DCS or APC (kitty graphics),
   the only ones terminals send — the escape key is not looked for until
-  `BEL` or ST, or until 100 ms pass without a byte: a Meta key sends the
-  same two bytes (Alt+_ is `ESC _`), and without the timeout it would leave
-  command mode deaf until the next `BEL`. `ESC ^` and `ESC X` (PM, SOS)
-  are keys.
+  `BEL` or ST, until 100 ms pass without a byte, or after 64 KiB: a Meta key
+  sends the same two bytes (Alt+_ is `ESC _`), and without the timeout it
+  would leave command mode deaf until the next `BEL`. `ESC ^` and `ESC X`
+  (PM, SOS) are keys. The byte cap covers what the timeout cannot (acs-55v):
+  the timeout only fires once the bytes *stop*, so a remote that keeps them
+  coming — a multi-megabyte clipboard set with OSC 52 and read back in a
+  loop — would otherwise hold the detector inside the string for as long as
+  it liked, sending `Ctrl-] Ctrl-] d` to the attacker instead of detaching
+  and leaving no way out but killing the terminal.
 - One exception to reassembly: a read that ends in a **lone `ESC`** is the Esc
   key and is sent at once — vim users press it constantly, and delaying it is
   worse than missing the rare escape-key sequence split right after its first
