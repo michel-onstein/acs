@@ -177,7 +177,10 @@ impl Pick {
         let mut buf = [0u8; 16 * 1024];
         loop {
             match self.dec.next_msg() {
-                Ok(Some(Msg::StatusReply(s))) => answer.sessions.push(s),
+                // Bounded, as the listing is (acs-rip).
+                Ok(Some(Msg::StatusReply(s))) => {
+                    crate::list::push_session(&mut answer.sessions, s)?
+                }
                 Ok(Some(Msg::Error { message, .. })) => answer.error = Some(message),
                 Ok(Some(Msg::ListEnd)) => return Ok(answer),
                 Ok(Some(other)) => {
