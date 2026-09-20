@@ -199,6 +199,18 @@ found the same way.
   overridable with `acs <host> [session] -- <command…>`. Environment gets
   `TERM` and `COLORTERM` from the client's HELLO (ssh `-T` no longer sends
   `TERM`), plus `ACS_SESSION=<name>`.
+  - **A session is not a login** (acs-aps). It outlives the ssh connection
+    that created it, and everyone who attaches later would otherwise inherit
+    *that* login's environment. `SSH_AUTH_SOCK` is the sharp one: attach to
+    a session someone else created with agent forwarding, and your shell
+    signs with their keys for as long as their connection lives — same uid,
+    so nothing is escalated that `/proc` would not have given you, but acs
+    hands it over without anyone asking. `SSH_CONNECTION`, `SSH_CLIENT`,
+    `SSH_TTY`, `DISPLAY`, `XAUTHORITY`, `KRB5CCNAME`,
+    `DBUS_SESSION_BUS_ADDRESS` and the `XDG_SESSION_*` pair are merely
+    wrong for everyone but the creator. None can be kept accurate for one
+    shell with many attachers over time, so none is passed on; anyone who
+    wants an agent in there exports one.
 - **Output ring**: every byte read from the pty is appended to a ring buffer
   (default 1 MiB, configurable) and given a monotonically increasing `u64`
   offset. The ring is what makes resume lossless (§5.2).
