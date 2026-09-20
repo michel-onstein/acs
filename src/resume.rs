@@ -180,14 +180,22 @@ impl InputDedupe {
     /// The part of an INPUT frame not yet written. A frame that starts beyond
     /// `written` (a client whose bytes were lost in between) is accepted in
     /// full and the counter jumps forward, so the stream never stalls.
-    pub fn accept<'a>(&mut self, seq: u64, bytes: &'a [u8]) -> &'a [u8] {
-        let end = seq + bytes.len() as u64;
+    ///
+    /// `None` for a frame whose sequence cannot be one: the end of it does
+    /// not fit in a `u64` (acs-hpf). The sequence comes off the wire, and
+    /// `seq + len` used to be an unguarded addition — release builds have
+    /// no overflow checks, so a frame with a sequence near `u64::MAX` wrapped
+    /// `end` to a small number, which then travelled into the master's
+    /// `written() - pty_in.len()` and underflowed the ACK the client uses to
+    /// decide what it may forget. A debug build aborted the master outright.
+    pub fn accept<'a>(&mut self, seq: u64, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        let end = seq.checked_add(bytes.len() as u64)?;
         if end <= self.written {
-            return &[];
+            return Some(&[]);
         }
         let skip = self.written.saturating_sub(seq) as usize;
         self.written = end;
-        &bytes[skip..]
+        Some(&bytes[skip..])
     }
 }
 
@@ -202,18 +210,42 @@ mod tests {
         }
     }
 
+    /// acs-hpf: the sequence comes off the wire, and `seq + len` was an
+    /// unguarded addition. Release builds have no overflow checks, so a
+    /// frame near `u64::MAX` wrapped the end to a small number, poisoning
+    /// the counter the ACK is computed from; a debug build aborted the
+    /// master instead.
+    #[test]
+    fn a_sequence_whose_end_does_not_fit_is_refused() {
+        let mut d = InputDedupe::default();
+        d.accept(0, b"hello").unwrap();
+        let before = d.written();
+
+        assert_eq!(d.accept(u64::MAX, b"abc"), None);
+        assert_eq!(d.accept(u64::MAX - 1, b"ab"), None);
+        assert_eq!(d.written(), before, "a refused frame moved the counter");
+
+        // The largest frame that does fit is still taken, and the counter
+        // lands exactly on the end.
+        let mut d = InputDedupe::default();
+        assert_eq!(d.accept(u64::MAX - 3, b"abc"), Some(&b"abc"[..]));
+        assert_eq!(d.written(), u64::MAX);
+        // An empty frame at the very end fits too.
+        assert_eq!(d.accept(u64::MAX, b""), Some(&b""[..]));
+    }
+
     /// Regression (acs-evm): input dropped before it reached the pty was
     /// never written, so the counter goes back and the client resends it.
     #[test]
     fn rewinding_undoes_accepted_bytes() {
         let mut d = InputDedupe::default();
-        assert_eq!(d.accept(0, b"abcd"), b"abcd");
+        assert_eq!(d.accept(0, b"abcd"), Some(&b"abcd"[..]));
         assert_eq!(d.written(), 4);
         d.rewind(3);
         assert_eq!(d.written(), 1);
         // The client resends from 1; the whole frame is written again but
         // for the byte that did reach the pty.
-        assert_eq!(d.accept(0, b"abcd"), b"bcd");
+        assert_eq!(d.accept(0, b"abcd"), Some(&b"bcd"[..]));
         d.rewind(100);
         assert_eq!(d.written(), 0);
     }
@@ -307,14 +339,14 @@ mod tests {
     #[test]
     fn dedupe_writes_each_byte_once() {
         let mut d = InputDedupe::default();
-        assert_eq!(d.accept(0, b"abc"), b"abc");
+        assert_eq!(d.accept(0, b"abc"), Some(&b"abc"[..]));
         // A resend that partially overlaps.
-        assert_eq!(d.accept(1, b"bcde"), b"de");
+        assert_eq!(d.accept(1, b"bcde"), Some(&b"de"[..]));
         // A full duplicate.
-        assert_eq!(d.accept(0, b"abcde"), b"");
+        assert_eq!(d.accept(0, b"abcde"), Some(&b""[..]));
         assert_eq!(d.written(), 5);
         // A jump forward is accepted whole.
-        assert_eq!(d.accept(9, b"xy"), b"xy");
+        assert_eq!(d.accept(9, b"xy"), Some(&b"xy"[..]));
         assert_eq!(d.written(), 11);
     }
 
@@ -325,14 +357,14 @@ mod tests {
         let mut master = InputDedupe::default();
         let seq = client.push(b"ls -l");
         let seq2 = client.push(b"\r");
-        let seen = master.accept(seq, &b"ls -l"[..4]).to_vec();
+        let seen = master.accept(seq, &b"ls -l"[..4]).unwrap().to_vec();
         assert_eq!(seen, b"ls -");
         let _ = seq2;
         // Reconnect: WELCOME says input_seq = 4.
         client.rebase(master.written(), true);
         let (s, bytes) = client.pending();
         let mut written = seen;
-        written.extend_from_slice(master.accept(s, &bytes));
+        written.extend_from_slice(master.accept(s, &bytes).unwrap());
         assert_eq!(written, b"ls -l\r");
     }
 }
