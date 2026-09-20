@@ -73,6 +73,24 @@ impl fmt::Display for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// How deeply a configuration may nest before it is refused (acs-q4f).
+///
+/// Both parsers recurse — the block one through maps and sequences, the
+/// flow one through `[` and `{` — and neither had a limit, so a few
+/// thousand brackets, which fit on one line, overflowed the stack. With
+/// `panic = "abort"` in the release profile that is not an error a caller
+/// can report but an immediate kill. Real configurations nest three or
+/// four deep.
+const MAX_DEPTH: usize = 64;
+
+/// The message a configuration too deep to parse gets.
+fn too_deep<T>(line: usize) -> Result<T> {
+    err(
+        line,
+        format!("nested more than {MAX_DEPTH} deep; this is not a configuration acs can use"),
+    )
+}
+
 fn err<T>(line: usize, msg: impl Into<String>) -> Result<T> {
     Err(Error {
         line,
@@ -158,6 +176,8 @@ impl Line {
 struct Parser {
     lines: Vec<Line>,
     pos: usize,
+    /// How deep the block parser is (acs-q4f).
+    depth: usize,
 }
 
 /// Parse a configuration file.
@@ -189,7 +209,11 @@ pub fn parse(src: &str) -> Result<Document> {
             text: text.to_string(),
         });
     }
-    let mut p = Parser { lines, pos: 0 };
+    let mut p = Parser {
+        lines,
+        pos: 0,
+        depth: 0,
+    };
     let root = match p.peek() {
         None => Node::new(Value::Null),
         Some(i) => {
@@ -232,6 +256,16 @@ impl Parser {
     fn block_node(&mut self, indent: usize) -> Result<Node> {
         let i = self.peek().expect("a significant line");
         let line = self.lines[i].no;
+        if self.depth >= MAX_DEPTH {
+            return too_deep(line);
+        }
+        self.depth += 1;
+        let out = self.block_node_inner(i, line, indent);
+        self.depth -= 1;
+        out
+    }
+
+    fn block_node_inner(&mut self, i: usize, line: usize, indent: usize) -> Result<Node> {
         let text = self.lines[i].text.clone();
         if is_seq_item(&text) {
             return Ok(Node {
@@ -426,6 +460,7 @@ fn inline(text: &str, line: usize) -> Result<(Option<(Value, bool)>, Option<Stri
                 i: 0,
                 text: t,
                 line,
+                depth: 0,
             };
             let v = f.value()?;
             (v, f.i, true)
@@ -520,6 +555,8 @@ struct Flow<'a> {
     i: usize,
     text: &'a str,
     line: usize,
+    /// How deep the flow parser is (acs-q4f).
+    depth: usize,
 }
 
 impl Flow<'_> {
@@ -530,7 +567,13 @@ impl Flow<'_> {
     }
 
     fn node(&mut self) -> Result<Node> {
-        let v = self.value()?;
+        if self.depth >= MAX_DEPTH {
+            return too_deep(self.line);
+        }
+        self.depth += 1;
+        let v = self.value();
+        self.depth -= 1;
+        let v = v?;
         let flow = matches!(v, Value::Seq(_) | Value::Map(_));
         Ok(Node {
             line: self.line,
@@ -852,6 +895,32 @@ pub fn emit(doc: &Document) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-q4f: both parsers recurse and neither was bounded, so a few
+    /// thousand brackets — which fit on one line — overflowed the stack.
+    /// With `panic = "abort"` in the release profile that is not an error
+    /// a caller can report but an immediate kill.
+    #[test]
+    fn a_configuration_nested_past_all_reason_is_an_error_not_a_crash() {
+        // Flow style: one line, thousands deep.
+        let deep = format!("k: {}{}", "[".repeat(5000), "]".repeat(5000));
+        let e = parse(&deep).expect_err("accepted 5000 levels of nesting");
+        assert!(e.to_string().contains("nested more than"), "{e}");
+
+        // Block style: a map inside a map inside a map…
+        let mut block = String::new();
+        for i in 0..5000 {
+            block.push_str(&" ".repeat(i * 2));
+            block.push_str(&format!("k{i}:\n"));
+        }
+        let e = parse(&block).expect_err("accepted 5000 levels of block nesting");
+        assert!(e.to_string().contains("nested more than"), "{e}");
+
+        // What a person actually writes still parses.
+        assert!(parse("a:\n  b:\n    c: [1, {d: 2}]\n").is_ok());
+        let ok = format!("k: {}1{}", "[".repeat(60), "]".repeat(60));
+        assert!(parse(&ok).is_ok(), "60 deep should be fine");
+    }
 
     fn text(n: &Node) -> &str {
         match &n.value {
