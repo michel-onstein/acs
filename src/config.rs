@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::netmatch::LocalNet;
 use crate::yaml::{self, Node, Value};
 
 /// Where a value came from: a file and line, for `acs config show` and error
@@ -93,6 +94,9 @@ pub struct Alias {
     /// Try first the hosts on a network this machine is on; `None` leaves
     /// it to the global setting.
     pub prefer_local_network: Option<Setting<bool>>,
+    /// Networks counted as local on top of this machine's own; `None`
+    /// leaves it to the global setting.
+    pub local_networks: Option<Setting<Vec<LocalNet>>>,
     /// How often to ping a lost host while waiting; `None` leaves it to the
     /// global setting.
     pub reachability_interval: Option<Setting<Duration>>,
@@ -120,6 +124,9 @@ pub struct Config {
     /// Try an alias's hosts on a network this machine is on first (default
     /// false; DESIGN §7.3).
     pub prefer_local_network: Setting<bool>,
+    /// Networks counted as local on top of the ones this machine's
+    /// interfaces are on (default none; DESIGN §7.3, acs-c9d).
+    pub local_networks: Setting<Vec<LocalNet>>,
     /// How often a lost host is pinged while waiting (default 5 s).
     pub reachability_interval: Setting<Duration>,
     /// Aliases in the order first defined, each with its hosts in order.
@@ -138,6 +145,7 @@ impl Default for Config {
             reachability_timeout: Setting::default(DEFAULT_REACHABILITY_TIMEOUT),
             persist: Setting::default(false),
             prefer_local_network: Setting::default(false),
+            local_networks: Setting::default(Vec::new()),
             reachability_interval: Setting::default(DEFAULT_REACHABILITY_INTERVAL),
             hosts: Vec::new(),
             files: Vec::new(),
@@ -155,6 +163,7 @@ pub const KEYS: &[&str] = &[
     "persist",
     "reachability_interval",
     "prefer_local_network",
+    "local_networks",
     "aliases",
 ];
 
@@ -187,6 +196,7 @@ pub const ALIAS_KEYS: &[&str] = &[
     "persist",
     "reachability_interval",
     "prefer_local_network",
+    "local_networks",
     "hosts",
 ];
 
@@ -195,6 +205,10 @@ pub const ALIAS_BOOLS: &[&str] = &["redraw_on_reconnect", "persist", "prefer_loc
 
 /// The settings, global or an alias's, that are a duration.
 pub const DURATIONS: &[&str] = &["reachability_timeout", "reachability_interval"];
+
+/// The settings, global or an alias's, that are a list of CIDR networks
+/// (acs-c9d).
+pub const NETWORKS: &[&str] = &["local_networks"];
 
 /// `reachability_timeout` when nothing sets it.
 pub const DEFAULT_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -315,6 +329,14 @@ impl Config {
                         origin: Some(at(node)),
                     }
                 }
+                k if NETWORKS.contains(&k) => {
+                    let value =
+                        networks_value(node).map_err(|e| fail(node, format!("{key}: {e}")))?;
+                    *self.networks_mut(k).expect("a networks setting") = Setting {
+                        value,
+                        origin: Some(at(node)),
+                    }
+                }
                 "aliases" => {
                     let aliases = node.value.map().ok_or_else(|| {
                         fail(
@@ -339,6 +361,7 @@ impl Config {
                                     reachability_timeout: None,
                                     persist: None,
                                     prefer_local_network: None,
+                                    local_networks: None,
                                     reachability_interval: None,
                                     origin: at(n),
                                 });
@@ -389,6 +412,21 @@ impl Config {
             "redraw_on_reconnect" => Some(&mut self.redraw_on_reconnect),
             "persist" => Some(&mut self.persist),
             "prefer_local_network" => Some(&mut self.prefer_local_network),
+            _ => None,
+        }
+    }
+
+    /// A list-of-networks setting by name (acs-c9d).
+    pub fn networks_setting(&self, key: &str) -> Option<&Setting<Vec<LocalNet>>> {
+        match key {
+            "local_networks" => Some(&self.local_networks),
+            _ => None,
+        }
+    }
+
+    fn networks_mut(&mut self, key: &str) -> Option<&mut Setting<Vec<LocalNet>>> {
+        match key {
+            "local_networks" => Some(&mut self.local_networks),
             _ => None,
         }
     }
@@ -466,6 +504,16 @@ impl Config {
             .prefer_local_network
             .as_ref()
             .unwrap_or(&self.prefer_local_network)
+    }
+
+    /// `local_networks` for `alias`: its own setting, else the global one —
+    /// as `prefer_local_network` resolves, the setting it extends (acs-c9d).
+    /// An alias's list replaces the global one rather than adding to it.
+    pub fn local_networks_for<'a>(&'a self, alias: &'a Alias) -> &'a Setting<Vec<LocalNet>> {
+        alias
+            .local_networks
+            .as_ref()
+            .unwrap_or(&self.local_networks)
     }
 }
 
@@ -574,6 +622,47 @@ pub fn format_timeout(d: Duration) -> String {
     }
 }
 
+/// A `local_networks` value (acs-c9d): a list of CIDR networks, or one
+/// value holding them separated by commas (as `acs config set` takes them).
+fn networks_value(n: &Node) -> Result<Vec<LocalNet>, String> {
+    match &n.value {
+        Value::Seq(items) => items
+            .iter()
+            .map(|i| match &i.value {
+                Value::Scalar(s) => LocalNet::parse(&s.text),
+                other => Err(format!(
+                    "expected a network such as 172.16.0.0/16, found {}",
+                    other.kind()
+                )),
+            })
+            .collect(),
+        Value::Scalar(s) => parse_networks(&s.text),
+        other => Err(format!(
+            "expected a list of networks such as [172.16.0.0/16, fd00::/48], found {}",
+            other.kind()
+        )),
+    }
+}
+
+/// Networks separated by commas, as `acs config set local_networks` takes
+/// them; no network at all is an empty list, which an alias may use to
+/// count none where the global setting counts some.
+pub fn parse_networks(text: &str) -> Result<Vec<LocalNet>, String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(LocalNet::parse)
+        .collect()
+}
+
+/// Networks as `acs config get` and `acs config set` write them.
+pub fn format_networks(nets: &[LocalNet]) -> String {
+    nets.iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn string_value(n: &Node) -> Result<String, String> {
     match &n.value {
         Value::Scalar(s) if !s.text.is_empty() => Ok(s.text.clone()),
@@ -621,6 +710,7 @@ struct AliasSettings {
     persist: Option<Setting<bool>>,
     reachability_interval: Option<Setting<Duration>>,
     prefer_local_network: Option<Setting<bool>>,
+    local_networks: Option<Setting<Vec<LocalNet>>>,
 }
 
 impl AliasSettings {
@@ -641,6 +731,13 @@ impl AliasSettings {
         }
     }
 
+    fn networks_mut(&mut self, key: &str) -> &mut Option<Setting<Vec<LocalNet>>> {
+        match key {
+            "local_networks" => &mut self.local_networks,
+            other => unreachable!("not a list of networks: {other}"),
+        }
+    }
+
     /// Set on `alias` what this file sets; the rest stays as it was.
     fn merge_into(self, alias: &mut Alias) {
         fn over<T>(to: &mut Option<T>, from: Option<T>) {
@@ -653,6 +750,7 @@ impl AliasSettings {
         over(&mut alias.reachability_timeout, self.reachability_timeout);
         over(&mut alias.persist, self.persist);
         over(&mut alias.prefer_local_network, self.prefer_local_network);
+        over(&mut alias.local_networks, self.local_networks);
         over(&mut alias.reachability_interval, self.reachability_interval);
     }
 }
@@ -677,7 +775,9 @@ fn alias_parts(
                         settings.identity_file = identity_file(v, at)
                             .map_err(|e| fail(v, format!("identity_file: {e}")))?
                     }
-                    k if (ALIAS_BOOLS.contains(&k) || DURATIONS.contains(&k))
+                    k if (ALIAS_BOOLS.contains(&k)
+                        || DURATIONS.contains(&k)
+                        || NETWORKS.contains(&k))
                         && v.value == Value::Null => {}
                     k if ALIAS_BOOLS.contains(&k) => {
                         let value = bool_value(v).map_err(|e| fail(v, format!("{k}: {e}")))?;
@@ -690,6 +790,13 @@ fn alias_parts(
                         let value =
                             duration_value(k, v).map_err(|e| fail(v, format!("{k}: {e}")))?;
                         *settings.duration_mut(k) = Some(Setting {
+                            value,
+                            origin: Some(at(v)),
+                        })
+                    }
+                    k if NETWORKS.contains(&k) => {
+                        let value = networks_value(v).map_err(|e| fail(v, format!("{k}: {e}")))?;
+                        *settings.networks_mut(k) = Some(Setting {
                             value,
                             origin: Some(at(v)),
                         })
@@ -904,9 +1011,30 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, aliases)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_networks, aliases)",
             ),
             ("aliases: [a]\n", ":1: aliases: expected a mapping"),
+            // acs-c9d: a bad network, globally and on an alias.
+            (
+                "local_networks: [172.16.0.0]\n",
+                ":1: local_networks: expected a network such as 172.16.0.0/16 or fd00::/48, found '172.16.0.0'",
+            ),
+            (
+                "local_networks: [0.0.0.0/0]\n",
+                ":1: local_networks: '0.0.0.0/0': a /0 network is every address",
+            ),
+            (
+                "local_networks:\n  - 172.16.0.0/16\n  - fd00::/200\n",
+                ":1: local_networks: 'fd00::/200': /200 is too long for an IPv6 network (at most /128)",
+            ),
+            (
+                "local_networks: {a: b}\n",
+                ":1: local_networks: expected a list of networks such as [172.16.0.0/16, fd00::/48], found a mapping",
+            ),
+            (
+                "aliases:\n  d:\n    local_networks: [nope/16]\n    hosts: [a]\n",
+                ":3: aliases.d: local_networks: expected a network such as 172.16.0.0/16 or fd00::/48, found 'nope/16'",
+            ),
             // acs-msy: the old name of the key says what it is now.
             (
                 "command_bell: false\nhosts:\n  d:\n    - host: a\n",
@@ -1057,7 +1185,7 @@ aliases:
             ),
             (
                 "aliases:\n  d:\n    user: me\n",
-                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, hosts; a single host entry needs 'host: <name>')",
+                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_networks, hosts; a single host entry needs 'host: <name>')",
             ),
             (
                 "aliases:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
@@ -1286,6 +1414,57 @@ aliases:
             let e = load("", local).unwrap_err();
             assert!(e.ends_with(want), "{local:?}: {e}");
         }
+    }
+
+    /// acs-c9d: `local_networks` globally and on an alias, in every form it
+    /// is written, with the local file replacing the global list.
+    #[test]
+    fn local_networks_read_as_a_list_globally_and_per_alias() {
+        let net = |s: &str| LocalNet::parse(s).unwrap();
+        // A block sequence, a flow one, and one value with commas all read
+        // the same.
+        for text in [
+            "local_networks:\n  - 172.16.0.0/16\n  - fd00::/48\n",
+            "local_networks: [172.16.0.0/16, fd00::/48]\n",
+            "local_networks: 172.16.0.0/16, fd00::/48\n",
+        ] {
+            let c = load("", text).unwrap();
+            assert_eq!(
+                c.local_networks.value,
+                [net("172.16.0.0/16"), net("fd00::/48")],
+                "{text:?}"
+            );
+            assert_eq!(c.local_networks.origin.unwrap().line, 1, "{text:?}");
+        }
+        // Nothing set: none, and no origin.
+        let c = load("", "").unwrap();
+        assert!(c.local_networks.value.is_empty());
+        assert_eq!(c.local_networks.origin, None);
+        // The local file replaces the global list rather than adding to it.
+        let c = load(
+            "local_networks: [10.0.0.0/8]\n",
+            "local_networks: [172.16.0.0/16]\n",
+        )
+        .unwrap();
+        assert_eq!(c.local_networks.value, [net("172.16.0.0/16")]);
+        // An alias's own list wins over the global one; another alias takes
+        // the global one, and an empty list counts no network at all.
+        let c = load(
+            "",
+            "local_networks: [10.0.0.0/8]\n\
+             aliases:\n  \
+               d:\n    local_networks: [172.16.0.0/16]\n    hosts: [{host: a}]\n  \
+               e:\n    hosts: [{host: b}]\n  \
+               f:\n    local_networks: []\n    hosts: [{host: c}]\n",
+        )
+        .unwrap();
+        let of = |a: &str| c.local_networks_for(c.alias(a).unwrap()).value.clone();
+        assert_eq!(of("d"), [net("172.16.0.0/16")]);
+        assert_eq!(of("e"), [net("10.0.0.0/8")]);
+        assert!(of("f").is_empty());
+        // An empty value sets nothing, as any setting's does.
+        let c = load("local_networks: [10.0.0.0/8]\n", "local_networks:\n").unwrap();
+        assert_eq!(c.local_networks.value, [net("10.0.0.0/8")]);
     }
 
     #[test]

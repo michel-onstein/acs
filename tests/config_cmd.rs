@@ -159,6 +159,68 @@ fn set_get_unset_keep_the_rest_of_the_file() {
     );
 }
 
+/// acs-c9d: `local_networks`, the first list-valued setting, through the
+/// real binary — set, get, show, and on an alias.
+#[test]
+fn local_networks_is_set_got_and_shown_as_a_list() {
+    let h = Home::new();
+    assert_eq!(h.ok(&["config", "get", "local_networks"]), "\n");
+    assert_eq!(
+        h.ok(&["config", "set", "local_networks", "172.16.0.0/16,fd00::/48"]),
+        "set local_networks to 172.16.0.0/16, fd00::/48 in ~/.config/acs/config.yaml\n"
+    );
+    assert_eq!(
+        h.ok(&["config", "get", "local_networks"]),
+        "172.16.0.0/16, fd00::/48\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "local_networks: [172.16.0.0/16, fd00::/48]\n"
+    );
+    // On an alias, beside prefer_local_network.
+    h.ok(&["config", "host", "add", "devbox", "devbox.lan"]);
+    h.ok(&[
+        "config",
+        "host",
+        "set",
+        "devbox",
+        "prefer_local_network",
+        "true",
+    ]);
+    h.ok(&[
+        "config",
+        "host",
+        "set",
+        "devbox",
+        "local_networks",
+        "10.0.0.0/8",
+    ]);
+    let show = h.ok(&["config", "show"]);
+    assert!(
+        show.contains("local_networks: [172.16.0.0/16, fd00::/48] # "),
+        "{show}"
+    );
+    assert!(
+        show.contains("    local_networks: [10.0.0.0/8] # "),
+        "{show}"
+    );
+    // A bad network is refused, naming what was wrong, and changes nothing.
+    let before = std::fs::read_to_string(h.local()).unwrap();
+    h.fails(
+        &["config", "set", "local_networks", "172.16.0.0"],
+        2,
+        "expected a network such as 172.16.0.0/16 or fd00::/48, found '172.16.0.0'",
+    );
+    h.fails(
+        &["config", "set", "local_networks", "10.0.0.0/8,0.0.0.0/0"],
+        2,
+        "a /0 network is every address",
+    );
+    assert_eq!(std::fs::read_to_string(h.local()).unwrap(), before);
+    h.ok(&["config", "unset", "local_networks"]);
+    assert_eq!(h.ok(&["config", "get", "local_networks"]), "\n");
+}
+
 /// Regression (acs-q8e): a configuration kept in dotfiles is reached through
 /// a symlink. An edit must change the file it points at and leave the link.
 #[test]

@@ -1,8 +1,9 @@
 //! Which of an alias's hosts is on a network this machine is on (DESIGN
 //! §7.3, `prefer_local_network`): the client's own networks from its
-//! interfaces (`getifaddrs`: IPv4 netmask, IPv6 prefix length), matched
-//! against the addresses each host name resolves to (`getaddrinfo`, A and
-//! AAAA).
+//! interfaces (`getifaddrs`: IPv4 netmask, IPv6 prefix length), and the
+//! ones `local_networks` counts as local besides them ([`LocalNet::parse`],
+//! acs-c9d), matched against the addresses each host name resolves to
+//! (`getaddrinfo`, A and AAAA).
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -36,6 +37,37 @@ impl LocalNet {
             }
             _ => false,
         }
+    }
+
+    /// A network in CIDR form, as the `local_networks` setting writes one
+    /// (acs-c9d): `172.16.0.0/16`, `fd00::/48`. The address need not be the
+    /// network's own — the prefix decides, and [`LocalNet::contains`] masks
+    /// both sides — so `172.16.8.2/16` is the same network.
+    pub fn parse(text: &str) -> Result<LocalNet, String> {
+        let bad =
+            || format!("expected a network such as 172.16.0.0/16 or fd00::/48, found '{text}'");
+        let (addr, prefix) = text.trim().rsplit_once('/').ok_or_else(bad)?;
+        let addr: IpAddr = addr.trim().parse().map_err(|_| bad())?;
+        let prefix: u8 = prefix.trim().parse().map_err(|_| bad())?;
+        let (family, max) = match addr {
+            IpAddr::V4(_) => (4, 32),
+            IpAddr::V6(_) => (6, 128),
+        };
+        if prefix > max {
+            return Err(format!(
+                "'{text}': /{prefix} is too long for an IPv{family} network (at most /{max})"
+            ));
+        }
+        if prefix == 0 {
+            return Err(format!("'{text}': a /0 network is every address"));
+        }
+        let net = LocalNet::new(addr, prefix);
+        if !net.usable() {
+            return Err(format!(
+                "'{text}': a loopback, link-local or unspecified network is never matched on"
+            ));
+        }
+        Ok(net)
     }
 
     /// Worth matching against: not loopback, link-local (which needs a
@@ -258,6 +290,46 @@ mod tests {
             "2001:db8::5/64",
         ] {
             assert!(net(s).usable(), "{s}");
+        }
+    }
+
+    /// acs-c9d: the CIDR form a `local_networks` setting is written in.
+    #[test]
+    fn a_configured_network_is_read_from_its_cidr_form() {
+        assert_eq!(LocalNet::parse("172.16.0.0/16"), Ok(net("172.16.0.0/16")));
+        assert_eq!(LocalNet::parse("  fd00::/48 "), Ok(net("fd00::/48")));
+        assert_eq!(LocalNet::parse("10.8.0.2/32"), Ok(net("10.8.0.2/32")));
+        // The address need not be the network's own: the prefix decides.
+        let n = LocalNet::parse("172.16.8.2/16").unwrap();
+        assert!(n.contains(ip("172.16.1.65")));
+        assert_eq!(n.to_string(), "172.16.0.0/16");
+        for (s, msg) in [
+            ("172.16.0.0", "expected a network such as 172.16.0.0/16"),
+            ("", "expected a network such as 172.16.0.0/16"),
+            ("172.16.0.0/", "expected a network such as 172.16.0.0/16"),
+            ("/16", "expected a network such as 172.16.0.0/16"),
+            (
+                "nowhere.invalid/16",
+                "expected a network such as 172.16.0.0/16",
+            ),
+            ("172.16.0.0/x", "expected a network such as 172.16.0.0/16"),
+            ("172.16.0.0/999", "expected a network such as 172.16.0.0/16"),
+            (
+                "172.16.0.0/33",
+                "/33 is too long for an IPv4 network (at most /32)",
+            ),
+            (
+                "fd00::/129",
+                "/129 is too long for an IPv6 network (at most /128)",
+            ),
+            ("0.0.0.0/0", "a /0 network is every address"),
+            ("::/0", "a /0 network is every address"),
+            ("127.0.0.0/8", "loopback, link-local or unspecified"),
+            ("169.254.0.0/16", "loopback, link-local or unspecified"),
+            ("fe80::/10", "loopback, link-local or unspecified"),
+        ] {
+            let e = LocalNet::parse(s).expect_err(s);
+            assert!(e.contains(msg), "{s}: {e}");
         }
     }
 

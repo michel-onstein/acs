@@ -1,8 +1,8 @@
 //! Host aliases (DESIGN §7.3): `acs [user@]<alias>` connects to the first of
 //! the alias's configured hosts that answers a ping, or that is not checked.
 //! The hosts are pinged at once, and their rank decides: on a network this
-//! machine is on (`prefer_local_network`), then `prefer: true`, then the
-//! configured order.
+//! machine is on (`prefer_local_network`, and the networks `local_networks`
+//! adds to its own), then `prefer: true`, then the configured order.
 
 use std::ffi::OsStr;
 use std::process::{Command, Stdio};
@@ -40,10 +40,18 @@ pub fn resolve(
         log(format!("{name}: logging in as {u}, from the command line"));
     }
     let timeout = config.reachability_timeout_for(alias).value;
+    // The configured networks (acs-c9d) come after the machine's own, so a
+    // host on one of its interfaces' networks is reported as on that, the
+    // narrower of the two.
     let network = config
         .prefer_local_network_for(alias)
         .value
         .then(network)
+        .map(|mut n| {
+            n.local
+                .extend(config.local_networks_for(alias).value.iter().copied());
+            n
+        })
         .filter(|n| !n.local.is_empty());
     pick(name, alias, user, timeout, reachable, network, log).map(Some)
 }
@@ -800,6 +808,101 @@ aliases:
             "{:?}",
             start.elapsed()
         );
+    }
+
+    // ---- local_networks (acs-c9d) ------------------------------------------
+
+    /// The bead's example: the target at 172.16.8.2, this machine on
+    /// 172.16.1.65 — the same site, a different /24 — and an IPv6 pair
+    /// beside it, likewise a /64 apart.
+    const SITE_NAMES: &[(&str, &str)] = &[
+        ("devbox.lan", "172.16.8.2"),
+        ("devbox.lan", "2001:db8:1:8::2"),
+        ("devbox.example.com", "203.0.113.9"),
+    ];
+
+    /// This machine at the site, on its own /24 and /64.
+    fn at_site() -> Network {
+        on(&["172.16.1.65/24", "2001:db8:1:1::65/64"], SITE_NAMES, 0)
+    }
+
+    fn both_up() -> Arc<Fake> {
+        Fake::up(&["devbox.example.com", "devbox.lan"])
+    }
+
+    #[test]
+    fn a_configured_network_counts_as_local_in_either_family() {
+        // The interfaces' own prefixes are too narrow to reach the target:
+        // the configured order decides, as it did before acs-c9d.
+        let yaml = home("    prefer_local_network: true\n");
+        let (r, log) = located(&yaml, &both_up(), at_site());
+        assert_eq!(r, Ok("devbox.example.com".into()));
+        assert!(!log.iter().any(|l| l.contains("local network")), "{log:?}");
+        // With the site's /16 counted as local, the target matches.
+        let yaml = home("    prefer_local_network: true\n    local_networks: [172.16.0.0/16]\n");
+        let (r, log) = located(&yaml, &both_up(), at_site());
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert_eq!(
+            log[0],
+            "devbox: devbox.lan is on the local network 172.16.0.0/16"
+        );
+        // IPv6 the same way, and a block sequence reads as a list too.
+        let yaml =
+            home("    prefer_local_network: true\n    local_networks:\n      - 2001:db8:1::/48\n");
+        let (r, log) = located(&yaml, &both_up(), at_site());
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert_eq!(
+            log[0],
+            "devbox: devbox.lan is on the local network 2001:db8:1::/48"
+        );
+    }
+
+    #[test]
+    fn a_configured_network_matches_with_no_network_of_this_machines_own() {
+        // Nothing usable from the interfaces: the setting is all there is.
+        let yaml = format!(
+            "local_networks: [172.16.0.0/16]\n{}",
+            home("    prefer_local_network: true\n")
+        );
+        let (r, log) = located(&yaml, &both_up(), on(&[], SITE_NAMES, 0));
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert_eq!(
+            log[0],
+            "devbox: devbox.lan is on the local network 172.16.0.0/16"
+        );
+    }
+
+    #[test]
+    fn an_aliass_networks_replace_the_global_ones_and_the_machines_come_first() {
+        // The alias's list replaces the global one rather than adding to it.
+        let yaml = format!(
+            "local_networks: [172.16.0.0/16]\n{}",
+            home("    prefer_local_network: true\n    local_networks: [10.0.0.0/8]\n")
+        );
+        let (r, _) = located(&yaml, &both_up(), on(&[], SITE_NAMES, 0));
+        assert_eq!(r, Ok("devbox.example.com".into()));
+        // Where both match, the machine's own — the narrower — is named.
+        let yaml = home("    prefer_local_network: true\n    local_networks: [192.168.0.0/16]\n");
+        let (r, log) = located(&yaml, &both_up(), on(&["192.168.1.5/24"], HOME_NAMES, 0));
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert_eq!(
+            log[0],
+            "devbox: devbox.lan is on the local network 192.168.1.0/24"
+        );
+    }
+
+    #[test]
+    fn networks_alone_do_nothing_without_prefer_local_network() {
+        // Off, the network is never asked for — so nor are the settings.
+        let c = config(&home("    local_networks: [172.16.0.0/16]\n"));
+        let r = resolve(
+            "devbox",
+            &c,
+            both_up().reachable(),
+            &|| panic!("the network was asked for"),
+            &mut |_| {},
+        );
+        assert_eq!(r.unwrap().unwrap().destination(), "devbox.example.com");
     }
 
     #[test]
