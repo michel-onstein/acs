@@ -53,7 +53,10 @@ impl Setup {
         ])
         .env("ACS_NO_UPDATE_CHECK", "")
         .env("XDG_STATE_HOME", self.state.path())
-        .env("ACS_RELEASES_URL", &self.server.url);
+        .env("ACS_RELEASES_URL", &self.server.url)
+        // The server signs with a key of its own; acs takes it only
+        // because this is not the default channel (acs-o9v).
+        .env("ACS_RELEASE_KEY", self.server.release_key());
         for (k, v) in extra {
             c.env(k, v);
         }
@@ -119,7 +122,15 @@ fn a_due_check_runs_in_the_background_and_shows_next_time() {
     // No state yet: a check is due; this start says nothing.
     assert_eq!(s.start(&[]), "");
     s.wait_state("latest=9.9.9");
-    assert_eq!(s.server.hits(), ["/latest/download/SHA256SUMS"]);
+    // The signature is fetched and checked before the sums are read, on
+    // the background check as much as on an upgrade (acs-o9v).
+    assert_eq!(
+        s.server.hits(),
+        [
+            "/latest/download/SHA256SUMS",
+            "/latest/download/SHA256SUMS.sig"
+        ]
+    );
     // The next start shows it.
     assert_eq!(s.start(&[]), message("9.9.9"));
 }
@@ -188,6 +199,7 @@ fn the_background_check_on_its_own() {
         .arg("_update-check")
         .env("XDG_STATE_HOME", s.state.path())
         .env("ACS_RELEASES_URL", &s.server.url)
+        .env("ACS_RELEASE_KEY", s.server.release_key())
         .output()
         .unwrap();
     assert!(out.status.success());

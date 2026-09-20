@@ -806,6 +806,80 @@ impl ReleaseServer {
             .insert(path.to_string(), data.into());
     }
 
+    /// Stop serving `path`, as a release published without that file would.
+    pub fn remove(&self, path: &str) {
+        self.files.lock().unwrap().remove(path);
+    }
+
+    /// The public half of the key this server signs its releases with
+    /// (acs-o9v), for `ACS_RELEASE_KEY`. A key per server, made on first
+    /// use, so one test's key is never another's.
+    pub fn release_key(&self) -> String {
+        self.signing_key();
+        std::fs::read_to_string(self.root.path().join("signer.pub"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// The private half's path, making the pair if it is not there yet.
+    fn signing_key(&self) -> PathBuf {
+        let key = self.root.path().join("signer");
+        if !key.is_file() {
+            let st = Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"])
+                .arg(&key)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        key
+    }
+
+    /// Sign `sums` as a release does and serve the signature at
+    /// `<path>.sig`; `key` overrides the server's own, for the test that a
+    /// release signed by somebody else is refused.
+    fn publish_signature(&self, path: &str, sums: &str, key: Option<&Path>) {
+        let owned = self.signing_key();
+        let key = key.unwrap_or(&owned);
+        let file = self.root.path().join("to-sign");
+        std::fs::write(&file, sums).unwrap();
+        let st = Command::new("ssh-keygen")
+            .args(["-Y", "sign", "-q", "-n", acs::signature::NAMESPACE, "-f"])
+            .arg(key)
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let sig = std::fs::read(self.root.path().join("to-sign.sig")).unwrap();
+        std::fs::remove_file(self.root.path().join("to-sign.sig")).unwrap();
+        self.put(&format!("{path}.sig"), sig);
+    }
+
+    /// Re-sign every `SHA256SUMS` served with a key that is not this
+    /// server's, as a release published by someone who took the account
+    /// over would be (acs-o9v).
+    pub fn sign_with_another_key(&self) {
+        let other = self.root.path().join("impostor");
+        if !other.is_file() {
+            let st = Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-C", "them", "-f"])
+                .arg(&other)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        let paths: Vec<String> = (self.files.lock().unwrap().keys())
+            .filter(|p| p.ends_with("SHA256SUMS"))
+            .cloned()
+            .collect();
+        for p in paths {
+            let sums = self.files.lock().unwrap().get(&p).cloned().unwrap();
+            let sums = String::from_utf8(sums).unwrap();
+            self.publish_signature(&p, &sums, Some(&other));
+        }
+    }
+
     /// Paths requested so far.
     pub fn hits(&self) -> Vec<String> {
         self.hits.lock().unwrap().clone()
@@ -855,9 +929,12 @@ impl ReleaseServer {
             "a".repeat(64)
         );
         self.put(&format!("/download/v{version}/{name}.tar.gz"), data);
-        self.put(&format!("/download/v{version}/SHA256SUMS"), sums.clone());
+        let versioned = format!("/download/v{version}/SHA256SUMS");
+        self.put(&versioned, sums.clone());
+        self.publish_signature(&versioned, &sums, None);
         if latest {
-            self.put("/latest/download/SHA256SUMS", sums);
+            self.put("/latest/download/SHA256SUMS", sums.clone());
+            self.publish_signature("/latest/download/SHA256SUMS", &sums, None);
         }
     }
 }

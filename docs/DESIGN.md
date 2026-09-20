@@ -1208,6 +1208,41 @@ their YAML shape:
 `acs upgrade [--version X.Y.Z] [--check]` replaces the running acs with the
 latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
 
+- **The checksums are signed, and the signature is checked before they
+  are believed** (acs-o9v, `signature.rs`). The checksums and the archives
+  come from the same place, so on their own they prove only that an archive
+  matches what that place said it should be. Anyone able to write to the
+  release — a leaked token, a taken-over account, a hostile runner —
+  replaces both files; `acs upgrade` then verifies happily, **runs** the
+  binary to check it works, renames it over `~/.local/bin/acs` and installs
+  it onto every remote the user connects to afterwards. So the release
+  script signs `SHA256SUMS` with `ssh-keygen -Y sign` in the `acs-release`
+  namespace, publishes `SHA256SUMS.sig` beside it, and both `release.rs`
+  and `scripts/install.sh` check it against a public key they carry before
+  reading a single checksum out of the file.
+  - **`ssh-keygen`, not minisign or cosign**: acs is an ssh tool, so a
+    machine that cannot run `ssh-keygen` cannot run acs — the verifier is
+    there by construction, on the client and in the one-line installer,
+    which runs before acs exists and can use only what the host already
+    has. It also keeps a signature verifier out of the binary, which
+    carries no cryptography beyond its own SHA-256 and has two
+    dependencies. cosign's keyless flow needs OIDC in CI, and this repo has
+    none: releases are published from a laptop.
+  - **The namespace** (`-n acs-release`) means a signature made by the same
+    key for something else — a git commit — is not a release signature.
+    The allowed-signers line names it too, so both ends agree.
+  - **Every failure is a refusal**: no `ssh-keygen`, no `SHA256SUMS.sig`, a
+    signature that does not verify, and a build with no key in it all stop
+    the upgrade. There is deliberately no path that skips the check, and a
+    test asserts the built-in key is not empty. The same key is in
+    `install.sh`, and a test asserts the two have not drifted.
+  - **What it does not cover**: the first fetch of `install.sh` itself is
+    unsigned — signing the checksums cannot fix trust on first use. The
+    public key is published in the Homebrew tap, a repository of its own,
+    so there is a second source to check it against. Binaries pushed to a
+    *remote* are unaffected: they are streamed by the client and checked by
+    the remote shell against a digest the client computed (§8), never
+    fetched from GitHub.
 - **What is newest** comes from the release's `SHA256SUMS`
   (`…/releases/latest/download/SHA256SUMS`): its archive names carry the
   version, and it holds the checksum the download must match — the same file
@@ -1494,6 +1529,7 @@ src/
   payload.rs    payload set format, ELF trailer, Mach-O embed
   prune.rs      pruning of unused remote versions
   sha256.rs     SHA-256 for install checks
+  signature.rs  the release key, and ssh-keygen -Y over a release's SHA256SUMS
   sys.rs        libc wrappers
 xtask/          cargo xtask dist
 tests/          integration tests (tests/common: fake remote, pty runner)

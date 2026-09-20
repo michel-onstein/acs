@@ -61,6 +61,25 @@ cargo xtask package --dist "$work/dist" --version "$version" --out "$work/assets
     --changes "$work/changes.md" >/dev/null
 cargo xtask formula --version "$version" --sums "$work/assets/SHA256SUMS" --out "$work/acs.rb"
 
+# Sign the checksums (acs-o9v). They and the archives come from the same
+# place, so unsigned they prove only that an archive matches what that place
+# said it should be; acs and install.sh check this signature against a key
+# they carry before believing either. No key, no release: a release without
+# a signature is one every client refuses.
+key=${ACS_SIGNING_KEY:-$HOME/.ssh/acs-release}
+[ -f "$key" ] || {
+    echo "no release signing key at $key (set ACS_SIGNING_KEY)" >&2
+    exit 1
+}
+echo "== signing SHA256SUMS"
+ssh-keygen -Y sign -q -n acs-release -f "$key" "$work/assets/SHA256SUMS"
+printf 'releases@acs namespaces="acs-release" %s\n' "$(cat "$key.pub")" > "$work/allowed_signers"
+ssh-keygen -Y verify -f "$work/allowed_signers" -I releases@acs -n acs-release \
+    -s "$work/assets/SHA256SUMS.sig" < "$work/assets/SHA256SUMS" >/dev/null || {
+    echo "the signature just made does not verify; not publishing" >&2
+    exit 1
+}
+
 if [ "$dry" = 1 ]; then
     echo "dry run: assets in $work/assets"
     ls -l "$work/assets"
@@ -71,10 +90,11 @@ fi
 echo "== publishing $tag"
 if gh release view "$tag" >/dev/null 2>&1; then
     gh release upload "$tag" "$work"/assets/*.tar.gz "$work/assets/SHA256SUMS" \
-        "$work/assets/install.sh" --clobber
+        "$work/assets/SHA256SUMS.sig" "$work/assets/install.sh" --clobber
     gh release edit "$tag" --notes-file "$work/assets/NOTES.md"
 else
-    gh release create "$tag" "$work"/assets/*.tar.gz "$work/assets/SHA256SUMS" "$work/assets/install.sh" \
+    gh release create "$tag" "$work"/assets/*.tar.gz "$work/assets/SHA256SUMS" \
+        "$work/assets/SHA256SUMS.sig" "$work/assets/install.sh" \
         --verify-tag --title "acs $version" --notes-file "$work/assets/NOTES.md"
 fi
 gh release view "$tag" --json url -q .url
