@@ -434,6 +434,11 @@ pub struct State {
     pub redraw_on_reconnect: bool,
     /// Whether the input sent so far is inside a bracketed paste.
     pub paste: keys::PasteTracker,
+    /// Take the session from whoever holds it on the **next** attach, and
+    /// then stop (acs-y5r). Agreement to a takeover is about the person
+    /// who was attached when it was given, so it is spent by the attach it
+    /// was given for rather than riding along on every later redial.
+    pub force_next: bool,
 }
 
 /// How serving a link ended.
@@ -541,6 +546,7 @@ pub fn run(args: ClientArgs, picked: Option<Picked>) -> u8 {
         bell_pending: false,
         redraw_on_reconnect: redraw_on_reconnect(&args),
         paste: keys::PasteTracker::default(),
+        force_next: args.force,
     };
     let mut raw: Option<RawMode> = None;
     let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals, picked);
@@ -711,7 +717,7 @@ fn serve(
     let _ = sys::set_nonblocking(from, true);
     let mut dec = Decoder::new();
     dec.push(&early);
-    let mut out = Msg::Hello(hello(args, state, args.force)).to_bytes();
+    let mut out = Msg::Hello(hello(args, state, state.force_next)).to_bytes();
     let mut buf = vec![0u8; 64 * 1024];
     let mut detector = Detector::new(escape_config());
     // A bell waiting from an earlier link's command mode is moot.
@@ -794,6 +800,10 @@ fn serve(
                     }
                     state.offset = w.offset;
                     state.attached_once = true;
+                    // Spent (acs-y5r). The agreement was about whoever was
+                    // attached a moment ago; hours later a redial may find
+                    // somebody else there, and that is a new question.
+                    state.force_next = false;
                     // Resend what the master may not have (DESIGN §5.2).
                     if !state.unacked.is_empty() {
                         let (seq, bytes) = state.unacked.pending();
@@ -821,6 +831,7 @@ fn serve(
                         true => {
                             // The question took the user's time, not the host's.
                             handshake_until = sys::now_ms() + handshake.as_millis() as u64;
+                            state.force_next = true;
                             Msg::Hello(hello(args, state, true)).encode(&mut out)
                         }
                         false => {

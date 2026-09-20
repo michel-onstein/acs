@@ -427,6 +427,13 @@ steals or breaks someone else's session **by accident**:
   `--force` skips the question; without a terminal the attach fails. The same
   identity (your own dropped connection, your own second terminal) takes over
   silently as before.
+  - **Agreement is spent by the attach it was given for** (acs-y5r). A `y`,
+    or a `--force` on the command line, applies to the attach in front of
+    the user and is then cleared, rather than riding along on every later
+    redial for the life of the process. It is agreement about *the person
+    who was attached at that moment*: hours later a dropped link may come
+    back to find somebody else there, and that is a new question. A redial
+    that meets a different identity therefore asks again.
 - **`acs list` shows who** is attached and who created each session, so picking
   another name is easy.
 - **Default name per person** when an account is shared: `ACS_DEFAULT_SESSION`
