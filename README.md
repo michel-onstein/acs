@@ -317,8 +317,7 @@ into it (`host unset` of its last setting turns it back into a list).
 | `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
 | `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
-| `local_networks` | networks counted as local on top of the ones this machine's interfaces are on, in CIDR form: `[172.16.0.0/16, fd00::/48]` (default none); an alias's own list replaces the global one, and it only matters with `prefer_local_network: true` |
-| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer` and `persist` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`, `local_networks`) and its `hosts` |
+| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist` and `local_networks` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`) and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -341,22 +340,34 @@ machine's networks goes first of all: at home on 192.168.1.0/24,
 `devbox.lan` (192.168.1.20) is used before `devbox.example.com` wherever
 it is listed — as long as it answers its ping.
 
-Only the networks this machine's own interfaces are on count by default,
-which is narrower than a site: from 172.16.1.65/24 a host at 172.16.8.2 is
-on another network, although both are on the same site. `local_networks`
-adds networks in CIDR form to the machine's own, so the two match:
+An interface's own prefix is narrower than a site, so that match alone
+misses a host one subnet away: from 172.16.1.65/24 a host at 172.16.8.2 is
+on another network, although both are at the same site. `local_networks`
+on a **host entry** says where that entry is the one to use — *when this
+machine is on one of these networks, try this host first*:
 
 ```yaml
-local_networks: [172.16.0.0/16, 2001:db8:1::/48]
+aliases:
+  devbox:
+    - host: devbox.example.com
+    - host: devbox.lan
+      local_networks: [172.16.0.0/16, 2001:db8:1::/48]
 ```
 
-The networks are added for the ranking only, so `prefer_local_network`
-still decides whether any of it happens. Set globally they hold for every
-alias; set on an alias they replace the global list for it (an empty list
-counts none). Where a host is on both a configured network and one of the
-machine's own, `-v` names the machine's own, the narrower of the two. A
-network that is not in CIDR form, matches every address (`/0`), or is
-loopback or link-local is a configuration error naming the file and line.
+The address tested is **this machine's own**, not the host's: at the site,
+on 172.16.1.65, `devbox.lan` goes first; from a café on 10.0.0.0/8 it does
+not, even though its own address is still inside 172.16.0.0/16. That is
+what makes the setting say something about *where you are*, and it is why
+it belongs to one entry rather than to the alias or the whole file —
+"prefer this host when I am on network X" does not parse without naming
+the host. It needs no `prefer_local_network` (it costs no name lookup, so
+there is nothing to switch off) and it does not exempt the host from its
+ping; it only ranks it. Several entries may carry the setting — among
+those that match, the order in the file decides — and an entry may be
+local both ways at once, in which case `-v` names the network the host
+itself is on. A network that is not in CIDR form, matches every address
+(`/0`), or is loopback or link-local is a configuration error naming the
+file and line.
 
 Without a
 `user`, your `~/.ssh/config` picks the login name. If no entry
@@ -438,7 +449,8 @@ acs config set command_bell false                     # no bell for command mode
 acs config set redraw_on_reconnect false              # no Ctrl-L on reconnect
 acs config set reachability_interval 10s              # ping a lost host every 10 s
 acs config host set devbox prefer_local_network true  # devbox.lan first at home
-acs config set local_networks 172.16.0.0/16,fd00::/48 # count these as local too
+acs config host add devbox devbox.site --local-networks 172.16.0.0/16
+                                                      # first when I am on that
 acs config set reachability_timeout 250ms             # pings must answer within 250 ms
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default

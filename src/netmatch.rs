@@ -1,9 +1,13 @@
-//! Which of an alias's hosts is on a network this machine is on (DESIGN
-//! §7.3, `prefer_local_network`): the client's own networks from its
-//! interfaces (`getifaddrs`: IPv4 netmask, IPv6 prefix length), and the
-//! ones `local_networks` counts as local besides them ([`LocalNet::parse`],
-//! acs-c9d), matched against the addresses each host name resolves to
-//! (`getaddrinfo`, A and AAAA).
+//! Which of an alias's hosts is local (DESIGN §7.3). The client's own
+//! networks come from its interfaces (`getifaddrs`: IPv4 netmask, IPv6
+//! prefix length), and the match runs in either direction:
+//!
+//! - `prefer_local_network` matches them against the addresses each host
+//!   name resolves to (`getaddrinfo`, A and AAAA);
+//! - a host entry's `local_networks` ([`LocalNet::parse`], acs-9yv) is
+//!   matched the other way round — the client's own addresses against the
+//!   networks that entry names, so the entry is local only where the
+//!   client is.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -39,8 +43,8 @@ impl LocalNet {
         }
     }
 
-    /// A network in CIDR form, as the `local_networks` setting writes one
-    /// (acs-c9d): `172.16.0.0/16`, `fd00::/48`. The address need not be the
+    /// A network in CIDR form, as a host entry's `local_networks` writes
+    /// one (acs-9yv): `172.16.0.0/16`, `fd00::/48`. The address need not be the
     /// network's own — the prefix decides, and [`LocalNet::contains`] masks
     /// both sides — so `172.16.8.2/16` is the same network.
     pub fn parse(text: &str) -> Result<LocalNet, String> {
@@ -293,7 +297,7 @@ mod tests {
         }
     }
 
-    /// acs-c9d: the CIDR form a `local_networks` setting is written in.
+    /// acs-9yv: the CIDR form a `local_networks` entry is written in.
     #[test]
     fn a_configured_network_is_read_from_its_cidr_form() {
         assert_eq!(LocalNet::parse("172.16.0.0/16"), Ok(net("172.16.0.0/16")));
