@@ -2,8 +2,17 @@
 *.db
 *.db-journal
 *.db-shm
-*.db-wal
+*.db-wal*
 *-fsqlite-ns-*
+
+# Schema-migration artifacts (`br doctor migrate-schema apply`): the WAL
+# certificates and the per-file migration state left beside the database.
+# `*.db-wal` above ends at the suffix, so `beads.db-wal-cert` and its
+# `-head` companion slip past it — hence the trailing glob there and the
+# two entries here. `br doctor` names all three under
+# gitignore.beads_inner_present when they are missing.
+*.vacuum-wal-cert*
+*.fsqlite-migration-state
 
 # Lock files
 *.lock
