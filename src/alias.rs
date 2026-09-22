@@ -1,10 +1,13 @@
 //! Host aliases (DESIGN §7.3): `acs [user@]<alias>` connects to the first of
 //! the alias's configured hosts that answers a ping, or that is not checked.
-//! The hosts are pinged at once, and their rank decides: on a network this
-//! machine is on (`prefer_local_network`, and the networks `local_networks`
-//! adds to its own), then `prefer: true`, then the configured order.
+//! The hosts are pinged at once, and their rank decides: local first, then
+//! `prefer: true`, then the configured order. An entry is local either
+//! because the host resolves onto a network this machine's interfaces are
+//! on (`prefer_local_network`) or because this machine is on one of the
+//! entry's own `local_networks` (acs-9yv).
 
 use std::ffi::OsStr;
+use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -16,6 +19,29 @@ use crate::netmatch::{self, LocalNet, Network};
 /// threads that ping an alias's hosts at once.
 pub type Reachable = dyn Fn(&str, Duration) -> bool + Send + Sync;
 
+/// Why an entry is ranked as local — the two directions the match can run
+/// (DESIGN §7.3). Both name the network to report; neither exempts the
+/// host from its ping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Local {
+    /// `prefer_local_network`: the host resolves onto a network this
+    /// machine's interfaces are on.
+    Host(LocalNet),
+    /// `local_networks` on the entry: one of this machine's own addresses
+    /// is on one of them (acs-9yv).
+    Caller(LocalNet),
+}
+
+/// What the alias is ranked by when locality is looked at at all: this
+/// machine's networks (and, for `prefer_local_network`, a resolver).
+struct Locality {
+    network: Network,
+    /// `prefer_local_network`: resolve each host too, and match its
+    /// addresses against this machine's networks. Off, nothing is resolved
+    /// and the rank is known before any ping.
+    by_host: bool,
+}
+
 /// The entry `name` stands for: `Ok(None)` if it is not an alias, the chosen
 /// entry otherwise, and an error naming every host tried when none answers.
 ///
@@ -23,8 +49,8 @@ pub type Reachable = dyn Fn(&str, Duration) -> bool + Send + Sync;
 /// `user` is the given one, whatever the entry says. An entry without an
 /// `identity_file` takes the alias's. `reachable` pings one host; `network`
 /// gives this machine's networks and a resolver, asked only when the alias
-/// has `prefer_local_network`; `log` receives why each entry was taken or
-/// skipped.
+/// has `prefer_local_network` or one of its entries has `local_networks`;
+/// `log` receives why each entry was taken or skipped.
 pub fn resolve(
     name: &str,
     config: &Config,
@@ -40,20 +66,15 @@ pub fn resolve(
         log(format!("{name}: logging in as {u}, from the command line"));
     }
     let timeout = config.reachability_timeout_for(alias).value;
-    // The configured networks (acs-c9d) come after the machine's own, so a
-    // host on one of its interfaces' networks is reported as on that, the
-    // narrower of the two.
-    let network = config
-        .prefer_local_network_for(alias)
-        .value
+    // This machine's own addresses are needed either way; only
+    // `prefer_local_network` also resolves the hosts' names.
+    let by_host = config.prefer_local_network_for(alias).value;
+    let by_caller = alias.entries.iter().any(|e| !e.local_networks.is_empty());
+    let locality = (by_host || by_caller)
         .then(network)
-        .map(|mut n| {
-            n.local
-                .extend(config.local_networks_for(alias).value.iter().copied());
-            n
-        })
-        .filter(|n| !n.local.is_empty());
-    pick(name, alias, user, timeout, reachable, network, log).map(Some)
+        .filter(|n| !n.local.is_empty())
+        .map(|network| Locality { network, by_host });
+    pick(name, alias, user, timeout, reachable, locality, log).map(Some)
 }
 
 /// `user@host` as its login name and host, split at the last `@` as ssh
@@ -69,16 +90,18 @@ pub fn split_user(name: &str) -> (Option<&str>, &str) {
 /// that could be chosen is pinged at once, and the k-th ranked host is taken
 /// as soon as it has answered and every one ranked before it has not — what
 /// trying them one after another would choose, in at most one `timeout`.
-/// With `network`, the host names are resolved meanwhile, by the same
-/// deadline, to rank the hosts on this machine's networks first; every
+/// With `locality.by_host`, the host names are resolved meanwhile, by the
+/// same deadline, to rank the hosts on this machine's networks first; every
 /// checked host is pinged then, since the rank is known only once they are.
+/// A caller-side `local_networks` needs no lookup, so that rank is known
+/// before anything is pinged.
 fn pick(
     name: &str,
     alias: &Alias,
     user: Option<&str>,
     timeout: Duration,
     reachable: Arc<Reachable>,
-    network: Option<Network>,
+    locality: Option<Locality>,
     log: &mut dyn FnMut(String),
 ) -> Result<HostEntry, String> {
     let entries: Vec<HostEntry> = alias
@@ -111,31 +134,46 @@ fn pick(
             None => order,
         }
     };
-    let (order, on_net) = match network {
+    // Caller-side first: it is this machine's own addresses against each
+    // entry's networks, so it costs no lookup and no wait.
+    let mut on_net: Vec<Option<Local>> = match &locality {
+        Some(l) => caller_side(&entries, &l.network),
+        None => vec![None; entries.len()],
+    };
+    let order = match locality.as_ref().filter(|l| l.by_host) {
+        // The rank is already known: only the hosts that could be chosen
+        // are pinged.
         None => {
-            let order = candidates(rank(&entries, &[]));
+            let order = candidates(rank(&entries, &on_net));
             for &i in &order {
                 if entries[i].reachability_check {
                     ping(i);
                 }
             }
-            (order, vec![None; entries.len()])
+            order
         }
-        Some(n) => {
+        Some(l) => {
             for (i, e) in entries.iter().enumerate() {
                 if e.reachability_check {
                     ping(i);
                 }
             }
-            let on_net = locate(&entries, &n, deadline);
-            for (e, net) in entries.iter().zip(&on_net) {
-                if let Some(net) = net {
-                    log(format!("{name}: {} is on the local network {net}", e.host));
-                }
-            }
-            (candidates(rank(&entries, &on_net)), on_net)
+            locate(&mut on_net, &entries, &l.network, deadline);
+            candidates(rank(&entries, &on_net))
         }
     };
+    for (e, local) in entries.iter().zip(&on_net) {
+        match local {
+            Some(Local::Host(net)) => {
+                log(format!("{name}: {} is on the local network {net}", e.host))
+            }
+            Some(Local::Caller(net)) => log(format!(
+                "{name}: this machine is on {net}, so {} is local",
+                e.host
+            )),
+            None => {}
+        }
+    }
     drop(tx);
     let mut answered = vec![None; entries.len()];
     let mut tried = Vec::new();
@@ -143,8 +181,10 @@ fn pick(
         let e = &entries[i];
         let dest = e.destination();
         let mut why: Vec<String> = Vec::new();
-        if let Some(net) = on_net[i] {
-            why.push(format!("on {net}"));
+        match on_net[i] {
+            Some(Local::Host(net)) => why.push(format!("on {net}")),
+            Some(Local::Caller(net)) => why.push(format!("this machine is on {net}")),
+            None => {}
         }
         if e.prefer {
             why.push("preferred".into());
@@ -187,10 +227,29 @@ fn pick(
     ))
 }
 
-/// The local network each entry's host is on, if any: every name resolved
-/// at once by `network`'s resolver, those not resolved by `deadline`
-/// counting as on none.
-fn locate(entries: &[HostEntry], network: &Network, deadline: Instant) -> Vec<Option<LocalNet>> {
+/// Each entry whose `local_networks` one of this machine's own addresses
+/// falls in (acs-9yv) — the caller-side direction, which needs no name
+/// resolution at all. The network reported is the first of the entry's own
+/// that matches, so several are taken in configured order.
+fn caller_side(entries: &[HostEntry], network: &Network) -> Vec<Option<Local>> {
+    let mine: Vec<IpAddr> = network.local.iter().map(|n| n.addr).collect();
+    entries
+        .iter()
+        .map(|e| netmatch::matching(&e.local_networks, &mine).map(Local::Caller))
+        .collect()
+}
+
+/// The local network each entry's host is on, where it is on one
+/// (`prefer_local_network`): every name resolved at once by `network`'s
+/// resolver, those not resolved by `deadline` counting as on none. A host
+/// match overrides a caller-side one already in `on_net`, being the
+/// statement about the host itself.
+fn locate(
+    on_net: &mut [Option<Local>],
+    entries: &[HostEntry],
+    network: &Network,
+    deadline: Instant,
+) {
     let (tx, rx) = mpsc::channel();
     let left = deadline.saturating_duration_since(Instant::now());
     for (i, e) in entries.iter().enumerate() {
@@ -200,21 +259,24 @@ fn locate(entries: &[HostEntry], network: &Network, deadline: Instant) -> Vec<Op
         });
     }
     drop(tx);
-    let mut on_net = vec![None; entries.len()];
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
-            Ok((i, addrs)) => on_net[i] = netmatch::matching(&network.local, &addrs),
+            Ok((i, addrs)) => {
+                if let Some(net) = netmatch::matching(&network.local, &addrs) {
+                    on_net[i] = Some(Local::Host(net));
+                }
+            }
             Err(_) => break,
         }
     }
-    on_net
 }
 
-/// The indices of `entries` in the order they are tried: those on a local
-/// network (`on_net`, empty for none) first, then those with
-/// `prefer: true`, then the rest — each group in configured order.
-fn rank(entries: &[HostEntry], on_net: &[Option<LocalNet>]) -> Vec<usize> {
+/// The indices of `entries` in the order they are tried: the local ones
+/// (`on_net`, empty for none — whichever direction made them local) first,
+/// then those with `prefer: true`, then the rest — each group in configured
+/// order.
+fn rank(entries: &[HostEntry], on_net: &[Option<Local>]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by_key(|&i| {
         let local = on_net.get(i).is_some_and(|n| n.is_some());
@@ -680,7 +742,7 @@ aliases:
         assert_eq!(ranked, ["b", "c", "a"]);
     }
 
-    // ---- prefer_local_network (acs-sia) ------------------------------------
+    // ---- prefer_local_network, host-side (acs-sia) -------------------------
 
     /// devbox.example.com first, devbox.lan second, as a home alias lists
     /// them; `extra` goes into the alias's settings.
@@ -810,10 +872,10 @@ aliases:
         );
     }
 
-    // ---- local_networks (acs-c9d) ------------------------------------------
+    // ---- local_networks, caller-side (acs-9yv) -----------------------------
 
     /// The bead's example: the target at 172.16.8.2, this machine on
-    /// 172.16.1.65 — the same site, a different /24 — and an IPv6 pair
+    /// 172.16.1.65 -- the same site, a different /24 -- and an IPv6 pair
     /// beside it, likewise a /64 apart.
     const SITE_NAMES: &[(&str, &str)] = &[
         ("devbox.lan", "172.16.8.2"),
@@ -830,71 +892,100 @@ aliases:
         Fake::up(&["devbox.example.com", "devbox.lan"])
     }
 
-    #[test]
-    fn a_configured_network_counts_as_local_in_either_family() {
-        // The interfaces' own prefixes are too narrow to reach the target:
-        // the configured order decides, as it did before acs-c9d.
-        let yaml = home("    prefer_local_network: true\n");
-        let (r, log) = located(&yaml, &both_up(), at_site());
-        assert_eq!(r, Ok("devbox.example.com".into()));
-        assert!(!log.iter().any(|l| l.contains("local network")), "{log:?}");
-        // With the site's /16 counted as local, the target matches.
-        let yaml = home("    prefer_local_network: true\n    local_networks: [172.16.0.0/16]\n");
-        let (r, log) = located(&yaml, &both_up(), at_site());
-        assert_eq!(r, Ok("devbox.lan".into()));
-        assert_eq!(
-            log[0],
-            "devbox: devbox.lan is on the local network 172.16.0.0/16"
-        );
-        // IPv6 the same way, and a block sequence reads as a list too.
-        let yaml =
-            home("    prefer_local_network: true\n    local_networks:\n      - 2001:db8:1::/48\n");
-        let (r, log) = located(&yaml, &both_up(), at_site());
-        assert_eq!(r, Ok("devbox.lan".into()));
-        assert_eq!(
-            log[0],
-            "devbox: devbox.lan is on the local network 2001:db8:1::/48"
-        );
+    /// devbox.example.com first, then devbox.lan carrying `nets` as its
+    /// own `local_networks`.
+    fn lan_on(nets: &str) -> String {
+        format!(
+            "aliases:\n  devbox:\n    hosts:\n      - host: devbox.example.com\n      \
+             - host: devbox.lan\n        local_networks: {nets}\n"
+        )
     }
 
     #[test]
-    fn a_configured_network_matches_with_no_network_of_this_machines_own() {
-        // Nothing usable from the interfaces: the setting is all there is.
-        let yaml = format!(
-            "local_networks: [172.16.0.0/16]\n{}",
-            home("    prefer_local_network: true\n")
+    fn an_entry_is_local_when_this_machine_is_on_one_of_its_networks() {
+        // The interfaces' own prefixes are too narrow to reach the target,
+        // and nothing else says the site is local: configured order.
+        let (r, log) = located(&lan_on("[10.0.0.0/8]"), &both_up(), at_site());
+        assert_eq!(r, Ok("devbox.example.com".into()));
+        assert!(
+            !log.iter().any(|l| l.contains("this machine is on")),
+            "{log:?}"
         );
+        // This machine at 172.16.1.65 is inside the entry's /16, so the
+        // entry is the local one although it is listed second.
+        let (r, log) = located(&lan_on("[172.16.0.0/16]"), &both_up(), at_site());
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert_eq!(
+            log,
+            [
+                "devbox: this machine is on 172.16.0.0/16, so devbox.lan is local",
+                "devbox: devbox.lan answers ping, using devbox.lan (this machine is on 172.16.0.0/16)",
+            ]
+        );
+        // IPv6 the same way, matched against this machine's 2001:db8:1:1::65.
+        let (r, log) = located(&lan_on("[2001:db8:1::/48]"), &both_up(), at_site());
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert_eq!(
+            log[0],
+            "devbox: this machine is on 2001:db8:1::/48, so devbox.lan is local"
+        );
+        // The first of the entry's own networks this machine is on is the
+        // one named.
+        let (r, log) = located(
+            &lan_on("[10.0.0.0/8, 172.16.0.0/16, 2001:db8:1::/48]"),
+            &both_up(),
+            at_site(),
+        );
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert_eq!(
+            log[0],
+            "devbox: this machine is on 172.16.0.0/16, so devbox.lan is local"
+        );
+    }
+
+    /// The regression test for acs-9yv: the address tested is the
+    /// **caller's**, not the host's. As acs-c9d built it, a host inside the
+    /// configured network was ranked first wherever the caller was; here
+    /// the host is inside it and the caller is not, so it is not.
+    #[test]
+    fn a_host_inside_the_network_is_not_local_when_the_caller_is_elsewhere() {
+        let yaml = lan_on("[172.16.0.0/16]");
+        // devbox.lan resolves to 172.16.8.2, inside the entry's /16 --
+        // which is exactly what the old, target-side test matched on. From
+        // a coffee shop on 10.0.0.0/8 it must not rank first.
+        let (r, log) = located(&yaml, &both_up(), on(&["10.0.0.5/8"], SITE_NAMES, 0));
+        assert_eq!(r, Ok("devbox.example.com".into()));
+        assert!(!log.iter().any(|l| l.contains("local")), "{log:?}");
+        // Nor when the machine has no usable network at all.
         let (r, log) = located(&yaml, &both_up(), on(&[], SITE_NAMES, 0));
-        assert_eq!(r, Ok("devbox.lan".into()));
-        assert_eq!(
-            log[0],
-            "devbox: devbox.lan is on the local network 172.16.0.0/16"
-        );
-    }
-
-    #[test]
-    fn an_aliass_networks_replace_the_global_ones_and_the_machines_come_first() {
-        // The alias's list replaces the global one rather than adding to it.
-        let yaml = format!(
-            "local_networks: [172.16.0.0/16]\n{}",
-            home("    prefer_local_network: true\n    local_networks: [10.0.0.0/8]\n")
-        );
-        let (r, _) = located(&yaml, &both_up(), on(&[], SITE_NAMES, 0));
         assert_eq!(r, Ok("devbox.example.com".into()));
-        // Where both match, the machine's own — the narrower — is named.
-        let yaml = home("    prefer_local_network: true\n    local_networks: [192.168.0.0/16]\n");
-        let (r, log) = located(&yaml, &both_up(), on(&["192.168.1.5/24"], HOME_NAMES, 0));
+        assert!(!log.iter().any(|l| l.contains("local")), "{log:?}");
+        // Back at the site, the same configuration ranks it first.
+        let (r, _) = located(&yaml, &both_up(), at_site());
         assert_eq!(r, Ok("devbox.lan".into()));
-        assert_eq!(
-            log[0],
-            "devbox: devbox.lan is on the local network 192.168.1.0/24"
-        );
     }
 
     #[test]
-    fn networks_alone_do_nothing_without_prefer_local_network() {
-        // Off, the network is never asked for — so nor are the settings.
-        let c = config(&home("    local_networks: [172.16.0.0/16]\n"));
+    fn a_caller_side_match_needs_no_resolver_and_no_prefer_local_network() {
+        // No `prefer_local_network`, and a resolver that would hang past
+        // the deadline: the caller-side rank is known without it, so the
+        // choice is immediate and right.
+        let yaml = lan_on("[172.16.0.0/16]");
+        let start = Instant::now();
+        let (r, _) = located(
+            &yaml,
+            &both_up(),
+            on(&["172.16.1.65/24"], SITE_NAMES, 10_000),
+        );
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            start.elapsed()
+        );
+        // With no entry carrying the setting and `prefer_local_network`
+        // off, the network is never asked for at all.
+        let c = config(&home(""));
         let r = resolve(
             "devbox",
             &c,
@@ -906,15 +997,78 @@ aliases:
     }
 
     #[test]
+    fn a_local_entry_must_still_answer_and_beats_a_preferred_one() {
+        // Local but not answering: the next in rank.
+        let fake = Fake::up(&["devbox.example.com"]);
+        let (r, log) = located(&lan_on("[172.16.0.0/16]"), &fake, at_site());
+        assert_eq!(r, Ok("devbox.example.com".into()));
+        assert_eq!(
+            log[1],
+            "devbox: devbox.lan does not answer ping within 500ms"
+        );
+        // prefer: true on the other host: the local entry still wins.
+        let yaml = "aliases:\n  devbox:\n    hosts:\n      - host: devbox.example.com\n        \
+                    prefer: true\n      - host: devbox.lan\n        \
+                    local_networks: [172.16.0.0/16]\n";
+        let (r, _) = located(yaml, &both_up(), at_site());
+        assert_eq!(r, Ok("devbox.lan".into()));
+    }
+
+    #[test]
+    fn the_two_directions_sit_side_by_side_and_the_host_side_is_named_first() {
+        // devbox.lan is local to the caller by its own setting;
+        // devbox.example.com is on one of this machine's interfaces'
+        // networks. Both are local, so configured order decides between
+        // them -- and each is named the way it matched.
+        let yaml = "aliases:\n  devbox:\n    prefer_local_network: true\n    hosts:\n      \
+                    - host: devbox.example.com\n      - host: devbox.lan\n        \
+                    local_networks: [172.16.0.0/16]\n";
+        let names = &[
+            ("devbox.lan", "172.16.8.2"),
+            ("devbox.example.com", "192.168.1.9"),
+        ];
+        let (r, log) = located(
+            yaml,
+            &both_up(),
+            on(&["192.168.1.5/24", "172.16.1.65/24"], names, 0),
+        );
+        assert_eq!(r, Ok("devbox.example.com".into()));
+        assert_eq!(
+            log[..2],
+            [
+                "devbox: devbox.example.com is on the local network 192.168.1.0/24",
+                "devbox: this machine is on 172.16.0.0/16, so devbox.lan is local",
+            ]
+        );
+        // Where one entry matches both ways, the host's own network is the
+        // statement named: devbox.lan resolves onto this machine's /24 and
+        // its own setting also holds.
+        let yaml = "aliases:\n  devbox:\n    prefer_local_network: true\n    hosts:\n      \
+                    - host: devbox.example.com\n      - host: devbox.lan\n        \
+                    local_networks: [192.168.0.0/16]\n";
+        let (r, log) = located(yaml, &both_up(), on(&["192.168.1.5/24"], HOME_NAMES, 0));
+        assert_eq!(r, Ok("devbox.lan".into()));
+        assert_eq!(
+            log[0],
+            "devbox: devbox.lan is on the local network 192.168.1.0/24"
+        );
+    }
+
+    #[test]
     fn the_rank_is_local_network_then_prefer_then_order() {
         let c = config(
             "aliases:\n  x:\n    - host: a\n    - host: b\n      prefer: true\n    - host: c\n    - host: d\n",
         );
         let entries = &c.alias("x").unwrap().entries;
-        let net = Some(LocalNet::new("192.168.1.5".parse().unwrap(), 24));
+        let n = LocalNet::new("192.168.1.5".parse().unwrap(), 24);
+        let (host, caller) = (Some(Local::Host(n)), Some(Local::Caller(n)));
         assert_eq!(rank(entries, &[]), [1, 0, 2, 3]);
-        assert_eq!(rank(entries, &[None, None, None, net]), [3, 1, 0, 2]);
-        assert_eq!(rank(entries, &[None, net, net, None]), [1, 2, 0, 3]);
+        assert_eq!(rank(entries, &[None, None, None, host]), [3, 1, 0, 2]);
+        assert_eq!(rank(entries, &[None, host, host, None]), [1, 2, 0, 3]);
+        // Either direction makes an entry local, and the two rank alike:
+        // among the local ones, configured order decides (acs-9yv).
+        assert_eq!(rank(entries, &[None, None, None, caller]), [3, 1, 0, 2]);
+        assert_eq!(rank(entries, &[caller, None, host, None]), [0, 2, 1, 3]);
     }
 
     #[test]

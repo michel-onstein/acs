@@ -159,66 +159,85 @@ fn set_get_unset_keep_the_rest_of_the_file() {
     );
 }
 
-/// acs-c9d: `local_networks`, the first list-valued setting, through the
-/// real binary — set, get, show, and on an alias.
+/// acs-9yv: `local_networks` on a host entry, through the real binary —
+/// added, shown, and refused where the setting used to live.
 #[test]
-fn local_networks_is_set_got_and_shown_as_a_list() {
+fn local_networks_is_added_to_a_host_and_shown_as_a_list() {
     let h = Home::new();
-    assert_eq!(h.ok(&["config", "get", "local_networks"]), "\n");
     assert_eq!(
-        h.ok(&["config", "set", "local_networks", "172.16.0.0/16,fd00::/48"]),
-        "set local_networks to 172.16.0.0/16, fd00::/48 in ~/.config/acs/config.yaml\n"
-    );
-    assert_eq!(
-        h.ok(&["config", "get", "local_networks"]),
-        "172.16.0.0/16, fd00::/48\n"
+        h.ok(&[
+            "config",
+            "host",
+            "add",
+            "devbox",
+            "devbox.lan",
+            "--local-networks",
+            "172.16.0.0/16,fd00::/48",
+        ]),
+        "added devbox.lan to devbox as its only host in ~/.config/acs/config.yaml\n"
     );
     assert_eq!(
         std::fs::read_to_string(h.local()).unwrap(),
-        "local_networks: [172.16.0.0/16, fd00::/48]\n"
+        "aliases:\n  devbox:\n    - host: devbox.lan\n      \
+         local_networks: [172.16.0.0/16, fd00::/48]\n"
     );
-    // On an alias, beside prefer_local_network.
-    h.ok(&["config", "host", "add", "devbox", "devbox.lan"]);
-    h.ok(&[
-        "config",
-        "host",
-        "set",
-        "devbox",
-        "prefer_local_network",
-        "true",
-    ]);
-    h.ok(&[
-        "config",
-        "host",
-        "set",
-        "devbox",
-        "local_networks",
-        "10.0.0.0/8",
-    ]);
     let show = h.ok(&["config", "show"]);
     assert!(
-        show.contains("local_networks: [172.16.0.0/16, fd00::/48] # "),
-        "{show}"
-    );
-    assert!(
-        show.contains("    local_networks: [10.0.0.0/8] # "),
+        show.contains("      local_networks: [172.16.0.0/16, fd00::/48]\n"),
         "{show}"
     );
     // A bad network is refused, naming what was wrong, and changes nothing.
     let before = std::fs::read_to_string(h.local()).unwrap();
     h.fails(
-        &["config", "set", "local_networks", "172.16.0.0"],
+        &[
+            "config",
+            "host",
+            "add",
+            "devbox",
+            "other.lan",
+            "--local-networks",
+            "172.16.0.0",
+        ],
         2,
         "expected a network such as 172.16.0.0/16 or fd00::/48, found '172.16.0.0'",
     );
     h.fails(
-        &["config", "set", "local_networks", "10.0.0.0/8,0.0.0.0/0"],
+        &[
+            "config",
+            "host",
+            "add",
+            "devbox",
+            "other.lan",
+            "--local-networks",
+            "10.0.0.0/8,0.0.0.0/0",
+        ],
         2,
         "a /0 network is every address",
     );
-    assert_eq!(std::fs::read_to_string(h.local()).unwrap(), before);
-    h.ok(&["config", "unset", "local_networks"]);
-    assert_eq!(h.ok(&["config", "get", "local_networks"]), "\n");
+    // It is no longer a global or a per-alias setting (acs-9yv): both say
+    // so rather than writing it.
+    h.fails(
+        &["config", "set", "local_networks", "172.16.0.0/16"],
+        2,
+        "unknown setting 'local_networks'",
+    );
+    h.fails(
+        &[
+            "config",
+            "host",
+            "set",
+            "devbox",
+            "local_networks",
+            "10.0.0.0/8",
+        ],
+        2,
+        "unknown alias setting 'local_networks'",
+    );
+    // A file that still carries the old form is a plain unknown key.
+    std::fs::write(h.local(), "local_networks: [172.16.0.0/16]\n").unwrap();
+    h.fails(&["config", "show"], 2, "unknown setting 'local_networks'");
+    std::fs::write(h.local(), before).unwrap();
+    assert_eq!(h.ok(&["config", "get", "aliases"]).lines().count(), 2);
 }
 
 /// Regression (acs-q8e): a configuration kept in dotfiles is reached through
