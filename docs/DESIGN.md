@@ -691,7 +691,10 @@ lossless resume will not repaint it. So:
 4. Whatever ends the client — resume, detach, or the session ending while
    the link was down — pops the title and blanks the status row on the way
    out, so the terminal is left as it was. While offline, the command key
-   uses the same key and window (`ACS_ESCAPE_TIMEOUT_MS`) as online.
+   uses the same key and window (`ACS_ESCAPE_TIMEOUT_MS`) as online — it is
+   the same detector, which outlives both the wait and the link (§6.1), so a
+   press held when a backoff expires into a redial is still held when the
+   wait comes back.
 
 ## 6. Command mode
 
@@ -708,6 +711,38 @@ lossless resume will not repaint it. So:
 
 The only cost is that a lone Ctrl-] reaches the remote up to 400 ms late. The
 window is a setting (`ACS_ESCAPE_TIMEOUT_MS`), and so is the key.
+
+**The detector's lifetime.** There is **one** detector, and it lives as long
+as the client does — not as long as a link, and not as long as one wait
+between redials. It belongs to the local terminal, whose byte stream never
+reconnects. A Ctrl-] held when the link dies, when a backoff expires into a
+redial attempt, or when the session comes back is therefore still the first
+press of the double tap on the other side, and **the escape window is the
+only thing that ends a half-finished gesture**.
+
+Until acs-e80 it was not: the offline wait (§5.4) built a fresh detector on
+every entry and the online loop one per link, so a press that straddled
+either boundary was dropped without a trace — invisible at the default
+400 ms, where a boundary almost never falls inside the window, and reachable
+as soon as someone widened `ACS_ESCAPE_TIMEOUT_MS` past their backoff
+because 400 ms was too quick for them.
+
+Clearing the detector at a link boundary would put a second, invisible
+expiry on the window the user configured, and it picks the worse of the two
+failures. A press silently dropped mid-gesture means the command key that
+follows lands in the program instead — `Ctrl-] Ctrl-] d` types a `d` at the
+shell. The failure in the other direction, a stale press arming command mode
+much later, cannot happen: `Held` and `Command` expire on their own clocks
+whatever the link is doing.
+
+One consequence is deliberate. A lone press held while the link was down and
+released after it came back **is** sent to the program, where a key typed
+into a dead link is dropped (§5.2). The escape key is not typed at the
+program: the client consumes it and only releases it once it turns out not
+to be a command. What §5.2 drops is input the user aimed at a program that
+could not receive it; what this forwards is one escape press, no older than
+the escape window, released into a live link exactly as the online path
+would have released it.
 
 Command mode prints nothing on the screen — it only rings the bell (below):
 the local terminal shows only what the remote sent. The table is intended to
@@ -737,7 +772,7 @@ the file (`0` off, `1` on). The bell does not break the transparent stream:
   bracketed paste the escape key is never recognised (§6.3), so it never
   rings there.
 - The same holds while the link is down (§5.4), where the offline wait arms
-  command mode with the same detector.
+  command mode with that same detector — literally the same one, as above.
 
 ### 6.2 Is Ctrl-] a good choice?
 

@@ -542,8 +542,10 @@ fn the_bell_rings_while_the_link_is_down_too() {
 /// BEL is the client saying it still had the first press a second later.
 /// The configured window is a whole `T` wide so that the end of the gap the
 /// test has no hold over — the two scheduling hops around the second press
-/// — has the room every other wait in the suite has; the backoff outlasts
-/// it because each redial attempt starts a fresh detector.
+/// — has the room every other wait in the suite has. The backoff outlasts
+/// the gap so that both presses land in the same offline wait, which is
+/// what this test is about; it no longer has to outlast the *window*, now
+/// that a redial attempt under a held press keeps it (acs-e80, below).
 #[test]
 fn the_escape_window_is_the_same_offline() {
     let remote = Remote::installed();
@@ -552,7 +554,7 @@ fn the_escape_window_is_the_same_offline() {
         "ew",
         "echo up; sleep 30",
         &[
-            ("ACS_BACKOFF_MS", "120000"),
+            ("ACS_BACKOFF_MS", "20000"),
             ("ACS_ESCAPE_TIMEOUT_MS", "30000"),
         ],
     );
@@ -569,4 +571,49 @@ fn the_escape_window_is_the_same_offline() {
     c.send(b"d");
     assert_eq!(c.wait(T), 0, "{}", c.text());
     c.wait_for("detached from devbox/ew", T);
+}
+
+/// Regression (acs-e80): the detector lives as long as the client, not as
+/// long as a link (DESIGN §6.1), so a command key held when the link dies
+/// is still the first press of the double tap after redial attempts have
+/// come and gone. `offline()` used to build a fresh one on every entry, and
+/// `serve()` one per link, so the press was dropped without a trace.
+///
+/// The backoff here is `FAST`'s 100 ms against a minute of escape window —
+/// the inverse of the constant `the_escape_window_is_the_same_offline`
+/// needed before the fix, and the combination the bug is reachable with:
+/// someone who widened `ACS_ESCAPE_TIMEOUT_MS` because 400 ms is too quick
+/// for them.
+///
+/// Nothing here is timed. The first press goes in while the client is
+/// online and certainly reading stdin, so it cannot miss a window; a third
+/// connection is the host saying the second one timed out and the offline
+/// wait was re-entered under the held press; and the second press goes in
+/// only once the session is back, where there is no deadline to race. The
+/// one floor is that the whole round trip fits inside the escape window,
+/// and a minute is many times what the nominal few seconds need.
+#[test]
+fn a_held_command_key_survives_a_redial_attempt() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_ESCAPE_TIMEOUT_MS", "60000"));
+    // As in `a_redial_into_a_silent_host_returns_to_the_backoff`: the limit
+    // covers the first connection too, which on a loaded test machine can
+    // take a few seconds.
+    env.push(("ACS_DIAL_TIMEOUT_MS", "4000"));
+    let mut c = start(&remote, "hk", "echo up; cat", &env);
+    c.wait_for("up", T);
+    // Half of Ctrl-] Ctrl-] d, and then the link goes.
+    c.send(&[0x1d]);
+    remote.silence(Some(""));
+    remote.cut_link();
+    // A redial attempt expires out of the offline wait, times out against
+    // the quiet host, and the wait comes back — all under the held press.
+    remote.wait_connections(3, T);
+    remote.silence(None);
+    c.wait_resumed();
+    // Still the first press: this completes the double tap and detaches.
+    c.send(&[0x1d, b'd']);
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/hk", T);
 }
