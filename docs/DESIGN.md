@@ -168,6 +168,20 @@ before its first frame; the client discards everything before the marker (and
 shows it on stderr under `-v`), then switches to frames. `ACS-NEED` (§8) is
 found the same way.
 
+**The client does not wait for it to speak first** (acs-trw). The marker says
+where the remote's *output* turns into frames; it is not a turn to speak.
+Nothing on the remote side reads stdin before the marker is out — the prelude
+(§8) never reads it, and the proxy reads its first frame only after printing
+the marker — so the client writes its `HELLO` into ssh's stdin the moment ssh
+is spawned, and waits for the marker with the greeting already on its way.
+Marker and `WELCOME` then come back together instead of a round trip apart,
+on the first connection and on every redial (§5.3). Two consequences are
+wanted: a `HELLO` left unread when the answer is `ACS-NEED` is discarded with
+the connection, and a startup file that reads stdin itself breaks the
+handshake either way — it used to eat the marker's turn and hang, and now
+eats the `HELLO` — so neither is a case acs supports (§3, restricted
+shells).
+
 ## 4. Remote side
 
 ### 4.1 Session directory and naming
@@ -243,7 +257,10 @@ found the same way.
 ### 4.3 Proxy
 
 `acs _proxy <session> [--create] [--proto N]` — connect (or start and connect)
-the master, then splice bytes both ways until either side closes. It does not
+the master, then splice bytes both ways until either side closes. It reads
+nothing from the client until `ACS-READY` is out, which is what lets the
+client send its `HELLO` ahead of the marker (§3): the frame is normally
+waiting in the pipe by the time the proxy looks. It does not
 parse frames beyond checking the protocol version in the HELLO. Whatever
 arrived after that HELLO goes to the master ahead of the splice — complete
 frames re-encoded, and the bytes of a frame that had only half arrived as
@@ -635,6 +652,13 @@ sequenceDiagram
   passed through, because ssh gets the controlling tty for prompts even with
   `-T`; the client restores cooked mode while ssh is authenticating. With
   keys in an agent, reconnect is silent.
+- **The greeting goes out with the dial** (acs-trw): the `HELLO` is written
+  into ssh's stdin as it is spawned, before the marker is awaited (§3), so a
+  redial costs the ssh handshake and one trip for the `WELCOME` rather than
+  two. The size it carries is the terminal's as of the dial; a `SIGWINCH`
+  while the handshake is in flight sends no `RESIZE` of its own — only a
+  welcomed link does — so the client compares the size again on the
+  `WELCOME` and sends one then if the window moved.
 - **Before the first WELCOME there is a deadline too**: liveness only starts
   with WELCOME, and `ConnectTimeout` only covers the TCP connect, so a host
   that accepts and then says nothing would otherwise hold the client forever.
@@ -865,7 +889,8 @@ before clearing the screen and forgetting them.
 - `cfmakeraw`-equivalent `termios` (dtach's flags), restored on every exit
   path: normal, signal (`SIGHUP`, `SIGTERM`, `SIGINT` before raw mode), and
   panic (`panic = "abort"` plus a restore in a drop guard and a signal handler).
-- `SIGWINCH` → `RESIZE`.
+- `SIGWINCH` → `RESIZE`, once a link is welcomed; one that lands while the
+  handshake is in flight is caught up on the `WELCOME` (§5.3).
 - Single-threaded `poll` loop over stdin, the ssh child's pipes, a self-pipe for
   signals, and a timer (escape timeout, pings) — the same shape as dtach.
 - Exit status: the child's status after `EXIT` (128+n for signals), 0 on detach,
@@ -1717,7 +1742,10 @@ scripts/        verify.sh, test_linux.sh, e2e_ssh.sh, source_stamp.sh
   producer's output — lossless resume as a byte-for-byte equality check.
   Plus: detach and re-attach, `x` killing the child's process group, takeover,
   a stale socket, two concurrent creates racing on the lock, and a gap after
-  ring overflow.
+  ring overflow. A remote that says nothing at all until the client has
+  written its first byte stands in for the handshake's order (§3): a client
+  that waited for the marker before greeting would deadlock there, so the
+  test needs no clock.
 - **Multi-user** (integration, needs a second test uid or root in CI):
   a squatted or symlinked socket directory is refused; a peer with another
   uid is disconnected; same-identity takeover is silent and cross-identity

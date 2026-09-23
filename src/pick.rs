@@ -108,7 +108,10 @@ fn open_pick(
     timing: &mut Timing,
 ) -> Result<Option<(Pick, Vec<StatusInfo>)>, Failure> {
     let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--pick"]);
-    let (link, marker) = client::dial(args, call, &remote, timeout, timing)
+    // The menu's connection speaks second: `_proxy --pick` sends the list
+    // before it reads anything, and the HELLO only names the session the
+    // user then chose (DESIGN §4.4), so there is nothing to send ahead.
+    let (link, marker) = client::dial(args, call, &remote, timeout, timing, Vec::new())
         .map_err(|e| Failure::Unreachable(e.to_string()))?;
     let rest = match marker {
         Marker::Ready { proto: p, rest } if p == proto::PROTO_VERSION => rest,

@@ -159,12 +159,15 @@ pub(crate) fn query(
 ) -> Result<Option<Vec<StatusInfo>>, Failure> {
     let deadline = Instant::now() + timeout;
     let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--list"]);
+    // Nothing to send ahead: `_proxy --list` speaks first and this call
+    // never sends a HELLO.
     let (link, marker) = client::dial(
         args,
         call,
         &remote,
         timeout,
         &mut crate::timing::Timing::off(),
+        Vec::new(),
     )
     .map_err(|e| Failure::Unreachable(e.to_string()))?;
     let rest = match marker {
