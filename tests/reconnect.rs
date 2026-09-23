@@ -223,6 +223,12 @@ fn detach_works_while_the_link_is_down() {
 
 /// Regression (acs-qty): keys typed while ssh redials (in cooked mode, for
 /// its prompts) are dropped, not delivered to the program on WELCOME.
+///
+/// Nothing here is timed (acs-o8h). The redial is *held* short of the
+/// remote command rather than merely made slow, and the key goes in once
+/// the client itself says it has left raw mode for the dial — so the key
+/// cannot land outside the redial however starved the host is, where the
+/// old shape gave it a 1.5 s window it had already spent 300 ms of.
 #[test]
 fn keys_typed_during_a_redial_are_dropped() {
     let remote = Remote::installed();
@@ -233,13 +239,13 @@ fn keys_typed_during_a_redial_are_dropped() {
         FAST,
     );
     c.wait_for("ready", T);
-    remote.slow_dial(Some("1.5"));
+    remote.hold_dial();
     remote.cut_link();
     remote.wait_connections(2, T);
-    // The redial is under way: its transport sleeps before the remote runs.
-    std::thread::sleep(Duration::from_millis(300));
+    // The redial is under way and stays that way until it is released.
+    c.wait_until("the client has left raw mode to redial", |c| c.echo_on(), T);
     c.send(b"typed\r");
-    remote.slow_dial(None);
+    remote.release_dial();
     // The status line goes when the resume's WELCOME arrives.
     c.wait_for("\x1b[23;0t", T);
     c.send(b"after\r");
@@ -416,6 +422,15 @@ fn a_network_change_redials_at_once() {
 /// Regression (acs-znr): a host that accepts the connection and then says
 /// nothing — before its marker, or after it, instead of WELCOME — is given
 /// up on in time rather than waited for forever.
+///
+/// The clock is the host's, so the test does not read it (acs-o8h). A
+/// silenced connection holds the link open for a minute, well past the `T`
+/// the helpers wait to, so "waited for forever" is a client that never
+/// exits — and both give-up messages are formatted from the very `Duration`
+/// that was used as the deadline, so the line naming 0.5 s *is* the
+/// assertion that the configured limit was the one applied. An `elapsed() <
+/// 5 s` around all of it added nothing to either and asked the host to have
+/// started a process, dialled and exited inside five seconds.
 #[test]
 fn a_silent_host_is_given_up_on() {
     let ready = acs::proto::ready_line();
@@ -428,10 +443,8 @@ fn a_silent_host_is_given_up_on() {
             "echo up; sleep 30",
             &[("ACS_DIAL_TIMEOUT_MS", "500")],
         );
-        let t0 = Instant::now();
-        assert_eq!(c.wait(T), 255, "{said:?}: {}", c.text());
-        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
         c.wait_for("no answer from devbox within 0.5 s", T);
+        assert_eq!(c.wait(T), 255, "{said:?}: {}", c.text());
     }
 }
 
@@ -507,9 +520,11 @@ fn the_bell_rings_while_the_link_is_down_too() {
     remote.cut_link();
     // The end of the status line (its title has a BEL of its own).
     c.wait_for("d to detach)\x1b[0m\x1b8", T);
-    c.send(&[0x1d]);
-    std::thread::sleep(Duration::from_millis(50));
-    c.send(&[0x1d]);
+    // One write, so the double tap cannot be split across the escape
+    // window by a host that deschedules the client between the two presses
+    // (acs-o8h): 50 ms of sleep inside the default 400 ms was the tightest
+    // wall-clock gap in this file.
+    c.send(&[0x1d, 0x1d]);
     c.wait_for("\x07", T);
     c.send(b"d");
     assert_eq!(c.wait(T), 0);
@@ -517,6 +532,18 @@ fn the_bell_rings_while_the_link_is_down_too() {
 
 /// Regression (acs-wxa): the command-key window set with
 /// `ACS_ESCAPE_TIMEOUT_MS` also applies while the link is down.
+///
+/// The gap between the presses is the subject here, so it stays — but as a
+/// floor rather than as a window (acs-o8h). The second press has to land
+/// *more* than the default 400 ms after the first, and `sleep` never
+/// returns early, so a starved host can only make the gap longer than the
+/// test needs. What the gap bought is then read off the client instead of
+/// off the clock: arming command mode rings the bell (DESIGN §6.1), so the
+/// BEL is the client saying it still had the first press a second later.
+/// The configured window is a whole `T` wide so that the end of the gap the
+/// test has no hold over — the two scheduling hops around the second press
+/// — has the room every other wait in the suite has; the backoff outlasts
+/// it because each redial attempt starts a fresh detector.
 #[test]
 fn the_escape_window_is_the_same_offline() {
     let remote = Remote::installed();
@@ -525,17 +552,21 @@ fn the_escape_window_is_the_same_offline() {
         "ew",
         "echo up; sleep 30",
         &[
-            ("ACS_BACKOFF_MS", "20000"),
-            ("ACS_ESCAPE_TIMEOUT_MS", "3000"),
+            ("ACS_BACKOFF_MS", "120000"),
+            ("ACS_ESCAPE_TIMEOUT_MS", "30000"),
         ],
     );
     c.wait_for("up", T);
     remote.cut_link();
-    c.wait_for("reconnecting in 20s", T);
-    // Well past the default 400 ms window, inside the configured one.
+    // Past the end of the status line, whose title carries a BEL of its own.
+    c.wait_for("d to detach)\x1b[0m\x1b8", T);
     c.send(&[0x1d]);
+    // Well past the default 400 ms window, inside the configured one.
     std::thread::sleep(Duration::from_millis(1000));
-    c.send(&[0x1d, b'd']);
+    c.send(&[0x1d]);
+    // The double tap was still a double tap: command mode armed.
+    c.wait_for("\x07", T);
+    c.send(b"d");
     assert_eq!(c.wait(T), 0, "{}", c.text());
     c.wait_for("detached from devbox/ew", T);
 }
