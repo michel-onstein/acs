@@ -317,11 +317,26 @@ impl Remote {
         let script = self.root.path().join("transport.sh");
         if !script.exists() {
             let body = format!(
-                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\nwhile [ -f '{gate}' ]; do sleep 0.05; done\n[ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n[ -f '{renv}' ] && . '{renv}'\nexec /bin/sh -c \"$1\"\n",
+                "#!/bin/sh\n\
+                 echo $$ >> '{pids}'\n\
+                 [ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\n\
+                 while [ -f '{gate}' ]; do sleep 0.05; done\n\
+                 if [ -f '{mute}' ]; then exec 3<&0; dd bs=1 count=1 of='{mute}'.$$ 2>/dev/null <&3; fi\n\
+                 [ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n\
+                 [ -f '{noise}' ] && cat '{noise}'\n\
+                 export HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n\
+                 [ -f '{renv}' ] && . '{renv}'\n\
+                 if [ -f '{mute}' ]; then\n\
+                 mkfifo '{mute}'.$$.in\n\
+                 {{ cat '{mute}'.$$; cat <&3; }} > '{mute}'.$$.in &\n\
+                 exec /bin/sh -c \"$1\" < '{mute}'.$$.in\n\
+                 fi\n\
+                 exec /bin/sh -c \"$1\"\n",
                 pids = self.pid_file().display(),
                 silent = self.silent_file().display(),
                 delay = self.delay_file().display(),
                 gate = self.gate_file().display(),
+                mute = self.mute_file().display(),
                 noise = self.noise_file().display(),
                 home = self.home().display(),
                 sock = self.sockets().display(),
@@ -353,6 +368,10 @@ impl Remote {
 
     fn gate_file(&self) -> PathBuf {
         self.root.path().join("dial-gate")
+    }
+
+    fn mute_file(&self) -> PathBuf {
+        self.root.path().join("mute-until-greeted")
     }
 
     fn remote_env_file(&self) -> PathBuf {
@@ -436,6 +455,16 @@ impl Remote {
     /// Let the connection held by [`Remote::hold_dial`] finish.
     pub fn release_dial(&self) {
         let _ = std::fs::remove_file(self.gate_file());
+    }
+
+    /// Make every connection say nothing at all — no login noise, no marker
+    /// — until the client has written its first byte, and hand that byte on
+    /// to the remote side unharmed (acs-trw). A client that waits for the
+    /// marker before it greets deadlocks here, so it is the whole of the
+    /// assertion that the HELLO goes out with the dial: no wall clock, and
+    /// the remote's own order is the evidence.
+    pub fn mute_until_greeted(&self) {
+        std::fs::write(self.mute_file(), "").unwrap();
     }
 
     /// Make new connections go quiet once accepted, as a half-alive host

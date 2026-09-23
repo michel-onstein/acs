@@ -318,6 +318,12 @@ pub struct Link {
     child: Child,
     to: OwnedFd,
     from: OwnedFd,
+    /// Frames for the host that have not been written yet: the HELLO
+    /// [`dial`] could not fit into the transport's stdin pipe in one go,
+    /// or the one a link the session menu opened still owes (DESIGN §5.3).
+    /// [`serve`] takes them as the first thing it writes, so nothing can
+    /// overtake them.
+    pending: Vec<u8>,
 }
 
 impl Link {
@@ -353,12 +359,19 @@ pub fn answer_timeout(redial: bool) -> Duration {
 /// Start the transport running `remote` and wait, at most `timeout`, for
 /// the marker line; `timing` is told when ssh is spawned and the marker
 /// seen.
+///
+/// `first` goes into the transport's stdin the moment it is spawned,
+/// before the marker is awaited (DESIGN §5.3, acs-trw): the remote side
+/// reads nothing until it has printed the marker, so a HELLO left waiting
+/// in the pipe saves a round trip on every dial and redial. Whatever does
+/// not fit stays in [`Link::pending`] for [`serve`] to write.
 pub fn dial(
     args: &ClientArgs,
     call: Call,
     remote: &str,
     timeout: Duration,
     timing: &mut Timing,
+    first: Vec<u8>,
 ) -> io::Result<(Link, Marker)> {
     let deadline = Instant::now() + timeout;
     let mut cmd = args.transport.command(call, remote);
@@ -381,6 +394,17 @@ pub fn dial(
     timing.mark("ssh spawned");
     let to: OwnedFd = child.stdin.take().unwrap().into();
     let from: OwnedFd = child.stdout.take().unwrap().into();
+    // The first frames, before anything is read back. Non-blocking, so a
+    // transport that has not read a byte yet — it has not even connected —
+    // cannot stall the dial: what the pipe takes goes now, the rest goes
+    // with the first write of the session. A write that fails says nothing
+    // the read loop below will not say better.
+    let mut pending = first;
+    if !pending.is_empty() {
+        let _ = sys::set_nonblocking(to.as_raw_fd(), true);
+        let _ = write_link(to.as_raw_fd(), &mut pending);
+        let _ = sys::set_nonblocking(to.as_raw_fd(), false);
+    }
     let mut scanner = MarkerScanner::new();
     let mut buf = [0u8; 4096];
     let marker = loop {
@@ -424,7 +448,15 @@ pub fn dial(
     if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
         note(&format!("skipped remote login output: {noise:?}"));
     }
-    Ok((Link { child, to, from }, marker))
+    Ok((
+        Link {
+            child,
+            to,
+            from,
+            pending,
+        },
+        marker,
+    ))
 }
 
 // ---- session state that survives reconnects --------------------------------
@@ -607,8 +639,20 @@ pub fn connect_and_serve(
     timing: &mut Timing,
 ) -> Outcome {
     let timeout = answer_timeout(resuming);
+    // Built before the dial so it can go out with it (acs-trw); the size
+    // it carries is the terminal's as of now, and `serve` follows a
+    // SIGWINCH that lands while the handshake is in flight.
+    let greeting = hello(args, state, state.force_next);
+    let size = greeting.size;
+    let greeting = Msg::Hello(greeting).to_bytes();
     if let Some(p) = picked {
-        return serve(args, state, raw, signals, p.link, p.rest, timeout, timing);
+        // The menu's connection is past its marker and owes its HELLO:
+        // the proxy read the list's frames from it first (DESIGN §4.4).
+        let mut link = p.link;
+        link.pending = greeting;
+        return serve(
+            args, state, raw, signals, link, p.rest, timeout, timing, size,
+        );
     }
     let pargs = proxy_args(args, state, resuming);
     let pargs: Vec<&str> = pargs.iter().map(String::as_str).collect();
@@ -617,7 +661,7 @@ pub fn connect_and_serve(
     if let Some(r) = raw.as_mut() {
         let _ = r.suspend();
     }
-    let (link, marker) = match dial(args, Call::Session, &remote, timeout, timing) {
+    let (link, marker) = match dial(args, Call::Session, &remote, timeout, timing, greeting) {
         Ok(x) => x,
         Err(e) => {
             if resuming {
@@ -662,7 +706,7 @@ pub fn connect_and_serve(
             };
         }
     };
-    serve(args, state, raw, signals, link, rest, timeout, timing)
+    serve(args, state, raw, signals, link, rest, timeout, timing, size)
 }
 
 fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -731,17 +775,21 @@ fn queue_input(state: &mut State, out: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-/// Serve one link: handshake, then relay until something ends it.
+/// Serve one link: finish the handshake, then relay until something ends
+/// it. The HELLO is the link's `pending`: written with the dial already
+/// (acs-trw), or still owed by a connection the session menu opened.
+/// `sent_size` is the terminal size that HELLO carried.
 #[allow(clippy::too_many_arguments)]
 fn serve(
     args: &ClientArgs,
     state: &mut State,
     raw: &mut Option<RawMode>,
     signals: &OwnedFd,
-    link: Link,
+    mut link: Link,
     early: Vec<u8>,
     handshake: Duration,
     timing: &mut Timing,
+    mut sent_size: proto::WinSize,
 ) -> Outcome {
     // The host has until then to WELCOME us (acs-znr): liveness only starts
     // with the WELCOME.
@@ -752,7 +800,7 @@ fn serve(
     let _ = sys::set_nonblocking(from, true);
     let mut dec = Decoder::new();
     dec.push(&early);
-    let mut out = Msg::Hello(hello(args, state, state.force_next)).to_bytes();
+    let mut out = std::mem::take(&mut link.pending);
     let mut buf = vec![0u8; 64 * 1024];
     // The detector is `state`'s: it carries over from the last link and from
     // the offline wait in between (DESIGN §6.1). The bell does not — one
@@ -861,6 +909,18 @@ fn serve(
                     if !w.created && state.redraw_on_reconnect && !state.paste.open() {
                         queue_input(state, &mut out, &[CTRL_L]);
                     }
+                    // The size went out with the HELLO, which now leaves
+                    // before ssh has even connected (acs-trw): a window
+                    // resized while the handshake was in flight raised a
+                    // SIGWINCH that no RESIZE followed, since only a
+                    // welcomed link sends them. Catch it up here, so the
+                    // program starts on the size the terminal has.
+                    if let Ok(s) = sys::get_winsize(STDIN) {
+                        if s != sent_size {
+                            sent_size = s;
+                            Msg::Resize(s).encode(&mut out);
+                        }
+                    }
                     crate::reconnect::on_welcome(state, w.kind, &mut out);
                 }
                 Msg::Busy { identity, since } if !welcomed => {
@@ -869,7 +929,9 @@ fn serve(
                             // The question took the user's time, not the host's.
                             handshake_until = sys::now_ms() + handshake.as_millis() as u64;
                             state.force_next = true;
-                            Msg::Hello(hello(args, state, true)).encode(&mut out)
+                            let again = hello(args, state, true);
+                            sent_size = again.size;
+                            Msg::Hello(again).encode(&mut out)
                         }
                         false => {
                             link.close();
