@@ -37,8 +37,12 @@ options:
   -V, --version       print the version
   -- <command...>     run <command> instead of the login shell (new sessions)
 
-ssh options (passed to every ssh call):
+ssh options:
   -i <identity_file>  -p <port>  -J <jump>  -F <config>  -o <option=value>
+                      passed to every ssh call acs makes
+  -L [bind:]port:host:hostport
+                      forward a local port, as ssh -L does; repeatable,
+                      and on the session's own connection alone
 
 in a session: Ctrl-] Ctrl-] then  d  detach (session keeps running)
                                   x  exit (ends the session)
@@ -129,6 +133,7 @@ where
 
     let mut p = lexopt::Parser::from_args(args);
     let mut user_opts: Vec<OsString> = Vec::new();
+    let mut local_forwards: Vec<String> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut new = false;
     let mut reconnect = true;
@@ -163,6 +168,14 @@ where
                 let v = p.value().map_err(|e| e.to_string())?;
                 user_opts.push(format!("-{c}").into());
                 user_opts.push(v);
+            }
+            // Not a user_opt: a forward goes to the session's ssh alone
+            // (DESIGN §7.1), and its spec is checked here rather than by
+            // ssh, per dial, on the session's terminal.
+            Short('L') => {
+                let spec = text(p.value().map_err(|e| e.to_string())?, "-L")?;
+                crate::ssh::check_local_forward(&spec)?;
+                local_forwards.push(spec);
             }
             // Listing is the `acs list` command; ssh's -l <login> was never
             // taken.
@@ -234,6 +247,7 @@ where
         transport.ssh = s;
     }
     transport.user_opts = user_opts;
+    transport.local_forwards = local_forwards;
     transport.transport_cmd = transport_cmd;
 
     let args = Box::new(ClientArgs {
@@ -385,6 +399,45 @@ mod tests {
             ]
         );
         assert_eq!(a.transport.destination, "me@box");
+    }
+
+    /// acs-6f5: `-L` is kept apart from the pass-through options, because
+    /// only the session's ssh gets it, and a bad spec is an acs error
+    /// before any ssh runs.
+    #[test]
+    fn local_forwards_are_repeatable_and_checked() {
+        let a = run(&[
+            "-L",
+            "8080:localhost:80",
+            "-p",
+            "2222",
+            "-L5432:db.internal:5432",
+            "me@box",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.transport.local_forwards,
+            ["8080:localhost:80", "5432:db.internal:5432"]
+        );
+        // They are not ssh pass-through options.
+        assert_eq!(opts(&a), ["-p", "2222"]);
+        assert!(run(&["box"]).unwrap().transport.local_forwards.is_empty());
+
+        // `acs list` may attach the session it picks from the menu (§7.3),
+        // so a forward is taken there too.
+        match list(&["-L", "8080:localhost:80"]).unwrap() {
+            Parsed::ListAll(a) => assert_eq!(a.transport.local_forwards, ["8080:localhost:80"]),
+            other => panic!("{other:?}"),
+        }
+
+        let e = run(&["-L", "8080:localhost", "box"]).unwrap_err();
+        assert!(e.contains("bad -L '8080:localhost'"), "{e}");
+        let e = run(&["-L", "eighty:localhost:80", "box"]).unwrap_err();
+        assert!(e.contains("is not a number"), "{e}");
+        let e = list(&["-L", "8080:localhost", "box"]).unwrap_err();
+        assert!(e.contains("bad -L"), "{e}");
+        let e = run(&["-L", "box"]).unwrap_err();
+        assert!(e.contains("bad -L 'box'"), "{e}");
     }
 
     #[test]
