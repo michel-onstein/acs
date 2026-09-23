@@ -440,6 +440,14 @@ pub struct State {
     pub redraw_on_reconnect: bool,
     /// Whether the input sent so far is inside a bracketed paste.
     pub paste: keys::PasteTracker,
+    /// The command-key detector (DESIGN §6.1). It belongs to the local
+    /// terminal, not to a link, so there is one of it for as long as the
+    /// client runs: a press held when the link dies, when a backoff
+    /// expires into a redial attempt, or when the session comes back is
+    /// still the first half of the double tap on the other side. The
+    /// escape window is the only thing that ends a half-finished gesture
+    /// (acs-e80).
+    pub detector: Detector,
     /// Take the session from whoever holds it on the **next** attach, and
     /// then stop (acs-y5r). Agreement to a takeover is about the person
     /// who was attached when it was given, so it is spent by the attach it
@@ -552,6 +560,7 @@ pub fn run(args: ClientArgs, picked: Option<Picked>) -> u8 {
         bell_pending: false,
         redraw_on_reconnect: redraw_on_reconnect(&args),
         paste: keys::PasteTracker::default(),
+        detector: Detector::new(escape_config()),
         force_next: args.force,
     };
     let mut raw: Option<RawMode> = None;
@@ -655,8 +664,8 @@ fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
 /// After feeding or ticking the command detector: ring the bell when
 /// command mode has just armed, and drop a bell still waiting once it is
 /// over (DESIGN §6.1).
-pub fn follow_detector(state: &mut State, was_armed: bool, detector: &Detector) {
-    if !detector.armed() {
+pub fn follow_detector(state: &mut State, was_armed: bool) {
+    if !state.detector.armed() {
         state.bell_pending = false;
     } else if !was_armed && state.command_bell {
         // Only between sequences: a BEL inside the program's OSC would end
@@ -725,8 +734,9 @@ fn serve(
     dec.push(&early);
     let mut out = Msg::Hello(hello(args, state, state.force_next)).to_bytes();
     let mut buf = vec![0u8; 64 * 1024];
-    let mut detector = Detector::new(escape_config());
-    // A bell waiting from an earlier link's command mode is moot.
+    // The detector is `state`'s: it carries over from the last link and from
+    // the offline wait in between (DESIGN §6.1). The bell does not — one
+    // waiting from an earlier link's command mode is moot.
     state.bell_pending = false;
     let mut welcomed = false;
     let mut exiting = false;
@@ -907,7 +917,7 @@ fn serve(
             let d = deadline.saturating_sub(now) as i64;
             timeout = if timeout < 0 { d } else { timeout.min(d) };
         };
-        if let Some(d) = detector.deadline() {
+        if let Some(d) = state.detector.deadline() {
             consider(d);
         }
         if welcomed {
@@ -955,17 +965,21 @@ fn serve(
                     return Outcome::Exit(code::DETACHED);
                 }
                 Ok(n) => {
-                    let was = detector.armed();
-                    let o = detector.feed(&buf[..n], sys::now_ms());
-                    follow_detector(state, was, &detector);
+                    let was = state.detector.armed();
+                    let o = state.detector.feed(&buf[..n], sys::now_ms());
+                    follow_detector(state, was);
                     queue_input(state, &mut out, &o.forward);
                     action = o.action;
                 }
             }
-        } else if detector.deadline().is_some_and(|d| sys::now_ms() >= d) {
-            let was = detector.armed();
-            let o = detector.tick(sys::now_ms());
-            follow_detector(state, was, &detector);
+        } else if state
+            .detector
+            .deadline()
+            .is_some_and(|d| sys::now_ms() >= d)
+        {
+            let was = state.detector.armed();
+            let o = state.detector.tick(sys::now_ms());
+            follow_detector(state, was);
             queue_input(state, &mut out, &o.forward);
         }
         match action {

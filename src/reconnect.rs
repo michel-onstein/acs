@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::cli::ClientArgs;
 use crate::client::{self, code, note, Outcome, State};
-use crate::keys::{Action, Detector};
+use crate::keys::Action;
 use crate::proto::{AttachKind, Msg};
 use crate::sys;
 use crate::tty::RawMode;
@@ -268,6 +268,12 @@ const EARLY_EVERY: Duration = Duration::from_secs(2);
 
 /// Wait `wait` before the next redial with the link down: show `msg` as the
 /// status, drop typed keys, but honour the command keys.
+///
+/// The detector is the client's own (`state.detector`, DESIGN §6.1), not one
+/// of this wait's: that makes it the same configuration as online, window
+/// included (acs-wxa), and it leaves a half-finished double tap held when
+/// the backoff expires under it, so the redial attempt in between does not
+/// eat the first press (acs-e80).
 fn offline(
     state: &mut State,
     raw: &mut Option<RawMode>,
@@ -282,7 +288,6 @@ fn offline(
     }
     show_status(state, msg);
     let deadline = Instant::now() + wait;
-    let mut detector = Detector::new(client_escape());
     let mut buf = [0u8; 4096];
     loop {
         let now = Instant::now();
@@ -290,7 +295,7 @@ fn offline(
             return Offline::Retry;
         }
         let mut timeout = deadline - now;
-        if let Some(d) = detector.deadline() {
+        if let Some(d) = state.detector.deadline() {
             timeout = timeout.min(Duration::from_millis(d.saturating_sub(sys::now_ms())));
         }
         let mut fds = [
@@ -309,16 +314,16 @@ fn offline(
                 return Offline::NetworkChanged;
             }
         }
-        let was = detector.armed();
+        let was = state.detector.armed();
         let out = if fds[0].revents != 0 {
             match sys::read(0, &mut buf) {
-                Ok(n) if n > 0 => detector.feed(&buf[..n], sys::now_ms()),
+                Ok(n) if n > 0 => state.detector.feed(&buf[..n], sys::now_ms()),
                 _ => return Offline::Detach,
             }
         } else {
-            detector.tick(sys::now_ms())
+            state.detector.tick(sys::now_ms())
         };
-        client::follow_detector(state, was, &detector);
+        client::follow_detector(state, was);
         // Keys typed into a dead link are dropped, not queued (DESIGN §5.2).
         match out.action {
             Some(Action::Detach) => return Offline::Detach,
@@ -331,12 +336,6 @@ fn offline(
             None => {}
         }
     }
-}
-
-/// The command key while offline: the same configuration as online, window
-/// included (acs-wxa).
-fn client_escape() -> crate::keys::Config {
-    client::escape_config()
 }
 
 /// One line on the bottom row (cursor saved and restored) and the window
