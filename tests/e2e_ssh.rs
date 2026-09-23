@@ -95,6 +95,45 @@ fn assert_consecutive(text: &str) {
     }
 }
 
+/// A local port with nothing on it: taken from the kernel and let go again,
+/// as the host's ssh port is, so two runs at once never pick the same one.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Whatever the far end of `127.0.0.1:port` says first; `None` while nothing
+/// is listening there, or while what listens says nothing.
+fn greeting(port: u16) -> Option<String> {
+    use std::io::Read;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 64];
+    match s.read(&mut buf) {
+        Ok(0) | Err(_) => None,
+        Ok(n) => Some(String::from_utf8_lossy(&buf[..n]).trim().to_string()),
+    }
+}
+
+/// [`greeting`], waiting for the forward to be bound and carrying bytes.
+fn wait_greeting(port: u16, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(g) = greeting(port) {
+            return g;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nothing answered on 127.0.0.1:{port} within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn e2e_01_first_contact_installs_and_attaches() {
     let Some(h) = host() else { return };
@@ -476,4 +515,85 @@ fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
     c.send(&command(b'x'));
     c.wait(T);
     eprintln!("VERIFIED plain acs <host>: menu, x and the attach over one ssh connection");
+}
+
+/// acs-8kv: `-L` against a real sshd. `ssh::argv` emits the forward for
+/// `Call::Session` alone, so that `acs list` and the install side calls do
+/// not each try to bind the user's local port (DESIGN §7.1); the unit tests
+/// read that out of the argv, and only this one watches what ssh does with
+/// it. The container's sshd is set to `AllowTcpForwarding yes` for it
+/// (scripts/e2e/Dockerfile) — Alpine ships `no`.
+#[test]
+fn e2e_14_a_local_forward_is_the_session_connections_alone() {
+    let Some(h) = host() else { return };
+    let port = free_port();
+    // Back to the container's own sshd, so what comes out of the forward is
+    // the host's real banner rather than something the test planted.
+    let spec = format!("{port}:127.0.0.1:22");
+    let mut args = vec!["-L".to_string(), spec.clone()];
+    args.extend(h.ssh_args());
+    args.extend(["dev@127.0.0.1", "fwd", "--", "/bin/sh", "-c"].map(String::from));
+    args.push(TICKER.to_string());
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut c = Client::spawn(
+        std::path::Path::new(&h.client),
+        &argv,
+        &[("ACS_BACKOFF_MS", "300")],
+    );
+    c.wait_for("#10#", T);
+    let banner = wait_greeting(port, T);
+    assert!(
+        banner.starts_with("SSH-2.0"),
+        "through the forward: {banner:?}"
+    );
+
+    // The same -L handed to `acs list <host>` — a Call::Side call — while
+    // the session's ssh holds the port. Gated off, that ssh never asks for
+    // the forward; ungated it would find the port taken and complain about
+    // it by number ("bind: Address already in use", "cannot listen to
+    // port: N", "Could not request local forwarding").
+    let mut largs = vec!["list".to_string(), "-L".into(), spec.clone()];
+    largs.extend(h.ssh_args());
+    largs.push("dev@127.0.0.1".into());
+    let out = Command::new(&h.client)
+        .args(&largs)
+        .env("XDG_CONFIG_HOME", NO_CONFIG)
+        .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+        .env("ACS_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}{err}");
+    assert!(text.contains("fwd"), "{text}{err}");
+    assert!(
+        !err.contains(&port.to_string()),
+        "the side call asked for the forward:\n{err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("forward"),
+        "the side call asked for the forward:\n{err}"
+    );
+    // ... and it left the session's own forward alone.
+    let after = wait_greeting(port, T);
+    assert!(after.starts_with("SSH-2.0"), "after acs list: {after:?}");
+
+    // The argv is rebuilt per dial, so a redial rebinds the port.
+    h.docker(&[
+        "exec",
+        &h.container,
+        "sh",
+        "-c",
+        "pkill -f '[s]shd-session: dev@' || pkill -f '[s]shd: dev@'",
+    ]);
+    let last = *numbers(&c.text()).last().unwrap();
+    c.wait_for(&format!("#{}#", last + 100), Duration::from_secs(30));
+    let again = wait_greeting(port, T);
+    assert!(again.starts_with("SSH-2.0"), "after the redial: {again:?}");
+    c.send(&command(b'x'));
+    c.wait(T);
+    eprintln!(
+        "VERIFIED -L over ssh: {banner} through 127.0.0.1:{port}, \
+         no forward on the acs list side call, rebound after a redial"
+    );
 }
