@@ -204,12 +204,44 @@ usual. The command key works in every keyboard encoding a terminal may use
 
 `-i <identity_file>`, `-p <port>`, `-J <jump>`, `-F <config>` and
 `-o <option=value>` are passed to every ssh call acs makes, with ssh's
-meaning. There is no `-l`, neither ssh's login option nor a list option:
-put a login name in `user@host` or `-o User=`, and list with `acs list`.
+meaning; `-L` (below) is the exception and goes to the session's
+connection alone. There is no `-l`, neither ssh's login option nor a list
+option: put a login name in `user@host` or `-o User=`, and list with
+`acs list`.
 Your `~/.ssh/config`, agent and keys apply as usual; nothing needs
 configuring on either side. A key can also be set per
 host alias in the configuration (`identity_file`, below); `-i` on the
 command line wins.
+
+### Forwarding a port
+
+`-L` forwards a local port over the session's connection, spelled as ssh
+spells it and repeatable:
+
+```sh
+acs -L 8080:localhost:80 -L 5432:db.internal:5432 devbox
+```
+
+`[bind_address:]port:host:hostport`, with an IPv6 literal in brackets
+(`-L '[::1]:8080:localhost:80'`) and an empty bind address or `*` for every
+interface. A spec acs cannot read is an error before any ssh runs, rather
+than a complaint from ssh on every dial.
+
+The forward rides the session's ssh **only** — not the connections
+`acs list`, the remote install or the menu over every alias make, which run
+side by side and would each try to bind the same port. It follows the
+session across reconnects, but it is gone for as long as the link is: the
+listening socket belongs to the ssh process, so a drop closes it and the
+redial rebinds it, and anything connected through it at the time is cut.
+If the port cannot be rebound — a second acs took it, or it is still in
+`TIME_WAIT` — ssh says so and the session carries on without the forward;
+add `-o ExitOnForwardFailure=yes` if you would rather acs kept redialling
+until the port is free. There is no key for adding or removing a forward
+once a session is running.
+
+`-o LocalForward="8080 localhost:80"` still works too, and is the way to
+forward a unix socket, but it goes to *every* ssh call acs makes (so
+several may fight over one port) and is passed to ssh unchecked.
 
 ### When the network drops
 

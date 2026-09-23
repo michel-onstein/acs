@@ -60,6 +60,10 @@ pub struct Transport {
     /// The configuration's key for the destination (DESIGN §7.3), passed as
     /// `-i` unless the user's options name one: the command line wins.
     pub identity_file: Option<String>,
+    /// `-L` specs, in the order given, passed only to the session's ssh
+    /// (DESIGN §7.1): the side and batch calls run their own ssh, and a
+    /// forward on those would have several of them binding one local port.
+    pub local_forwards: Vec<String>,
     /// Test hook: run this (split on whitespace) with the remote command as
     /// its last argument instead of ssh (DESIGN §9.1).
     pub transport_cmd: Option<String>,
@@ -74,6 +78,7 @@ impl Transport {
             user_opts: Vec::new(),
             destination: destination.into(),
             identity_file: None,
+            local_forwards: Vec::new(),
             transport_cmd: None,
         }
     }
@@ -107,6 +112,15 @@ impl Transport {
         };
         v.extend(fixed.iter().map(OsString::from));
         v.extend(self.user_opts.iter().cloned());
+        // The user's session, and nothing else, gets the forwards: the side
+        // and batch calls are separate ssh processes, and several of them
+        // binding one local port is noise at best (DESIGN §7.1).
+        if call == Call::Session {
+            for spec in &self.local_forwards {
+                v.push("-L".into());
+                v.push(spec.into());
+            }
+        }
         if let Some(key) = self
             .identity_file
             .as_ref()
@@ -128,6 +142,88 @@ impl Transport {
         c.args(&argv[1..]);
         c
     }
+}
+
+/// Split a forward spec on the colons that separate its fields, leaving the
+/// ones inside an IPv6 literal's `[…]` alone. `None`: the brackets do not
+/// balance.
+fn colon_fields(spec: &str) -> Option<Vec<&str>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut depth = 0u32;
+    for (i, c) in spec.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.checked_sub(1)?,
+            ':' if depth == 0 => {
+                out.push(&spec[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then(|| {
+        out.push(&spec[start..]);
+        out
+    })
+}
+
+/// An address field: a name or an IPv4 literal, or an IPv6 one in `[…]`.
+fn addr_ok(s: &str) -> bool {
+    let inner = match s.strip_prefix('[') {
+        Some(rest) => match rest.strip_suffix(']') {
+            Some(inner) => inner,
+            None => return false,
+        },
+        None => s,
+    };
+    !inner.is_empty() && !inner.contains(['[', ']']) && !inner.contains(char::is_whitespace)
+}
+
+/// Check a `-L` spec before any ssh is spawned: ssh would only find a bad
+/// one per dial, printing its own complaint onto the session's terminal
+/// mid-reconnect (DESIGN §7.1).
+///
+/// Only the TCP forms are taken — `[bind_address:]port:host:hostport`, an
+/// IPv6 literal in `[…]` — because a unix-socket forward's grammar is
+/// ambiguous enough that checking it would reject specs ssh accepts.
+/// `-o LocalForward=…` stays the unchecked pass-through for those.
+pub fn check_local_forward(spec: &str) -> Result<(), String> {
+    let bad = |why: String| {
+        Err(format!(
+            "bad -L '{spec}': {why} — want [bind_address:]port:host:hostport, \
+             as ssh spells it (a unix socket needs -o LocalForward=… instead)"
+        ))
+    };
+    if spec.contains('/') {
+        return bad("acs does not take socket paths here".into());
+    }
+    let Some(fields) = colon_fields(spec) else {
+        return bad("the [] around an address do not balance".into());
+    };
+    let (bind, port, host, hostport) = match fields[..] {
+        [p, h, hp] => (None, p, h, hp),
+        [b, p, h, hp] => (Some(b), p, h, hp),
+        _ => {
+            return bad(format!(
+                "want 3 or 4 colon-separated fields, not {}",
+                fields.len()
+            ))
+        }
+    };
+    // An empty bind address, like `*`, means every interface to ssh.
+    if let Some(b) = bind.filter(|b| !b.is_empty() && *b != "*" && !addr_ok(b)) {
+        return bad(format!("'{b}' is not a bind address"));
+    }
+    for (what, p) in [("port", port), ("hostport", hostport)] {
+        if !matches!(p.parse::<u16>(), Ok(n) if n > 0) {
+            return bad(format!("{what} '{p}' is not a number from 1 to 65535"));
+        }
+    }
+    if !addr_ok(host) {
+        return bad(format!("'{host}' is not a host"));
+    }
+    Ok(())
 }
 
 /// Quote a string for POSIX `sh`.
@@ -235,6 +331,7 @@ mod tests {
             .collect(),
             destination: "me@box".into(),
             identity_file: None,
+            local_forwards: Vec::new(),
             transport_cmd: None,
         }
     }
@@ -363,6 +460,117 @@ mod tests {
         // A value that only looks like the flag is not one.
         tr.user_opts = vec!["-J".into(), "-i".into()];
         assert!(!tr.user_identity());
+    }
+
+    /// acs-6f5: a forward belongs to the user's session. The side and batch
+    /// calls are ssh processes of their own — `acs list`, the remote
+    /// install, the session menu over every alias — and a `-L` on those
+    /// would have several of them binding the same local port at once.
+    #[test]
+    fn a_local_forward_goes_to_the_session_ssh_and_no_other_call() {
+        let mut tr = t();
+        tr.local_forwards = vec!["8080:localhost:80".into(), "5432:db:5432".into()];
+        let v = strs(tr.argv(Call::Session, "R"));
+        let n = v.len();
+        assert_eq!(
+            v[n - 7..],
+            [
+                "-L",
+                "8080:localhost:80",
+                "-L",
+                "5432:db:5432",
+                "--",
+                "me@box",
+                "R"
+            ],
+            "{v:?}"
+        );
+        // After the user's options, so an -o of theirs still wins (§7.1).
+        assert!(
+            v.iter().position(|a| a == "-L") > v.iter().position(|a| a == "-p"),
+            "{v:?}"
+        );
+        for call in [Call::Side, Call::Batch] {
+            let v = strs(tr.argv(call, "R"));
+            assert!(!v.iter().any(|a| a == "-L"), "{call:?}: {v:?}");
+            assert!(!v.iter().any(|a| a.contains("8080")), "{call:?}: {v:?}");
+            // Nothing else about those calls changed.
+            assert_eq!(v, strs(t().argv(call, "R")), "{call:?}");
+        }
+    }
+
+    #[test]
+    fn a_configured_key_still_follows_the_forwards() {
+        let mut tr = t();
+        tr.local_forwards = vec!["8080:localhost:80".into()];
+        tr.identity_file = Some("/keys/devbox".into());
+        tr.user_opts = vec!["-p".into(), "2222".into()];
+        assert_eq!(
+            strs(tr.argv(Call::Session, "R")),
+            [
+                "ssh",
+                "-T",
+                "-e",
+                "none",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "ServerAliveInterval=0",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                "2222",
+                "-L",
+                "8080:localhost:80",
+                "-i",
+                "/keys/devbox",
+                "--",
+                "me@box",
+                "R"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_local_forward_spec_is_checked_before_any_ssh_runs() {
+        for good in [
+            "8080:localhost:80",
+            "127.0.0.1:8080:db.internal:5432",
+            ":8080:h:80",
+            "*:8080:h:80",
+            "8080:[::1]:80",
+            "[::1]:8080:[fe80::1%eth0]:80",
+            "65535:h:1",
+        ] {
+            assert_eq!(check_local_forward(good), Ok(()), "{good}");
+        }
+        let cases = [
+            ("", "want 3 or 4"),
+            ("8080", "want 3 or 4"),
+            ("8080:localhost", "want 3 or 4"),
+            ("8080:localhost:80:9:9", "want 3 or 4"),
+            ("http:localhost:80", "port 'http' is not a number"),
+            ("0:localhost:80", "port '0' is not a number"),
+            ("99999:localhost:80", "port '99999' is not a number"),
+            ("8080:localhost:www", "hostport 'www' is not a number"),
+            ("8080:localhost:0", "hostport '0' is not a number"),
+            ("8080::80", "'' is not a host"),
+            ("1.2.3.4:8080::80", "'' is not a host"),
+            ("nope:8080:h:80/x", "socket paths"),
+            ("/tmp/s:localhost:80", "socket paths"),
+            ("[::1:8080:h:80", "do not balance"),
+            ("]:8080:h:80", "do not balance"),
+            ("[a][b]:8080:h:80", "is not a bind address"),
+            ("8080:host name:80", "is not a host"),
+        ];
+        for (bad, want) in cases {
+            let e = check_local_forward(bad).unwrap_err();
+            assert!(e.contains(want), "{bad:?}: {e}");
+            // Every complaint says what a spec should look like.
+            assert!(e.contains("port:host:hostport"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

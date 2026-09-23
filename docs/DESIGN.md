@@ -147,8 +147,10 @@ lives in the master and the client.
   client returns to its backoff wait, where `d` still detaches (§6.1).
 - Everything else — keys, agent, `ProxyJump`, host aliases — comes from the
   user's ssh config unchanged, plus any ssh options given on the `acs`
-  command line (`-i`, `-p`, `-J`, `-F`, `-o`; §7.1). `acs` opens no ports
-  and has no auth of its own.
+  command line (`-i`, `-p`, `-J`, `-F`, `-o`; §7.1). `acs` has no auth of
+  its own, and opens no port of its own: the only local socket it can
+  listen on is one `-L` asked ssh for, on the session's connection alone
+  (§7.1).
 
 **No ssh-side configuration.** The client runs the system `ssh` binary as a
 child process; the `-o` options above are per-invocation overrides and never
@@ -841,7 +843,8 @@ A handful of ssh's own options are accepted with ssh's spelling and meaning,
 and passed **verbatim** to every ssh call `acs` makes — the session transport,
 reconnects, `acs list` and remote install — so a host reachable as
 `ssh -i ~/.ssh/id_work -p 2222 me@box` is reachable as
-`acs -i ~/.ssh/id_work -p 2222 me@box`:
+`acs -i ~/.ssh/id_work -p 2222 me@box`. `-L` is the one exception, and goes
+to the session's ssh alone:
 
 | Option | Meaning (as in ssh) |
 | --- | --- |
@@ -850,6 +853,7 @@ reconnects, `acs list` and remote install — so a host reachable as
 | `-J <destination>` | jump host(s) |
 | `-F <configfile>` | alternative ssh config file |
 | `-o <option=value>` | any ssh config option; repeatable (e.g. `-o IdentitiesOnly=yes` to use **only** the `-i` key rather than the agent's keys first) |
+| `-L [bind_address:]port:host:hostport` | forward a local port; repeatable — but on the session's connection only, see below |
 | `[user@]host` | login name in the destination, as with ssh |
 
 - **No `-l`**: ssh's `-l <login>` is not accepted (and `dsh`'s `-l`, its
@@ -868,6 +872,53 @@ reconnects, `acs list` and remote install — so a host reachable as
   `ControlMaster=no`, `ControlPath=none`, `ServerAliveInterval=0`) **before**
   the user's. A stray `-o ControlMaster=auto` cannot break reconnects; every
   other option, including all `-i` keys, applies as given.
+
+**Local forwards (`-L`)** are the one option `acs` does not hand to every ssh
+call, and the one whose value it checks before running any:
+
+- **The session's ssh, and no other call.** `acs` makes three kinds of ssh
+  call (`Call` in `ssh.rs`): the session transport, a *side* call
+  (`acs list <host>`, remote install, ending a session from the menu) and a
+  *batch* call (`acs list` over every alias, §7.3). They are separate ssh
+  processes, often several at once, so a forward handed to all of them would
+  have each one try to bind the same local port. ssh's default
+  `ExitOnForwardFailure=no` makes that a warning per call rather than a
+  failure — noise on a terminal `acs` otherwise keeps clean, and wrong. `-L`
+  is therefore emitted for the session call only, after the user's options.
+  The menu's connection *is* the session's (§4.4), so a plain
+  `acs -L … host` binds the port once, as soon as it connects.
+- **Checked by `acs`, not per dial by ssh.** A malformed spec would otherwise
+  be found by ssh on every dial, mid-reconnect-loop, as a line of ssh stderr
+  across the session's screen. `acs` parses
+  `[bind_address:]port:host:hostport` — an IPv6 literal in `[…]`, an empty
+  bind address or `*` for every interface — and refuses a bad one with its
+  own error before spawning anything.
+- **`-o LocalForward=…` still works, and differs.** It is an unchecked
+  pass-through like any other `-o`, so it reaches *every* ssh call (the
+  duplicate bind above is exactly what it gets wrong), and it takes the
+  config file's spelling — `-o LocalForward="8080 localhost:80"`, a space
+  where `-L` has a colon. It stays as the escape hatch for what `-L` does
+  not accept: unix-socket forwards, whose grammar is ambiguous enough that
+  validating it would reject specs ssh takes.
+- **The forward drops briefly across a redial.** It belongs to the ssh child,
+  which dies with the link, and the listening socket goes with it; the next
+  dial rebinds it, since the argv is rebuilt from `Transport` every time
+  (§5.3). Connections through it do not survive — nothing tunnels their TCP
+  state — and if the port cannot be rebound (a second `acs` took it
+  meanwhile, a stale `TIME_WAIT`) ssh warns and the session continues
+  without it. `ExitOnForwardFailure=yes` is deliberately *not* set: losing
+  the shell because a convenience port is busy is the worse trade. Anyone
+  who wants the other one can pass `-o ExitOnForwardFailure=yes`, which
+  costs a redial loop for as long as the port stays taken.
+- **Not a runtime control** (non-goal). Command mode (§6) cannot add or drop
+  a forward on a running session: ssh's `~C` prompt is off (`-e none`) and
+  the control socket with it (`ControlMaster=no`, `ControlPath=none`), so
+  there is no channel to reconfigure a live ssh — changing a forward means
+  tearing the link down and redialling — and command mode has no prompt or
+  line editor to type a spec into.
+- **No `-R`, no `-D`.** Only the forward the local user asked for is taken;
+  `-o RemoteForward=…` and `-o DynamicForward=…` remain available, with the
+  every-call caveat above.
 
 ### 7.2 Configuration file
 
