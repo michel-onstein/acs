@@ -1059,6 +1059,29 @@ one of the alias's entries instead of `<name>`:
   another would make, only in at most one deadline instead of one per host.
   A later host that answers first waits for the earlier ones; `-v` lines
   and the "tried …" error keep the configured order.
+- **Every entry accounts for itself** under `-v` (acs-qis): one line each,
+  so a host missing from the output means a host missing from the
+  configuration. Beyond the lines above — the locality of an entry, the
+  key, the login name, a host that did not answer, the one that was used —
+  the entries the choice never reached are named too, after the "using"
+  line and in rank order, continuing the walk that made the choice:
+  - `<host> not tried: <chosen> was chosen first` — it is ranked behind the
+    entry that was taken, so the trial loop stopped before it. It was in
+    the running: had the entries before it all failed to answer, it would
+    have been pinged.
+  - `<host> not tried: it is listed after <unchecked>, whose
+    reachability_check is off` — it is ranked behind an entry that is taken
+    without a ping, so it was pruned before anything was pinged
+    (`candidates`) and could not have been chosen however the pings went.
+    This is the reason worth giving over the one above, and `alias::untried`
+    gives it whenever the unchecked entry is not itself the one chosen (when
+    it is, the entries behind it were simply beaten to it).
+  - Nothing is added on the **failure path**: with no unchecked entry there
+    is nothing to prune, so every entry was reached and already says why,
+    and the error names them all.
+  - It is one level: `-v` shows all of it. `args.verbose` counts the flag
+    (`-vv`) but nothing reads the count — a second level is worth adding
+    when a single one is shown to be too noisy, not before.
 - **The deadline** is `reachability_timeout` (§7.2): 500 ms by default, the
   alias's own value over the global one. An answer after it counts as none.
   acs keeps the deadline itself, to the millisecond, since macOS `ping -t`

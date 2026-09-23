@@ -371,8 +371,20 @@ file and line.
 
 Without a
 `user`, your `~/.ssh/config` picks the login name. If no entry
-answers, acs lists the hosts it tried and exits with 255. `-v` shows which
-entry was chosen and why.
+answers, acs lists the hosts it tried and exits with 255. `-v` accounts
+for **every** entry of the alias, one line each: which was chosen and why,
+which did not answer its ping, and — the entries the choice never reached
+— which host was chosen before them, or which `reachability_check: false`
+entry they are listed behind and so could never have been used:
+
+```text
+acs: devbox: devbox.lan does not answer ping within 500ms
+acs: devbox: devbox.vpn answers ping, using devbox.vpn
+acs: devbox: devbox.backup not tried: devbox.vpn was chosen first
+acs: devbox: devbox.old not tried: it is listed after devbox.backup, whose reachability_check is off
+```
+
+The untried entries come last, continuing the order the choice walked in.
 
 The alias is resolved again on every reconnect, so when you move from home
 to outside, the redial goes to whichever address answers. List ways of
