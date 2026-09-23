@@ -174,19 +174,43 @@ fn no_reconnect_exits_on_a_drop() {
 /// dead interval is not a lost link. The client blocks writing to stdout
 /// meanwhile, and judged liveness by what it had decoded before the block
 /// rather than by the bytes waiting in the pipe.
+///
+/// The 8 s pause is the stimulus and stays a sleep: it must *exceed*
+/// `ACS_DEAD_MS` (800 ms), and a starved host can only make it longer. What
+/// followed it was a 500 ms settle before a negative assertion, which a
+/// stalled host silently turns into no test at all (acs-7wu). The settle is
+/// now an event: the session prints `RESUMED` only once the flag file is
+/// there, and the flag is written after the terminal starts draining again,
+/// so those bytes cannot be among the ones buffered during the pause — they
+/// were produced afterwards and carried across the same link. Seeing them is
+/// the client saying it read the host after the write unblocked and lived,
+/// which is exactly the moment the bug fired: the first `tick` after the
+/// unblocking write, with the newly read bytes not yet decoded. Waiting for
+/// output alone would not do — on unpause the flood of buffered `y`s arrives
+/// whether the link was kept or dropped and redialled.
+///
+/// The stimulus itself is untouched: the flag test is a shell builtin beside
+/// two forks already in the loop, and until the flag appears the frame is the
+/// same 101 bytes, so the trickle that fills the terminal's buffer mid-pause
+/// is the one acs-7k7 was reproduced with.
 #[test]
 fn a_stalled_terminal_is_not_a_dead_link() {
     let remote = Remote::installed();
     // The master keeps its client for a minute (it has its own liveness,
     // acs-ode); this is about the client's judgement of the master.
     remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
+    let go = remote.root.path().join("go");
     let mut c = start(
         &remote,
         "stall",
         // A trickle: one small frame per read, and the terminal's buffer
         // fills partway through the pause, blocking the client in a write
         // with nothing left to decode.
-        "echo up; while true; do head -c 100 /dev/zero | tr '\\0' y; echo; sleep 0.05; done",
+        &format!(
+            "echo up; while true; do head -c 100 /dev/zero | tr '\\0' y; \
+             [ -f '{}' ] && printf RESUMED; echo; sleep 0.05; done",
+            go.display()
+        ),
         FAST,
     );
     c.wait_for("up", T);
@@ -194,11 +218,25 @@ fn a_stalled_terminal_is_not_a_dead_link() {
     c.set_paused(true);
     std::thread::sleep(Duration::from_secs(8));
     c.set_paused(false);
-    std::thread::sleep(Duration::from_millis(500));
+    // Only now, so every RESUMED is output made after the stall.
+    std::fs::write(&go, "").unwrap();
+    c.wait_for("RESUMED", T);
     assert_eq!(remote.transport_pids().len(), 1, "the link was given up on");
     assert!(!c.text().contains("reconnecting"), "{}", c.text());
 }
 
+/// The detach key is honoured during the offline wait, rather than noticed
+/// when the wait expires — which is what the elapsed bound distinguishes, so
+/// it stays a bound on elapsed time (acs-7wu).
+///
+/// What changed is the room it has: two minutes of backoff against the
+/// suite's own `T`, where it was 20 s against 5 s. The same statement — an
+/// exit a quarter of the way into the wait cannot be the wait ending — with
+/// six times the slack. `T` rather than a number of its own is the point:
+/// the backoff now outlasts every deadline in the suite, so a detach that
+/// waited for it is caught by the `c.wait(T)` above as well, and this bound
+/// is the one thing in the test that cannot be starved past first. acs-o8h
+/// made the same move in `the_escape_window_is_the_same_offline`.
 #[test]
 fn detach_works_while_the_link_is_down() {
     let remote = Remote::installed();
@@ -206,15 +244,15 @@ fn detach_works_while_the_link_is_down() {
         &remote,
         "dd",
         "echo up; sleep 30",
-        &[("ACS_BACKOFF_MS", "20000")],
+        &[("ACS_BACKOFF_MS", "120000")],
     );
     c.wait_for("up", T);
     remote.cut_link();
-    c.wait_for("reconnecting in 20s", T);
+    c.wait_for("reconnecting in 120s", T);
     let t0 = Instant::now();
     c.send(&command(b'd'));
     assert_eq!(c.wait(T), 0);
-    assert!(t0.elapsed() < Duration::from_secs(5));
+    assert!(t0.elapsed() < T, "{:?}", t0.elapsed());
     c.wait_for("detached from devbox/dd", T);
     assert!(c.echo_on());
     // The title pushed for the status line was popped again.
@@ -390,6 +428,9 @@ fn modes_of_a_restarted_session_are_reset() {
     }
 }
 
+/// A network change redials out of the offline wait instead of sitting it
+/// out — again a statement about elapsed time, and again with two minutes of
+/// backoff against `T` rather than 20 s against 5 s (acs-7wu).
 #[test]
 fn a_network_change_redials_at_once() {
     let remote = Remote::installed();
@@ -401,17 +442,17 @@ fn a_network_change_redials_at_once() {
         &remote,
         "net",
         TICKER,
-        &[("ACS_BACKOFF_MS", "20000"), ("ACS_NETWATCH_FIFO", &fifo_s)],
+        &[("ACS_BACKOFF_MS", "120000"), ("ACS_NETWATCH_FIFO", &fifo_s)],
     );
     c.wait_for("#10#", T);
     remote.cut_link();
-    c.wait_for("reconnecting in 20s", T);
+    c.wait_for("reconnecting in 120s", T);
     let t0 = Instant::now();
     // Wi-Fi came back: the watcher fires, the client redials now.
     let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
     std::io::Write::write_all(&mut w, b"up").unwrap();
-    remote.wait_connections(2, Duration::from_secs(5));
-    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    remote.wait_connections(2, T);
+    assert!(t0.elapsed() < T, "{:?}", t0.elapsed());
     let target = last_number(&c) + 20;
     c.wait_for(&format!("#{target}#"), T);
     assert_consecutive(&c.text());
