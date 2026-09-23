@@ -541,5 +541,11 @@ scripts/release-binaries.sh  # (re)publish a tag's binaries to GitHub Releases
 scripts/update-tap.sh vX.Y.Z # point the Homebrew tap at a release
 ```
 
+`scripts/e2e_ssh.sh --no-build` reuses the binaries already in `dist/` (about
+20 s instead of a minute), but only when `dist/source.stamp` says they were
+built from the tree as it is now — otherwise it refuses, since a failure from
+a stale binary looks exactly like a real one. `--allow-stale-dist` runs it
+anyway.
+
 Results of the checks that need a real terminal are in
 [docs/VERIFICATION.md](docs/VERIFICATION.md).

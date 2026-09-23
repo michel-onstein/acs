@@ -76,4 +76,8 @@ claimed as verified:
   the owner's call.
 
 To run the automated part again: `scripts/e2e_ssh.sh` (add `--no-build` to
-reuse `dist/`).
+reuse `dist/`, which takes the suite from about a minute to about 20 s).
+`--no-build` reuses `dist/` only if `dist/source.stamp` — written by
+`cargo xtask dist`, a hash of the sources it built from — matches this tree,
+so an edit made since the build is refused rather than silently tested
+against the old binary (acs-gb4). `--allow-stale-dist` says you mean it.
