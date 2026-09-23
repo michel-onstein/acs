@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::process::Command;
+
 use acs::proto::{Marker, Mode, Msg};
 use acs::testutil::{hello, FrameConn};
 use common::*;
@@ -91,6 +93,40 @@ fn dropping_a_remote_ends_its_sessions() {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// Regression (acs-fzx): the helpers that configure the remote side all
+/// write one file, and `remote_env` used to write it *whole* — so calling
+/// it after `remote_umask` or `log_master` silently discarded their
+/// settings, leaving a test that still passed while no longer configuring
+/// what its name said it configured. Set three of them in that once-fatal
+/// order and ask the transport what the remote side actually sees: every
+/// setting must be there.
+#[test]
+fn remote_env_helpers_compose_in_any_order() {
+    let remote = Remote::new();
+    remote.remote_umask("077");
+    remote.log_master();
+    remote.remote_env(&[("ACS_DEAD_MS", "60000")]);
+
+    let out = output_of(
+        Command::new(remote.transport())
+            .arg("umask; printf '%s\\n' \"$ACS_DEAD_MS\" \"$ACS_MASTER_LOG\""),
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    assert_eq!(lines.len(), 3, "{text:?}");
+    // Printed as `077` or `0077` depending on the shell; both are 0o77.
+    assert_eq!(
+        u32::from_str_radix(lines[0], 8).ok(),
+        Some(0o77),
+        "umask lost: {text:?}"
+    );
+    assert_eq!(lines[1], "60000", "remote_env lost: {text:?}");
+    assert!(
+        lines[2].ends_with("master.log"),
+        "log_master lost: {text:?}"
+    );
 }
 
 /// Regression: waiting twice for the same text waits for its second

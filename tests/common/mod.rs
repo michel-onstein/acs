@@ -359,12 +359,27 @@ impl Remote {
         self.root.path().join("remote-env")
     }
 
+    /// Add one shell line to the environment the transport sources before
+    /// the remote command. **Every helper that configures the remote side
+    /// goes through here, and here only ever appends** (acs-fzx): one that
+    /// wrote the file whole would silently drop whatever the others had
+    /// already set, and which setting survived would depend on the order a
+    /// test happened to call them in — a test that still passes while no
+    /// longer configuring what its name says it configures.
+    fn remote_env_line(&self, line: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.remote_env_file())
+            .unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
     /// Run the remote side under `mask`, a restrictive umask (077) masking
     /// the mode files are created with.
     pub fn remote_umask(&self, mask: &str) {
-        let mut body = std::fs::read_to_string(self.remote_env_file()).unwrap_or_default();
-        body.push_str(&format!("umask {mask}\n"));
-        std::fs::write(self.remote_env_file(), body).unwrap();
+        self.remote_env_line(&format!("umask {mask}"));
     }
 
     /// Turn the master's debug log on (`ACS_MASTER_LOG`). It is the only
@@ -373,12 +388,10 @@ impl Remote {
     /// wait it says so whatever the host's load is doing (acs-o6x). Call
     /// before the client starts; read with [`Remote::master_log`].
     pub fn log_master(&self) {
-        let mut body = std::fs::read_to_string(self.remote_env_file()).unwrap_or_default();
-        body.push_str(&format!(
-            "export ACS_MASTER_LOG='{}'\n",
+        self.remote_env_line(&format!(
+            "export ACS_MASTER_LOG='{}'",
             self.master_log_file().display()
         ));
-        std::fs::write(self.remote_env_file(), body).unwrap();
     }
 
     /// What the master has logged so far, empty until it writes its first
@@ -394,11 +407,9 @@ impl Remote {
     /// Environment for the remote side only (the proxy and the master),
     /// where the client's own must differ — different liveness timers, say.
     pub fn remote_env(&self, vars: &[(&str, &str)]) {
-        let body: String = vars
-            .iter()
-            .map(|(k, v)| format!("export {k}='{v}'\n"))
-            .collect();
-        std::fs::write(self.remote_env_file(), body).unwrap();
+        for (k, v) in vars {
+            self.remote_env_line(&format!("export {k}='{v}'"));
+        }
     }
 
     /// Make new connections take `secs` seconds to reach the remote command,
