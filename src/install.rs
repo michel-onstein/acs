@@ -80,20 +80,28 @@ pub fn plan(
     ))
 }
 
-/// The one-line installer: it puts a release where the prelude looks for it.
-pub const INSTALLER: &str =
-    "https://github.com/michel-onstein/acs/releases/latest/download/install.sh";
+/// The one-line installer: it puts a release where the prelude looks for
+/// it. It travels with each release, so it is the one beside this build's
+/// releases ([`crate::release::DEFAULT_RELEASES_URL`]) — a fork's users
+/// are told to install the fork, not upstream (acs-5em).
+pub fn installer() -> String {
+    format!(
+        "{}/latest/download/install.sh",
+        crate::release::DEFAULT_RELEASES_URL
+    )
+}
 
 /// What to say when the remote lacks acs and `install_on_remote` is off.
 pub fn not_installing(args: &ClientArgs, os: &str, arch: &str) -> String {
     let v = crate::VERSION;
+    let installer = installer();
     let why = match &args.config.install_on_remote.origin {
         Some(o) => format!(" ({o})"),
         None => String::new(),
     };
     format!(
         "acs {v} is not installed on {host} ({os} {arch}), and install_on_remote is false{why}; \
-         install it there with `curl -fsSL {INSTALLER} | ACS_VERSION={v} sh`, or set install_on_remote: true",
+         install it there with `curl -fsSL {installer} | ACS_VERSION={v} sh`, or set install_on_remote: true",
         host = args.transport.destination
     )
 }
@@ -465,6 +473,27 @@ mod tests {
             gz: b"GZ",
         }]))
         .unwrap()
+    }
+
+    /// acs-5em: the installer in the "not installed" message is the one
+    /// beside this build's releases, so a fork built with its own
+    /// `ACS_DEFAULT_RELEASES_URL` does not send its users upstream.
+    #[test]
+    fn the_one_line_installer_follows_this_builds_releases() {
+        assert_eq!(
+            installer(),
+            format!(
+                "{}/latest/download/install.sh",
+                crate::release::DEFAULT_RELEASES_URL
+            )
+        );
+        // An upstream build: the URL that has always been printed.
+        if crate::release::DEFAULT_RELEASES_URL == crate::release::UPSTREAM_RELEASES_URL {
+            assert_eq!(
+                installer(),
+                "https://github.com/michel-onstein/acs/releases/latest/download/install.sh"
+            );
+        }
     }
 
     #[test]
