@@ -75,14 +75,29 @@ fn cut_link_mid_stream_resumes_without_loss() {
 /// Regression (acs-ode): under steady output the client hears the master
 /// and never pings on its own, so only its PONG to the master's PING keeps
 /// the master from giving it up.
+///
+/// What is waited for is the answers, not a stretch of wall clock with the
+/// link still standing (acs-o6x). The old shape slept past a few of the
+/// master's ping intervals and then counted connections, which asks the
+/// host as much as it asks acs: descheduling either process for longer
+/// than `ACS_DEAD_MS` — 800 ms here — is a dropped link and a red gate for
+/// a client that was never at fault, and on a busy laptop that happens.
+/// The master's count restarts with each connection, so eight answers in a
+/// row are eight liveness rounds *one* link came through: a client that
+/// stops answering never gets there (nothing is logged at all), nor does a
+/// master that stops counting the answers as having heard it — it gives
+/// the link up after three. A host that stalls only makes it take longer.
 #[test]
 fn a_client_busy_with_output_answers_the_masters_ping() {
     let remote = Remote::installed();
+    remote.log_master();
     let mut c = start(&remote, "busy", TICKER, FAST);
     c.wait_for("#20#", T);
-    std::thread::sleep(Duration::from_secs(3));
-    assert_eq!(remote.transport_pids().len(), 1, "the link was dropped");
-    assert!(!c.text().contains("reconnecting"));
+    c.wait_until(
+        "the client has answered eight of the master's pings on one link",
+        |_| remote.master_log().contains("answered ping 8 on this link"),
+        T,
+    );
 }
 
 #[test]

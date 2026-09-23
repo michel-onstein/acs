@@ -362,6 +362,30 @@ impl Remote {
         std::fs::write(self.remote_env_file(), body).unwrap();
     }
 
+    /// Turn the master's debug log on (`ACS_MASTER_LOG`). It is the only
+    /// window a test has on what the master made of a link — whether it
+    /// heard the client, and why it gave it up — and unlike a wall-clock
+    /// wait it says so whatever the host's load is doing (acs-o6x). Call
+    /// before the client starts; read with [`Remote::master_log`].
+    pub fn log_master(&self) {
+        let mut body = std::fs::read_to_string(self.remote_env_file()).unwrap_or_default();
+        body.push_str(&format!(
+            "export ACS_MASTER_LOG='{}'\n",
+            self.master_log_file().display()
+        ));
+        std::fs::write(self.remote_env_file(), body).unwrap();
+    }
+
+    /// What the master has logged so far, empty until it writes its first
+    /// line. See [`Remote::log_master`].
+    pub fn master_log(&self) -> String {
+        std::fs::read_to_string(self.master_log_file()).unwrap_or_default()
+    }
+
+    fn master_log_file(&self) -> PathBuf {
+        self.root.path().join("master.log")
+    }
+
     /// Environment for the remote side only (the proxy and the master),
     /// where the client's own must differ — different liveness timers, say.
     pub fn remote_env(&self, vars: &[(&str, &str)]) {

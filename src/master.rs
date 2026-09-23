@@ -269,6 +269,10 @@ struct Conn {
     /// Pings the attached client after silence and gives it up when it
     /// stays silent (DESIGN §5.3, acs-ode).
     live: Liveness,
+    /// How many of our PINGs this connection has answered. It restarts
+    /// with the connection, so the debug log says how many liveness rounds
+    /// *one* link survived rather than how many went by (acs-o6x).
+    answered: u64,
 }
 
 impl Conn {
@@ -605,6 +609,7 @@ impl Master {
                         since: 0,
                         dead: false,
                         live: Liveness::new(),
+                        answered: 0,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -737,6 +742,17 @@ impl Master {
             }
             Msg::Resize(s) => self.resize(s, false),
             Msg::Ping(n) => self.conns[i].send(&Msg::Pong(n)),
+            // Our own PING answered. `read_conn` has already counted the
+            // bytes as liveness; the line is what a test — and anyone
+            // reading the log after a link was given up on — can see the
+            // handshake by, and its number restarts with the link.
+            Msg::Pong(_) => {
+                self.conns[i].answered += 1;
+                mlog!(
+                    "the client answered ping {} on this link",
+                    self.conns[i].answered
+                );
+            }
             Msg::Detach => {
                 mlog!("client detached");
                 self.conns[i].state = ConnState::Closing;
