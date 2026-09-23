@@ -1,6 +1,6 @@
 # acs — verification
 
-**Status:** Automated end-to-end checks pass (2026-09-18); the checks that
+**Status:** Automated end-to-end checks pass (2026-09-23); the checks that
 need a person at a real terminal are listed at the end, not yet done.
 
 What the unit and integration tests cannot show is checked here: acs over a
@@ -15,7 +15,9 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 - Host: Alpine Linux container (`scripts/e2e/Dockerfile`) running OpenSSH
   `sshd`, user `dev` accepting only a freshly generated ed25519 key, reached
   as `acs -F /dev/null -i <key> -p <port> … dev@127.0.0.1` (a free port docker
-  picks, or `ACS_E2E_PORT`).
+  picks, or `ACS_E2E_PORT`). The image sets `AllowTcpForwarding yes`, which
+  Alpine ships as `no`, so that `-L` can be exercised at all; that is a test
+  fixture and not something acs installs or asks a host for.
 - Linux suite: `rust:alpine` container, musl, run as root with users `alice`
   and `bob`.
 
@@ -25,7 +27,7 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 | --- | --- | --- |
 | First contact installs acs | fresh host; client streams its Linux aarch64 payload, `_install --finish` completes it | Pass — installed, session attached |
 | `-i` selects the key | same command without `-i` (`IdentitiesOnly=yes`, `BatchMode=yes`) | Pass — exit 255 without it, works with it |
-| `-L` forwards a port | `acs -L 19080:127.0.0.1:22 … dev@127.0.0.1 demo -- sleep 300`, the port read with `nc`, then the session's ssh killed to force a redial; the container's sshd set to `AllowTcpForwarding yes` (Alpine ships `no`) (2026-09-23) | Pass — only the session's ssh binds 19080 (`acs list -v` on the same host shows no `-L`), the container's sshd banner comes back through it, and after the redial a new ssh rebinds the port and the banner comes back |
+| `-L` forwards a port, and only on the session's ssh | `scripts/e2e_ssh.sh` (`e2e_14`): `acs -L <free port>:127.0.0.1:22 … dev@127.0.0.1 fwd`, the port read with a plain TCP connect, `acs list` given the same `-L` while the session holds the port, then the session's ssh killed to force a redial (2026-09-23) | Pass — the container's sshd banner comes back through the port; the `acs list` side call succeeds and its stderr never names the port, so its ssh never asked to bind it; after the redial a new ssh rebinds the port and the banner comes back |
 | vim | `vim -u NONE -N`, then `:q` | Pass — alternate screen entered and left, exit status 0, terminal restored |
 | OSC 52 and OSC 8 | program prints a clipboard write and a hyperlink | Pass — both byte-exact at the client |
 | Kitty keyboard protocol | program pushes kitty flags; client sends Ctrl-] Ctrl-] d as `CSI 93;5u` | Pass — detaches; the pushed flags are popped on the way out |
