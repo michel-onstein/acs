@@ -1334,6 +1334,14 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
     the upgrade. There is deliberately no path that skips the check, and a
     test asserts the built-in key is not empty. The same key is in
     `install.sh`, and a test asserts the two have not drifted.
+  - **Which key is built in is itself a choice**: a build with
+    `ACS_DEFAULT_RELEASE_KEY` set bakes in another one, beside the
+    `ACS_DEFAULT_RELEASES_URL` it belongs to, for a fork that signs its own
+    releases (VERSIONING.md, "Forking"). Unset it is acs's own key — the
+    one `install.sh` carries — an empty value counts as unset, and a value
+    that is not an ssh public key line fails the build. Like the URL, that
+    is the builder's decision rather than the environment's, so it carries
+    none of the limits the runtime overrides below do.
   - **What it does not cover**: the first fetch of `install.sh` itself is
     unsigned — signing the checksums cannot fix trust on first use. The
     public key is published in the Homebrew tap, a repository of its own,

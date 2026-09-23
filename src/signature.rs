@@ -19,15 +19,44 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// The public half of the key that signs acs releases. The private half
-/// signs `SHA256SUMS` in `scripts/release-binaries.sh`; it is not on any
-/// machine that only *runs* acs.
+/// The public half of the key that signs acs's own releases: the key of a
+/// build that was not told otherwise. The private half signs `SHA256SUMS`
+/// in `scripts/release-binaries.sh`; it is not on any machine that only
+/// *runs* acs.
 ///
 /// Also published in the Homebrew tap, which is a repository of its own:
 /// someone who wants to check this key against a second source, rather
 /// than trusting the binary that carries it, has one.
-pub const RELEASE_KEY: &str =
+pub const UPSTREAM_RELEASE_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILbxQW5C9X7CdwcQ4bab0gsQi4Evk2xfgmI/972dlHCb acs release signing";
+
+/// The public half of the key this build checks releases against —
+/// [`UPSTREAM_RELEASE_KEY`], or whatever `ACS_DEFAULT_RELEASE_KEY` named
+/// when the binary was built (`build.rs`, docs/VERSIONING.md "Forking").
+///
+/// It travels with [`crate::release::DEFAULT_RELEASES_URL`], and the two
+/// are only useful together: [`key_for`] checks the channel this build
+/// updates from against this key and nothing else, so a fork that bakes in
+/// its own releases URL and keeps acs's key cannot verify its own releases
+/// (acs-ktm). That is a choice made by whoever builds the binary, who
+/// already decides what it does; it is not the runtime `ACS_RELEASE_KEY`
+/// override, which keeps every limit it has.
+///
+/// Nothing here can turn verification off. An empty value counts as unset
+/// and leaves acs's own key in place, and `build.rs` refuses to build a
+/// value that is not an ssh public key line, so a mistyped key is a build
+/// error rather than a release nobody can install.
+pub const RELEASE_KEY: &str = release_key(option_env!("ACS_DEFAULT_RELEASE_KEY"));
+
+/// The build-time key: what `build.rs` passed, or acs's own. An empty
+/// value counts as unset, so `ACS_DEFAULT_RELEASE_KEY=` cannot leave a
+/// build with no key to check a signature against.
+const fn release_key(built_in: Option<&'static str>) -> &'static str {
+    match built_in {
+        Some(key) if !key.is_empty() => key,
+        _ => UPSTREAM_RELEASE_KEY,
+    }
+}
 
 /// The principal this key signs as, in the allowed-signers file and as
 /// `-I` when verifying.
@@ -53,9 +82,11 @@ fn allowed_signers(key: &str) -> String {
 
 /// The key a release from `base` is checked against.
 ///
-/// For the release channel acs actually ships from this is [`RELEASE_KEY`]
-/// and nothing else: there is no environment variable, no flag and no file
-/// that can put another key in its place.
+/// For the release channel this build actually ships from this is
+/// [`RELEASE_KEY`] and nothing else: there is no environment variable, no
+/// flag and no file that can put another key in its place. Which key that
+/// is was settled when the binary was built — acs's own, or a fork's
+/// (acs-ktm) — and so was the channel it belongs to.
 ///
 /// `ACS_RELEASE_KEY` is read only when `base` is *not* that channel — when
 /// `ACS_RELEASES_URL` already points acs somewhere else, which the tests do
@@ -189,6 +220,30 @@ mod tests {
     }
 
     const SUMS: &str = "abc  acs-1.2.3-x86_64-unknown-linux-musl.tar.gz\n";
+
+    /// acs-ktm: a fork builds with `ACS_DEFAULT_RELEASE_KEY` set and its
+    /// binaries check its own releases against its own key; unset — every
+    /// upstream build — the key is acs's own, unchanged.
+    #[test]
+    fn the_release_key_can_be_set_at_build_time() {
+        // Unset: today's key.
+        assert_eq!(
+            release_key(None),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILbxQW5C9X7CdwcQ4bab0gsQi4Evk2xfgmI/972dlHCb acs release signing"
+        );
+        assert_eq!(release_key(None), UPSTREAM_RELEASE_KEY);
+        // Set: the fork's key.
+        let theirs = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPfNoK6xJ0aUTVQO2S4pfnCbFrwVzBc5SkMRqgP4ePxX fork release signing";
+        assert_eq!(release_key(Some(theirs)), theirs);
+        // Set to nothing is not a build with no key to check against.
+        assert_eq!(release_key(Some("")), UPSTREAM_RELEASE_KEY);
+        // This build made the same choice, whichever it was.
+        assert_eq!(
+            RELEASE_KEY,
+            release_key(option_env!("ACS_DEFAULT_RELEASE_KEY"))
+        );
+        assert!(!RELEASE_KEY.trim().is_empty());
+    }
 
     #[test]
     fn a_signature_from_the_release_key_verifies() {

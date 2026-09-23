@@ -304,11 +304,22 @@ fn the_installer_carries_the_same_release_key_and_checks_before_reading() {
         .expect("the installer names a release key")
         .trim_matches('"')
         .to_string();
+    // The script is copied into each release as it is, so it carries acs's
+    // own key rather than this build's: a fork edits that line as it edits
+    // the script's default releases URL (acs-ktm, VERSIONING.md
+    // "Forking"). In every build but a fork's the two are one key.
     assert_eq!(
         key,
-        acs::signature::RELEASE_KEY,
-        "the installer's release key is not the one built into acs"
+        acs::signature::UPSTREAM_RELEASE_KEY,
+        "the installer's release key is not acs's own"
     );
+    if acs::signature::RELEASE_KEY == acs::signature::UPSTREAM_RELEASE_KEY {
+        assert_eq!(
+            key,
+            acs::signature::RELEASE_KEY,
+            "the installer's release key is not the one built into acs"
+        );
+    }
     // The identity and the namespace must match too, or a signature this
     // binary accepts is one the installer rejects.
     assert!(

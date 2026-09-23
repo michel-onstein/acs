@@ -27,10 +27,11 @@ pub const UPSTREAM_RELEASES_URL: &str = "https://github.com/michel-onstein/acs/r
 /// the guards the runtime `ACS_RELEASES_URL` override carries (acs-95w):
 /// those exist because the *environment* of a run is not the builder's.
 ///
-/// A fork that also signs its own releases must replace
-/// [`crate::signature::RELEASE_KEY`] too — the built-in key is the one
-/// used for whatever this constant names, and nothing at runtime can
-/// replace it there.
+/// A fork that also signs its own releases sets
+/// [`crate::signature::RELEASE_KEY`] in the same build
+/// (`ACS_DEFAULT_RELEASE_KEY`, acs-ktm) — the built-in key is the one used
+/// for whatever this constant names, and nothing at runtime can replace it
+/// there.
 pub const DEFAULT_RELEASES_URL: &str =
     default_releases_url(option_env!("ACS_DEFAULT_RELEASES_URL"));
 
