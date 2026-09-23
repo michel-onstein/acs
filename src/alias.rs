@@ -4,7 +4,9 @@
 //! `prefer: true`, then the configured order. An entry is local either
 //! because the host resolves onto a network this machine's interfaces are
 //! on (`prefer_local_network`) or because this machine is on one of the
-//! entry's own `local_networks` (acs-9yv).
+//! entry's own `local_networks` (acs-9yv). Under `-v` every entry of the
+//! alias accounts for itself, the ones the choice never reached included
+//! (acs-qis).
 
 use std::ffi::OsStr;
 use std::net::IpAddr;
@@ -126,12 +128,15 @@ fn pick(
             let _ = tx.send((i, reachable(&host, timeout)));
         });
     };
+    // The first unchecked entry in the rank: it is taken as soon as it is
+    // reached, so nothing ranked after it can ever be chosen.
+    let unchecked = |order: &[usize]| order.iter().position(|&i| !entries[i].reachability_check);
     // Nothing ranked after an unchecked host can be chosen, so nothing
     // there is pinged.
-    let candidates = |order: Vec<usize>| -> Vec<usize> {
-        match order.iter().position(|&i| !entries[i].reachability_check) {
+    let candidates = |order: &[usize]| -> Vec<usize> {
+        match unchecked(order) {
             Some(p) => order[..=p].to_vec(),
-            None => order,
+            None => order.to_vec(),
         }
     };
     // Caller-side first: it is this machine's own addresses against each
@@ -140,17 +145,19 @@ fn pick(
         Some(l) => caller_side(&entries, &l.network),
         None => vec![None; entries.len()],
     };
-    let order = match locality.as_ref().filter(|l| l.by_host) {
+    // The whole rank, pruned or not: every entry accounts for itself under
+    // `-v`, including the ones never tried (acs-qis).
+    let ranked = match locality.as_ref().filter(|l| l.by_host) {
         // The rank is already known: only the hosts that could be chosen
         // are pinged.
         None => {
-            let order = candidates(rank(&entries, &on_net));
-            for &i in &order {
+            let ranked = rank(&entries, &on_net);
+            for &i in &candidates(&ranked) {
                 if entries[i].reachability_check {
                     ping(i);
                 }
             }
-            order
+            ranked
         }
         Some(l) => {
             for (i, e) in entries.iter().enumerate() {
@@ -159,9 +166,10 @@ fn pick(
                 }
             }
             locate(&mut on_net, &entries, &l.network, deadline);
-            candidates(rank(&entries, &on_net))
+            rank(&entries, &on_net)
         }
     };
+    let order = candidates(&ranked);
     for (e, local) in entries.iter().zip(&on_net) {
         match local {
             Some(Local::Host(net)) => {
@@ -177,7 +185,8 @@ fn pick(
     drop(tx);
     let mut answered = vec![None; entries.len()];
     let mut tried = Vec::new();
-    for &i in &order {
+    let mut chosen = None;
+    for (k, &i) in order.iter().enumerate() {
         let e = &entries[i];
         let dest = e.destination();
         let mut why: Vec<String> = Vec::new();
@@ -193,7 +202,8 @@ fn pick(
             why.insert(0, "reachability_check is off".into());
             why.push(e.origin.to_string());
             log(format!("{name}: using {dest} ({})", why.join(", ")));
-            return Ok(e.clone());
+            chosen = Some(k);
+            break;
         }
         // An answer after the deadline counts as none.
         while answered[i].is_none() {
@@ -212,7 +222,8 @@ fn pick(
                 "{name}: {} answers ping, using {dest}{why}",
                 e.host
             ));
-            return Ok(e.clone());
+            chosen = Some(k);
+            break;
         }
         log(format!(
             "{name}: {} does not answer ping within {}",
@@ -221,10 +232,42 @@ fn pick(
         ));
         tried.push(e.host.clone());
     }
-    Err(format!(
-        "no host for '{name}' is reachable (tried {})",
-        tried.join(", ")
-    ))
+    // Nothing answered: every entry was tried and has its line already, and
+    // the error names them all.
+    let Some(k) = chosen else {
+        return Err(format!(
+            "no host for '{name}' is reachable (tried {})",
+            tried.join(", ")
+        ));
+    };
+    untried(name, &entries, &ranked, k, unchecked(&ranked), log);
+    Ok(entries[ranked[k]].clone())
+}
+
+/// The entries the choice never reached, each with why — the rest of the
+/// rank once `ranked[k]` was taken (acs-qis). They come after the "using"
+/// line, in rank order, so the whole account reads as the walk that made
+/// it. An entry ranked behind an unchecked one that did not itself win was
+/// out of the running before any ping, which is the reason worth giving;
+/// the others were simply beaten to it.
+fn untried(
+    name: &str,
+    entries: &[HostEntry],
+    ranked: &[usize],
+    k: usize,
+    unchecked: Option<usize>,
+    log: &mut dyn FnMut(String),
+) {
+    for (j, &i) in ranked.iter().enumerate().skip(k + 1) {
+        let why = match unchecked {
+            Some(p) if j > p && p != k => format!(
+                "it is listed after {}, whose reachability_check is off",
+                entries[ranked[p]].host
+            ),
+            _ => format!("{} was chosen first", entries[ranked[k]].host),
+        };
+        log(format!("{name}: {} not tried: {why}", entries[i].host));
+    }
 }
 
 /// Each entry whose `local_networks` one of this machine's own addresses
@@ -518,6 +561,7 @@ aliases:
             [
                 "you@devbox: logging in as you, from the command line",
                 "you@devbox: devbox.lan answers ping, using you@devbox.lan",
+                "you@devbox: devbox.example.com not tried: devbox.lan was chosen first",
             ]
         );
     }
@@ -545,7 +589,13 @@ aliases:
         assert_eq!(r, Ok(Some("devbox.lan".into())));
         // Both were pinged, at once; the configured order decides.
         assert_eq!(pinged, ["devbox.example.com", "devbox.lan"]);
-        assert_eq!(log, ["devbox: devbox.lan answers ping, using devbox.lan"]);
+        assert_eq!(
+            log,
+            [
+                "devbox: devbox.lan answers ping, using devbox.lan",
+                "devbox: devbox.example.com not tried: devbox.lan was chosen first",
+            ]
+        );
     }
 
     #[test]
@@ -627,7 +677,14 @@ aliases:
         let fake = Fake::new(&[("a", 150, true), ("b", 0, true), ("c", 0, true)]);
         let (r, log, took) = timed(ABC, "abc", &fake);
         assert_eq!(r, Ok("a".into()));
-        assert_eq!(log, ["abc: a answers ping, using a"]);
+        assert_eq!(
+            log,
+            [
+                "abc: a answers ping, using a",
+                "abc: b not tried: a was chosen first",
+                "abc: c not tried: a was chosen first",
+            ]
+        );
         assert!(took >= Duration::from_millis(150), "{took:?}");
         // And b, answering, is taken over a c that answered first.
         let fake = Fake::new(&[("a", 0, false), ("b", 150, true), ("c", 0, true)]);
@@ -638,6 +695,7 @@ aliases:
             [
                 "abc: a does not answer ping within 500ms",
                 "abc: b answers ping, using b",
+                "abc: c not tried: b was chosen first",
             ]
         );
     }
@@ -691,7 +749,14 @@ aliases:
         let fake = Fake::new(&[("a", 0, true), ("b", 0, true), ("c", 150, true)]);
         let (r, log, _) = timed(&preferring(&["c"], &[]), "abc", &fake);
         assert_eq!(r, Ok("c".into()));
-        assert_eq!(log, ["abc: c answers ping, using c (preferred)"]);
+        assert_eq!(
+            log,
+            [
+                "abc: c answers ping, using c (preferred)",
+                "abc: a not tried: c was chosen first",
+                "abc: b not tried: c was chosen first",
+            ]
+        );
         // A preferred host that does not answer: the configured order.
         let fake = Fake::new(&[("a", 0, false), ("b", 0, true), ("c", 0, false)]);
         let (r, log, _) = timed(&preferring(&["c"], &[]), "abc", &fake);
@@ -704,6 +769,7 @@ aliases:
                 "abc: b answers ping, using b",
             ]
         );
+        // The rank is walked to its end: nothing is left after b.
         // None answering: every host named, the preferred first.
         let fake = Fake::new(&[]);
         let (r, _, _) = timed(&preferring(&["b"], &[]), "abc", &fake);
@@ -740,6 +806,76 @@ aliases:
             .map(|e| e.host.as_str())
             .collect();
         assert_eq!(ranked, ["b", "c", "a"]);
+    }
+
+    // ---- every entry accounts for itself (acs-qis) -------------------------
+
+    #[test]
+    fn the_entries_ranked_after_the_chosen_one_say_who_beat_them() {
+        let yaml = "\
+aliases:
+  devbox:
+    - host: devbox.lan
+    - host: devbox.vpn
+    - host: devbox.example.com
+";
+        let fake = Fake::up(&["devbox.vpn", "devbox.example.com"]);
+        let (r, log, _) = timed(yaml, "devbox", &fake);
+        assert_eq!(r, Ok("devbox.vpn".into()));
+        assert_eq!(
+            log,
+            [
+                "devbox: devbox.lan does not answer ping within 500ms",
+                "devbox: devbox.vpn answers ping, using devbox.vpn",
+                "devbox: devbox.example.com not tried: devbox.vpn was chosen first",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entry_behind_an_unchecked_one_says_it_was_never_in_the_running() {
+        // a answers, so b (unchecked) was merely beaten to it -- but c
+        // could not have been chosen however the pings had gone.
+        let yaml = preferring(&[], &["b"]);
+        let (r, log, _) = timed(&yaml, "abc", &Fake::up(&["a", "c"]));
+        assert_eq!(r, Ok("a".into()));
+        assert_eq!(
+            log,
+            [
+                "abc: a answers ping, using a",
+                "abc: b not tried: a was chosen first",
+                "abc: c not tried: it is listed after b, whose reachability_check is off",
+            ]
+        );
+        // a down: b is taken unpinged, and c was beaten by it.
+        let (r, log, _) = timed(&yaml, "abc", &Fake::up(&["c"]));
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(log[0], "abc: a does not answer ping within 500ms");
+        assert!(
+            log[1].starts_with("abc: using b (reachability_check is off, "),
+            "{log:?}"
+        );
+        assert_eq!(log[2], "abc: c not tried: b was chosen first");
+        assert_eq!(log.len(), 3, "{log:?}");
+    }
+
+    #[test]
+    fn nothing_answering_tries_every_entry_and_adds_no_line() {
+        // The failure path is unchanged: each entry is reached, so each
+        // already says why, and the error names them all.
+        let (r, log, _) = timed(ABC, "abc", &Fake::new(&[]));
+        assert_eq!(
+            r,
+            Err("no host for 'abc' is reachable (tried a, b, c)".into())
+        );
+        assert_eq!(
+            log,
+            [
+                "abc: a does not answer ping within 500ms",
+                "abc: b does not answer ping within 500ms",
+                "abc: c does not answer ping within 500ms",
+            ]
+        );
     }
 
     // ---- prefer_local_network, host-side (acs-sia) -------------------------
@@ -817,6 +953,7 @@ aliases:
             [
                 "devbox: devbox.lan is on the local network 192.168.1.0/24",
                 "devbox: devbox.lan answers ping, using devbox.lan (on 192.168.1.0/24)",
+                "devbox: devbox.example.com not tried: devbox.lan was chosen first",
             ]
         );
         // IPv6 alone matches too.
@@ -920,6 +1057,7 @@ aliases:
             [
                 "devbox: this machine is on 172.16.0.0/16, so devbox.lan is local",
                 "devbox: devbox.lan answers ping, using devbox.lan (this machine is on 172.16.0.0/16)",
+                "devbox: devbox.example.com not tried: devbox.lan was chosen first",
             ]
         );
         // IPv6 the same way, matched against this machine's 2001:db8:1:1::65.
