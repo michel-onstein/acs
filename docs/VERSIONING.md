@@ -3,8 +3,8 @@
 **Status:** Built — `scripts/version-bump.sh` (`cargo xtask bump`),
 `scripts/release-binaries.sh` (`cargo xtask package`) and
 `scripts/update-tap.sh` (`cargo xtask formula`). Of the fork knobs
-("Forking"), the build-time releases URL and `ACS_TAP_REPO` are built; the
-rest are source edits.
+("Forking"), the build-time releases URL, the build-time signing key and
+`ACS_TAP_REPO` are built; the rest are source edits.
 
 acs follows semantic versioning, and the version moves **automatically** after
 every merge to `main`. The version lives in `Cargo.toml` (and so in
@@ -126,19 +126,22 @@ update message (DESIGN §7.5, §7.6).
 ## Forking
 
 A fork that publishes its own releases has to point five things at itself.
-Only the first is decided when the binary is built; the rest are the release
-machinery, and are read from the environment or edited in the fork's source.
+The first two are decided when the binary is built, and belong together; the
+rest are the release machinery, and are read from the environment or edited
+in the fork's source.
 
 | Knob | Where | How |
 | --- | --- | --- |
 | The releases a binary updates from | `release::DEFAULT_RELEASES_URL` | build with `ACS_DEFAULT_RELEASES_URL=https://github.com/you/acs/releases` |
-| The release signing key | `signature::RELEASE_KEY` (`src/signature.rs`) | edit: sign with your own key and put its public half there |
+| The release signing key | `signature::RELEASE_KEY` | build with `ACS_DEFAULT_RELEASE_KEY="$(cat release_key.pub)"` |
 | The tap that is pushed | `scripts/update-tap.sh` | `ACS_TAP_REPO=https://github.com/you/homebrew-acs.git` |
 | The formula's homepage and download URLs | `REPO` in `xtask/src/formula.rs` | edit |
 | The install instructions in the release notes | `xtask/src/package.rs` | edit |
 
 ```sh
-ACS_DEFAULT_RELEASES_URL=https://github.com/you/acs/releases cargo xtask dist
+ACS_DEFAULT_RELEASES_URL=https://github.com/you/acs/releases \
+ACS_DEFAULT_RELEASE_KEY="$(cat release_key.pub)" \
+    cargo xtask dist
 ```
 
 The build-time URL is what `acs upgrade` and the weekly update check look at
@@ -152,16 +155,32 @@ different matter and keeps its guards — https only unless
 `--allow-insecure-url` is passed on the command line, and ignored outright
 when the real and effective user differ (DESIGN §7.5).
 
-The signing key travels with the URL: `signature::key_for` uses the built-in
-`RELEASE_KEY` for whatever `DEFAULT_RELEASES_URL` names, and nothing at
-runtime can replace it there. A fork that bakes in its own releases URL but
-keeps acs's key cannot verify its own releases, and `acs upgrade` will refuse
-them.
+The signing key travels with the URL, which is why it is set in the same
+build: `signature::key_for` uses the built-in `RELEASE_KEY` for whatever
+`DEFAULT_RELEASES_URL` names, and nothing at runtime can replace it there. A
+fork that bakes in its own releases URL but keeps acs's key cannot verify its
+own releases, and `acs upgrade` will refuse them. The value is the public
+half — one line, the contents of an `ssh-keygen` `.pub` file; the private
+half signs `SHA256SUMS` (`ACS_SIGNING_KEY` in `scripts/release-binaries.sh`)
+and stays off every machine that only runs acs. The key also goes into the
+generated Homebrew formula, so a fork's tap is a second source for the fork's
+key as acs's tap is for acs's.
 
-`scripts/install.sh` has its own default, the same upstream URL, and honours
-`ACS_RELEASES_URL` (over https, not under sudo). A fork publishing its own
-installer as a release asset edits that one line; `ACS_DEFAULT_RELEASES_URL`
-does not reach it, because the script is copied into the release as it is.
+Neither knob can leave a binary that verifies nothing. Unset — every build of
+acs itself — the key is acs's own, an empty value counts as unset, and a
+value that is not an ssh public key line **fails the build** rather than
+shipping a release that no one can install. A key that is merely the wrong
+one fails closed: every release is refused, nothing is downloaded or run.
+Like the URL, it is the builder's decision rather than the environment's, so
+it carries none of the limits on the runtime `ACS_RELEASE_KEY` override —
+which is read only for a channel that has itself been redirected, and is
+untouched here (DESIGN §7.5).
+
+`scripts/install.sh` has its own default releases URL, the upstream one, and
+its own copy of acs's key, and honours `ACS_RELEASES_URL` (over https, not
+under sudo) but nothing for the key. A fork publishing its own installer as a
+release asset edits those two lines; neither build-time variable reaches
+them, because the script is copied into the release as it is.
 
 ## Options
 
