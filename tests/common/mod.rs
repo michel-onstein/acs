@@ -317,10 +317,11 @@ impl Remote {
         let script = self.root.path().join("transport.sh");
         if !script.exists() {
             let body = format!(
-                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\n[ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n[ -f '{renv}' ] && . '{renv}'\nexec /bin/sh -c \"$1\"\n",
+                "#!/bin/sh\necho $$ >> '{pids}'\n[ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\nwhile [ -f '{gate}' ]; do sleep 0.05; done\n[ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n[ -f '{noise}' ] && cat '{noise}'\nexport HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n[ -f '{renv}' ] && . '{renv}'\nexec /bin/sh -c \"$1\"\n",
                 pids = self.pid_file().display(),
                 silent = self.silent_file().display(),
                 delay = self.delay_file().display(),
+                gate = self.gate_file().display(),
                 noise = self.noise_file().display(),
                 home = self.home().display(),
                 sock = self.sockets().display(),
@@ -348,6 +349,10 @@ impl Remote {
 
     fn delay_file(&self) -> PathBuf {
         self.root.path().join("delay")
+    }
+
+    fn gate_file(&self) -> PathBuf {
+        self.root.path().join("dial-gate")
     }
 
     fn remote_env_file(&self) -> PathBuf {
@@ -405,6 +410,21 @@ impl Remote {
                 let _ = std::fs::remove_file(self.delay_file());
             }
         }
+    }
+
+    /// Hold every new connection open just short of the remote command, as
+    /// a dial still handshaking, until [`Remote::release_dial`] lets it
+    /// through. Where [`Remote::slow_dial`] gives a test a stretch of wall
+    /// clock it has to fit inside — and a host that stalls for longer than
+    /// that turns a passing test red — this one ends when the test says so,
+    /// so a stall only makes the test slower (acs-o8h).
+    pub fn hold_dial(&self) {
+        std::fs::write(self.gate_file(), "").unwrap();
+    }
+
+    /// Let the connection held by [`Remote::hold_dial`] finish.
+    pub fn release_dial(&self) {
+        let _ = std::fs::remove_file(self.gate_file());
     }
 
     /// Make new connections go quiet once accepted, as a half-alive host
