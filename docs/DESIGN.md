@@ -1303,7 +1303,11 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   effective user differ, so whoever seeds the environment of a `sudo acs
   upgrade` does not thereby choose the binary it installs. The background
   update check only compares version numbers, downloading and running
-  nothing, so there the scheme is not load-bearing.
+  nothing, so there the scheme is not load-bearing. The default it overrides
+  is itself a choice: a build with `ACS_DEFAULT_RELEASES_URL` set bakes in
+  another releases URL, for a fork that publishes its own (VERSIONING.md,
+  "Forking"). That one is the builder's decision rather than the
+  environment's, so it carries none of these limits.
 - **Downloads use `curl`** (or `wget` when there is no curl, as on Alpine):
   an HTTP and TLS client of our own would cost more than the whole binary
   (§9).

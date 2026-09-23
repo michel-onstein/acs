@@ -12,8 +12,37 @@ use std::cmp::Ordering;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// Where releases are published when nothing overrides it.
-pub const DEFAULT_RELEASES_URL: &str = "https://github.com/michel-onstein/acs/releases";
+/// Where acs itself publishes its releases: the default of a build that
+/// was not told otherwise.
+pub const UPSTREAM_RELEASES_URL: &str = "https://github.com/michel-onstein/acs/releases";
+
+/// Where this build's releases are published when nothing overrides it —
+/// [`UPSTREAM_RELEASES_URL`], or whatever `ACS_DEFAULT_RELEASES_URL` named
+/// when the binary was built (`build.rs`, docs/VERSIONING.md "Forking").
+///
+/// A fork publishing its own releases bakes its own value in here, so its
+/// users' `acs upgrade` and weekly update check look at the fork rather
+/// than upstream without anyone having to export anything. That is a
+/// choice made by whoever builds the binary, which is why it needs none of
+/// the guards the runtime `ACS_RELEASES_URL` override carries (acs-95w):
+/// those exist because the *environment* of a run is not the builder's.
+///
+/// A fork that also signs its own releases must replace
+/// [`crate::signature::RELEASE_KEY`] too — the built-in key is the one
+/// used for whatever this constant names, and nothing at runtime can
+/// replace it there.
+pub const DEFAULT_RELEASES_URL: &str =
+    default_releases_url(option_env!("ACS_DEFAULT_RELEASES_URL"));
+
+/// The build-time default: what `build.rs` passed, or acs's own releases.
+/// An empty value counts as unset, so `ACS_DEFAULT_RELEASES_URL=` cannot
+/// leave a build with no release channel at all.
+const fn default_releases_url(built_in: Option<&'static str>) -> &'static str {
+    match built_in {
+        Some(url) if !url.is_empty() => url,
+        _ => UPSTREAM_RELEASES_URL,
+    }
+}
 
 /// Where releases are published, with `ACS_RELEASES_URL` honoured only
 /// where it is safe to (acs-95w).
@@ -341,6 +370,32 @@ pub fn lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-5em: a fork builds with `ACS_DEFAULT_RELEASES_URL` set and its
+    /// binaries update from the fork; unset — every upstream build — the
+    /// default is acs's own releases, unchanged.
+    #[test]
+    fn the_default_releases_url_can_be_set_at_build_time() {
+        // Unset: today's value.
+        assert_eq!(
+            default_releases_url(None),
+            "https://github.com/michel-onstein/acs/releases"
+        );
+        assert_eq!(default_releases_url(None), UPSTREAM_RELEASES_URL);
+        // Set: the fork's releases.
+        assert_eq!(
+            default_releases_url(Some("https://github.com/someone/acs-fork/releases")),
+            "https://github.com/someone/acs-fork/releases"
+        );
+        // Set to nothing is not a build without a release channel.
+        assert_eq!(default_releases_url(Some("")), UPSTREAM_RELEASES_URL);
+        // This build made the same choice, whichever it was.
+        assert_eq!(
+            DEFAULT_RELEASES_URL,
+            default_releases_url(option_env!("ACS_DEFAULT_RELEASES_URL"))
+        );
+        assert!(!DEFAULT_RELEASES_URL.is_empty());
+    }
 
     /// acs-95w: what `ACS_RELEASES_URL` names is downloaded, checked only
     /// against sums fetched from the same place, and then run. A scheme
