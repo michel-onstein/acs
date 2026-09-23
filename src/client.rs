@@ -17,6 +17,7 @@ use crate::proto::{self, AttachKind, Decoder, Hello, Marker, MarkerScanner, Mode
 use crate::resume::Unacked;
 use crate::ssh::{self, Call};
 use crate::sys;
+use crate::timing::Timing;
 use crate::tty::{self, RawMode};
 
 const STDIN: RawFd = 0;
@@ -83,6 +84,7 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
         };
     }
     let name = args.transport.destination.clone();
+    let mut timing = Timing::start(args.verbose > 0, "first connection");
     if let Err(e) = resolve_alias(&mut args, &name) {
         eprintln!("acs: {e}");
         // Persisting (DESIGN §5.3): wait until one of its hosts answers.
@@ -91,6 +93,9 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
         }
         wait_for_host(&mut args, &name);
     }
+    if args.alias.is_some() {
+        timing.mark("alias resolved");
+    }
     if args.list && !menu {
         return crate::list::run(&args);
     }
@@ -98,8 +103,8 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     // over the connection the session then uses.
     let always = args.list;
     loop {
-        match crate::pick::choose(&mut args, always) {
-            Ok(picked) => return ExitCode::from(run(args, picked)),
+        match crate::pick::choose(&mut args, always, &mut timing) {
+            Ok(picked) => return ExitCode::from(run(args, picked, timing)),
             // The host could not be reached for the menu: persisting, wait
             // until it answers a ping, then ask again.
             Err(code::UNREACHABLE) if !args.list && persist(&args) => {
@@ -346,12 +351,14 @@ pub fn answer_timeout(redial: bool) -> Duration {
 }
 
 /// Start the transport running `remote` and wait, at most `timeout`, for
-/// the marker line.
+/// the marker line; `timing` is told when ssh is spawned and the marker
+/// seen.
 pub fn dial(
     args: &ClientArgs,
     call: Call,
     remote: &str,
     timeout: Duration,
+    timing: &mut Timing,
 ) -> io::Result<(Link, Marker)> {
     let deadline = Instant::now() + timeout;
     let mut cmd = args.transport.command(call, remote);
@@ -371,6 +378,7 @@ pub fn dial(
             format!("cannot run {}: {e}", argv[0].to_string_lossy()),
         )
     })?;
+    timing.mark("ssh spawned");
     let to: OwnedFd = child.stdin.take().unwrap().into();
     let from: OwnedFd = child.stdout.take().unwrap().into();
     let mut scanner = MarkerScanner::new();
@@ -409,6 +417,10 @@ pub fn dial(
             break m;
         }
     };
+    timing.mark(match marker {
+        Marker::Ready { .. } => "ACS-READY seen",
+        Marker::Need { .. } => "ACS-NEED seen",
+    });
     if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
         note(&format!("skipped remote login output: {noise:?}"));
     }
@@ -525,8 +537,9 @@ fn hello(args: &ClientArgs, state: &State, force: bool) -> Hello {
 // ---- running ---------------------------------------------------------------
 
 /// Run the session until it ends or the user leaves; returns the exit code.
-/// `picked` is the first connection when the session menu opened it.
-pub fn run(args: ClientArgs, picked: Option<Picked>) -> u8 {
+/// `picked` is the first connection when the session menu opened it;
+/// `timing`, the first connection's clock.
+pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
     if !sys::isatty(STDIN) {
         eprintln!("acs: stdin is not a terminal");
         return code::USAGE;
@@ -564,7 +577,7 @@ pub fn run(args: ClientArgs, picked: Option<Picked>) -> u8 {
         force_next: args.force,
     };
     let mut raw: Option<RawMode> = None;
-    let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals, picked);
+    let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals, picked, timing);
     leave(&mut state, &mut raw);
     result
 }
@@ -583,6 +596,7 @@ pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
 /// Connect once: dial, handshake, and serve until the link ends.
 /// `resuming` is true for a redial after a lost link. `picked`, a
 /// connection the session menu opened, is used instead of dialing.
+/// `timing` is this connection's clock.
 pub fn connect_and_serve(
     args: &ClientArgs,
     state: &mut State,
@@ -590,10 +604,11 @@ pub fn connect_and_serve(
     signals: &OwnedFd,
     resuming: bool,
     picked: Option<Picked>,
+    timing: &mut Timing,
 ) -> Outcome {
     let timeout = answer_timeout(resuming);
     if let Some(p) = picked {
-        return serve(args, state, raw, signals, p.link, p.rest, timeout);
+        return serve(args, state, raw, signals, p.link, p.rest, timeout, timing);
     }
     let pargs = proxy_args(args, state, resuming);
     let pargs: Vec<&str> = pargs.iter().map(String::as_str).collect();
@@ -602,7 +617,7 @@ pub fn connect_and_serve(
     if let Some(r) = raw.as_mut() {
         let _ = r.suspend();
     }
-    let (link, marker) = match dial(args, Call::Session, &remote, timeout) {
+    let (link, marker) = match dial(args, Call::Session, &remote, timeout, timing) {
         Ok(x) => x,
         Err(e) => {
             if resuming {
@@ -636,7 +651,10 @@ pub fn connect_and_serve(
                 return Outcome::Exit(code::INSTALL_FAILED);
             }
             return match crate::install::install(args, &os, &arch) {
-                Ok(()) => connect_and_serve(args, state, raw, signals, resuming, None),
+                Ok(()) => {
+                    timing.mark("acs installed");
+                    connect_and_serve(args, state, raw, signals, resuming, None, timing)
+                }
                 Err(e) => {
                     note(&e);
                     Outcome::Exit(code::INSTALL_FAILED)
@@ -644,7 +662,7 @@ pub fn connect_and_serve(
             };
         }
     };
-    serve(args, state, raw, signals, link, rest, timeout)
+    serve(args, state, raw, signals, link, rest, timeout, timing)
 }
 
 fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -714,6 +732,7 @@ fn queue_input(state: &mut State, out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Serve one link: handshake, then relay until something ends it.
+#[allow(clippy::too_many_arguments)]
 fn serve(
     args: &ClientArgs,
     state: &mut State,
@@ -722,6 +741,7 @@ fn serve(
     link: Link,
     early: Vec<u8>,
     handshake: Duration,
+    timing: &mut Timing,
 ) -> Outcome {
     // The host has until then to WELCOME us (acs-znr): liveness only starts
     // with the WELCOME.
@@ -762,6 +782,7 @@ fn serve(
             match msg {
                 Msg::Welcome(w) if !welcomed => {
                     welcomed = true;
+                    timing.mark("WELCOME received");
                     let first = state.instance.is_none();
                     let same = state.instance == Some(w.instance);
                     if !first && !same {
@@ -874,6 +895,7 @@ fn serve(
                     // Skip anything we already wrote (never expected).
                     let skip = state.offset.saturating_sub(offset) as usize;
                     if skip < bytes.len() {
+                        timing.first_output();
                         if write_output(state, &bytes[skip..]).is_err() {
                             link.close();
                             return Outcome::Exit(code::ERROR);

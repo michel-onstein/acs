@@ -159,8 +159,14 @@ pub(crate) fn query(
 ) -> Result<Option<Vec<StatusInfo>>, Failure> {
     let deadline = Instant::now() + timeout;
     let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--list"]);
-    let (link, marker) = client::dial(args, call, &remote, timeout)
-        .map_err(|e| Failure::Unreachable(e.to_string()))?;
+    let (link, marker) = client::dial(
+        args,
+        call,
+        &remote,
+        timeout,
+        &mut crate::timing::Timing::off(),
+    )
+    .map_err(|e| Failure::Unreachable(e.to_string()))?;
     let rest = match marker {
         Marker::Ready { rest, .. } => rest,
         Marker::Need { .. } => {

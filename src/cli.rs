@@ -31,7 +31,7 @@ options:
       --persist       never give up on a lost host: ping it every reachability_interval
                       (default 5s) and dial as soon as it answers, from the first connect on
       --force         take over a session attached by someone else
-  -v                  verbose: show ssh commands and remote login noise
+  -v                  verbose: show ssh commands, remote login noise and connect timings
       --ssh <path>    ssh program to run (also ACS_SSH)
   -h, --help          this help
   -V, --version       print the version

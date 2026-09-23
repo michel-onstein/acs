@@ -180,8 +180,11 @@ what it does there:
 
 The list, the menu's `x` and the attach share one ssh connection, so a
 plain `acs host` logs in once (one touch of a hardware key), and `acs -v
-host` shows a single `running ssh …`. Without a terminal on stdout there is
-no menu: `acs host` attaches `main`, creating it if needed.
+host` shows a single `running ssh …`. `-v` also times each phase of a
+connection — ssh spawned, acs ready on the remote, the session list, the
+attach, the first output — as `acs: timing: …` lines, for every redial
+too. Without a terminal on stdout there is no menu: `acs host` attaches
+`main`, creating it if needed.
 
 In a session, press **Ctrl-] Ctrl-]** quickly, then:
 
