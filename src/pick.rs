@@ -22,6 +22,7 @@ use crate::menu::{Answer, Choice, Menu};
 use crate::proto::{self, Decoder, Marker, Msg, StatusInfo};
 use crate::ssh::{self, Call};
 use crate::sys;
+use crate::timing::Timing;
 use crate::tty::{self, AltScreen, RawMode};
 
 const STDIN: RawFd = 0;
@@ -35,8 +36,12 @@ const STDOUT: RawFd = 1;
 /// installed there, or the connection lost while the menu was up). `Err` is
 /// the exit status when the user left the menu or the host could not be
 /// asked. `always` shows the menu even with nothing detached
-/// (`acs list <host>`).
-pub fn choose(args: &mut ClientArgs, always: bool) -> Result<Option<Picked>, u8> {
+/// (`acs list <host>`). `timing` is the first connection's clock.
+pub fn choose(
+    args: &mut ClientArgs,
+    always: bool,
+    timing: &mut Timing,
+) -> Result<Option<Picked>, u8> {
     let Target::Pick(default) = args.target.clone() else {
         return Ok(None);
     };
@@ -50,8 +55,9 @@ pub fn choose(args: &mut ClientArgs, always: bool) -> Result<Option<Picked>, u8>
         eprintln!("acs: {}", f.message(&host));
         f.code()
     };
+    let timeout = client::answer_timeout(false);
     let (mut pick, sessions) =
-        match open_pick(args, Call::Session, client::answer_timeout(false)).map_err(fail)? {
+        match open_pick(args, Call::Session, timeout, timing).map_err(fail)? {
             Some(p) => p,
             // acs is not installed there yet: the attach installs it, and
             // there is nothing to pick.
@@ -94,14 +100,15 @@ pub fn choose(args: &mut ClientArgs, always: bool) -> Result<Option<Picked>, u8>
 }
 
 /// Dial `_proxy --pick` and read its first list: `Ok(None)` if acs of our
-/// version is not installed there.
+/// version is not installed there. `timing` is told when the list is in.
 fn open_pick(
     args: &ClientArgs,
     call: Call,
     timeout: Duration,
+    timing: &mut Timing,
 ) -> Result<Option<(Pick, Vec<StatusInfo>)>, Failure> {
     let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--pick"]);
-    let (link, marker) = client::dial(args, call, &remote, timeout)
+    let (link, marker) = client::dial(args, call, &remote, timeout, timing)
         .map_err(|e| Failure::Unreachable(e.to_string()))?;
     let rest = match marker {
         Marker::Ready { proto: p, rest } if p == proto::PROTO_VERSION => rest,
@@ -128,7 +135,10 @@ fn open_pick(
         force: args.force,
     };
     match pick.list() {
-        Ok(a) => Ok(Some((pick, a.sessions))),
+        Ok(a) => {
+            timing.mark("session list received");
+            Ok(Some((pick, a.sessions)))
+        }
         Err(f) => {
             pick.link.close();
             Err(f)
@@ -410,11 +420,13 @@ pub fn every_host(args: &ClientArgs) -> u8 {
     picked.list = false;
     picked.target = target;
     picked.force |= force;
+    let mut timing = Timing::start(args.verbose > 0, "first connection");
     if let Err(e) = client::resolve_alias(&mut picked, &names[h]) {
         eprintln!("acs: {e}");
         return code::UNREACHABLE;
     }
-    client::run(picked, None)
+    timing.mark("alias resolved");
+    client::run(picked, None, timing)
 }
 
 /// Ask every alias in parallel, as `acs list` does; each answer comes on
@@ -460,7 +472,12 @@ fn end_on(args: &ClientArgs, alias: &str, menu: &mut Menu, h: usize, session: &s
     let mut on = args.clone();
     let note = match client::resolve_alias(&mut on, alias) {
         Err(e) => format!("{alias}: {e}"),
-        Ok(()) => match open_pick(&on, Call::Batch, client::answer_timeout(true)) {
+        Ok(()) => match open_pick(
+            &on,
+            Call::Batch,
+            client::answer_timeout(true),
+            &mut Timing::off(),
+        ) {
             Ok(Some((mut pick, _))) => {
                 let note = match pick.end(session) {
                     Ok(a) => ended(menu, h, session, a),

@@ -33,6 +33,7 @@ pub mod ssh;
 pub mod sys;
 #[doc(hidden)]
 pub mod testutil;
+pub mod timing;
 pub mod tty;
 pub mod update_check;
 pub mod upgrade;

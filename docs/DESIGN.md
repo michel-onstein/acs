@@ -871,6 +871,16 @@ before clearing the screen and forgetting them.
 - Exit status: the child's status after `EXIT` (128+n for signals), 0 on detach,
   and distinct codes for "host unreachable", "remote install failed" and
   "taken over".
+- **Connect timings** under `-v` (acs-pgn, `timing.rs`): one line per phase
+  of a connection, `acs: timing: <connection>: <phase> +<step> ms (<total>
+  ms total)`, for the first connection and for every redial. The phases, in
+  order: `alias resolved` (an alias's pings and lookups), `ssh spawned`,
+  `ACS-READY seen`, `session list received` (the menu's `_proxy --pick`,
+  §4.4), `WELCOME received`, `first output byte`; a phase a connection does
+  not go through is not told, and nothing is told after the first output
+  byte. They exist to show what dominates connect latency on a real host —
+  the ssh handshake, remote startup files or the reachability deadline —
+  before any of it is optimised.
 
 ### 7.1 ssh options
 

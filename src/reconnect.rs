@@ -10,6 +10,7 @@ use crate::client::{self, code, note, Outcome, State};
 use crate::keys::Action;
 use crate::proto::{AttachKind, Msg};
 use crate::sys;
+use crate::timing::Timing;
 use crate::tty::RawMode;
 
 fn env_ms(name: &str, default: u64) -> u64 {
@@ -56,13 +57,15 @@ impl Backoff {
 }
 
 /// Serve the session over as many links as it takes, the first one the
-/// session menu's when it opened one (`picked`, DESIGN §4.4).
+/// session menu's when it opened one (`picked`, DESIGN §4.4). `timing` is
+/// the first connection's clock; every redial starts one of its own.
 pub fn run(
     args: &ClientArgs,
     state: &mut State,
     raw: &mut Option<RawMode>,
     signals: &OwnedFd,
     mut picked: Option<client::Picked>,
+    mut timing: Timing,
 ) -> u8 {
     let mut backoff = Backoff::new(env_ms("ACS_BACKOFF_MS", 1000));
     let netwatch = crate::netwatch::NetWatch::new();
@@ -75,14 +78,20 @@ pub fn run(
     let mut args = args.clone();
     loop {
         let started = Instant::now();
+        if redial {
+            timing = Timing::start(args.verbose > 0, "redial");
+        }
         // An alias is resolved again for every redial, so a fallback host is
         // picked up after a network change (DESIGN §7.3).
         let reachable = !redial || gated || redial_alias(&mut args, state);
+        if redial && reachable && !gated && args.alias.is_some() {
+            timing.mark("alias resolved");
+        }
         gated = false;
         let first = picked.take();
         let was_picked = first.is_some();
         let outcome = if reachable {
-            client::connect_and_serve(&args, state, raw, signals, resuming, first)
+            client::connect_and_serve(&args, state, raw, signals, resuming, first, &mut timing)
         } else {
             Outcome::LinkLost
         };
