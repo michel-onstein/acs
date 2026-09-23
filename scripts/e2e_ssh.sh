@@ -6,20 +6,53 @@
 # sent after a re-attach and a resume, and a -L forward (the session's ssh
 # alone binds the port).
 #
-#   scripts/e2e_ssh.sh [--no-build]
+#   scripts/e2e_ssh.sh [--no-build [--allow-stale-dist]]
 #
 # Needs docker and `cargo xtask dist` output (built unless --no-build).
+# --no-build reuses dist/ only when `dist/source.stamp` says it was built from
+# this source tree (acs-gb4); --allow-stale-dist reuses it regardless.
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
+build=1
+allow_stale=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-build) build=0 ;;
+        --allow-stale-dist) allow_stale=1 ;;
+        *)
+            echo "usage: $0 [--no-build [--allow-stale-dist]]" >&2
+            exit 2
+            ;;
+    esac
+done
 # Per checkout, so worktrees running this at once keep their own host.
 name=acs-e2e-host-$(printf %s "$root" | cksum | cut -d' ' -f1)
 port=${ACS_E2E_PORT:-}
 work=$(mktemp -d /tmp/acs-e2e.XXXXXX)
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "$build" = 1 ]; then
     cargo xtask dist
+elif [ "$allow_stale" = 1 ]; then
+    echo "e2e: --allow-stale-dist: reusing dist/ unchecked" >&2
+else
+    # dist/ is only worth reusing if it was built from what is on disk now:
+    # a red run from a binary two edits old reads exactly like a real one
+    # (acs-gb4). The stamp is written by `cargo xtask dist` into the
+    # directory it wipes and refills, so it cannot outlive those binaries.
+    want=$(scripts/source_stamp.sh)
+    have=$(cat dist/source.stamp 2>/dev/null || echo '<none>')
+    if [ "$want" != "$have" ]; then
+        echo >&2
+        echo "e2e: REFUSING --no-build: dist/ was not built from this tree." >&2
+        echo "  dist/source.stamp  $have" >&2
+        echo "  this source tree   $want" >&2
+        echo "A failure from a stale binary is indistinguishable from a real" >&2
+        echo "one. Rebuild by dropping --no-build, or pass" >&2
+        echo "--allow-stale-dist to reuse dist/ anyway." >&2
+        exit 1
+    fi
 fi
 case "$(uname -s)-$(uname -m)" in
     Darwin-arm64) client=dist/aarch64-apple-darwin/acs ;;

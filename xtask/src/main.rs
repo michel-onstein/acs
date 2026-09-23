@@ -9,7 +9,10 @@
 //! 3. complete Linux builds: slim + appended blob;
 //! 4. complete macOS builds: rebuilt with `--features embed-payloads`, then
 //!    ad-hoc signed;
-//! 5. a size report, failing over budget (slim 1 MB, complete 2 MB).
+//! 5. a size report, failing over budget (slim 1 MB, complete 2 MB);
+//! 6. `source.stamp`, the fingerprint of the sources it built from
+//!    (`scripts/source_stamp.sh`), which `scripts/e2e_ssh.sh --no-build`
+//!    checks before it reuses the binaries (acs-gb4).
 //!
 //! `cargo xtask bump` releases the next version, `cargo xtask package` makes
 //! the release assets and `cargo xtask formula` the Homebrew formula (see
@@ -122,6 +125,25 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     out.stdout
 }
 
+/// The fingerprint of the sources this build comes from, from
+/// `scripts/source_stamp.sh`.
+fn source_stamp() -> String {
+    let script = root().join("scripts/source_stamp.sh");
+    let out = Command::new(&script)
+        .current_dir(root())
+        .output()
+        .unwrap_or_else(|e| {
+            eprintln!("xtask: cannot run {}: {e}", script.display());
+            exit(1)
+        });
+    if !out.status.success() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        eprintln!("xtask: {} failed ({})", script.display(), out.status);
+        exit(1);
+    }
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 fn size(p: &Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
@@ -152,6 +174,11 @@ fn dist(args: &[String]) {
     }
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).unwrap();
+
+    // 0. What we are about to build from, read before the first build so it
+    //    describes what cargo actually reads. Written at the very end, so a
+    //    build that fails leaves no stamp at all.
+    let stamp = source_stamp();
 
     // 1. Slim builds.
     let mut slim = Vec::new();
@@ -226,4 +253,12 @@ fn dist(args: &[String]) {
         eprintln!("xtask: over the size budget");
         exit(1);
     }
+
+    // 6. The source stamp, beside the binaries it describes: it goes into the
+    //    directory this run wiped and refilled, last, so it cannot outlive
+    //    them and a run that failed leaves none. `scripts/e2e_ssh.sh
+    //    --no-build` refuses to reuse a dist/ whose stamp is not this tree's
+    //    (acs-gb4).
+    std::fs::write(out.join("source.stamp"), format!("{stamp}\n")).unwrap();
+    eprintln!("source stamp: {stamp}");
 }

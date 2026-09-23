@@ -1624,6 +1624,15 @@ appending the trailer and the macOS builds by rebuilding with
 slim: it can still self-copy (case 1) and says `cargo xtask dist` is needed
 for anything else.
 
+It finally writes `dist/source.stamp`, the hash `scripts/source_stamp.sh`
+takes over the sources it built from (`Cargo.toml`, `Cargo.lock`, `build.rs`,
+`src/`, `xtask/`). `scripts/e2e_ssh.sh --no-build` recomputes it and refuses
+to reuse `dist/` when it differs: a red end-to-end run from a binary two edits
+old reads exactly like a real one, and the edits that cause it are usually
+uncommitted, so a revision alone would not see them (acs-gb4). The stamp is
+written into the directory the run wipes and refills, last, so it cannot
+outlive the binaries it describes; `--allow-stale-dist` overrides it.
+
 ## 9. Implementation
 
 - **Crates, chosen for size**: only `libc` (termios, pty, poll, signals,
@@ -1678,7 +1687,7 @@ src/
   sys.rs        libc wrappers
 xtask/          cargo xtask dist
 tests/          integration tests (tests/common: fake remote, pty runner)
-scripts/        verify.sh, test_linux.sh, e2e_ssh.sh
+scripts/        verify.sh, test_linux.sh, e2e_ssh.sh, source_stamp.sh
 ```
 
 ### 9.1 Testing

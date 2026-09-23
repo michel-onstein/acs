@@ -19,22 +19,63 @@ case "$(basename "$0") $1" in
 esac
 "#;
 
-/// A copy of the repository's scripts at `<dir>/<name>`, as a checkout.
+/// A copy of the repository's scripts at `<dir>/<name>`, as a checkout, with
+/// a source tree and a `dist/` built from it.
 fn checkout(dir: &Path, name: &str) -> PathBuf {
     let root = dir.join(name);
     let scripts = root.join("scripts");
     std::fs::create_dir_all(&scripts).unwrap();
-    for s in ["test_linux.sh", "e2e_ssh.sh"] {
+    for s in ["test_linux.sh", "e2e_ssh.sh", "source_stamp.sh"] {
         let src = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("scripts")
             .join(s);
-        std::fs::copy(src, scripts.join(s)).unwrap();
+        let dest = scripts.join(s);
+        std::fs::copy(src, &dest).unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"acs\"\n").unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    dist(&root);
     root
+}
+
+/// What `cargo xtask dist` leaves behind for `--no-build`: the fingerprint of
+/// the checkout's sources as they are now, beside the binaries.
+fn dist(root: &Path) -> String {
+    let out = Command::new("sh")
+        .arg(root.join("scripts").join("source_stamp.sh"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "source_stamp.sh: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stamp = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stamp.trim().len(), 64, "not a sha256: {stamp:?}");
+    std::fs::create_dir_all(root.join("dist")).unwrap();
+    std::fs::write(root.join("dist").join("source.stamp"), &stamp).unwrap();
+    stamp
 }
 
 /// Runs `script` of `root` with the fakes first on PATH; returns the log.
 fn run(dir: &Path, root: &Path, script: &str, args: &[&str]) -> Vec<String> {
+    let out = try_run(dir, root, script, args);
+    assert!(
+        out.status.success(),
+        "{script}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_to_string(dir.join("log"))
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// The same, without insisting the script succeeded.
+fn try_run(dir: &Path, root: &Path, script: &str, args: &[&str]) -> std::process::Output {
     let bin = dir.join("bin");
     if !bin.exists() {
         std::fs::create_dir(&bin).unwrap();
@@ -47,24 +88,14 @@ fn run(dir: &Path, root: &Path, script: &str, args: &[&str]) -> Vec<String> {
     let log = dir.join("log");
     let _ = std::fs::remove_file(&log);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let out = Command::new("sh")
+    Command::new("sh")
         .arg(root.join("scripts").join(script))
         .args(args)
         .env("PATH", path)
         .env("FAKE_LOG", &log)
         .env_remove("ACS_E2E_PORT")
         .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{script}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    std::fs::read_to_string(&log)
         .unwrap()
-        .lines()
-        .map(String::from)
-        .collect()
 }
 
 /// The word after `flag` in the first logged line starting with `call`.
@@ -119,6 +150,63 @@ fn e2e_gives_each_checkout_its_own_host_on_a_free_port() {
     for l in la.iter().filter(|l| l.starts_with("docker rm")) {
         assert!(l.ends_with(&na), "{l}");
     }
+}
+
+/// acs-gb4: `--no-build` reuses whatever is in `dist/`, and a red e2e run
+/// from a binary two edits old reads exactly like a real one. It was found
+/// on an *uncommitted* edit — build dist/, edit a source file, run again —
+/// where HEAD never moves and a dirty flag is set both times, so the stamp
+/// has to be over the file contents. The run must refuse, unless asked for
+/// the stale binaries by name.
+#[test]
+fn e2e_no_build_refuses_a_dist_that_is_not_this_source_tree() {
+    let dir = TempDir::new();
+    let root = checkout(dir.path(), "a");
+    // A dist/ built from this tree is reused, as before.
+    let fresh = run(dir.path(), &root, "e2e_ssh.sh", &["--no-build"]);
+    assert!(
+        fresh.iter().any(|l| l.starts_with("docker run")),
+        "{fresh:?}"
+    );
+
+    // The edit that bit: nothing committed, nothing but a file's contents.
+    std::fs::write(root.join("src/main.rs"), "fn main() { broken() }\n").unwrap();
+    let out = try_run(dir.path(), &root, "e2e_ssh.sh", &["--no-build"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "reused a stale dist/: {err}");
+    assert!(err.contains("REFUSING --no-build"), "{err}");
+    assert!(err.contains("--allow-stale-dist"), "no way out: {err}");
+    // And it stopped before a host was started, let alone a test run.
+    let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
+    assert!(!log.contains("docker run"), "{log}");
+    assert!(!log.contains("cargo test"), "{log}");
+
+    // Asked for by name, the stale dist/ is used.
+    let stale = run(
+        dir.path(),
+        &root,
+        "e2e_ssh.sh",
+        &["--no-build", "--allow-stale-dist"],
+    );
+    assert!(
+        stale.iter().any(|l| l.starts_with("docker run")),
+        "{stale:?}"
+    );
+
+    // Rebuilding dist/ makes --no-build honest again.
+    dist(&root);
+    run(dir.path(), &root, "e2e_ssh.sh", &["--no-build"]);
+
+    // A dist/ with no stamp at all — an older or a half-written one — is a
+    // mismatch too.
+    std::fs::remove_file(root.join("dist").join("source.stamp")).unwrap();
+    let out = try_run(dir.path(), &root, "e2e_ssh.sh", &["--no-build"]);
+    assert!(!out.status.success(), "reused an unstamped dist/");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("<none>"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// A checkout whose `scripts/` holds version-bump.sh, a release-binaries.sh
