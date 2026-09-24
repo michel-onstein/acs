@@ -585,7 +585,9 @@ sequenceDiagram
   back, so the next resume sends it again. `WELCOME`'s input sequence is the
   same count. Keys typed **while the client knows the link is down** are
   dropped rather than queued: blind typing into a frozen screen replayed
-  seconds later is how accidents happen. (Command-mode keys still work — §6.)
+  seconds later is how accidents happen. (Command-mode keys still work — §6
+  — which is why what ends the wait early matters: only a change to this
+  machine's own network does, §5.3.)
   That includes the redial itself, where the terminal is back in cooked mode
   for ssh's prompts: what was typed then is discarded when raw mode resumes
   on `WELCOME` (`TCSAFLUSH`), and the takeover question discards it before
@@ -647,7 +649,7 @@ sequenceDiagram
   `--no-reconnect` restores `dsh`'s default behaviour.
 - **The first redial goes at once** (acs-iyq). Only the attempts after it
   wait: backoff 1 s → 30 s, reset after a connection that lasted 30 s (as in
-  `dsh`), plus an immediate retry when the local host's default route changes
+  `dsh`), plus an immediate retry when this machine's own network changes
   (Wi-Fi switch, laptop wake) where the platform exposes that cheaply — that
   retry *is* the immediate attempt, so the backoff resumes at its base rather
   than handing out a second dial with nothing in between. A drop has already
@@ -658,6 +660,35 @@ sequenceDiagram
   wait is where typed command keys are honoured (§5.4), so the second
   between a drop and the first dial is no longer one in which `d` detaches
   — it is a dial like any other, and keys typed into a dial are dropped.
+- **What counts as a network change** (acs-6p8). The watcher
+  (`netwatch.rs`) has two halves, and the socket is only the first: a
+  `PF_ROUTE` (macOS) or `NETLINK_ROUTE` (Linux) message says the kernel
+  touched the network, which on a laptop it does the whole time — an
+  unrelated interface appearing, a VPN churning its routes, an interface
+  flapping while the link's own path is untouched, an IPv6 probe. What
+  makes a hint a *change* is the second half: the set of networks this
+  machine could dial from — every up interface's address with its prefix,
+  loopback and link-local left out (§7.3's `getifaddrs`) — differing from
+  the set as of the hint before it. A hint that leaves them as they were
+  ends nothing, and the wait runs to its deadline.
+  - Why it matters beyond tidiness: cutting the wait short starts a
+    redial, and keys typed into a redial are discarded (§5.2). Reporting
+    every hint meant a laptop redialled over and over through one outage,
+    so `d` typed while disconnected did nothing at all — the opposite of
+    what §5.2 and §5.4 promise. It also made three of the reconnect tests
+    fail together, at random, on whatever the developer's own network was
+    doing.
+  - What it costs: a change that this machine's addresses do not show —
+    the same lease on a different physical path, a change upstream — no
+    longer shortens the wait. The backoff does that instead, within 30 s.
+    Joining a network, waking, a VPN coming up or going away all move an
+    address, so the case the watcher exists for is as fast as it was. Two
+    changes inside two seconds are still one redial (`EARLY_EVERY`).
+  - The tests drive both halves rather than the developer's laptop:
+    `ACS_NETWATCH_FIFO` is the hint (one per write) and `ACS_NETWATCH_NETS`
+    a file of the machine's networks, one CIDR per line. The harness points
+    every other client at a watcher path that does not exist, so no test
+    but the watcher's own is exposed to the host's network.
 - Authentication prompts on reconnect (password, hardware key touch) are
   passed through, because ssh gets the controlling tty for prompts even with
   `-T`; the client restores cooked mode while ssh is authenticating. With
@@ -1704,7 +1735,8 @@ src/
   reconnect.rs  liveness, backoff, offline status line, takeover prompt
   keys.rs       Ctrl-] Ctrl-] command-key detector
   modes.rs      passive terminal-mode observer and resets
-  netwatch.rs   network-change watcher (PF_ROUTE / NETLINK_ROUTE)
+  netwatch.rs   network-change watcher: a PF_ROUTE / NETLINK_ROUTE hint,
+                then the machine's own networks to say whether it changed
   tty.rs        raw mode and emergency restore
   proto.rs      frames, messages, ACS-READY / ACS-NEED markers
   resume.rs     output ring, input ack tracking

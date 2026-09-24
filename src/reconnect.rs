@@ -304,7 +304,13 @@ enum Offline {
     Detach,
 }
 
-/// At most one early redial per this interval, however chatty the network.
+/// At most one early redial per this interval. A chatty network is no
+/// longer what this guards against — the watcher answers a hint that
+/// changed nothing with `false` (acs-6p8) — but a link coming up and going
+/// down again can change the machine's addresses twice in a second, and
+/// dialling on each would drop what was typed in between for nothing. The
+/// change suppressed here is not queued: the backoff (30 s at worst) is
+/// what covers it, as it did before there was a watcher at all.
 const EARLY_EVERY: Duration = Duration::from_secs(2);
 
 /// Wait `wait` before the next redial with the link down: show `msg` as the
