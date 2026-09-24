@@ -345,9 +345,9 @@ pub fn remote_candidates(version: &str) -> [String; 2] {
 pub fn prelude(version: &str, args: &[&str]) -> String {
     let args: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
     let [home, system] = remote_candidates(version);
-    // Before exec'ing anything, check it is ours and that nobody else can
-    // write it or the directory holding it (acs-08m). The path is fixed and
-    // acs runs it on every single connection, so on a host where `$HOME` or
+    // Before exec'ing anything, check it is ours or root's and that nobody
+    // else can write it or the directory holding it (acs-08m). The path is
+    // fixed and acs runs it on every connection, so on a host where `$HOME` or
     // `~/.local/share` is group-writable — umask 002 with a shared group,
     // which lab and appliance images still ship — another local user plants
     // a binary there once and owns every later session.
@@ -365,8 +365,8 @@ pub fn prelude(version: &str, args: &[&str]) -> String {
     // Following the link answers what is executed, not who can change what
     // is executed, so `acs_safe` walks the chain itself with `readlink` and
     // demands that **every directory it passes through** — the one holding
-    // each link, and the one holding the final file — is ours and closed to
-    // group and other, as well as the final file itself. A link's own mode
+    // each link, and the one holding the final file — passes the ownership
+    // and mode test below, as does the final file itself. A link's own mode
     // is never judged: it cannot be set meaningfully, and write access to
     // the directory, not to the link, is what lets someone repoint it.
     //
@@ -383,32 +383,73 @@ pub fn prelude(version: &str, args: &[&str]) -> String {
     // "group" would satisfy from the echo, before any connection exists.
     // The mode string is the better half of the message anyway; it says
     // which bit is set without the reader taking the shell's word for it.
+    //
+    // **Owned by you *or* by root** (acs-6w9). acs-08m wrote "owned by the
+    // invoking user", which made the second candidate — DESIGN §8's
+    // `/usr/local/lib/acs/<version>/acs`, "an optional system-wide location
+    // an administrator can populate once for all users" — refusable by
+    // construction: an administrator populates it as root, so every
+    // non-root user refused it and fell through to a per-user install. Root
+    // already owns the machine, the sshd that authenticated this session
+    // and every binary on `PATH`; a file root owns that neither group nor
+    // other can write, in directories root owns that neither group nor
+    // other can write, is not a weaker guarantee than one of the user's
+    // own. What the widening must not do is accept a root-owned file
+    // somebody else can *substitute*, and it does not: the directory
+    // holding it is checked by the same rule, so a root-owned file in a
+    // world- or group-writable directory is still refused, as is one owned
+    // by any third uid.
+    //
+    // The rule is the same for both candidates rather than root-only for
+    // the system one. It is one sentence to state and one condition to
+    // read; making it depend on which path is being checked would mean
+    // threading that through `acs_ok`, in a script whose every byte is
+    // echoed by `-v` and crosses the wire on every connection. And the
+    // narrow version buys nothing: for root to have placed a file under
+    // someone's `$HOME`, root already had the power that accepting it
+    // grants, while refusing it breaks the appliance images that bake a
+    // per-user install into a root-owned tree.
+    //
+    // `[ -f ]` as well as `[ -x ]` (acs-6w9): `[ -x ]` is true of a
+    // *directory*, so a directory at a candidate path was `exec`'d, `sh`
+    // exited 126, and the loop's closing `printf` never ran — the client
+    // saw a silent failure instead of a request to install. A path that is
+    // not a regular file is now simply not there, which is how a dangling
+    // link is already treated.
+    //
+    // Every variable is `acs_`-prefixed (acs-6w9). `u`, `b`, `p`, `n`, `t`
+    // and `w` are ordinary enough names that one of them being *exported*
+    // in the ssh environment is not far-fetched, and the prelude would have
+    // handed the changed value to the acs it execs and to the user's remote
+    // shell. The function names were already prefixed.
     format!(
-        "u=$(id -u); w=; \
+        "acs_u=$(id -u); acs_w=; \
          acs_ok() {{ \
          set -- \"$1\" $(ls -ldnL \"$1\" 2>/dev/null); \
-         [ -n \"$2\" ] || {{ w=\"cannot read $1\"; return 1; }}; \
+         [ -n \"$2\" ] || {{ acs_w=\"cannot read $1\"; return 1; }}; \
          case \"$2\" in \
-         ?????w*|????????w*) w=\"$1 is writable by others: $2\"; return 1;; \
-         l*) w=\"$1 is a symlink that does not resolve\"; return 1;; \
+         ?????w*|????????w*) acs_w=\"$1 is writable by others: $2\"; return 1;; \
+         l*) acs_w=\"$1 is a symlink that does not resolve\"; return 1;; \
          esac; \
-         [ \"$4\" = \"$u\" ] || {{ w=\"$1 is owned by uid $4, not by you\"; return 1; }}; }}; \
+         [ \"$4\" = \"$acs_u\" ] || [ \"$4\" = 0 ] || \
+         {{ acs_w=\"$1 is owned by uid $4, not by you or root\"; return 1; }}; }}; \
          acs_safe() {{ \
-         [ -e \"$1\" ] || {{ w=\"$1 does not exist\"; return 1; }}; \
-         p=$1; n=0; \
-         while [ -L \"$p\" ]; do \
-         n=$((n+1)); \
-         [ \"$n\" -le 16 ] || {{ w=\"$1 leads through more than 16 symlinks\"; return 1; }}; \
-         acs_ok \"$(dirname \"$p\")\" || return 1; \
-         t=$(readlink \"$p\" 2>/dev/null); \
-         [ -n \"$t\" ] || {{ w=\"cannot resolve the symlink $p\"; return 1; }}; \
-         case \"$t\" in /*) p=$t;; *) p=$(dirname \"$p\")/$t;; esac; \
+         [ -e \"$1\" ] || {{ acs_w=\"$1 does not exist\"; return 1; }}; \
+         acs_p=$1; acs_n=0; \
+         while [ -L \"$acs_p\" ]; do \
+         acs_n=$((acs_n+1)); \
+         [ \"$acs_n\" -le 16 ] || \
+         {{ acs_w=\"$1 leads through more than 16 symlinks\"; return 1; }}; \
+         acs_ok \"$(dirname \"$acs_p\")\" || return 1; \
+         acs_t=$(readlink \"$acs_p\" 2>/dev/null); \
+         [ -n \"$acs_t\" ] || {{ acs_w=\"cannot resolve the symlink $acs_p\"; return 1; }}; \
+         case \"$acs_t\" in /*) acs_p=$acs_t;; *) acs_p=$(dirname \"$acs_p\")/$acs_t;; esac; \
          done; \
-         acs_ok \"$p\" && acs_ok \"$(dirname \"$p\")\"; }}; \
-         for b in {home} {system}; do \
-         if [ -x \"$b\" ]; then \
-         if acs_safe \"$b\"; then exec \"$b\" {args}; fi; \
-         printf 'acs: refusing to run %s: %s\\n' \"$b\" \"$w\" >&2; \
+         acs_ok \"$acs_p\" && acs_ok \"$(dirname \"$acs_p\")\"; }}; \
+         for acs_b in {home} {system}; do \
+         if [ -f \"$acs_b\" ] && [ -x \"$acs_b\" ]; then \
+         if acs_safe \"$acs_b\"; then exec \"$acs_b\" {args}; fi; \
+         printf 'acs: refusing to run %s: %s\\n' \"$acs_b\" \"$acs_w\" >&2; \
          fi; \
          done; \
          printf '\\nACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"",
@@ -1040,6 +1081,83 @@ mod tests {
         assert!(
             !err.contains("refusing"),
             "a dangling link was complained about: {err}"
+        );
+    }
+
+    /// acs-6w9: `[ -x "$b" ]` is true for a *directory*, so a directory with
+    /// mode 755 at a candidate path was `exec`'d — `sh` exits 126 and the
+    /// loop's closing `printf` is never reached, so the client saw a silent
+    /// failure where it should have seen a request to install. `[ -f "$b" ]`
+    /// alongside makes it a path that is simply not there, which is what a
+    /// dangling link already got.
+    #[test]
+    fn a_directory_on_a_candidate_path_asks_to_be_installed() {
+        let home = TempDir::new();
+        let dir = home.path().join(".local/share/acs/9.9.9/acs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(prelude("9.9.9", &["--version"]))
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            said.contains("ACS-NEED"),
+            "a directory at a candidate path printed no marker: \
+             status {:?}, stdout {said:?}, stderr {err:?}",
+            out.status.code()
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stdout {said:?}, stderr {err:?}"
+        );
+    }
+
+    /// acs-6w9: the prelude used to work in `u`, `b`, `p`, `n`, `t` and
+    /// `w`. They are ordinary enough names that one of them being
+    /// *exported* into the ssh environment is not far-fetched — and the
+    /// prelude would then have handed the changed value to the acs it
+    /// execs, and to the user's remote shell behind it. Every one is
+    /// `acs_`-prefixed now, so the environment arrives as it was sent.
+    #[test]
+    fn the_prelude_does_not_disturb_the_environment_it_runs_in() {
+        let home = TempDir::new();
+        let dir = home.path().join(".local/share/acs/9.9.9");
+        std::fs::create_dir_all(&dir).unwrap();
+        let acs = dir.join("acs");
+        std::fs::write(
+            &acs,
+            "#!/bin/sh\nprintf 'u=%s b=%s p=%s n=%s t=%s w=%s\\n' \
+             \"$u\" \"$b\" \"$p\" \"$n\" \"$t\" \"$w\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&acs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(prelude("9.9.9", &["--version"]))
+            .env("HOME", home.path());
+        for (k, v) in [
+            ("u", "mine"),
+            ("b", "yours"),
+            ("p", "theirs"),
+            ("n", "seven"),
+            ("t", "tea"),
+            ("w", "wide"),
+        ] {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "u=mine b=yours p=theirs n=seven t=tea w=wide\n",
+            "the prelude changed an exported variable; stderr {:?}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 

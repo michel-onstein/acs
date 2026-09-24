@@ -3,6 +3,7 @@
 //! `scripts/test_linux.sh`, which sets `ACS_MULTIUSER_TEST=1`. Elsewhere
 //! they are skipped.
 
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -332,4 +333,174 @@ fn two_users_main_sessions_are_independent() {
         names.push(s.name);
     }
     assert_eq!(names, ["main"]);
+}
+
+// ---- the system-wide candidate (acs-6w9, DESIGN §8) ------------------------
+
+/// Everything the prelude needs to judge a path, set by root.
+fn plant(path: &Path, body: &str, owner: u32, mode: u32) {
+    std::fs::write(path, body).unwrap();
+    std::os::unix::fs::chown(path, Some(owner), Some(0)).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// acs-6w9: DESIGN §8 offers `/usr/local/lib/acs/<version>/acs` as "an
+/// optional system-wide location an administrator can populate once for all
+/// users" — and an administrator populates it *as root*. acs-08m's check
+/// demanded the file be owned by the invoking user, so every non-root user
+/// refused it and installed its own copy: the documented feature could only
+/// ever serve the one account that owned it.
+///
+/// The rule is now "owned by you or by root", for the file and for the
+/// directory holding it. This test is the one that can only run here: it
+/// really is root, and alice and bob really are other users.
+#[test]
+fn a_root_installed_binary_is_run_by_every_user() {
+    if !enabled() {
+        return;
+    }
+    let (alice, bob) = (user("alice"), user("bob"));
+    let version = "9.9.9-sys";
+    // Only this version's directory is made and removed: the check looks at
+    // the file and the directory holding it, never at `/usr/local/lib/acs`
+    // itself, so a real install there is neither needed nor disturbed.
+    let dir = PathBuf::from(format!("/usr/local/lib/acs/{version}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    set_mode(&dir, 0o755);
+    let binary = dir.join("acs");
+    plant(&binary, "#!/bin/sh\necho RAN\n", 0, 0o755);
+
+    let script = acs::ssh::prelude(version, &["--version"]);
+    let run = |u: &User| {
+        let out = as_user(u, "/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // 1. Root put it there; both users run it. This is the whole point of
+    //    the location, and it did not work before acs-6w9.
+    for u in [&alice, &bob] {
+        let (out, err) = run(u);
+        assert!(out.contains("RAN"), "uid {} refused it: {err}", u.uid);
+    }
+
+    // 2. Root's file in a directory anyone can write: refused. Ownership of
+    //    the file says nothing when someone else can replace it.
+    set_mode(&dir, 0o777);
+    let (out, err) = run(&alice);
+    assert!(
+        !out.contains("RAN"),
+        "a root file in a shared directory ran"
+    );
+    assert!(out.contains("ACS-NEED"), "no marker: {out}");
+    assert!(
+        err.contains(dir.to_str().unwrap()) && err.contains("is writable by others"),
+        "{err}"
+    );
+
+    // 3. Group-writable is refused too (acs-08m's own case, at this path).
+    set_mode(&dir, 0o775);
+    let (out, err) = run(&alice);
+    assert!(
+        !out.contains("RAN"),
+        "a root file under a 0775 directory ran"
+    );
+    assert!(err.contains("is writable by others"), "{err}");
+    set_mode(&dir, 0o755);
+    set_mode(&binary, 0o775);
+    let (out, err) = run(&alice);
+    assert!(!out.contains("RAN"), "a 0775 root-owned binary ran");
+    assert!(err.contains("is writable by others"), "{err}");
+    set_mode(&binary, 0o755);
+
+    // 4. A third uid is still refused: "you or root", not "anyone".
+    plant(&binary, "#!/bin/sh\necho RAN\n", bob.uid, 0o755);
+    let (out, err) = run(&alice);
+    assert!(!out.contains("RAN"), "bob's binary ran as alice");
+    assert!(
+        err.contains(&format!("is owned by uid {}, not by you or root", bob.uid)),
+        "{err}"
+    );
+    // ...and it is bob's, so bob may run it.
+    assert!(
+        run(&bob).0.contains("RAN"),
+        "bob was refused his own binary"
+    );
+
+    // 5. The directory is judged by the same rule: bob's directory holding
+    //    root's file is refused.
+    plant(&binary, "#!/bin/sh\necho RAN\n", 0, 0o755);
+    std::os::unix::fs::chown(&dir, Some(bob.uid), Some(0)).unwrap();
+    let (out, err) = run(&alice);
+    assert!(!out.contains("RAN"), "root's file in bob's directory ran");
+    assert!(
+        err.contains(&format!("is owned by uid {}, not by you or root", bob.uid)),
+        "{err}"
+    );
+
+    std::os::unix::fs::chown(&dir, Some(0), Some(0)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// acs-6w9: root may also have baked a per-user install into an image, so
+/// the same rule reaches the first candidate. What it must not reach is a
+/// binary belonging to a third user — which is exactly acs-08m's attack.
+#[test]
+fn the_home_candidate_takes_the_same_owners_and_no_others() {
+    if !enabled() {
+        return;
+    }
+    let (alice, bob) = (user("alice"), user("bob"));
+    let version = "9.9.9-home";
+    // As above, only this version's directory — the one the check reads —
+    // is made, owned and removed.
+    let dir = alice.home.join(format!(".local/share/acs/{version}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::chown(&dir, Some(alice.uid), Some(alice.gid)).unwrap();
+    set_mode(&dir, 0o755);
+    let binary = dir.join("acs");
+    let script = acs::ssh::prelude(version, &["--version"]);
+    let run = |u: &User| {
+        let out = as_user(u, "/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // Root's file in alice's directory: accepted, as root's file anywhere.
+    plant(&binary, "#!/bin/sh\necho RAN\n", 0, 0o755);
+    let (out, err) = run(&alice);
+    assert!(
+        out.contains("RAN"),
+        "root's file under $HOME was refused: {err}"
+    );
+
+    // Bob's, in the same place: refused. acs-08m's attack, unchanged.
+    plant(&binary, "#!/bin/sh\necho RAN\n", bob.uid, 0o755);
+    let (out, err) = run(&alice);
+    assert!(!out.contains("RAN"), "bob's binary under alice's $HOME ran");
+    assert!(out.contains("ACS-NEED"), "no marker: {out}");
+    assert!(
+        err.contains(&format!("is owned by uid {}, not by you or root", bob.uid)),
+        "{err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
