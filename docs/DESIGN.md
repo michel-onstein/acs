@@ -644,10 +644,20 @@ sequenceDiagram
   answers in time; one that does not only costs a resume.
 - Reconnect is **on by default**: the protocol distinguishes a clean end (`EXIT`,
   `DETACH` acknowledged, `TAKEOVER`) from a drop, so there is nothing to guess.
-  `--no-reconnect` restores `dsh`'s default behaviour. Backoff 1 s → 30 s,
-  reset after a connection that lasted 30 s (as in `dsh`), plus an immediate
-  retry when the local host's default route changes (Wi-Fi switch, laptop
-  wake) where the platform exposes that cheaply.
+  `--no-reconnect` restores `dsh`'s default behaviour.
+- **The first redial goes at once** (acs-iyq). Only the attempts after it
+  wait: backoff 1 s → 30 s, reset after a connection that lasted 30 s (as in
+  `dsh`), plus an immediate retry when the local host's default route changes
+  (Wi-Fi switch, laptop wake) where the platform exposes that cheaply — that
+  retry *is* the immediate attempt, so the backoff resumes at its base rather
+  than handing out a second dial with nothing in between. A drop has already
+  cost 10 s of silence before it is a drop at all (§5.3), and most of them
+  are momentary, so a wait before looking once put a second on every resume
+  to buy nothing; a host that is really gone refuses the attempt (or times
+  out, below) and the backoff starts from there. What it costs: the offline
+  wait is where typed command keys are honoured (§5.4), so the second
+  between a drop and the first dial is no longer one in which `d` detaches
+  — it is a dial like any other, and keys typed into a dial are dropped.
 - Authentication prompts on reconnect (password, hardware key touch) are
   passed through, because ssh gets the controlling tty for prompts even with
   `-T`; the client restores cooked mode while ssh is authenticating. With

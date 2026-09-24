@@ -59,6 +59,31 @@ fn last_number(c: &Client) -> u64 {
     *numbers(&c.text()).last().unwrap_or(&0)
 }
 
+/// acs-iyq: the first redial after a drop waits for nothing, so a momentary
+/// drop costs the dial and no more.
+///
+/// The backoff is two minutes — longer than every deadline in the suite, as
+/// acs-7wu left it — so a client that waited even its *first* step could not
+/// be back inside `T` however fast the machine is. Nothing here is timed:
+/// resuming at all is the assertion, and the clock it is read against is the
+/// helper's own deadline (acs-o8h).
+#[test]
+fn the_first_redial_after_a_drop_does_not_wait() {
+    let remote = Remote::installed();
+    let mut c = start(&remote, "now", TICKER, &[("ACS_BACKOFF_MS", "120000")]);
+    c.wait_for("#20#", T);
+    remote.cut_link();
+    c.wait_resumed();
+    let target = last_number(&c) + 20;
+    c.wait_for(&format!("#{target}#"), T);
+    assert_consecutive(&c.text());
+    // The status line still says what happened — it is what the resume
+    // repaints over — but it names no wait, because there was none.
+    let text = c.text();
+    assert!(text.contains("reconnecting now"), "{text:?}");
+    assert!(!text.contains("reconnecting in"), "{text:?}");
+}
+
 #[test]
 fn cut_link_mid_stream_resumes_without_loss() {
     let remote = Remote::installed();
@@ -247,6 +272,9 @@ fn detach_works_while_the_link_is_down() {
         &[("ACS_BACKOFF_MS", "120000")],
     );
     c.wait_for("up", T);
+    // The network is down, not merely the link: the free first redial
+    // (acs-iyq) is refused, and the client is in its wait once it says so.
+    remote.refuse_one_dial();
     remote.cut_link();
     c.wait_for("reconnecting in 120s", T);
     let t0 = Instant::now();
@@ -326,8 +354,11 @@ fn exit_needs_the_link() {
         &[("ACS_BACKOFF_MS", "20000")],
     );
     c.wait_for("up", T);
+    remote.refuse_one_dial();
     remote.cut_link();
-    c.wait_for("reconnecting", T);
+    // The wait, not the free first attempt (acs-iyq): `in 20s` is the
+    // second attempt's line, and command keys are only read in the wait.
+    c.wait_for("reconnecting in 20s", T);
     c.send(&command(b'x'));
     c.wait_for("ending the session needs the connection", T);
     assert!(c.child.try_wait().unwrap().is_none(), "client must stay");
@@ -347,6 +378,10 @@ fn output_lost_to_a_small_ring_is_a_gap_and_redraw() {
     );
     c.wait_for("up", T);
     let before = c.output().len();
+    // The 700 ms backoff is what lets the program overwrite the 4 KiB ring
+    // before the client is back; the free first attempt (acs-iyq) would
+    // skip it, so the network refuses that one.
+    remote.refuse_one_dial();
     remote.cut_link();
     remote.wait_connections(2, T);
     // After reconnecting with an overwritten offset the client clears the
@@ -379,6 +414,9 @@ fn modes_on_before_a_gap_are_reset_on_detach() {
         &env,
     );
     c.wait_for("up", T);
+    // As above: the backoff is what lets the ring be overwritten, so the
+    // free first attempt is refused out of the way (acs-iyq).
+    remote.refuse_one_dial();
     remote.cut_link();
     remote.wait_connections(2, T);
     c.wait_for("\x1b[H\x1b[J", T);
@@ -405,6 +443,10 @@ fn modes_of_a_restarted_session_are_reset() {
         &env,
     );
     a.wait_for("TUI", T);
+    // The free first redial (acs-iyq) would land while the first program is
+    // still running and resume it; refused, it costs nothing and `a` is
+    // left in the backoff, as it was before there was a free attempt.
+    remote.refuse_one_dial();
     remote.cut_link();
     // The first program ends while the link is down; another takes its name.
     let deadline = Instant::now() + T;
@@ -445,6 +487,10 @@ fn a_network_change_redials_at_once() {
         &[("ACS_BACKOFF_MS", "120000"), ("ACS_NETWATCH_FIFO", &fifo_s)],
     );
     c.wait_for("#10#", T);
+    // The network is down: the free first redial (acs-iyq) is refused, and
+    // the two minutes of backoff behind it are what the watcher then has to
+    // cut short for this to mean anything.
+    remote.refuse_one_dial();
     remote.cut_link();
     c.wait_for("reconnecting in 120s", T);
     let t0 = Instant::now();
@@ -532,6 +578,9 @@ fn a_session_ending_during_an_outage_leaves_no_status_behind() {
         ],
     );
     c.wait_for("up", T);
+    // Refused the free attempt (acs-iyq), the client is in its 1.5 s wait:
+    // the program has ended long before it dials again.
+    remote.refuse_one_dial();
     remote.cut_link();
     c.wait_for("reconnecting in", T);
     // The program ends while nobody is attached.
@@ -558,9 +607,12 @@ fn the_bell_rings_while_the_link_is_down_too() {
         &[("ACS_BACKOFF_MS", "20000")],
     );
     c.wait_for("up", T);
+    remote.refuse_one_dial();
     remote.cut_link();
-    // The end of the status line (its title has a BEL of its own).
-    c.wait_for("d to detach)\x1b[0m\x1b8", T);
+    // The end of the wait's status line (its title has a BEL of its own).
+    // `in 20s` and not the free attempt's line (acs-iyq): the double tap
+    // below is only read while the client is waiting, not while it dials.
+    c.wait_for("in 20s (Ctrl-] Ctrl-] d to detach)\x1b[0m\x1b8", T);
     // One write, so the double tap cannot be split across the escape
     // window by a host that deschedules the client between the two presses
     // (acs-o8h): 50 ms of sleep inside the default 400 ms was the tightest
@@ -600,9 +652,12 @@ fn the_escape_window_is_the_same_offline() {
         ],
     );
     c.wait_for("up", T);
+    remote.refuse_one_dial();
     remote.cut_link();
-    // Past the end of the status line, whose title carries a BEL of its own.
-    c.wait_for("d to detach)\x1b[0m\x1b8", T);
+    // Past the end of the wait's status line, whose title carries a BEL of
+    // its own — `in 20s`, so both presses land in the offline wait rather
+    // than the first one in the free redial (acs-iyq).
+    c.wait_for("in 20s (Ctrl-] Ctrl-] d to detach)\x1b[0m\x1b8", T);
     c.send(&[0x1d]);
     // Well past the default 400 ms window, inside the configured one.
     std::thread::sleep(Duration::from_millis(1000));

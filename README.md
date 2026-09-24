@@ -248,11 +248,12 @@ several may fight over one port) and is passed to ssh unchecked.
 
 ### When the network drops
 
-The client notices a dead link within 10 seconds, redials with backoff
-(1 s doubling to 30 s, or at once when your network changes) and resumes
-exactly where the output stopped — nothing is lost or repeated. While it is
-disconnected a status line shows at the bottom of the screen, typed keys are
-dropped, and Ctrl-] Ctrl-] `d` still detaches. `--no-reconnect` exits
+The client notices a dead link within 10 seconds, redials **at once** — most
+drops are a blip and the network is back by then — and then with backoff
+(1 s doubling to 30 s, or at once again when your network changes) and
+resumes exactly where the output stopped — nothing is lost or repeated.
+While it is waiting a status line shows at the bottom of the screen, typed
+keys are dropped, and Ctrl-] Ctrl-] `d` still detaches. `--no-reconnect` exits
 instead.
 
 ### Never giving up on a host

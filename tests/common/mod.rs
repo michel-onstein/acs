@@ -318,6 +318,9 @@ impl Remote {
         if !script.exists() {
             let body = format!(
                 "#!/bin/sh\n\
+                 if [ -f '{refuse}' ]; then rm -f '{refuse}'; \
+                 echo 'ssh: connect to host devbox port 22: Connection refused' >&2; \
+                 exit 255; fi\n\
                  echo $$ >> '{pids}'\n\
                  [ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\n\
                  while [ -f '{gate}' ]; do sleep 0.05; done\n\
@@ -332,6 +335,7 @@ impl Remote {
                  exec /bin/sh -c \"$1\" < '{mute}'.$$.in\n\
                  fi\n\
                  exec /bin/sh -c \"$1\"\n",
+                refuse = self.refuse_file().display(),
                 pids = self.pid_file().display(),
                 silent = self.silent_file().display(),
                 delay = self.delay_file().display(),
@@ -368,6 +372,10 @@ impl Remote {
 
     fn gate_file(&self) -> PathBuf {
         self.root.path().join("dial-gate")
+    }
+
+    fn refuse_file(&self) -> PathBuf {
+        self.root.path().join("dial-refused")
     }
 
     fn mute_file(&self) -> PathBuf {
@@ -455,6 +463,23 @@ impl Remote {
     /// Let the connection held by [`Remote::hold_dial`] finish.
     pub fn release_dial(&self) {
         let _ = std::fs::remove_file(self.gate_file());
+    }
+
+    /// Refuse the *next* connection out of hand, as a network still down
+    /// does: nothing is spawned, so it is no connection at all
+    /// ([`Remote::transport_pids`] does not count it) and the client is
+    /// back in its backoff at once. The refusal is spent by that one
+    /// connection; everything after it connects normally.
+    ///
+    /// **This is how a test puts the client in the offline wait**, now that
+    /// the first redial after a drop goes at once (acs-iyq): cutting the
+    /// link no longer leaves it there by itself, because that free attempt
+    /// would succeed. Refusing it restores what a test used to get from the
+    /// cut alone — the client waiting out `ACS_BACKOFF_MS` — with no wall
+    /// clock involved, and it says so itself when it is there: only the
+    /// second attempt onwards prints `reconnecting in <n>s`.
+    pub fn refuse_one_dial(&self) {
+        std::fs::write(self.refuse_file(), "").unwrap();
     }
 
     /// Make every connection say nothing at all — no login noise, no marker
