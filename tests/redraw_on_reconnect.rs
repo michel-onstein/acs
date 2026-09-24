@@ -87,12 +87,13 @@ fn sent_once_on_a_lossless_resume_after_the_resent_input() {
     let mut c = start(&remote, "devbox", "rs", FAST);
     // Freeze the connection, type into it, then cut it: the keys never
     // reached the master and are resent on the resume.
+    let dialled = remote.connections();
     let pid = *remote.transport_pids().last().unwrap();
     acs::sys::kill(pid, libc::SIGSTOP).unwrap();
     c.send(b"abc");
     std::thread::sleep(Duration::from_millis(200));
     let _ = acs::sys::kill(pid, libc::SIGKILL);
-    remote.wait_connections(2, T);
+    remote.wait_more_connections(dialled, 1, T);
     c.wait_for("in:0c", T);
     sync(&mut c);
     assert_eq!(received(&c), ["61", "62", "63", "0c", "7a"], "{}", c.text());
@@ -105,8 +106,9 @@ fn not_sent_into_a_paste_the_drop_left_open() {
     // A paste whose end marker never made it before the link was cut.
     c.send(b"\x1b[200~ab");
     c.wait_for("in:62", T);
+    let dialled = remote.connections();
     remote.cut_link();
-    remote.wait_connections(2, T);
+    remote.wait_more_connections(dialled, 1, T);
     // Resumed: the status line's title is popped.
     c.wait_for("\x1b[23;0t", T);
     sync(&mut c);
@@ -168,8 +170,9 @@ fn one_per_reconnect_a_reattach_then_a_resume() {
     assert_eq!(c.wait(T), 0);
     let mut c = Client::start_env(&remote, &["devbox", "rr"], FAST);
     c.wait_for("in:0c", T);
+    let dialled = remote.connections();
     remote.cut_link();
-    remote.wait_connections(3, T);
+    remote.wait_more_connections(dialled, 1, T);
     c.wait_for("in:0c", T);
     sync(&mut c);
     assert_eq!(received(&c), ["0c", "0c", "7a"], "{}", c.text());

@@ -81,7 +81,7 @@ fn a_dropped_plain_host_is_pinged_until_it_answers_then_resumed() {
     env.push(("ACS_PING_MS", "200"));
     let mut c = Client::start_env(&remote, &session("devbox", &[]), &env);
     c.wait_for("up", T);
-    let dials = remote.transport_pids().len();
+    let dials = remote.connections();
     net.set_up(&[]);
     let pinged = net.pinged().len();
     remote.cut_link();
@@ -90,7 +90,7 @@ fn a_dropped_plain_host_is_pinged_until_it_answers_then_resumed() {
         net.pinged().len() >= pinged + 3
     });
     assert_eq!(
-        remote.transport_pids().len(),
+        remote.connections(),
         dials,
         "dialled while the host did not answer"
     );
@@ -101,7 +101,7 @@ fn a_dropped_plain_host_is_pinged_until_it_answers_then_resumed() {
     c.send(b"back\r");
     // After the Ctrl-L every resume sends first (redraw_on_reconnect).
     c.wait_for("got:\x0cback", T);
-    assert_eq!(remote.transport_pids().len(), dials + 1);
+    assert_eq!(remote.connections(), dials + 1);
 }
 
 #[test]

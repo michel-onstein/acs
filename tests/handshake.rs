@@ -59,6 +59,7 @@ fn a_redial_greets_before_the_marker_too() {
 fn a_window_resized_while_the_dial_is_held_reaches_the_program() {
     let remote = Remote::installed();
     remote.hold_dial();
+    let dialled = remote.connections();
     let mut c = Client::start(
         &remote,
         &[
@@ -73,7 +74,7 @@ fn a_window_resized_while_the_dial_is_held_reaches_the_program() {
     // The HELLO was built before the transport was spawned, so by the time
     // there is a connection to hold it is already written: the resize is
     // the one the handshake cannot carry.
-    remote.wait_connections(1, T);
+    remote.wait_more_connections(dialled, 1, T);
     c.resize(101, 33);
     remote.release_dial();
     c.wait_for("33 101", T);

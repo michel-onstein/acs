@@ -1242,6 +1242,20 @@ aliases:
         p
     }
 
+    /// The backstop is the deadline's whole seconds plus two, and the exit
+    /// code is the ping's own.
+    ///
+    /// **The deadlines are generous on purpose** (acs-ryz). They are not
+    /// what is being asserted — the argv is, and the code — but each one
+    /// has to cover a `fork`, an `exec` and a shell's startup, and this
+    /// binary runs three hundred tests twelve at a time, many of which
+    /// spawn processes of their own. At a second and a half, `exit 1`
+    /// missed it: `cargo test --lib` failed here four runs out of four on
+    /// a laptop at load average six. A ping that is going to answer
+    /// answers in milliseconds, so nothing waits these out; what they buy
+    /// is that a busy host cannot turn "the deadline was applied" into
+    /// "the host is down". `ping_is_killed_at_the_deadline` below is the
+    /// test that the deadline *is* enforced, and it keeps a short one.
     #[test]
     fn ping_is_one_packet_with_a_backstop_past_the_deadline() {
         let dir = TempDir::new();
@@ -1252,7 +1266,8 @@ aliases:
         } else {
             "-W"
         };
-        for (ms, secs) in [(1500, 3), (2500, 4), (4000, 6)] {
+        // Fractional, so the backstop is seen to truncate and add two.
+        for (ms, secs) in [(5500, 7), (6500, 8), (9000, 11)] {
             assert_eq!(
                 ping_with(p.as_os_str(), "h.lan", Duration::from_millis(ms)),
                 Some(0)
@@ -1264,12 +1279,12 @@ aliases:
         }
         let down = script(&dir, "down", "exit 1");
         assert_eq!(
-            ping_with(down.as_os_str(), "h", Duration::from_secs(1)),
+            ping_with(down.as_os_str(), "h", Duration::from_secs(10)),
             Some(1)
         );
         let none = dir.path().join("no-such-ping");
         assert_eq!(
-            ping_with(none.as_os_str(), "h", Duration::from_secs(1)),
+            ping_with(none.as_os_str(), "h", Duration::from_secs(10)),
             None
         );
     }

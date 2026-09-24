@@ -216,12 +216,12 @@ fn a_menu_connection_lost_while_reading_is_dialed_afresh() {
     detached(&remote, "one");
     let mut c = Client::start(&remote, &["devbox"]);
     menu_up(&mut c);
-    let before = remote.transport_pids().len();
+    let before = remote.connections();
     remote.cut_link();
     std::thread::sleep(Duration::from_millis(200));
     c.send(b"1");
     attached_to(&mut c, "one");
-    assert_eq!(remote.transport_pids().len(), before + 1);
+    assert_eq!(remote.connections(), before + 1);
     assert!(!c.text().contains("connection lost"), "{:?}", c.text());
 }
 
