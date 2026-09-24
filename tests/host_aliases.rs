@@ -23,6 +23,22 @@ fn session(host: &str) -> Vec<&str> {
     vec!["-v", host, "s", "--", "/bin/sh", "-c", "echo up; sleep 30"]
 }
 
+/// The program has started: the session announcement first, then its
+/// `up`.
+///
+/// **Every client in this file runs under `-v`**, which echoes the whole
+/// remote prelude into the terminal before the dial is answered — and the
+/// word `up` is two letters that any of that kilobyte of shell script may
+/// contain. It has happened: a refusal naming the *group* write bit
+/// satisfied waits like this one before the connection existed, and
+/// `src/ssh.rs` carries a reworded message to this day. `wait_session`
+/// puts the echo behind the search cursor, so the `up` found after it is
+/// the program's and can be nothing else (acs-ryz).
+fn wait_up(c: &mut Client, session: &str) {
+    c.wait_session(session);
+    c.wait_for("up", T);
+}
+
 #[test]
 fn an_alias_connects_to_its_first_reachable_host() {
     let remote = Remote::installed();
@@ -30,7 +46,7 @@ fn an_alias_connects_to_its_first_reachable_host() {
     let env = net.env(CONFIG);
     let mut c = Client::start_env(&remote, &session("devbox"), &refs(&env));
     c.wait_for("devbox: devbox.lan answers ping, using devbox.lan", T);
-    c.wait_for("up", T);
+    wait_up(&mut c, "s");
     assert_eq!(net.pinged(), ["devbox.example.com", "devbox.lan"]);
 }
 
@@ -45,7 +61,7 @@ fn falls_back_to_the_next_host_and_its_user() {
         "devbox: devbox.example.com answers ping, using me@devbox.example.com",
         T,
     );
-    c.wait_for("up", T);
+    wait_up(&mut c, "s");
 }
 
 /// Regression (acs-4pv): macOS ping cannot reach an IPv6 host at all — it
@@ -58,7 +74,7 @@ fn an_ipv6_host_is_pinged_with_ping6() {
     let env = net.env("aliases:\n  nas:\n    - host: \"fd00:1::20\"\n");
     let mut c = Client::start_env(&remote, &session("nas"), &refs(&env));
     c.wait_for("nas: fd00:1::20 answers ping, using fd00:1::20", T);
-    c.wait_for("up", T);
+    wait_up(&mut c, "s");
     assert_eq!(
         net.pinged(),
         ["fd00:1::20", "fd00:1::20"],
@@ -73,7 +89,7 @@ fn an_unchecked_host_is_used_without_a_ping() {
     let env = net.env(CONFIG);
     let mut c = Client::start_env(&remote, &session("lab"), &refs(&env));
     c.wait_for("lab: using lab2 (reachability_check is off, ", T);
-    c.wait_for("up", T);
+    wait_up(&mut c, "s");
     assert_eq!(net.pinged(), ["lab1"]);
 }
 
@@ -118,7 +134,7 @@ aliases:
         "devbox: devbox.example.com answers ping, using me@devbox.example.com",
         T,
     );
-    c.wait_for("up", T);
+    wait_up(&mut c, "s");
     let took = t0.elapsed();
     assert!(took < std::time::Duration::from_secs(25), "{took:?}");
     assert!(took >= std::time::Duration::from_secs(5), "{took:?}");
@@ -135,7 +151,7 @@ fn user_at_alias_logs_in_as_that_user_on_every_host() {
         "you@devbox: devbox.lan answers ping, using you@devbox.lan",
         T,
     );
-    c.wait_for("up", T);
+    wait_up(&mut c, "s");
     c.send(&command(b'x'));
     c.wait(T);
 
@@ -146,7 +162,7 @@ fn user_at_alias_logs_in_as_that_user_on_every_host() {
         "you@devbox: devbox.example.com answers ping, using you@devbox.example.com",
         T,
     );
-    c.wait_for("up", T);
+    wait_up(&mut c, "s");
     c.send(&command(b'x'));
     c.wait(T);
 }
@@ -158,7 +174,7 @@ fn other_names_are_not_resolved() {
     let env = net.env(CONFIG);
     for host in ["other", "me@other"] {
         let mut c = Client::start_env(&remote, &session(host), &refs(&env));
-        c.wait_for("up", T);
+        wait_up(&mut c, "s");
         c.send(&command(b'x'));
         c.wait(T);
         assert!(!c.text().contains("ping"), "{host}: {}", c.text());
@@ -206,7 +222,7 @@ fn redialling(remote: &Remote, net: &Net, name: &str) -> Client {
         &[name, "r", "--", "/bin/sh", "-c", "echo up; sleep 30"],
         &refs(&env),
     );
-    c.wait_for("up", T);
+    wait_up(&mut c, "r");
     c
 }
 
@@ -217,12 +233,13 @@ fn a_redial_resolves_the_alias_again() {
     let mut c = redialling(&remote, &net, "devbox");
     // The network changes: only the outside address answers now.
     net.set_up(&["devbox.example.com"]);
+    let dialled = remote.connections();
     remote.cut_link();
     c.wait_for(
         "devbox: now using me@devbox.example.com (was devbox.lan)",
         T,
     );
-    remote.wait_connections(2, T);
+    remote.wait_more_connections(dialled, 1, T);
     // The fake remote is one machine, so the session resumes.
     // The resume's Ctrl-L, echoed by the session's terminal: typing now
     // reaches the program (keys typed during the redial are dropped).
@@ -239,12 +256,13 @@ fn a_redial_of_user_at_alias_keeps_the_user() {
     let net = Net::new(&["devbox.lan"]);
     let mut c = redialling(&remote, &net, "you@devbox");
     net.set_up(&["devbox.example.com"]);
+    let dialled = remote.connections();
     remote.cut_link();
     c.wait_for(
         "you@devbox: now using you@devbox.example.com (was you@devbox.lan)",
         T,
     );
-    remote.wait_connections(2, T);
+    remote.wait_more_connections(dialled, 1, T);
     // The resume's Ctrl-L, echoed by the session's terminal: typing now
     // reaches the program (keys typed during the redial are dropped).
     c.wait_for("^L", T);
@@ -306,7 +324,7 @@ fn the_command_line_key_beats_the_hosts_which_beats_the_aliass() {
     // The entry's own key, with ~ expanded as the shell would.
     let mut c = keyed_client(&ssh, &net, &[], &[]);
     c.wait_for("devbox: identity_file ~/.ssh/id_lan (", T);
-    c.wait_for("up", T);
+    wait_up(&mut c, "k");
     c.send(&command(b'x'));
     c.wait(T);
     assert_eq!(
@@ -318,7 +336,7 @@ fn the_command_line_key_beats_the_hosts_which_beats_the_aliass() {
     net.set_up(&["devbox.example.com"]);
     let mut c = keyed_client(&ssh, &net, &[], &[]);
     c.wait_for("devbox: identity_file /keys/devbox (", T);
-    c.wait_for("up", T);
+    wait_up(&mut c, "k");
     c.send(&command(b'x'));
     c.wait(T);
     assert_eq!(
@@ -337,7 +355,7 @@ fn the_command_line_key_beats_the_hosts_which_beats_the_aliass() {
             "devbox: the key given on the command line replaces identity_file ~/.ssh/id_lan (",
             T,
         );
-        c.wait_for("up", T);
+        wait_up(&mut c, "k");
         c.send(&command(b'x'));
         c.wait(T);
         assert_eq!(ssh.keys().last().unwrap(), &key("devbox.lan", want));
@@ -355,11 +373,12 @@ fn a_redial_onto_the_fallback_host_switches_to_its_key() {
         ("ACS_DEAD_MS", "800"),
     ];
     let mut c = keyed_client(&ssh, &net, &[], &fast);
-    c.wait_for("up", T);
+    wait_up(&mut c, "k");
     net.set_up(&["devbox.example.com"]);
+    let dialled = remote.connections();
     remote.cut_link();
     c.wait_for("devbox: now using devbox.example.com (was devbox.lan)", T);
-    remote.wait_connections(2, T);
+    remote.wait_more_connections(dialled, 1, T);
     // The resume's Ctrl-L, echoed by the session's terminal: typing now
     // reaches the program (keys typed during the redial are dropped).
     c.wait_for("^L", T);

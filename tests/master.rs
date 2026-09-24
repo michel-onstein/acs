@@ -42,12 +42,46 @@ fn start_env(
 }
 
 fn attach(dir: &Path, name: &str, identity: &str, resume: Option<Resume>) -> (FrameConn, Msg) {
-    let mut c = FrameConn::connect(&sock(dir, name)).unwrap();
+    attach_conn(
+        FrameConn::connect(&sock(dir, name)).unwrap(),
+        name,
+        identity,
+        resume,
+    )
+}
+
+fn attach_conn(
+    mut c: FrameConn,
+    name: &str,
+    identity: &str,
+    resume: Option<Resume>,
+) -> (FrameConn, Msg) {
     let mut h = hello(name, Mode::Attach, identity);
     h.resume = resume;
     c.send(&Msg::Hello(h));
     let m = c.recv_control(T).expect("reply to HELLO");
     (c, m)
+}
+
+/// Attach as soon as the socket answers, retrying while it does not.
+///
+/// **A path that is back is not a socket that is listening** (acs-ryz).
+/// `UnixListener::bind` creates the file and then listens, and a `connect`
+/// landing between the two is refused — so a test that polls for the file
+/// and then attaches has a race, not a wait. It fired: under parallel
+/// copies of the suite with `dd` and fork loops beside them, the attach in
+/// `socket_is_rebound_after_deletion` came back `Connection refused`.
+/// Connecting is the question the test is really asking, so it is the one
+/// that is asked, and the connection that answers is the one used.
+fn attach_when_bound(dir: &Path, name: &str, identity: &str) -> (FrameConn, Msg) {
+    let deadline = Instant::now() + T;
+    loop {
+        if let Ok(c) = FrameConn::connect(&sock(dir, name)) {
+            return attach_conn(c, name, identity, None);
+        }
+        assert!(Instant::now() < deadline, "the socket never answered again");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn wait_exit(c: &mut FrameConn) -> i32 {
@@ -132,13 +166,9 @@ fn socket_is_rebound_after_deletion() {
         &[("ACS_MASTER_REBIND_MS", "100")],
     );
     std::fs::remove_file(sock(t.path(), "rb")).unwrap();
-    let deadline = Instant::now() + T;
-    while !sock(t.path(), "rb").exists() {
-        assert!(Instant::now() < deadline, "socket never re-bound");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // The new socket reaches the same session.
-    let (mut c2, m) = attach(t.path(), "rb", "me", None);
+    // Re-bound means it answers again, not that the path is back: see
+    // `attach_when_bound`. The new socket reaches the same session.
+    let (mut c2, m) = attach_when_bound(t.path(), "rb", "me");
     assert!(
         matches!(m, Msg::Welcome(ref w2) if w2.instance == w.instance),
         "{m:?}"
@@ -173,7 +203,8 @@ fn socket_directory_is_recreated_after_deletion() {
     }
     use std::os::unix::fs::MetadataExt;
     assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
-    let (_c2, m) = attach(&dir, "gone", "me", None);
+    // As above: the path being back is not the socket listening yet.
+    let (_c2, m) = attach_when_bound(&dir, "gone", "me");
     assert!(
         matches!(m, Msg::Welcome(ref x) if x.instance == w.instance),
         "{m:?}"

@@ -144,14 +144,24 @@ impl Net {
     }
 
     /// The environment for a client with `config` as its configuration and
-    /// this ping. This ping answers at once, but on a machine busy with every
-    /// other test it may not even have started within the 500 ms default, so
-    /// a configuration that sets no `reachability_timeout` gets 10 s.
+    /// this ping. This ping answers at once, but on a machine busy with
+    /// every other test it may not even have *started* within the 500 ms
+    /// default, so a configuration that sets no `reachability_timeout` gets
+    /// one wider than the deadline the test itself waits to.
+    ///
+    /// Ten seconds was not enough (acs-ryz): under parallel copies of the
+    /// suite with `dd` and fork loops beside them, `does not answer ping
+    /// within 10s` was the commonest failure of the whole run — a shell
+    /// script that had not been scheduled yet, reported as a host that is
+    /// down. A ping that is going to answer answers in milliseconds, so
+    /// nothing waits this out; what it buys is that [`T`] fires first, and
+    /// a test that fails says which wait it was stuck in rather than
+    /// blaming the network.
     pub fn env(&self, config: &str) -> Vec<(String, String)> {
         let config = if config.contains("reachability_timeout") {
             config.to_string()
         } else {
-            format!("reachability_timeout: 10s\n{config}")
+            format!("reachability_timeout: 60s\n{config}")
         };
         let mut env = config_env(self.dir.path(), &config);
         env.push(("ACS_PING".into(), self.ping().display().to_string()));
@@ -667,14 +677,34 @@ impl Remote {
         let _ = sys::kill(pid, libc::SIGKILL);
     }
 
-    /// Wait until `n` connections have been made.
-    pub fn wait_connections(&self, n: usize, timeout: Duration) {
+    /// How many connections have been made so far: the baseline a test
+    /// takes before the stimulus it is about, and counts further
+    /// connections from with [`Remote::wait_more_connections`].
+    ///
+    /// **There is no absolute-count wait any more** (acs-ryz). One existed,
+    /// and it invited the bug acs-cu8 spent a morning on: how many
+    /// connections a client has made by the time a test is ready to disturb
+    /// it is not a constant. A remote that has to install acs first spends
+    /// one or two before the session — which is what the Linux container
+    /// does and a developer's laptop does not — so `wait_connections(2)`
+    /// was already satisfied before the cut it was meant to observe, and
+    /// the test passed without testing anything. Five call sites had grown
+    /// a hand-written baseline against it; this makes the baseline the only
+    /// way to ask.
+    pub fn connections(&self) -> usize {
+        self.transport_pids().len()
+    }
+
+    /// Wait until `extra` more connections have been made than the `base`
+    /// [`Remote::connections`] returned before the stimulus.
+    pub fn wait_more_connections(&self, base: usize, extra: usize, timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        while self.transport_pids().len() < n {
+        while self.connections() < base + extra {
             assert!(
                 Instant::now() < deadline,
-                "only {} connections",
-                self.transport_pids().len()
+                "{} connections, waiting for {} more than the {base} there were",
+                self.connections(),
+                extra,
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -869,6 +899,24 @@ impl Client {
     /// before then are dropped (DESIGN §5.2), so a test types after it.
     pub fn wait_resumed(&mut self) {
         self.wait_for("\x1b[23;0t", T);
+    }
+
+    /// Wait until the client announces the session it created — `new
+    /// session '<name>' on <host>`, printed on the WELCOME that created it.
+    ///
+    /// **This is the anchor a short needle from the program needs** under
+    /// `-v` (acs-ryz). Verbose echoes the whole remote prelude into the
+    /// terminal before the dial is answered — a kilobyte of shell script —
+    /// and [`Client::wait_for`] searches forward from the end of the last
+    /// match, so a wait for the two letters `up` is satisfied by any word
+    /// of that script containing them, before the program has run at all.
+    /// It has happened: a refusal that named the *group* write bit passed
+    /// several tests that were waiting for `echo up`, and `src/ssh.rs`
+    /// still carries the reworded message. Waiting for this line first puts
+    /// the echo behind the cursor, so what is found afterwards is the
+    /// session's own output and can be nothing else.
+    pub fn wait_session(&mut self, name: &str) {
+        self.wait_for(&format!("new session '{name}' on "), T);
     }
 
     /// Change the terminal size (the client gets SIGWINCH).
