@@ -1782,6 +1782,29 @@ touches `$HOME`, `~/.local` or `~/.local/share` where they already exist:
 acs did not make them, and the prelude does not look at them. The binary's
 own mode is set past the umask already (acs-28b).
 
+**A symlinked candidate is judged by the file it points at** (acs-gov). The
+check above read the candidate's mode with `ls -ldn`, without `-L`, so on a
+symlink it read the *link*. A link's own mode is `lrwxrwxrwx` on Linux,
+which matches the other-writable pattern, so a symlinked binary was always
+refused and told the user about permissions that were not the problem; on
+macOS it is `lrwxr-xr-x`, so it passed and the target's mode and owner were
+never looked at at all — exactly the hole acs-08m closes for a real file.
+The prelude now walks the chain itself and requires that **every directory
+it passes through** — the one holding each link and the one holding the
+final file — and the final file are owned by the user and closed to group
+and other. Following the link says what is executed; the directories say who
+can change what is executed, and write access to a directory, not to a link,
+is what lets someone repoint it. A link's own mode is therefore never
+judged. What is accepted, unchanged from acs-08m: ancestors above those
+immediate directories are not examined, so a host that lets others write
+`$HOME` or `~/.local/share` is out of reach of this check. A dangling link
+or a loop fails `[ -x ]` and is passed over in silence, as a missing binary
+is; a chain longer than 16 links, or a host with no `readlink`, is refused
+and falls back to installing a real file. `readlink` reached POSIX only in
+2024, but it is in busybox, toybox, coreutils and the BSDs, and it is
+consulted only for a candidate that *is* a symlink — which no acs install
+produces, so the ordinary path depends on nothing new.
+
 **The shell does the checking, not the uploaded binary** (acs-4km). The
 digest used to be verified by `_install --finish` itself, which hashes its
 own `current_exe()` — no check at all, since a substituted binary simply

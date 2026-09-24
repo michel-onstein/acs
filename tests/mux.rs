@@ -52,8 +52,7 @@ impl Fake {
             ));
         }
         let body = format!(
-            "#!/bin/sh\n\
-             printf '%s\\n' \"$*\" >> '{log}'\n\
+            "#!/bin/sh\n{log}\
              case \" $* \" in\n\
              *' -O check '*) exit 0 ;;\n\
              *' -O exit '*) rm -f '{wedge}'; exit 0 ;;\n\
@@ -68,7 +67,7 @@ impl Fake {
              case \"$d\" in\n{cases}esac\n\
              echo \"ssh: connect to host $d port 22: Connection refused\" >&2\n\
              exit 255\n",
-            log = f.log().display(),
+            log = log_call_sh(&f.log()),
             wedge = f.wedge().display(),
         );
         std::fs::write(f.path(), body).unwrap();
