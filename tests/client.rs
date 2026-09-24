@@ -264,6 +264,157 @@ fn the_bell_waits_for_the_programs_osc_to_end() {
     );
 }
 
+/// Every `acs:` note the client printed landed where the program's own
+/// stream was between sequences and characters, never inside one
+/// (acs-z22). The client's mode observer is what "boundary" means, so this
+/// uses the same one, fed everything on the terminal that was not a note.
+///
+/// Returns how many notes there were, so a test can say the interleaving
+/// it set up really happened.
+fn notes_at_a_boundary(out: &[u8]) -> usize {
+    let mut stream = acs::modes::ModeObserver::new();
+    let mut notes = 0;
+    let mut i = 0;
+    while i < out.len() {
+        if out[i..].starts_with(b"acs: ") {
+            assert!(
+                stream.at_boundary(),
+                "a note landed inside the program's sequence at byte {i}:\n{}",
+                String::from_utf8_lossy(&out[i.saturating_sub(60)..out.len().min(i + 80)])
+            );
+            notes += 1;
+            // Past the line: a note is one line, and anything that looks
+            // like a second note inside it is its text.
+            i += out[i..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(out.len() - i, |n| n + 1);
+        } else {
+            stream.observe(&out[i..i + 1]);
+            i += 1;
+        }
+    }
+    notes
+}
+
+/// acs-z22 — and the assertion acs-4i2 deliberately left out of its `-v`
+/// tests because of it: a note goes where the bell goes, at a boundary of
+/// the program's stream, so it cannot split an escape sequence, a UTF-8
+/// character or a line the program is drawing.
+///
+/// Notes are written to fd 2 and the session's bytes to fd 1; under `-v`
+/// both land on the same terminal, with nothing in the stream separating
+/// them. `-v` is what someone reaches for when something is already wrong,
+/// so the corruption used to appear exactly where it was most confusing.
+///
+/// **Nothing here is timed.** The program stops halfway through a CSI and
+/// stays there until this test lets it past a fifo, so the window the note
+/// has to land in is held open by the test rather than by a sleep. That
+/// the client saw the hint *while* it was open is established the same
+/// way: the keystroke behind it comes back echoed by the remote pty, and
+/// the client cannot have forwarded the key without having read the
+/// netwatch descriptor first — it was readable earlier, and the frame loop
+/// reads it before stdin in the same pass.
+#[test]
+fn a_verbose_note_lands_at_a_boundary_of_the_programs_output() {
+    const ROUNDS: usize = 4;
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let gate = remote.root.path().join("sequence-gate");
+    make_fifo(&gate);
+    // Each round: a marker at a boundary, then a CSI opened and left open
+    // (no final byte) until the fifo is released, then the byte that ends
+    // it. After the last one the program is left at a boundary, so the
+    // detach at the end has one to print its own note at.
+    let prog = format!(
+        "n=0; while [ $n -lt {ROUNDS} ]; do n=$((n+1)); printf '#%d#' \"$n\"; \
+         printf '\\033[%d;0;0' \"$n\"; cat '{}' >/dev/null; printf 'm'; done; \
+         printf 'DONE'; sleep 60",
+        gate.display()
+    );
+    let mut env = vec![
+        // The held note must be released by the boundary, not by the
+        // bound behind it: the round trip below is not timed, and a loaded
+        // machine may take a while over it.
+        ("ACS_NOTE_HOLD_MS".to_string(), "600000".to_string()),
+    ];
+    env.extend(watch.env());
+    let mut c = Client::start_env(
+        &remote,
+        &["-v", "devbox", "note", "--", "/bin/sh", "-c", &prog],
+        &refs(&env),
+    );
+    // `-v` echoes the whole prelude, so the session announcement anchors
+    // the short needles that follow (acs-ryz).
+    c.wait_session("note");
+    for round in 1..=ROUNDS {
+        c.wait_for(&format!("#{round}#"), T);
+        // On the terminal, and unfinished: the client's observer is inside
+        // this CSI until the program ends it.
+        c.wait_for(&format!("\x1b[{round};0;0"), T);
+        // The kernel says something about the network. Under `-v` that is
+        // a note, raised with the terminal in the middle of that sequence.
+        watch.hint();
+        // A keystroke behind it: the remote pty echoes it, so seeing it
+        // back says the client has been round its loop since the hint —
+        // and `<` is a CSI parameter byte, so the sequence is still open.
+        c.send(b"<");
+        c.wait_for("<", T);
+        // Only now may the program finish the sequence. Nothing waits for
+        // the note here: where it comes out is the assertion, and a wait
+        // would only find it in the wrong place and then time out.
+        release_fifo(&gate);
+    }
+    // The last note is written when the program's last sequence ends,
+    // which is the frame `DONE` arrives in or an earlier one: by here,
+    // every one of them has been printed.
+    c.wait_for("DONE", T);
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/note", T);
+    // Every hint said its line, once — held is delayed, not dropped, and
+    // not repeated.
+    let hint = "acs: network hint: still on 192.168.1.5/24 — not a change";
+    assert_eq!(c.text().matches(hint).count(), ROUNDS, "{}", c.text());
+    // And not one of them, nor the prelude's or the detach's, landed
+    // inside the program's stream.
+    assert!(notes_at_a_boundary(&c.output()) > ROUNDS);
+}
+
+/// acs-z22: what is held is delayed, never dropped. A program that stops
+/// halfway through a sequence and says nothing more would otherwise keep
+/// a note for ever — so the wait is bounded (`ACS_NOTE_HOLD_MS`), and the
+/// note is printed where it stands rather than lost.
+#[test]
+fn a_note_is_not_swallowed_by_a_session_that_goes_quiet() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![("ACS_NOTE_HOLD_MS".to_string(), "300".to_string())];
+    env.extend(watch.env());
+    let mut c = Client::start_env(
+        &remote,
+        &[
+            "-v",
+            "devbox",
+            "quiet",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '#1#'; printf '\\033[1;0;0'; sleep 60",
+        ],
+        &refs(&env),
+    );
+    c.wait_session("quiet");
+    c.wait_for("\x1b[1;0;0", T);
+    // The sequence is never finished and no further frame ever comes. The
+    // note arrives all the same.
+    watch.hint();
+    c.wait_for(
+        "acs: network hint: still on 192.168.1.5/24 — not a change",
+        T,
+    );
+}
+
 /// acs-gov: `-v` names the whole ssh command line, and that line carries
 /// the remote prelude — 1046 bytes since the symlink check, against 518
 /// before it. `note`'s cap ended the line in the middle of the prelude,
