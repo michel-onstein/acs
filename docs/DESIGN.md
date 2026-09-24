@@ -1683,7 +1683,7 @@ in, so a missing binary is detected in the same ssh round trip:
 ```sh
 v=0.3.1
 for b in "$HOME/.local/share/acs/$v/acs" "/usr/local/lib/acs/$v/acs"; do
-  [ -x "$b" ] && exec "$b" _proxy main --create
+  [ -f "$b" ] && [ -x "$b" ] && exec "$b" _proxy main --create
 done
 printf '\nACS-NEED %s %s\n' "$(uname -s)" "$(uname -m)"
 ```
@@ -1695,6 +1695,10 @@ would not be recognised.
 
 - `/usr/local/lib/acs/<version>/` is an optional system-wide location an
   administrator can populate once for all users; `acs` never writes there.
+  The administrator populates it **as root**, so the safety check below
+  accepts a candidate owned by root as readily as one owned by the invoking
+  user (acs-6w9) — without that it was a location only its own owner could
+  ever use.
 - After an install, `~/.local/bin/acs` is pointed (symlink created under a
   temporary name, then renamed over) at the installed version, so the remote
   can be used as a client for the next hop — but only when it is missing, or
@@ -1791,8 +1795,9 @@ macOS it is `lrwxr-xr-x`, so it passed and the target's mode and owner were
 never looked at at all — exactly the hole acs-08m closes for a real file.
 The prelude now walks the chain itself and requires that **every directory
 it passes through** — the one holding each link and the one holding the
-final file — and the final file are owned by the user and closed to group
-and other. Following the link says what is executed; the directories say who
+final file — and the final file are owned acceptably (next paragraph) and
+closed to group and other. Following the link says what is executed; the
+directories say who
 can change what is executed, and write access to a directory, not to a link,
 is what lets someone repoint it. A link's own mode is therefore never
 judged. What is accepted, unchanged from acs-08m: ancestors above those
@@ -1804,6 +1809,37 @@ and falls back to installing a real file. `readlink` reached POSIX only in
 2024, but it is in busybox, toybox, coreutils and the BSDs, and it is
 consulted only for a candidate that *is* a symlink — which no acs install
 produces, so the ordinary path depends on nothing new.
+
+**An acceptable owner is you or root** (acs-6w9). acs-08m wrote the rule as
+"owned by the invoking user", which made the second candidate unusable by
+construction: `/usr/local/lib/acs/<version>/acs` exists so an administrator
+can populate it once for everybody, an administrator populates it as root,
+and every non-root user then refused it and installed a per-user copy — a
+documented location that only its own owner could ever use. Root already
+owns the machine, the sshd that authenticated the session and every binary
+on `PATH`, so a file root owns, in a directory root owns, neither of them
+writable by group or other, is not a weaker guarantee than one of the user's
+own. The widening is only of the *owner*: every other part of the check is
+as it was, and the file and the directory holding it are judged by the same
+rule, so a root-owned file in a world- or group-writable directory is still
+refused — the directory is what lets somebody substitute the file — as is a
+file or directory owned by any third uid. The rule is the same for both
+candidates rather than special-cased to the system path: it is one sentence
+instead of two, and a root-owned file under `$HOME` (an appliance image that
+bakes one in) is not a thing root needed permission from this check to
+place.
+
+**A candidate must be a regular file** (acs-6w9). `[ -x ]` is true of a
+directory, so a directory with mode 755 at a candidate path was `exec`'d:
+`sh` exits 126 and the loop never reaches its closing `printf`, so the
+client saw a silent failure where it should have seen `ACS-NEED`. The loop
+tests `[ -f ]` as well, which makes such a path simply absent — the same
+treatment a dangling link already got.
+
+**Every variable the prelude uses is `acs_`-prefixed** (acs-6w9). It worked
+in `u`, `b`, `p`, `n`, `t` and `w`, and an *exported* variable of any of
+those names would have reached the acs it execs, and the user's shell behind
+it, with the prelude's value instead of the user's.
 
 **The shell does the checking, not the uploaded binary** (acs-4km). The
 digest used to be verified by `_install --finish` itself, which hashes its
