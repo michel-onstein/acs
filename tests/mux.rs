@@ -1,10 +1,13 @@
 //! The ssh master acs owns (acs-9n3, DESIGN §3, §7.1, §12 decision 10).
 //!
 //! The fake ssh here is a little more than `common::Ssh`: it answers
-//! `ssh -O check` and `ssh -O exit` the way a real one would, and it can be
-//! told to play a **wedged** master — one whose control socket answers
-//! while its connection is dead — which is the failure a shared master
-//! adds and the one the fallback exists for.
+//! `ssh -O check` and `ssh -O exit` the way a real one would — **an exit
+//! takes the channels on that socket down with it**, which is what makes a
+//! sibling session observable (acs-n1m) — and it can be told to play a
+//! **wedged** master — one whose control socket answers while its
+//! connection is dead — which is the failure a shared master adds and the
+//! one the fallback exists for. It can also poison one channel's stream
+//! without touching the connection under it.
 
 mod common;
 
@@ -16,6 +19,11 @@ use common::*;
 /// A remote command that says when it is up and then stays: nothing here
 /// waits on a shell prompt it does not control.
 const UP: &[&str] = &["--", "/bin/sh", "-c", "echo MUX-UP; exec sleep 300"];
+
+/// The session whose channel [`Fake::poison_the_channel`] breaks. The name
+/// reaches the fake ssh in the remote command (`_proxy --session …`), which
+/// is how one channel out of several on a master is singled out.
+const POISONED: &str = "poisoned";
 
 /// The master persists long enough that nothing here races it, and the
 /// fallback window is short enough that a test waiting it out is quick.
@@ -46,29 +54,72 @@ impl Fake {
         std::fs::create_dir_all(f.dir()).unwrap();
         let mut cases = String::new();
         for (dest, remote) in hosts {
-            cases.push_str(&format!(
-                "    '{dest}') exec '{}' \"$1\" ;;\n",
-                remote.transport()
-            ));
+            cases.push_str(&format!("    '{dest}') t='{}' ;;\n", remote.transport()));
         }
         let body = format!(
             "#!/bin/sh\n{log}\
+             # The master this call names, if it names one at all.\n\
+             cp=\n\
+             for a in \"$@\"; do case \"$a\" in ControlPath=/*) cp=${{a#ControlPath=}} ;; esac; done\n\
              case \" $* \" in\n\
              *' -O check '*) exit 0 ;;\n\
-             *' -O exit '*) rm -f '{wedge}'; exit 0 ;;\n\
+             *' -O exit '*)\n\
+             # A master takes its channels with it. Without that, a session\n\
+             # here would survive an `-O exit` that a real one would have\n\
+             # dropped, and acs-n1m would have nothing to observe.\n\
+             [ -n \"$cp\" ] && : > \"$cp.gone\"\n\
+             rm -f '{wedge}'; exit 0 ;;\n\
              esac\n\
+             # Dialling with ControlMaster=auto on a socket whose master has\n\
+             # gone starts a new one, so this call is the master again.\n\
+             [ -n \"$cp\" ] && rm -f \"$cp.gone\"\n\
              # A master whose control socket answers while its connection is\n\
              # dead: the channel opens and nothing ever comes back.\n\
-             if [ -f '{wedge}' ]; then\n\
-             case \" $* \" in *' ControlPath=/'*) exec sleep 300 ;; esac\n\
+             if [ -f '{wedge}' ] && [ -n \"$cp\" ]; then exec sleep 300; fi\n\
+             # On demand, bytes this channel's client cannot read as a frame\n\
+             # (acs-n1m): the conversation breaks while the transport, the\n\
+             # master and every other channel carry on. Enough of them that\n\
+             # wherever the run lands, a frame header is read out of it.\n\
+             case \" $* \" in\n\
+             *'{marker}'*)\n\
+             me=$$\n\
+             ( while kill -0 $me 2>/dev/null; do\n\
+             if [ -f '{poison}' ]; then\n\
+             rm -f '{poison}'\n\
+             i=0; while [ $i -lt 64 ]; do printf '\\377'; i=$((i+1)); done\n\
+             break\n\
              fi\n\
+             sleep 0.05\n\
+             done ) & ;;\n\
+             esac\n\
              while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
              d=$2\nshift 2\n\
+             t=\n\
              case \"$d\" in\n{cases}esac\n\
+             if [ -z \"$t\" ]; then\n\
              echo \"ssh: connect to host $d port 22: Connection refused\" >&2\n\
-             exit 255\n",
+             exit 255\n\
+             fi\n\
+             if [ -z \"$cp\" ]; then exec \"$t\" \"$1\"; fi\n\
+             # A channel on a master, so it dies when the master does. The\n\
+             # transport runs as this script's own child and only that child\n\
+             # is ever signalled: a pid recorded and killed later could have\n\
+             # been recycled by another target of the suite by then.\n\
+             # A background job's stdin is /dev/null unless it is given one\n\
+             # (POSIX), and this one is the client's frames.\n\
+             exec 9<&0\n\
+             \"$t\" \"$1\" <&9 &\n\
+             c=$!\n\
+             while kill -0 $c 2>/dev/null; do\n\
+             if [ -f \"$cp.gone\" ]; then kill -9 $c 2>/dev/null; break; fi\n\
+             sleep 0.05\n\
+             done\n\
+             wait $c\n\
+             exit $?\n",
             log = log_call_sh(&f.log()),
             wedge = f.wedge().display(),
+            poison = f.poison().display(),
+            marker = POISONED,
         );
         std::fs::write(f.path(), body).unwrap();
         std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -92,6 +143,10 @@ impl Fake {
         self.root.path().join("wedged")
     }
 
+    fn poison(&self) -> PathBuf {
+        self.root.path().join("poison")
+    }
+
     /// From now on, a dial that joins acs's master never answers — until
     /// something runs `ssh -O exit` on it.
     fn wedge_the_master(&self) {
@@ -100,6 +155,13 @@ impl Fake {
 
     fn wedged(&self) -> bool {
         self.wedge().exists()
+    }
+
+    /// Break the [`POISONED`] session's channel, once: unreadable bytes
+    /// into its stream and nothing else touched — not the transport
+    /// carrying it, not the master, not another channel on that master.
+    fn poison_the_channel(&self) {
+        std::fs::write(self.poison(), b"").unwrap();
     }
 
     fn calls(&self) -> Vec<String> {
@@ -232,6 +294,89 @@ fn a_redial_dials_its_own_connection_and_ends_the_master() {
         "the master the lost link ran on was left up: {:?}",
         fake.calls()
     );
+}
+
+/// acs-n1m: the other half of the rule above. A channel that breaks while
+/// the connection under it keeps carrying bytes is not the connection
+/// failing, and ending the master over it drops every other acs session
+/// sharing it — each losing what its user had typed (DESIGN §5.2) for
+/// nothing. Two sessions on one master, one channel poisoned: the redial
+/// leaves the master alone and the sibling never notices.
+#[test]
+fn a_channel_that_breaks_leaves_the_master_and_the_sibling_alone() {
+    let remote = Remote::installed();
+    let fake = Fake::new("devbox", &remote);
+    let mut env = env(&fake);
+    env.push(("ACS_BACKOFF_MS".into(), "100".into()));
+    let ssh = fake.path();
+
+    // The sibling. It starts the master and must never hear about any of
+    // what follows.
+    let mut args = vec!["--ssh", ssh.to_str().unwrap(), "devbox", "sibling"];
+    args.extend(UP);
+    let mut sibling = Client::spawn(&exe(), &args, &refs(&env));
+    sibling.wait_for("MUX-UP", T);
+    let sibling_pid = *remote.transport_pids().last().unwrap();
+    let path = Fake::control_path(&fake.dials()[0]).unwrap();
+
+    // The session whose channel breaks, on that same master. `-v` so the
+    // decision itself is on the record, not only its effects.
+    let mut args = vec!["-v", "--ssh", ssh.to_str().unwrap(), "devbox", POISONED];
+    args.extend(UP);
+    let mut poisoned = Client::spawn(&exe(), &args, &refs(&env));
+    poisoned.wait_session(POISONED);
+    poisoned.wait_for("MUX-UP", T);
+    fake.assert_all_on(&path);
+
+    // The socket the master would be listening on, so that an `ssh -O exit`
+    // this test says must not happen *could* have happened.
+    fake.leave_a_socket(&path);
+    let base = remote.connections();
+
+    fake.poison_the_channel();
+    poisoned.wait_resumed();
+    remote.wait_more_connections(base, 1, T);
+
+    // The decision itself, on the record. Read rather than waited for: the
+    // resume above is already past it, and `wait_for` only searches
+    // forward.
+    let said = poisoned.text();
+    assert!(said.contains("keeping the shared ssh master"), "{said:?}");
+    assert!(
+        said.contains("protocol error"),
+        "the channel broke some other way: {said:?}"
+    );
+    // The assertion that does not race: with no `ssh -O exit` at all,
+    // nothing could have taken the sibling's connection away. The two
+    // below say the same thing from the sibling's side, but a master that
+    // *was* ended reaches it through a 50 ms poll in the fake, so they are
+    // corroboration rather than the signal.
+    assert!(
+        !fake.calls().iter().any(|c| c.contains(" -O exit ")),
+        "the master was ended over a broken channel: {:?}",
+        fake.calls()
+    );
+    // The redial had its own connection, as every redial does.
+    let last = fake.dials().last().unwrap().clone();
+    assert!(last.contains("-o ControlPath=none"), "{last:?}");
+    // One new connection, and it is the redial's. A second one would be
+    // the sibling coming back from a drop it should never have had.
+    assert_eq!(
+        remote.connections(),
+        base + 1,
+        "something besides the one redial dialled: {:?}",
+        fake.dials()
+    );
+
+    // And the sibling is still the connection it was — the fake's channels
+    // die when their master does, so this is what fails once the master
+    // goes down with a broken channel.
+    assert!(
+        acs::sys::kill(sibling_pid, 0).is_ok(),
+        "the sibling's connection was taken down with the master"
+    );
+    let text = sibling.text();
+    assert!(!text.contains("connection lost"), "{text:?}");
 }
 
 /// An alias is resolved again **before** every redial (DESIGN §7.3), so by
