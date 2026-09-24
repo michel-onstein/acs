@@ -355,18 +355,60 @@ pub fn prelude(version: &str, args: &[&str]) -> String {
     // `ls -ldn` rather than `test -O`, which is not POSIX and is missing
     // from dash: field 1 is the mode string, where character 6 is group
     // write and character 9 is other write, and field 3 is the numeric
-    // owner.
+    // owner. `-L` so the mode and owner read are the *target's* when the
+    // candidate is a symlink (acs-gov): without it the link's own mode was
+    // read, which is `lrwxrwxrwx` on Linux — matching the pattern, so a
+    // symlinked binary was always refused, and for a reason that was not
+    // true — and `lrwxr-xr-x` on macOS, where it passed and the target was
+    // never looked at at all.
+    //
+    // Following the link answers what is executed, not who can change what
+    // is executed, so `acs_safe` walks the chain itself with `readlink` and
+    // demands that **every directory it passes through** — the one holding
+    // each link, and the one holding the final file — is ours and closed to
+    // group and other, as well as the final file itself. A link's own mode
+    // is never judged: it cannot be set meaningfully, and write access to
+    // the directory, not to the link, is what lets someone repoint it.
+    //
+    // `readlink` is not in POSIX.1-2017 (it arrived in 2024) but is in
+    // busybox, toybox, coreutils and the BSDs. It is consulted only for a
+    // candidate that *is* a symlink — which no acs install produces — and a
+    // host without it refuses that candidate and falls back to installing a
+    // real file, so the common path keeps the dependencies it always had.
+    //
+    // A refusal says "writable by others" and shows the mode, rather than
+    // naming the group and other bits it tested: `-v` echoes this whole
+    // script into the client's terminal, and several tests wait for the two
+    // letters "up" to mean their program has started — which the word
+    // "group" would satisfy from the echo, before any connection exists.
+    // The mode string is the better half of the message anyway; it says
+    // which bit is set without the reader taking the shell's word for it.
     format!(
-        "u=$(id -u); \
+        "u=$(id -u); w=; \
+         acs_ok() {{ \
+         set -- \"$1\" $(ls -ldnL \"$1\" 2>/dev/null); \
+         [ -n \"$2\" ] || {{ w=\"cannot read $1\"; return 1; }}; \
+         case \"$2\" in \
+         ?????w*|????????w*) w=\"$1 is writable by others: $2\"; return 1;; \
+         l*) w=\"$1 is a symlink that does not resolve\"; return 1;; \
+         esac; \
+         [ \"$4\" = \"$u\" ] || {{ w=\"$1 is owned by uid $4, not by you\"; return 1; }}; }}; \
          acs_safe() {{ \
-         [ -e \"$1\" ] || return 1; \
-         set -- \"$1\" $(ls -ldn \"$1\" 2>/dev/null); \
-         case \"$2\" in ?????w*|????????w*) return 1;; esac; \
-         [ \"$4\" = \"$u\" ]; }}; \
+         [ -e \"$1\" ] || {{ w=\"$1 does not exist\"; return 1; }}; \
+         p=$1; n=0; \
+         while [ -L \"$p\" ]; do \
+         n=$((n+1)); \
+         [ \"$n\" -le 16 ] || {{ w=\"$1 leads through more than 16 symlinks\"; return 1; }}; \
+         acs_ok \"$(dirname \"$p\")\" || return 1; \
+         t=$(readlink \"$p\" 2>/dev/null); \
+         [ -n \"$t\" ] || {{ w=\"cannot resolve the symlink $p\"; return 1; }}; \
+         case \"$t\" in /*) p=$t;; *) p=$(dirname \"$p\")/$t;; esac; \
+         done; \
+         acs_ok \"$p\" && acs_ok \"$(dirname \"$p\")\"; }}; \
          for b in {home} {system}; do \
          if [ -x \"$b\" ]; then \
-         if acs_safe \"$b\" && acs_safe \"$(dirname \"$b\")\"; then exec \"$b\" {args}; fi; \
-         printf 'acs: refusing to run %s: it or its directory is writable by others, or not yours\\n' \"$b\" >&2; \
+         if acs_safe \"$b\"; then exec \"$b\" {args}; fi; \
+         printf 'acs: refusing to run %s: %s\\n' \"$b\" \"$w\" >&2; \
          fi; \
          done; \
          printf '\\nACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"",
@@ -844,6 +886,11 @@ mod tests {
         assert!(!out.contains("RAN"), "a group-writable binary was run");
         assert!(out.contains("ACS-NEED"), "no marker after refusing: {out}");
         assert!(err.contains("refusing to run"), "no reason given: {err}");
+        // The refusal names the path it is talking about and why (acs-gov).
+        assert!(
+            err.contains(acs.to_str().unwrap()) && err.contains("is writable by others"),
+            "the refusal does not name the real reason: {err}"
+        );
 
         // Writable by anyone: refused.
         std::fs::set_permissions(&acs, std::fs::Permissions::from_mode(0o707)).unwrap();
@@ -861,6 +908,139 @@ mod tests {
 
         // Put it back so the temporary directory can be removed.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// acs-gov: the check above read the candidate's mode with `ls -ldn`,
+    /// without `-L`, so on a symlink it judged the *link*. A link's own mode
+    /// is `lrwxrwxrwx` on Linux — it matched the other-writable pattern, so
+    /// every symlinked binary was refused, for a reason that was not true —
+    /// and `lrwxr-xr-x` on macOS, where it passed and the target's mode and
+    /// owner were never looked at at all. The prelude now follows the link
+    /// and judges what it will actually exec, plus every directory on the
+    /// way, since those are where someone else could substitute it.
+    #[test]
+    fn a_symlinked_binary_is_judged_by_the_file_it_points_at() {
+        use std::os::unix::fs::symlink;
+
+        let home = TempDir::new();
+        let dir = home.path().join(".local/share/acs/9.9.9");
+        let store = home.path().join("store");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        let mode = |p: &std::path::Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        mode(&dir, 0o755);
+        mode(&store, 0o755);
+
+        let candidate = dir.join("acs");
+        let run = || {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(prelude("9.9.9", &["--version"]))
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+        let relink = |target: &std::path::Path| {
+            let _ = std::fs::remove_file(&candidate);
+            symlink(target, &candidate).unwrap();
+        };
+
+        let target = store.join("acs-real");
+        std::fs::write(&target, "#!/bin/sh\necho RAN\n").unwrap();
+
+        // 1. A real binary that is ours and private: run, as before.
+        mode(&target, 0o755);
+        std::fs::copy(&target, &candidate).unwrap();
+        mode(&candidate, 0o755);
+        let (out, err) = run();
+        assert!(
+            out.contains("RAN"),
+            "a real, safe binary was not run: {err}"
+        );
+
+        // 2. A real binary anyone can write: refused, as acs-08m left it.
+        mode(&candidate, 0o777);
+        let (out, err) = run();
+        assert!(!out.contains("RAN"), "a real, unsafe binary was run");
+        assert!(err.contains("is writable by others"), "{err}");
+
+        // 3. A symlink to a safe target: run. This is the half that was
+        //    refused outright on Linux, with a message about permissions
+        //    that were never the problem.
+        relink(&target);
+        let (out, err) = run();
+        assert!(
+            out.contains("RAN"),
+            "a symlink to a safe binary was refused: {err}"
+        );
+
+        // 4. A symlink to a target anyone can write: refused, naming the
+        //    target. This is the half macOS ran without a word.
+        mode(&target, 0o777);
+        let (out, err) = run();
+        assert!(
+            !out.contains("RAN"),
+            "a symlink to an unsafe binary was run"
+        );
+        assert!(out.contains("ACS-NEED"), "no marker after refusing: {out}");
+        assert!(
+            err.contains(target.to_str().unwrap()) && err.contains("is writable by others"),
+            "the refusal does not name the target: {err}"
+        );
+        mode(&target, 0o755);
+
+        // 5. A safe target in a directory anyone can write: refused. The
+        //    file is fine, but whoever holds the directory can replace it.
+        mode(&store, 0o777);
+        let (out, err) = run();
+        assert!(
+            !out.contains("RAN"),
+            "a target in a shared directory was run"
+        );
+        assert!(
+            err.contains(store.to_str().unwrap()) && err.contains("is writable by others"),
+            "the refusal does not name the target's directory: {err}"
+        );
+        mode(&store, 0o755);
+
+        // 6. The link's own directory is where someone else would repoint
+        //    it, so it is checked too.
+        mode(&dir, 0o777);
+        let (out, err) = run();
+        assert!(!out.contains("RAN"), "a link in a shared directory was run");
+        assert!(
+            err.contains(dir.to_str().unwrap()) && err.contains("is writable by others"),
+            "the refusal does not name the link's directory: {err}"
+        );
+        mode(&dir, 0o755);
+
+        // 7. A relative link, and a chain of links, resolve the same way.
+        relink(std::path::Path::new("../../../../store/acs-real"));
+        let (out, err) = run();
+        assert!(out.contains("RAN"), "a relative link was refused: {err}");
+        let hop = store.join("acs-hop");
+        let _ = std::fs::remove_file(&hop);
+        symlink(&target, &hop).unwrap();
+        relink(&hop);
+        let (out, err) = run();
+        assert!(out.contains("RAN"), "a chain of links was refused: {err}");
+
+        // 8. A dangling link is not executable, so the prelude passes over
+        //    it in silence and asks to be installed.
+        relink(&store.join("gone"));
+        let (out, err) = run();
+        assert!(!out.contains("RAN"), "a dangling link was run");
+        assert!(out.contains("ACS-NEED"), "no marker: {out}");
+        assert!(
+            !err.contains("refusing"),
+            "a dangling link was complained about: {err}"
+        );
     }
 
     /// acs-ciz: the version reaches the remote shell inside double quotes,

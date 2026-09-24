@@ -315,7 +315,20 @@ pub fn note(msg: &str) {
     // an ERROR frame), so nothing printed here may steer the terminal
     // (acs-w1z). The message is one line; the cap is generous enough for
     // the longest of them.
-    let msg = crate::safe::display_max(msg, 4 * crate::safe::MAX_FIELD);
+    note_max(msg, 4 * crate::safe::MAX_FIELD)
+}
+
+/// [`note`] with a cap of its own.
+///
+/// For a message built entirely from what acs is about to run rather than
+/// from anything a remote said: the `-v` line naming the ssh command line
+/// carries the whole prelude, which is over a kilobyte since acs-gov, and
+/// [`note`]'s cap cut it off in the middle — taking with it the acs
+/// arguments at the end, the one part of that line that differs from one
+/// dial to the next. Still sanitised, since a destination or a key path
+/// comes from a configuration file.
+pub fn note_max(msg: &str, max: usize) {
+    let msg = crate::safe::display_max(msg, max);
     let _ = sys::write_all(2, format!("acs: {msg}\r\n").as_bytes());
 }
 
@@ -431,10 +444,13 @@ fn dial_once(
     let deadline = Instant::now() + timeout;
     let mut cmd = args.transport.command(call, remote);
     if args.verbose > 0 {
-        note(&format!(
-            "running {}",
-            ssh::display_argv(&args.transport.argv(call, remote))
-        ));
+        note_max(
+            &format!(
+                "running {}",
+                ssh::display_argv(&args.transport.argv(call, remote))
+            ),
+            16 * crate::safe::MAX_FIELD,
+        );
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

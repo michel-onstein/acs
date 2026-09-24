@@ -229,6 +229,30 @@ impl NetWatch {
     }
 }
 
+/// The shell a fake `ssh` runs first: one line per call, appended to `log`
+/// under a lock.
+///
+/// The lock is not decoration. Several of these run at once — `acs list`
+/// over every alias dials every host in parallel, and a redial overlaps the
+/// master it is replacing — and a call's line is long, because it carries
+/// the whole remote command: the prelude alone is 1046 bytes since acs-gov,
+/// against 518 before it. `printf … >> log` goes through stdio, whose
+/// buffer is 1024 bytes on macOS, so a line that size reaches the file in
+/// two `write()`s and a second caller appends between them. The line then
+/// arrives torn in half, and a test parsing it — `tests/list.rs` splits on
+/// `" -- "` to read the destination — fails on a fragment that has no
+/// destination in it. `mkdir` is atomic on every filesystem here, so it is
+/// the lock.
+pub fn log_call_sh(log: &Path) -> String {
+    format!(
+        "until mkdir '{lock}' 2>/dev/null; do sleep 0.01; done\n\
+         printf '%s\\n' \"$*\" >> '{log}'\n\
+         rmdir '{lock}'\n",
+        log = log.display(),
+        lock = log.with_extension("lock").display(),
+    )
+}
+
 /// A fake `ssh` for `--ssh`: runs the remote command on the fake remote its
 /// destination stands for, and refuses any other destination as a dead host
 /// would. It records each call's arguments.
@@ -251,12 +275,12 @@ impl Ssh {
         std::fs::write(
             s.path(),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                "#!/bin/sh\n{log}\
                  while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
                  dest=$2\nshift 2\n\
                  case \"$dest\" in\n{cases}esac\n\
                  echo \"ssh: connect to host $dest port 22: Connection refused\" >&2\nexit 255\n",
-                log = s.log().display(),
+                log = log_call_sh(&s.log()),
             ),
         )
         .unwrap();

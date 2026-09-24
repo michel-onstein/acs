@@ -263,3 +263,42 @@ fn the_bell_waits_for_the_programs_osc_to_end() {
         c.text()
     );
 }
+
+/// acs-gov: `-v` names the whole ssh command line, and that line carries
+/// the remote prelude — 1046 bytes since the symlink check, against 518
+/// before it. `note`'s cap ended the line in the middle of the prelude,
+/// taking the acs arguments at the end of it with it: the one part of that
+/// line that says what this dial is actually for. The line may still be
+/// truncated (a `…` says so), but not before those arguments.
+#[test]
+fn the_verbose_command_line_reaches_the_acs_arguments() {
+    let remote = Remote::installed();
+    // Through a fake `ssh` rather than `--transport-cmd`: the options a real
+    // dial carries are a couple of hundred characters of the line, and the
+    // cap bit only once they were in front of the prelude.
+    let ssh = Ssh::new(&[("devbox", &remote)]);
+    let mut c = Client::spawn(
+        &exe(),
+        &[
+            "--ssh",
+            &ssh.path().display().to_string(),
+            "-p",
+            "2222",
+            "-v",
+            "devbox",
+            "vline",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo up; sleep 30",
+        ],
+        &[],
+    );
+    c.wait_for("acs: running ", T);
+    // The prelude's own text comes first, then what acs was asked to run.
+    c.wait_for("acs_safe", T);
+    c.wait_for("_proxy", T);
+    c.wait_for("--session vline", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+}
