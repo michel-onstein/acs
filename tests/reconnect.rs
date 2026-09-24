@@ -785,6 +785,10 @@ fn under_v_a_hint_that_changed_nothing_says_so_and_still_ends_nothing() {
         ],
         &refs(&env),
     );
+    // The session announcement first: this is the one client in this file
+    // that runs under `-v`, so the whole prelude is echoed above and the
+    // two letters of `up` must be looked for after it (acs-ryz).
+    c.wait_session("vq");
     c.wait_for("up", T);
     remote.refuse_one_dial();
     remote.cut_link();
