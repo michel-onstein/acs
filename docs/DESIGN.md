@@ -130,18 +130,26 @@ must outlive every ssh connection, and `sshd` must see its channel close when
 the connection ends. The proxy is a dumb relay — ~100 lines — so all state
 lives in the master and the client.
 
-**Transport** is `ssh -T -e none -o ControlMaster=no -o ControlPath=none
--o ServerAliveInterval=0 -o ConnectTimeout=10 <host> <remote command>`:
+**Transport** is `ssh -T -e none -o ServerAliveInterval=0
+-o ConnectTimeout=10 <control options> <host> <remote command>`:
 
 - `-T`: no remote pty. The ssh channel is an 8-bit clean pipe carrying frames;
   the only pty is the master's. One pty instead of two.
 - `-e none`: ssh's `~.` escape is off (it is already off without a tty; this
   makes it explicit).
-- `ControlMaster=no`, `ControlPath=none`: the session gets its own TCP
-  connection, so a reconnect never waits on a dead multiplexer; the session
-  menu rides that connection too (§4.4). Side commands (`acs list`, install)
-  keep using the user's multiplexing; `acs list` on
-  every alias adds `BatchMode=yes` and `ConnectTimeout=10` (§7.3).
+- **The control options depend on which call it is** (`Call` in `ssh.rs`).
+  The first connection and a side call (`acs list <host>`, install) reuse an
+  ssh master **acs owns** — `ControlMaster=auto` on acs's own
+  `ControlPath`, with `ControlPersist` — so a detach-and-reattach, or an
+  `acs list <host>` followed by an attach, costs one round trip instead of a
+  whole handshake and a second hardware-key touch. A **redial** gets
+  `ControlMaster=no -o ControlPath=none` and its own TCP connection, so a
+  reconnect never waits on a multiplexer — and since the master's own
+  connection is the one that just failed, the redial runs `ssh -O exit` on
+  it first. `acs list` over every alias (`BatchMode=yes`,
+  `ConnectTimeout=10`, §7.3) neither starts nor joins one. The whole
+  arrangement, its failure modes and how to turn it off are in §7.1 under
+  **The ssh master acs owns**, and the decision is §12 decision 10.
 - `ServerAliveInterval=0`: liveness is ours (§5.3), much faster than ssh's.
 - `ConnectTimeout=10`: a redial into a dead network fails fast and the
   client returns to its backoff wait, where `d` still detaches (§6.1).
@@ -1020,9 +1028,72 @@ to the session's ssh alone:
   replaces the configured one rather than being tried alongside it.
 - **Precedence**: ssh keeps the *first* value it sees for an option, so `acs`
   places the options its transport depends on (§3: `-T`, `-e none`,
-  `ControlMaster=no`, `ControlPath=none`, `ServerAliveInterval=0`) **before**
-  the user's. A stray `-o ControlMaster=auto` cannot break reconnects; every
+  `ServerAliveInterval=0`, and the control options below) **before** the
+  user's. A stray `-o ControlMaster=auto` cannot break reconnects; every
   other option, including all `-i` keys, applies as given.
+
+**The ssh master acs owns.** A full handshake is six to eight round trips
+plus, on a hardware key, a touch — and until acs-9n3 it was paid again on
+every `acs <host>`, detach-and-reattach included, and again on every
+`acs list <host>`. OpenSSH can skip all of it by opening another channel on
+a connection that is already up. acs therefore keeps **its own** master:
+never the user's `ControlPath`, and never on a connection acs did not open.
+
+- **Which calls use it.** The session's **first** connection (the menu's
+  connection is that same one, §4.4) and **side** calls. A **redial** never
+  does, and `acs list` over every alias (a *batch* call) neither starts nor
+  joins one: it asks a dozen hosts at once, so a master per host would
+  leave a dozen authenticated connections behind a listing, and several
+  `ControlMaster=auto` racing for one host wedge each other.
+- **Why the redial is the exception.** §3 opted out of multiplexing because
+  a reconnect can hang on a dead multiplexer (§1.3). That hazard is the
+  redial's, not a fresh start's: a redial happens *because* a connection
+  died, and the master's connection is very likely the one that died. So a
+  redial gets `ControlMaster=no -o ControlPath=none` — and, when the link it
+  lost was itself a channel on the master, runs `ssh -O exit` on the master
+  first. A sibling session sharing that master is dropped with it and
+  redials onto a connection of its own; that is the same recovery it would
+  make once the master noticed by itself, only sooner.
+  The master it ends is the one the lost link **ran on**, which is not
+  necessarily the one the transport now points at: an alias is resolved
+  again before every redial (§7.3), and by then the destination may be
+  another host — whose master is a live connection of somebody else's.
+- **A master must answer fast or not at all.** Joining one costs a round
+  trip. So when a dial would join a master that is up (the socket is there
+  and `ssh -O check` answers), it is given `ACS_CONTROL_FALLBACK_MS` (2 s)
+  rather than the usual answer timeout; past that the master is ended and
+  the dial made again on a connection of its own, with the whole timeout —
+  where a password or a key touch may legitimately take a minute. This is
+  what catches the failure a shared master adds: a master whose control
+  socket still answers while its TCP connection is dead, which
+  `ServerAliveInterval=0` (§3) means it will never notice by itself.
+- **Who kills it.** `ControlPersist`, and nothing else, which is why it is
+  a bounded number of seconds and never `yes`: an `acs` that is killed
+  outright, or crashes, leaves a master that reaps itself
+  `ACS_CONTROL_PERSIST` seconds (300 by default) after its last channel
+  closes. Nothing is leaked past that window, and no cleanup depends on acs
+  running.
+- **The socket.** `$ACS_CONTROL_DIR`, else `/tmp/acs-mux-<uid>` — keyed by
+  the numeric uid, as the remote's session directory is (§4.1), and *not*
+  that directory, which is listed and pruned as session sockets. It is made
+  and checked exactly as §4.5 checks that one: `0700`, not a symlink, owned
+  by us, with no ancestor a stranger could replace (ssh makes the socket
+  itself `0600`). A control socket is an authenticated shell on the far
+  end, so every one of those checks is load-bearing, and **any of them
+  failing costs the speed-up, never the connection**: acs says so under
+  `-v` and dials exactly as it always did.
+  The socket's name is a hash of everything that decides *which* connection
+  it is — the ssh binary, the user's options, the key in use, the
+  destination — so two calls share a master only when they would have
+  authenticated the same way. ssh's own `%C` is deliberately not used: it
+  hashes the host, port and remote user but not `-i` or `-J`, so two `acs`
+  calls naming different keys would share one authenticated connection.
+  A format tag in the hash means a master an older acs left is never
+  joined by a newer one that would ask for something else; it simply
+  expires.
+- **Turning it off.** `ACS_CONTROL_PERSIST=0` restores exactly the dial acs
+  made before: `ControlMaster=no`, `ControlPath=none`, every call its own
+  connection.
 
 **Local forwards (`-L`)** are the one option `acs` does not hand to every ssh
 call, and the one whose value it checks before running any:
@@ -1051,6 +1122,14 @@ call, and the one whose value it checks before running any:
   where `-L` has a colon. It stays as the escape hatch for what `-L` does
   not accept: unix-socket forwards, whose grammar is ambiguous enough that
   validating it would reject specs ssh takes.
+- **A session that forwards anything has no master.** A `-L` asked of a
+  *client* of an ssh master is opened by the **master**, which outlives the
+  session — so the listener would stay bound after `acs` had exited, for as
+  long as `ControlPersist` allows, which is the opposite of what the next
+  bullet promises. Rather than special-case the teardown, a transport
+  carrying `-L` (or a `-o LocalForward`/`RemoteForward`/`DynamicForward`)
+  starts and joins no master at all, and keeps the connection of its own it
+  has always had. `acs` says which under `-v`.
 - **The forward drops briefly across a redial.** It belongs to the ssh child,
   which dies with the link, and the listening socket goes with it; the next
   dial rebinds it, since the argv is rebuilt from `Transport` every time
@@ -1062,11 +1141,11 @@ call, and the one whose value it checks before running any:
   who wants the other one can pass `-o ExitOnForwardFailure=yes`, which
   costs a redial loop for as long as the port stays taken.
 - **Not a runtime control** (non-goal). Command mode (§6) cannot add or drop
-  a forward on a running session: ssh's `~C` prompt is off (`-e none`) and
-  the control socket with it (`ControlMaster=no`, `ControlPath=none`), so
-  there is no channel to reconfigure a live ssh — changing a forward means
-  tearing the link down and redialling — and command mode has no prompt or
-  line editor to type a spec into.
+  a forward on a running session: ssh's `~C` prompt is off (`-e none`), and
+  a session that forwards anything has no control socket either (the bullet
+  above), so there is no channel to reconfigure a live ssh — changing a
+  forward means tearing the link down and redialling — and command mode has
+  no prompt or line editor to type a spec into.
 - **No `-R`, no `-D`.** Only the forward the local user asked for is taken;
   `-o RemoteForward=…` and `-o DynamicForward=…` remain available, with the
   every-call caveat above.
@@ -1895,3 +1974,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 7 | What plain `acs <host>` attaches | Revisited at the user's request (2026-09-18). It used to mean `main` always, created if absent, so that the default "never depends on what else happens to exist". In use that meant a detached session under another name (`--new`'s `2`, a named one) was only found by `acs list` and retyping its name, and `acs <host>` with `main` attached elsewhere took it over (or asked to) instead of giving a fresh shell. Now it lists the sessions first: with none detached it creates one (`main` if free, else numbered), otherwise it shows a menu of the detached ones (§4.4). The list costs no second connection since decision 8. The predictable form stays: `acs <host> <name>`, and without a terminal plain `acs <host>` is still `main` |
 | 8 | One connection for the session menu and the attach | Revisited at the user's request (2026-09-19). The menu first listed with a `_proxy --list` side call and the attach dialed its own connection, since "reusing one connection for both is not worth a second proxy mode". In use the second full ssh handshake (TCP, key exchange, auth) cost a few hundred ms before every plain `acs <host>`, more through a jump host, and a hardware key needed two touches. The session call cannot share a multiplexed connection (it opts out on purpose, §3), so the fix is the proxy mode after all: `_proxy --pick` lists, ends sessions and then relays the session the client's HELLO names, on one connection (§4.3, §4.4) |
 | 9 | Listing: an option or a command | Revisited at the user's request (2026-09-19). Listing was `dsh`'s `-l`/`--list` option, and without a host it listed every alias — an option doing a whole-program action, as a command would. Now it is the command `acs list [<host>]`, beside `acs config` and `acs upgrade`: one host with a host, every alias without. The per-host form moved too rather than staying `acs <host> --list`, so that listing has one spelling. `list` is reserved as a first argument (a host of that name: `user@list`, an option first, or `acs list list`), and `-l`/`--list` are removed outright, with a usage error pointing to `acs list` — acs has no compatibility contract to keep yet (§7, §7.4) |
+| 10 | Reusing an ssh master (acs-9n3) | Revisited 2026-09-23, with the per-phase timings of acs-pgn in hand. §3 set `ControlMaster=no` outright because a reconnect can hang on a dead multiplexer — but that hazard is the redial's, and the price was a full handshake (and a second hardware-key touch) on every first connection, `acs list <host>` and reattach. acs now keeps **its own** master — its own `ControlPath` under `/tmp/acs-mux-<uid>`, its own `ControlPersist`, never the user's — for the first connection and side calls; a redial still opts out and ends the master the lost link ran on; a dial that joins a master must produce its marker within 2 s or the master is ended and the dial made again on its own connection; a session with a `-L` has no master, because a forward asked of a client is opened by the master and would outlive the session. Measured over ssh to a container on loopback, where a handshake costs almost no round trips: 51 ms to `ACS-READY` cold against 13 ms on the master. Every reason acs cannot vouch for the socket's directory costs the speed-up and nothing else; `ACS_CONTROL_PERSIST=0` restores the old dial exactly (§3, §7.1) |

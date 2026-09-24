@@ -2,6 +2,7 @@
 //! that finds or asks for the acs binary (DESIGN §8).
 
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Options the session transport depends on. They come before the user's so
@@ -11,10 +12,6 @@ pub const TRANSPORT_OPTS: &[&str] = &[
     "-e",
     "none",
     "-o",
-    "ControlMaster=no",
-    "-o",
-    "ControlPath=none",
-    "-o",
     "ServerAliveInterval=0",
     // A redial into a dead network must fail fast so the client returns to
     // its backoff wait, where the command keys work.
@@ -22,8 +19,12 @@ pub const TRANSPORT_OPTS: &[&str] = &[
     "ConnectTimeout=10",
 ];
 
-/// Options for side calls (`acs list`, install): no pty and no escape char,
-/// but the user's connection multiplexing is kept.
+/// No multiplexer at all: this connection is its own, and looks at no
+/// control socket — neither the user's nor acs's (DESIGN §3). Every redial
+/// gets these, so a reconnect can never wait on a dead master.
+pub const NO_CONTROL_OPTS: &[&str] = &["-o", "ControlMaster=no", "-o", "ControlPath=none"];
+
+/// Options for side calls (`acs list`, install): no pty and no escape char.
 pub const SIDE_OPTS: &[&str] = &["-T", "-e", "none"];
 
 /// Side calls made to several hosts at once (`acs list`, DESIGN §7.3): no
@@ -42,9 +43,27 @@ pub const BATCH_OPTS: &[&str] = &[
 /// Which kind of ssh call to build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Call {
+    /// The session's first connection: it may join or start the master acs
+    /// keeps for the host (`mux.rs`, DESIGN §3).
     Session,
+    /// A redial after a lost link: the same options as [`Call::Session`],
+    /// but never multiplexed — a reconnect must not wait on a master whose
+    /// connection is the one that just died.
+    Redial,
+    /// `acs list <host>`, the remote install, ending a session from the
+    /// menu: one host, and the master is reused.
     Side,
+    /// `acs list` over every alias (DESIGN §7.3): many hosts at once, and
+    /// no master is started or joined.
     Batch,
+}
+
+impl Call {
+    /// Whether this call carries the session's own options: the forwards,
+    /// and the liveness and connect timeouts §3 sets.
+    fn is_session(self) -> bool {
+        matches!(self, Call::Session | Call::Redial)
+    }
 }
 
 /// Everything needed to reach a host.
@@ -67,6 +86,11 @@ pub struct Transport {
     /// Test hook: run this (split on whitespace) with the remote command as
     /// its last argument instead of ssh (DESIGN §9.1).
     pub transport_cmd: Option<String>,
+    /// The ssh master acs keeps for this host, once `mux::configure` has
+    /// found somewhere safe to keep its socket (acs-9n3). `None` — the
+    /// default, and whatever acs cannot vouch for — dials exactly as §3
+    /// always did.
+    pub mux: Option<crate::mux::Mux>,
 }
 
 impl Transport {
@@ -80,6 +104,7 @@ impl Transport {
             identity_file: None,
             local_forwards: Vec::new(),
             transport_cmd: None,
+            mux: None,
         }
     }
 
@@ -106,26 +131,23 @@ impl Transport {
         }
         let mut v = vec![self.ssh.clone()];
         let fixed = match call {
-            Call::Session => TRANSPORT_OPTS,
+            Call::Session | Call::Redial => TRANSPORT_OPTS,
             Call::Side => SIDE_OPTS,
             Call::Batch => BATCH_OPTS,
         };
         v.extend(fixed.iter().map(OsString::from));
+        v.extend(self.control_opts(call));
         v.extend(self.user_opts.iter().cloned());
         // The user's session, and nothing else, gets the forwards: the side
         // and batch calls are separate ssh processes, and several of them
         // binding one local port is noise at best (DESIGN §7.1).
-        if call == Call::Session {
+        if call.is_session() {
             for spec in &self.local_forwards {
                 v.push("-L".into());
                 v.push(spec.into());
             }
         }
-        if let Some(key) = self
-            .identity_file
-            .as_ref()
-            .filter(|_| !self.user_identity())
-        {
+        if let Some(key) = self.effective_identity() {
             v.push("-i".into());
             v.push(key.into());
         }
@@ -141,6 +163,68 @@ impl Transport {
         let mut c = Command::new(&argv[0]);
         c.args(&argv[1..]);
         c
+    }
+
+    /// The key this call actually passes: the configured one, unless the
+    /// user's options name a key of their own (DESIGN §7.1).
+    pub fn effective_identity(&self) -> Option<&str> {
+        self.identity_file
+            .as_deref()
+            .filter(|_| !self.user_identity())
+    }
+
+    /// Whether a call of this kind uses acs's own master (`mux.rs`). Only
+    /// the first connection and the side calls do: a redial must have its
+    /// own connection, and `acs list` over every alias would otherwise
+    /// leave a master on every host it asked.
+    pub fn multiplexes(&self, call: Call) -> bool {
+        self.mux.is_some()
+            && matches!(call, Call::Session | Call::Side)
+            && self.control_path().is_some()
+    }
+
+    /// Where acs's master for this destination listens, if it has one.
+    /// `None` also when the path would not fit in a `sockaddr_un`, which
+    /// ssh would silently truncate into somebody else's name.
+    pub fn control_path(&self) -> Option<PathBuf> {
+        let p = self.mux.as_ref()?.dir.join(crate::mux::socket_name(self));
+        (p.as_os_str().len() <= crate::sys::max_socket_path()).then_some(p)
+    }
+
+    /// The control-socket options for this call: acs's master, or the
+    /// opt-out §3 has always used, or — for a side or batch call with no
+    /// master — nothing, leaving the user's own multiplexing alone.
+    fn control_opts(&self, call: Call) -> Vec<OsString> {
+        match (self.multiplexes(call), call) {
+            (true, _) => {
+                let (m, path) = (self.mux.as_ref().unwrap(), self.control_path().unwrap());
+                let mut v = Vec::new();
+                v.extend(crate::mux::opt("ControlMaster", "auto"));
+                v.extend(crate::mux::opt("ControlPath", &path));
+                v.extend(crate::mux::opt("ControlPersist", m.persist.to_string()));
+                v
+            }
+            (false, c) if c.is_session() => NO_CONTROL_OPTS.iter().map(OsString::from).collect(),
+            (false, _) => Vec::new(),
+        }
+    }
+
+    /// `ssh -O <op>` against acs's master for this destination: the same
+    /// socket and the same options, so it reaches the master a dial would.
+    pub fn control_argv(&self, op: &str) -> Option<Vec<OsString>> {
+        let path = self.control_path()?;
+        let mut v = vec![self.ssh.clone()];
+        v.extend(crate::mux::opt("ControlPath", &path));
+        v.extend(self.user_opts.iter().cloned());
+        if let Some(key) = self.effective_identity() {
+            v.push("-i".into());
+            v.push(key.into());
+        }
+        v.push("-O".into());
+        v.push(op.into());
+        v.push("--".into());
+        v.push(self.destination.clone().into());
+        Some(v)
     }
 }
 
@@ -333,7 +417,19 @@ mod tests {
             identity_file: None,
             local_forwards: Vec::new(),
             transport_cmd: None,
+            mux: None,
         }
+    }
+
+    /// The same transport with acs's master at a fixed path, so the
+    /// options it adds can be spelled out.
+    fn muxed() -> Transport {
+        let mut t = t();
+        t.mux = Some(crate::mux::Mux {
+            dir: "/tmp/acs-mux-test".into(),
+            persist: 300,
+        });
+        t
     }
 
     fn strs(v: Vec<OsString>) -> Vec<String> {
@@ -350,13 +446,13 @@ mod tests {
                 "-e",
                 "none",
                 "-o",
-                "ControlMaster=no",
-                "-o",
-                "ControlPath=none",
-                "-o",
                 "ServerAliveInterval=0",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "-i",
                 "~/.ssh/id_work",
                 "-o",
@@ -368,6 +464,108 @@ mod tests {
                 "REMOTE"
             ]
         );
+    }
+
+    /// acs-9n3: the first connection may join or start the master acs owns
+    /// — its own socket, its own persist window, ahead of the user's
+    /// options so a `-o ControlPath` of theirs cannot point it elsewhere.
+    #[test]
+    fn a_first_connection_and_a_side_call_share_acss_own_master() {
+        let tr = muxed();
+        let path = tr.control_path().unwrap();
+        let path = path.to_str().unwrap();
+        for call in [Call::Session, Call::Side] {
+            let v = strs(tr.argv(call, "R"));
+            let at = v.iter().position(|a| a == "ControlMaster=auto").unwrap();
+            assert_eq!(
+                v[at - 1..at + 5],
+                [
+                    "-o",
+                    "ControlMaster=auto",
+                    "-o",
+                    &format!("ControlPath={path}"),
+                    "-o",
+                    "ControlPersist=300"
+                ],
+                "{call:?}: {v:?}"
+            );
+            // Ours win: ssh keeps the first value it sees (DESIGN §7.1),
+            // and the user's own `-o ControlMaster=auto` comes later.
+            assert!(
+                at < v.iter().position(|a| a == "-p").unwrap(),
+                "{call:?}: {v:?}"
+            );
+            assert!(!v.iter().any(|a| a == "ControlPath=none"), "{call:?}");
+        }
+        // Both calls reach the same socket, or `acs list <host>` would
+        // leave a master the attach then could not use.
+        let of = |c| {
+            strs(tr.argv(c, "R"))
+                .into_iter()
+                .find(|a| a.starts_with("ControlPath="))
+        };
+        assert_eq!(of(Call::Session), of(Call::Side));
+    }
+
+    /// acs-9n3: the hazard §3 opted out of belongs to the redial, and the
+    /// redial still opts out — whatever master is up, and whether or not
+    /// this client is the one that started it.
+    #[test]
+    fn a_redial_never_multiplexes() {
+        for tr in [t(), muxed()] {
+            let v = strs(tr.argv(Call::Redial, "R"));
+            assert!(v.contains(&"ControlMaster=no".to_string()), "{v:?}");
+            assert!(v.contains(&"ControlPath=none".to_string()), "{v:?}");
+            assert!(!v.iter().any(|a| a.starts_with("ControlPersist")), "{v:?}");
+            // Nothing else about it differs from the first connection's.
+            let first: Vec<String> = strs(t().argv(Call::Session, "R"));
+            assert_eq!(v, first, "{v:?}");
+        }
+    }
+
+    /// `acs list` asks every alias at once (DESIGN §7.3): starting a master
+    /// on each would leave a dozen authenticated connections behind a
+    /// listing, and several `ControlMaster=auto` racing for one host wedge
+    /// each other.
+    #[test]
+    fn a_batch_call_starts_no_master() {
+        let v = strs(muxed().argv(Call::Batch, "R"));
+        assert!(!v.iter().any(|a| a.starts_with("ControlPath=")), "{v:?}");
+        assert!(!v.iter().any(|a| a.starts_with("ControlPersist")), "{v:?}");
+        // The user's own multiplexing is still theirs to keep.
+        assert_eq!(v, strs(t().argv(Call::Batch, "R")));
+        assert!(!muxed().multiplexes(Call::Batch));
+        assert!(!muxed().multiplexes(Call::Redial));
+    }
+
+    /// `ssh -O check` / `-O exit` must reach the socket a dial would, with
+    /// the same key and options, or it would answer about another master.
+    #[test]
+    fn the_control_command_names_the_same_socket_as_a_dial() {
+        let mut tr = muxed();
+        tr.identity_file = Some("/keys/devbox".into());
+        tr.user_opts = vec!["-p".into(), "2222".into()];
+        let path = tr.control_path().unwrap();
+        assert_eq!(
+            strs(tr.control_argv("exit").unwrap()),
+            [
+                "ssh",
+                "-o",
+                &format!("ControlPath={}", path.to_str().unwrap()),
+                "-p",
+                "2222",
+                "-i",
+                "/keys/devbox",
+                "-O",
+                "exit",
+                "--",
+                "me@box"
+            ]
+        );
+        assert!(strs(tr.argv(Call::Session, "R"))
+            .contains(&format!("ControlPath={}", path.to_str().unwrap())));
+        // Nothing to talk to without a master.
+        assert!(t().control_argv("exit").is_none());
     }
 
     #[test]
@@ -497,6 +695,12 @@ mod tests {
             // Nothing else about those calls changed.
             assert_eq!(v, strs(t().argv(call, "R")), "{call:?}");
         }
+        // The redial is the same session, so it rebinds the same forward
+        // (DESIGN §7.1: the listener dies with the ssh child).
+        assert_eq!(
+            strs(tr.argv(Call::Redial, "R")),
+            strs(tr.argv(Call::Session, "R"))
+        );
     }
 
     #[test]
@@ -513,13 +717,13 @@ mod tests {
                 "-e",
                 "none",
                 "-o",
-                "ControlMaster=no",
-                "-o",
-                "ControlPath=none",
-                "-o",
                 "ServerAliveInterval=0",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "-p",
                 "2222",
                 "-L",

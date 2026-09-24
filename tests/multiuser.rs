@@ -51,6 +51,23 @@ fn dir_of(u: &User) -> PathBuf {
     PathBuf::from(format!("/tmp/acs-{}", u.uid))
 }
 
+/// Where the client keeps the control sockets of the ssh masters it owns
+/// (acs-9n3). One per uid, like the session directory beside it.
+fn mux_dir_of(u: &User) -> PathBuf {
+    PathBuf::from(format!("/tmp/acs-mux-{}", u.uid))
+}
+
+/// A client that never reaches the network: the ssh it would run is
+/// `/bin/false`, and `-v` makes it say what it decided about a master.
+fn client_as(u: &User) -> Command {
+    let mut c = as_user(u, exe());
+    c.env("ACS_SSH", "/bin/false")
+        .env("ACS_NO_UPDATE_CHECK", "1")
+        .env("XDG_CONFIG_HOME", "/nonexistent/acs-test-config")
+        .env("ACS_GLOBAL_CONFIG", "/nonexistent/acs-test-config/g.yaml");
+    c
+}
+
 fn reset(p: &Path) {
     let _ = std::fs::remove_file(p);
     let _ = std::fs::remove_dir_all(p);
@@ -219,6 +236,70 @@ fn another_uid_is_dropped_by_the_master() {
         "{text}"
     );
     reset(&dir);
+}
+
+/// acs-9n3: a control socket is an authenticated shell on the far end, so
+/// the directory holding them is one user's and the checks that guard the
+/// session directory (DESIGN §4.5) guard it too — including when someone
+/// else got there first.
+#[test]
+fn a_control_directory_is_one_users_and_a_squatted_one_is_refused() {
+    if !enabled() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let (alice, bob) = (user("alice"), user("bob"));
+    let d = mux_dir_of(&bob);
+    reset(&d);
+
+    // Alice gets there first, with a mode that gives nothing away.
+    assert!(as_user(&alice, "/bin/mkdir")
+        .arg("-m")
+        .arg("0700")
+        .arg(&d)
+        .status()
+        .unwrap()
+        .success());
+    let out = client_as(&bob)
+        .args(["list", "-v", "devbox"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no shared ssh master"), "{err}");
+    assert!(err.contains("is owned by alice"), "{err}");
+    assert!(err.contains("ACS_CONTROL_DIR"), "{err}");
+    // And bob's ssh was given no path into it: the dial is the one acs
+    // has always made.
+    assert!(err.contains("running "), "{err}");
+    assert!(!err.contains("ControlPath=/tmp/acs-mux-"), "{err}");
+    reset(&d);
+
+    // His own directory: 0700, his, and nothing alice can open.
+    let out = client_as(&bob)
+        .args(["list", "-v", "devbox"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!("shared ssh master at {}/", d.display())),
+        "{err}"
+    );
+    let meta = std::fs::metadata(&d).unwrap();
+    assert_eq!(meta.uid(), bob.uid);
+    assert_eq!(meta.mode() & 0o777, 0o700);
+    assert!(
+        !as_user(&alice, "/bin/ls")
+            .arg(&d)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success(),
+        "alice can list bob's control sockets"
+    );
+    // Alice's own is somewhere else entirely.
+    assert_ne!(mux_dir_of(&alice), d);
+    reset(&d);
 }
 
 #[test]

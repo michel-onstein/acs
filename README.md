@@ -216,6 +216,24 @@ configuring on either side. A key can also be set per
 host alias in the configuration (`identity_file`, below); `-i` on the
 command line wins.
 
+### Connecting again without another handshake
+
+An ssh handshake is several round trips and, with a hardware key, a touch.
+acs keeps a connection of its own alive for a few minutes after you last
+used a host, so a reattach after a detach — or an `acs list devbox`
+followed by `acs devbox` — opens another channel on it instead of starting
+over. It is acs's own connection, in acs's own `0700` directory
+(`/tmp/acs-mux-<uid>`), never the one your `~/.ssh/config` multiplexes;
+nothing is left behind more than `ACS_CONTROL_PERSIST` seconds (300 by
+default) after the last use, even if acs is killed.
+
+A **reconnect** never reuses it: that is the one case where a shared
+connection could be the dead one, so a redial dials its own and ends the
+shared one on its way. A session that forwards a port (`-L`, below) does
+not use it either — a forward opened on a shared connection would outlive
+the session. `ACS_CONTROL_PERSIST=0` turns the whole thing off, and `-v`
+says what acs decided and how long each phase took.
+
 ### Forwarding a port
 
 `-L` forwards a local port over the session's connection, spelled as ssh
@@ -532,6 +550,9 @@ reached as `user@config`.
 | `ACS_PERSIST` | `1`: never give up on a lost host (as `--persist`); `0`: give up as by default, whatever the configuration says |
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
+| `ACS_CONTROL_DIR` | local directory for acs's own ssh control sockets (default `/tmp/acs-mux-<uid>`, made `0700`) |
+| `ACS_CONTROL_PERSIST` | seconds an acs-owned ssh master outlives its last use (default 300); `0` turns the shared master off |
+| `ACS_CONTROL_FALLBACK_MS` | how long a connection that joins an existing master may take to answer before the master is ended and the connection made on its own (default 2000) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
 | `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial and for each host of `acs list`) |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |

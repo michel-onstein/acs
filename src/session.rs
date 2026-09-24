@@ -107,36 +107,42 @@ fn check_ancestors(path: &Path) -> Result<(), DirError> {
     Ok(())
 }
 
-impl fmt::Display for DirError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let hint = "set ACS_SOCKET_DIR to a private directory";
+/// What to tell someone whose session socket directory is unusable. The
+/// same checks guard the client's control sockets, which are pointed
+/// somewhere else by another variable (`mux.rs`), so the hint is a
+/// parameter of [`DirError::with_hint`] rather than part of the message.
+pub const SOCKET_DIR_HINT: &str = "set ACS_SOCKET_DIR to a private directory";
+
+impl DirError {
+    /// The complaint, with `hint` naming the variable that would point the
+    /// directory somewhere else.
+    pub fn with_hint(&self, hint: &str) -> String {
         match self {
             DirError::Symlink(p) => {
-                write!(
-                    f,
-                    "{} is a symlink, refusing to use it ({hint})",
-                    p.display()
-                )
+                format!("{} is a symlink, refusing to use it ({hint})", p.display())
             }
             DirError::NotDir(p) => {
-                write!(
-                    f,
+                format!(
                     "{} is not a directory, refusing to use it ({hint})",
                     p.display()
                 )
             }
-            DirError::Foreign { path, owner } => write!(
-                f,
+            DirError::Foreign { path, owner } => format!(
                 "{} is owned by {owner}, not by you — refusing to use it ({hint})",
                 path.display()
             ),
-            DirError::Replaceable { path, why } => write!(
-                f,
+            DirError::Replaceable { path, why } => format!(
                 "{} sits under a directory anyone could replace: {why} ({hint})",
                 path.display()
             ),
-            DirError::Io(p, e) => write!(f, "{}: {e}", p.display()),
+            DirError::Io(p, e) => format!("{}: {e}", p.display()),
         }
+    }
+}
+
+impl fmt::Display for DirError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.with_hint(SOCKET_DIR_HINT))
     }
 }
 
