@@ -106,8 +106,8 @@ fn a_granted_takeover_is_not_reused_on_a_later_redial() {
     let mut alice = client(&remote, "alice@laptop", &[]);
     alice.wait_for("up", T);
 
-    // Bob takes it, agreeing once. A long backoff keeps him in the wait
-    // after his link is cut, so Carol is reliably there when he redials.
+    // Bob takes it, agreeing once. The backoff keeps him in the wait after
+    // his link is cut, so Carol is reliably there when he redials.
     let mut bob = Client::start_env(
         &remote,
         &[&["devbox", "main", "--force"][..], CMD].concat(),
@@ -118,7 +118,12 @@ fn a_granted_takeover_is_not_reused_on_a_later_redial() {
     bob.wait_for(&got("mine"), T);
 
     // The link drops, and Carol attaches to the session Bob left behind.
+    // Bob's free first redial (acs-iyq) would take it back before she got
+    // there, so the network refuses that one; his own line saying he is
+    // waiting is what makes the order certain, rather than a wall clock.
+    remote.refuse_one_dial();
     remote.cut_link();
+    bob.wait_for("reconnecting in 3s", T);
     let mut carol = client(&remote, "carol@pi", &[]);
     // A fresh attach clears the screen; typing before that is dropped.
     carol.wait_for("\x1b[H\x1b[J", T);

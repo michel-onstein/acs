@@ -1,6 +1,6 @@
-//! Keeping a session across links (DESIGN §5.2–§5.4): liveness, redial with
-//! backoff, what the terminal shows while disconnected, and command keys
-//! that still work when the link is down.
+//! Keeping a session across links (DESIGN §5.2–§5.4): liveness, redial at
+//! once and then with backoff, what the terminal shows while disconnected,
+//! and command keys that still work when the link is down.
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
@@ -30,28 +30,50 @@ fn dead_after() -> u64 {
     env_ms("ACS_DEAD_MS", 10_000)
 }
 
-/// Exponential backoff between redials: 1 s → 30 s (`ACS_BACKOFF_MS` sets
-/// the first step), reset after a connection that lasted 30 s.
+/// Waits between redials (acs-iyq): **the first attempt after a drop goes
+/// at once**, and only then the exponential backoff 1 s → 30 s
+/// (`ACS_BACKOFF_MS` sets its first step), reset after a connection that
+/// lasted 30 s.
+///
+/// Most drops are momentary — a Wi-Fi blip, a laptop waking, a NAT that
+/// forgot the flow — and the link is back by the time the drop is noticed
+/// at all (10 s of silence, §5.3). Waiting a second more before even
+/// looking put that second on every resume to buy nothing; a host that is
+/// really gone answers the free attempt with a refused connect and the
+/// backoff starts from there, so nobody is hammered either.
 pub struct Backoff {
     first: u64,
-    next: u64,
+    /// The next wait, or `None` for the free attempt that goes at once.
+    next: Option<u64>,
 }
 
 impl Backoff {
     pub fn new(first_ms: u64) -> Backoff {
         Backoff {
             first: first_ms,
-            next: first_ms,
+            next: None,
         }
     }
 
+    /// Back to the free immediate attempt: this is a fresh drop, not the
+    /// same one being sat out.
     pub fn reset(&mut self) {
-        self.next = self.first;
+        self.next = None;
+    }
+
+    /// A redial is being made right now for a reason of its own (a network
+    /// change): that *is* the immediate attempt, so what follows it is the
+    /// base wait rather than a second dial with nothing in between.
+    pub fn spent(&mut self) {
+        self.next = Some(self.first);
     }
 
     pub fn step(&mut self) -> Duration {
-        let d = self.next;
-        self.next = (self.next * 2).min(30_000.max(self.first));
+        let d = self.next.unwrap_or(0);
+        self.next = Some(match self.next {
+            None => self.first,
+            Some(n) => (n * 2).min(30_000.max(self.first)),
+        });
         Duration::from_millis(d)
     }
 }
@@ -136,11 +158,18 @@ pub fn run(
                 backoff.reset();
             }
             let wait = backoff.step();
-            let msg = format!(
-                "connection lost — reconnecting in {}s ({})",
-                wait.as_secs().max(1),
-                give_up_keys(state)
-            );
+            // The status line goes up even when nothing is waited for: the
+            // dial itself takes as long as it takes, and it is what the
+            // frozen terminal is owed an explanation for. It is also what
+            // `on_welcome` repaints over afterwards.
+            let keys = give_up_keys(state);
+            let msg = match wait.is_zero() {
+                true => format!("connection lost — reconnecting now ({keys})"),
+                false => format!(
+                    "connection lost — reconnecting in {}s ({keys})",
+                    wait.as_secs().max(1),
+                ),
+            };
             match offline(
                 state,
                 raw,
@@ -152,8 +181,11 @@ pub fn run(
             ) {
                 Offline::Retry => false,
                 Offline::NetworkChanged => {
-                    // A new network is a fresh start.
-                    backoff.reset();
+                    // A new network is a fresh start — and the redial it
+                    // cuts the wait short for is the immediate attempt
+                    // itself, so the backoff starts at its base again
+                    // rather than handing out a second dial for free.
+                    backoff.spent();
                     false
                 }
                 Offline::Detach => true,
@@ -276,7 +308,9 @@ enum Offline {
 const EARLY_EVERY: Duration = Duration::from_secs(2);
 
 /// Wait `wait` before the next redial with the link down: show `msg` as the
-/// status, drop typed keys, but honour the command keys.
+/// status, drop typed keys, but honour the command keys. A `wait` of zero
+/// (the free first attempt, [`Backoff`]) puts the status up and returns at
+/// once, so the dial follows the drop with nothing in between.
 ///
 /// The detector is the client's own (`state.detector`, DESIGN §6.1), not one
 /// of this wait's: that makes it the same configuration as online, window
@@ -490,12 +524,46 @@ impl Liveness {
 mod tests {
     use super::*;
 
+    /// acs-iyq: the first attempt after a drop waits for nothing, and the
+    /// doubling starts at `ACS_BACKOFF_MS` from the second.
     #[test]
-    fn backoff_doubles_to_thirty_seconds_and_resets() {
+    fn the_first_redial_goes_at_once_then_the_backoff_doubles_and_resets() {
         let mut b = Backoff::new(1000);
-        let steps: Vec<u64> = (0..7).map(|_| b.step().as_millis() as u64).collect();
-        assert_eq!(steps, [1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+        let steps: Vec<u64> = (0..8).map(|_| b.step().as_millis() as u64).collect();
+        assert_eq!(steps, [0, 1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+        // A connection that lasted, or a network change: free attempt again.
         b.reset();
+        assert_eq!(b.step(), Duration::ZERO);
+        assert_eq!(b.step(), Duration::from_millis(1000));
+    }
+
+    /// `ACS_BACKOFF_MS` still sets the base of the doubling — the free
+    /// first attempt is not it (acs-iyq).
+    #[test]
+    fn the_configured_base_is_the_first_waited_step() {
+        let mut b = Backoff::new(100);
+        let steps: Vec<u64> = (0..4).map(|_| b.step().as_millis() as u64).collect();
+        assert_eq!(steps, [0, 100, 200, 400]);
+        // A base above the ceiling is honoured, as before: it is the wait a
+        // test or a user asked for.
+        let mut b = Backoff::new(120_000);
+        assert_eq!(b.step(), Duration::ZERO);
+        assert_eq!(b.step(), Duration::from_millis(120_000));
+        assert_eq!(b.step(), Duration::from_millis(120_000));
+    }
+
+    /// A network change redials at once by itself (DESIGN §5.3), so it
+    /// spends the free attempt rather than being given another one on top
+    /// — two dials in a row with nothing in between would help nobody.
+    #[test]
+    fn a_redial_made_at_once_for_another_reason_spends_the_free_attempt() {
+        let mut b = Backoff::new(1000);
+        b.spent();
+        assert_eq!(b.step(), Duration::from_millis(1000));
+        assert_eq!(b.step(), Duration::from_millis(2000));
+        // And it is the base that comes back, whatever the backoff had
+        // climbed to while the network was down.
+        b.spent();
         assert_eq!(b.step(), Duration::from_millis(1000));
     }
 
