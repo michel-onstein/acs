@@ -228,10 +228,15 @@ nothing is left behind more than `ACS_CONTROL_PERSIST` seconds (300 by
 default) after the last use, even if acs is killed.
 
 A **reconnect** never reuses it: that is the one case where a shared
-connection could be the dead one, so a redial dials its own and ends the
-shared one on its way. A session that forwards a port (`-L`, below) does
-not use it either — a forward opened on a shared connection would outlive
-the session. `ACS_CONTROL_PERSIST=0` turns the whole thing off, and `-v`
+connection could be the dead one, so a redial always dials its own. It also
+ends the shared one on its way, but only when what ended the link says the
+*connection* failed — an ssh that exited, or a host that went silent. A
+link that broke while bytes were still arriving on it took nothing else
+with it, and any other session sharing that connection keeps it rather than
+being dropped and losing what you had typed. A session that forwards a port
+(`-L`, below) does not use it either — a forward opened on a shared
+connection would outlive the session. `ACS_CONTROL_PERSIST=0` turns the
+whole thing off, and `-v`
 says what acs decided and how long each phase took.
 
 ### Forwarding a port

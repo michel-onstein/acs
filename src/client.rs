@@ -346,8 +346,9 @@ pub struct Link {
     /// overtake them.
     pending: Vec<u8>,
     /// Whether this connection is a channel on the master acs keeps for
-    /// the host (`mux.rs`). When such a link dies, the master's own TCP is
-    /// the one that failed, so the redial takes the master down with it.
+    /// the host (`mux.rs`). Only such a link can take the master down with
+    /// it when it dies, and only for the endings [`LinkEnd`] blames on the
+    /// connection rather than on the channel.
     pub muxed: bool,
 }
 
@@ -570,8 +571,8 @@ pub struct State {
     /// was given for rather than riding along on every later redial.
     pub force_next: bool,
     /// The transport of the link now in hand, when that link is a channel
-    /// on acs's shared ssh master (acs-9n3) — the redial after it ends
-    /// that master.
+    /// on acs's shared ssh master (acs-9n3) — the redial after it may end
+    /// that master ([`LinkEnd::failed_the_connection`]).
     ///
     /// The transport, not a flag: an alias is resolved again **before**
     /// every redial (DESIGN §7.3), so by the time the redial runs
@@ -581,13 +582,59 @@ pub struct State {
     pub master: Option<ssh::Transport>,
 }
 
+/// Why a link ended, so far as this side can tell (acs-n1m). It decides
+/// one thing: whether the connection the link ran on is still worth
+/// anything, and so whether the redial ends the master that link was a
+/// channel on (DESIGN §7.1).
+///
+/// Only what the serve loop actually observed is in here. The far end
+/// saying *why* it is finished — the session ended, somebody took it over,
+/// the host refused us — is not a lost link at all: those are
+/// [`Outcome::Exit`], and an `acs` that leaves on one never touches the
+/// master, so a sibling on it keeps its connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEnd {
+    /// The transport is gone: EOF on its pipes, a write to it that failed,
+    /// or the poll watching them failing. ssh exits when its connection
+    /// does — that is what `ServerAliveInterval=0` (DESIGN §3) leaves it
+    /// to the TCP stack to notice — so this is the connection having
+    /// failed until something says otherwise.
+    Transport,
+    /// Nothing came back in time: `ACS_DEAD_MS` of silence, or
+    /// `ACS_NETCHECK_MS` after this machine's network moved (acs-ft1), or
+    /// a handshake that was accepted and then went quiet. The transport is
+    /// still running and the host is not answering.
+    Silent,
+    /// Bytes arrived on the link and ended it — a frame this client could
+    /// not decode. The connection carried those bytes a moment ago, so it
+    /// is up; what broke is the conversation on this one channel.
+    Channel,
+}
+
+impl LinkEnd {
+    /// Whether the evidence says the **connection** failed rather than
+    /// only this channel on it — and so whether the redial should take the
+    /// master the lost link ran on down with it (DESIGN §7.1, acs-n1m).
+    ///
+    /// [`LinkEnd::Silent`] is on the blunt side on purpose: from here a
+    /// master whose TCP died without noticing looks exactly like a network
+    /// that stopped answering, and of the two mistakes, keeping a wedged
+    /// master is the one that strands somebody.
+    pub fn failed_the_connection(self) -> bool {
+        match self {
+            LinkEnd::Transport | LinkEnd::Silent => true,
+            LinkEnd::Channel => false,
+        }
+    }
+}
+
 /// How serving a link ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Leave with this exit code.
     Exit(u8),
-    /// The link died; the session may still be there.
-    LinkLost,
+    /// The link died, and how; the session may still be there.
+    LinkLost(LinkEnd),
 }
 
 fn proxy_args(args: &ClientArgs, state: &State, resuming: bool) -> Vec<String> {
@@ -712,11 +759,12 @@ pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
 }
 
 /// Connect once: dial, handshake, and serve until the link ends.
-/// `resuming` is true for a redial after a lost link. `picked`, a
-/// connection the session menu opened, is used instead of dialing.
-/// `timing` is this connection's clock. `netwatch` is the client's network
-/// watcher, polled here too so a change is noticed while the link is up and
-/// not only while it is down (acs-ft1).
+/// `resuming` is true for a redial after a lost link, and `ended` is how
+/// the link before this one ended — `None` before there was one (acs-n1m).
+/// `picked`, a connection the session menu opened, is used instead of
+/// dialing. `timing` is this connection's clock. `netwatch` is the client's
+/// network watcher, polled here too so a change is noticed while the link
+/// is up and not only while it is down (acs-ft1).
 #[allow(clippy::too_many_arguments)]
 pub fn connect_and_serve(
     args: &ClientArgs,
@@ -724,6 +772,7 @@ pub fn connect_and_serve(
     raw: &mut Option<RawMode>,
     signals: &OwnedFd,
     resuming: bool,
+    ended: Option<LinkEnd>,
     picked: Option<Picked>,
     timing: &mut Timing,
     netwatch: Option<&crate::netwatch::NetWatch>,
@@ -745,24 +794,35 @@ pub fn connect_and_serve(
             args, state, raw, signals, link, p.rest, timeout, timing, size, netwatch,
         );
     }
-    // The link that just died was a channel on acs's master, so the
-    // master's own connection is the one that failed: take it down before
-    // dialing, or it would answer the next client with a dead path
-    // (acs-9n3). A sibling session sharing it is dropped too, and redials
-    // onto a connection of its own — the same recovery it would make if
-    // the master had noticed by itself.
+    // The link that just died was a channel on acs's master. Whether the
+    // master goes with it depends on what ended the link (acs-n1m): a
+    // transport that is gone, or a host that stopped answering, is the
+    // master's own connection having failed, and leaving it up would
+    // answer the next client with a dead path (acs-9n3). A channel that
+    // broke while the connection kept carrying bytes is not — ending the
+    // master there drops every *other* acs session on it, each losing what
+    // its user had typed (DESIGN §5.2), for a connection that was fine.
     //
     // The transport the link *ran on*, which is not `args.transport` any
     // more if the alias resolved to another host a moment ago: that host's
     // master is a live connection of somebody else's.
     if let Some(old) = state.master.take().filter(|_| resuming) {
-        if args.verbose > 0 {
+        // No reason means no evidence, and this is the direction to be
+        // wrong in: a sibling redials, a stranded user waits.
+        if ended.map_or(true, LinkEnd::failed_the_connection) {
+            if args.verbose > 0 {
+                note(&format!(
+                    "ending the shared ssh master the lost link ran on ({})",
+                    old.destination
+                ));
+            }
+            crate::mux::stop(&old);
+        } else if args.verbose > 0 {
             note(&format!(
-                "ending the shared ssh master the lost link ran on ({})",
+                "keeping the shared ssh master ({}): the channel ended, not the connection",
                 old.destination
             ));
         }
-        crate::mux::stop(&old);
     }
     // A redial never multiplexes (DESIGN §3): its whole job is to get a
     // connection of its own after one was lost.
@@ -780,14 +840,16 @@ pub fn connect_and_serve(
     let (link, marker) = match dial(args, call, &remote, timeout, timing, greeting) {
         Ok(x) => x,
         Err(e) => {
+            // The dial itself did not come up: nothing reached the host,
+            // so this is the connection, not a channel on one.
             if resuming {
-                return Outcome::LinkLost;
+                return Outcome::LinkLost(LinkEnd::Transport);
             }
             note(&e.to_string());
             // Persisting, the first connection's failure is waited out
             // like a later one's (DESIGN §5.3).
             return match persist(args) {
-                true => Outcome::LinkLost,
+                true => Outcome::LinkLost(LinkEnd::Transport),
                 false => Outcome::Exit(code::UNREACHABLE),
             };
         }
@@ -813,7 +875,9 @@ pub fn connect_and_serve(
             return match crate::install::install(args, &os, &arch) {
                 Ok(()) => {
                     timing.mark("acs installed");
-                    connect_and_serve(args, state, raw, signals, resuming, None, timing, netwatch)
+                    connect_and_serve(
+                        args, state, raw, signals, resuming, ended, None, timing, netwatch,
+                    )
                 }
                 Err(e) => {
                     note(&e);
@@ -930,9 +994,12 @@ fn serve(
     let mut exiting = false;
     let mut liveness = crate::reconnect::Liveness::new();
 
-    let lost = |link: Link| {
+    // Every way out of here that is not an exit code says *why*, because
+    // the redial ends the shared master on some of them and not on others
+    // (acs-n1m, DESIGN §7.1).
+    let lost = |link: Link, why: LinkEnd| {
         link.close();
-        Outcome::LinkLost
+        Outcome::LinkLost(why)
     };
 
     loop {
@@ -942,8 +1009,11 @@ fn serve(
                 Ok(Some(m)) => m,
                 Ok(None) => break,
                 Err(e) => {
+                    // Bytes got here and could not be read as a frame. The
+                    // connection carried them, so it is up; this channel's
+                    // conversation is what is over.
                     note(&format!("protocol error: {e}"));
-                    return lost(link);
+                    return lost(link, LinkEnd::Channel);
                 }
             };
             liveness.heard();
@@ -1112,7 +1182,7 @@ fn serve(
         }
 
         if let Err(_e) = write_link(to, &mut out) {
-            return lost(link);
+            return lost(link, LinkEnd::Transport);
         }
 
         let now = sys::now_ms();
@@ -1145,7 +1215,7 @@ fn serve(
             sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
         ];
         if sys::poll(&mut fds, timeout.min(i32::MAX as i64) as i32).is_err() {
-            return lost(link);
+            return lost(link, LinkEnd::Transport);
         }
 
         if fds[1].revents != 0 {
@@ -1241,7 +1311,7 @@ fn serve(
 
         if fds[0].revents != 0 {
             match sys::read(from, &mut buf) {
-                Ok(0) => return lost(link),
+                Ok(0) => return lost(link, LinkEnd::Transport),
                 Ok(n) => {
                     dec.push(&buf[..n]);
                     // Bytes from the host are proof it is there. Their
@@ -1253,20 +1323,20 @@ fn serve(
                     liveness.heard();
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(_) => return lost(link),
+                Err(_) => return lost(link, LinkEnd::Transport),
             }
         }
 
         if welcomed {
             match liveness.tick(&mut out) {
                 crate::reconnect::Health::Ok => {}
-                crate::reconnect::Health::Dead => return lost(link),
+                crate::reconnect::Health::Dead => return lost(link, LinkEnd::Silent),
             }
         } else if sys::now_ms() >= handshake_until {
             // Accepted, then silent: a redial goes back to its backoff; a
             // first connection gives up.
             if state.instance.is_some() {
-                return lost(link);
+                return lost(link, LinkEnd::Silent);
             }
             link.close();
             note(&format!(
@@ -1282,6 +1352,23 @@ fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-n1m: which endings take the shared ssh master down with them.
+    /// A channel that broke while the connection was demonstrably carrying
+    /// bytes does not — ending the master there drops every other acs
+    /// session on it for nothing. Everything else does, including silence:
+    /// a wedged master and a wedged network are the same evidence from
+    /// here, and a stranded user is worse than a dropped sibling.
+    #[test]
+    fn only_an_ending_that_blames_the_connection_ends_the_master() {
+        assert!(LinkEnd::Transport.failed_the_connection());
+        assert!(LinkEnd::Silent.failed_the_connection());
+        assert!(!LinkEnd::Channel.failed_the_connection());
+        // No reason at all is the blunt side too: `connect_and_serve` ends
+        // the master when it is given `None`.
+        let unknown: Option<LinkEnd> = None;
+        assert!(unknown.map_or(true, LinkEnd::failed_the_connection));
+    }
 
     #[test]
     fn the_environment_decides_a_switch_over_the_configuration() {

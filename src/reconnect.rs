@@ -6,7 +6,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use crate::cli::ClientArgs;
-use crate::client::{self, code, note, Outcome, State};
+use crate::client::{self, code, note, LinkEnd, Outcome, State};
 use crate::keys::Action;
 use crate::proto::{AttachKind, Msg};
 use crate::sys;
@@ -105,6 +105,10 @@ pub fn run(
     // gate, so it is resolved already.
     let mut redial = false;
     let mut gated = false;
+    // How the last link ended, carried to the next dial so it knows
+    // whether the connection it ran on failed or only our channel on it
+    // did (acs-n1m). `None` until a link has ended.
+    let mut ended: Option<LinkEnd> = None;
     let mut args = args.clone();
     loop {
         let started = Instant::now();
@@ -127,19 +131,26 @@ pub fn run(
                 raw,
                 signals,
                 resuming,
+                ended,
                 first,
                 &mut timing,
                 netwatch.as_ref(),
             )
         } else {
-            Outcome::LinkLost
+            // No host to dial: nothing new was learned about the link that
+            // was lost, so its reason still stands. (`ended` is set by
+            // then — this branch only runs on a redial.)
+            Outcome::LinkLost(ended.unwrap_or(LinkEnd::Transport))
         };
         match outcome {
             Outcome::Exit(c) => return c,
             // The menu's connection sat idle while the user read it, and may
             // have died meanwhile: before any session, dial it afresh once.
-            Outcome::LinkLost if was_picked && state.instance.is_none() => continue,
-            Outcome::LinkLost => {}
+            Outcome::LinkLost(e) if was_picked && state.instance.is_none() => {
+                ended = Some(e);
+                continue;
+            }
+            Outcome::LinkLost(e) => ended = Some(e),
         }
         let name = state.session.clone().unwrap_or_default();
         // Persisting, even a host lost before any session is waited for

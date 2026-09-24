@@ -13,7 +13,11 @@
 //!   hazard §3 opted out of — a reconnect waiting on a dead multiplexer —
 //!   belongs to the redial, and the redial still gets its own connection.
 //!   A link that *was* multiplexed takes the master down with it
-//!   ([`stop`]), because the master's TCP is the one that just failed.
+//!   ([`stop`]) where the master's TCP is the one that just failed — but
+//!   only there: see [`crate::client::LinkEnd`], which decides that from
+//!   what ended the link, so a channel that broke on a connection still
+//!   carrying bytes leaves every sibling session on the master alone
+//!   (acs-n1m).
 //! - **A master must answer fast or not at all.** Joining one is supposed
 //!   to cost a round trip; if the marker does not arrive within
 //!   `ACS_CONTROL_FALLBACK_MS` the master is killed and the dial is made
