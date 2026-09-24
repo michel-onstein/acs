@@ -555,6 +555,82 @@ fn a_hint_that_changed_no_network_does_not_cut_the_wait_short() {
     );
 }
 
+/// acs-ft1: the watcher is polled while the link is *up* too, and what a
+/// change buys there is a question, not a redial.
+///
+/// The dead-link timeout is a minute here, so nothing but the network
+/// change can end this link inside `T` — and the client's own clock cannot
+/// reach it either, which is exactly the laptop-wake case the watcher is
+/// for (`sys::now_ms` is monotonic and stops with the machine, so the sleep
+/// is not silence anything measured). The connection is frozen rather than
+/// cut, as a Wi-Fi switch leaves it: nothing flows and nothing closes, so
+/// there is no EOF to notice. `ACS_NETCHECK_MS` is left at its default, so
+/// what is on trial is the deadline acs ships with.
+#[test]
+fn a_network_change_ends_a_frozen_link_without_the_dead_timeout() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![
+        ("ACS_BACKOFF_MS".to_string(), "100".to_string()),
+        ("ACS_PING_MS".to_string(), "20000".to_string()),
+        ("ACS_DEAD_MS".to_string(), "60000".to_string()),
+    ];
+    env.extend(watch.env());
+    let mut c = start(&remote, "wake", TICKER, &refs(&env));
+    c.wait_for("#20#", T);
+    let dialled = remote.transport_pids().len();
+    let pid = *remote.transport_pids().last().unwrap();
+    acs::sys::kill(pid, libc::SIGSTOP).unwrap();
+    // Woken on another network: the kernel's hint, and addresses that are
+    // not the ones this machine had.
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    // Inside `T`, which is half the dead interval: only the change can
+    // have ended it.
+    remote.wait_connections(dialled + 1, T);
+    let _ = acs::sys::kill(pid, libc::SIGKILL);
+    let target = last_number(&c) + 100;
+    c.wait_for(&format!("#{target}#"), T);
+    assert_consecutive(&c.text());
+}
+
+/// acs-ft1, the other half: a network change under a link that is *still
+/// working* costs nothing — no redial, and so not a byte of what was typed
+/// (keys typed into a redial are discarded, DESIGN §5.2). Dropping a live
+/// session because an address moved would be the worse bug of the two.
+///
+/// Nothing is timed (acs-o8h). The program's own output is the clock: the
+/// ticker sleeps 10 ms between lines, so a hundred more of them cannot
+/// have taken less than a second — twice the 500 ms the change gives the
+/// host here — and the connection count after them is the assertion.
+#[test]
+fn a_network_change_on_a_live_link_costs_nothing() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env: Vec<(String, String)> = FAST
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    env.push(("ACS_NETCHECK_MS".to_string(), "500".to_string()));
+    env.extend(watch.env());
+    let mut c = start(&remote, "keep", TICKER, &refs(&env));
+    c.wait_for("#20#", T);
+    let dialled = remote.transport_pids().len();
+    // A VPN came up: the addresses moved, and the link over the one that
+    // did not is untouched.
+    watch.set_networks("192.168.1.5/24\n10.8.0.2/24\n");
+    watch.hint();
+    let target = last_number(&c) + 100;
+    c.wait_for(&format!("#{target}#"), T);
+    assert_eq!(
+        remote.transport_pids().len(),
+        dialled,
+        "a live link was redialled for a network change: {}",
+        c.text()
+    );
+    assert_consecutive(&c.text());
+}
+
 // ---- bug hunt 2026-09-18 -----------------------------------------------------
 
 /// Regression (acs-znr): a host that accepts the connection and then says
