@@ -932,7 +932,10 @@ the file (`0` off, `1` on). The bell does not break the transparent stream:
   sequence, the bell waits and is written as soon as the output reaches a
   boundary — right after the ST or `BEL` that ends the string. It is dropped
   if command mode ends first (a key, or the 2 s timeout), so a late bell never
-  announces a command mode that is over.
+  announces a command mode that is over. An `acs:` note printed under `-v`
+  waits for the same boundary and is written at the same point (§7), with
+  the difference that it is never dropped: an announcement nobody needs any
+  more is noise, a diagnostic that never arrives is a bug.
 - It rings only when command mode arms and then waits: Ctrl-] Ctrl-] and the
   command key arriving in one read (a paste without bracketed paste, or
   typed faster than the terminal is read) need no announcement. Inside a
@@ -1039,6 +1042,41 @@ before clearing the screen and forgetting them.
 - Exit status: the child's status after `EXIT` (128+n for signals), 0 on detach,
   and distinct codes for "host unreachable", "remote install failed" and
   "taken over".
+- **`acs:` notes go where the bell goes** (acs-z22, §6.1). A note is written
+  to fd 2 and the session's bytes to fd 1, and under `-v` both land on the
+  same terminal with nothing in the stream to separate them. A note raised
+  while the program is halfway through an escape sequence, an OSC string or
+  a UTF-8 character therefore used to be written *into* it: the sequence
+  split, or the note's own text swallowed as the body of a title. That is at
+  its worst under `-v`, which is what someone reaches for when something is
+  already wrong — the corruption arrives exactly where it looks like the bug
+  being investigated. So, while the frame loop is relaying, a note raised
+  with the stream mid-sequence waits for the first **boundary** the mode
+  observer (§6.4) reaches and is written there, spliced between the two
+  halves of the frame that gets to it exactly as the bell is. The
+  boundary is the stream's and not the frame's: a sequence is split across
+  two frames precisely because the host framed it that way, so waiting for a
+  frame that happens to *end* at a boundary would leave the note behind
+  steady output for as long as the output lasts.
+  - **Never reordered, never dropped.** Held notes queue oldest first and are
+    written in that order, ahead of anything raised after the boundary.
+  - **Nothing outside the frame loop waits.** The dial, the offline wait and
+    alias resolution have no frame in flight, and inside the loop a note
+    raised at a boundary — which is where the stream is between frames, and
+    always before the first one — is written at once. A note about a dial
+    that is still hanging is worth nothing once the dial has finished.
+  - **A quiet session cannot swallow one.** A program that stops
+    mid-sequence, or a link that dies there, would hold a note for ever:
+    the wait ends after `ACS_NOTE_HOLD_MS` (500 ms) or when the frame loop
+    does, whichever comes first, and the note is then written where it
+    stands. Late and ugly beats lost.
+  - The status line (§5.4) writes to fd 1 and has a convention of its own —
+    the bottom row, cursor saved and restored, the title pushed on the xterm
+    stack — but it is about *placement*, not about boundaries, and it is put
+    up after a link is lost, which may be in the middle of a sequence the
+    last frame opened. Same for the reset `leave` writes and the clear a
+    resume writes. That is the same hazard in a narrower window and is not
+    fixed here.
 - **Connect timings** under `-v` (acs-pgn, `timing.rs`): one line per phase
   of a connection, `acs: timing: <connection>: <phase> +<step> ms (<total>
   ms total)`, for the first connection and for every redial. The phases, in

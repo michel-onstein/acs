@@ -56,6 +56,23 @@ pub fn config_env(dir: &Path, yaml: &str) -> Vec<(String, String)> {
     vec![("XDG_CONFIG_HOME".into(), dir.display().to_string())]
 }
 
+/// A named pipe at `path`, for a test that has to let a remote program
+/// past a point of its own choosing rather than after a sleep.
+pub fn make_fifo(path: &Path) {
+    let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    // SAFETY: a path in the test's own temporary directory.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+}
+
+/// Let a reader of the fifo at `path` past: it blocks until the program
+/// has opened it, so the release is ordered against what the program does
+/// next and not against the clock.
+pub fn release_fifo(path: &Path) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.write_all(b"x").unwrap();
+}
+
 /// Borrow an owned environment for [`Client::start_env`].
 pub fn refs(env: &[(String, String)]) -> Vec<(&str, &str)> {
     env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
@@ -192,9 +209,7 @@ impl NetWatch {
         let w = NetWatch {
             dir: TempDir::new(),
         };
-        let path = std::ffi::CString::new(w.fifo().to_str().unwrap()).unwrap();
-        // SAFETY: a path in this test's own temporary directory.
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        make_fifo(&w.fifo());
         w.set_networks(nets);
         w
     }
@@ -216,12 +231,7 @@ impl NetWatch {
     /// went, an interface changed state. Whether that is a *change* is for
     /// the client to work out from the networks.
     pub fn hint(&self) {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(self.fifo())
-            .unwrap();
-        f.write_all(b"x").unwrap();
+        release_fifo(&self.fifo());
     }
 
     /// The environment that points a client at this watcher.

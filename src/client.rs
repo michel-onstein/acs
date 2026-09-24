@@ -329,7 +329,212 @@ pub fn note(msg: &str) {
 /// comes from a configuration file.
 pub fn note_max(msg: &str, max: usize) {
     let msg = crate::safe::display_max(msg, max);
-    let _ = sys::write_all(2, format!("acs: {msg}\r\n").as_bytes());
+    notes::raise(format!("acs: {msg}\r\n"));
+}
+
+/// Where a note may be written (acs-z22).
+///
+/// Notes go to fd 2 and the session's bytes to fd 1, and under `-v` both
+/// land on the same terminal. Nothing in the stream separates them, so a
+/// note raised while the program is halfway through an escape sequence, an
+/// OSC string or a UTF-8 character is written *into* it: the sequence is
+/// split, or the note's own text is swallowed as the body of a title. That
+/// is at its worst under `-v`, which is what someone reaches for when
+/// something is already wrong.
+///
+/// The rule is the bell's (DESIGN §6.1): acs may put a byte of its own only
+/// at a **boundary** of the output, which the mode observer (§6.4) already
+/// knows. So while [`serve`] is relaying — and only then — a note raised
+/// with the stream mid-sequence waits, and is written at the first point
+/// where [`ModeObserver::at_boundary`] holds again, which is inside the
+/// frame that gets there rather than after it.
+///
+/// What that must not become is a note that is late, lost or out of order:
+///
+/// - **Nothing outside the frame loop waits.** The gate is open only for
+///   the length of a [`serve`] call, and even inside it a note raised with
+///   the stream at a boundary — which is where it is between frames, and
+///   always before the first one — is written at once. The dial, the
+///   offline wait and alias resolution have no frame in flight and are
+///   never delayed: a note about a dial that is still hanging is worth
+///   nothing after the dial has finished.
+/// - **Order is kept.** Held notes queue oldest-first and are written in
+///   that order, ahead of anything raised after the boundary.
+/// - **The boundary is the stream's, not the frame's.** A frame is not an
+///   atom of the program's output — a sequence is split across two of them
+///   precisely because the host framed it that way — so the writer looks
+///   for the first boundary *inside* the next frame and puts the notes
+///   there, as it splices the bell. Waiting for a frame that happens to
+///   end at a boundary would leave a note behind steady output for as long
+///   as the output lasts.
+/// - **A quiet session cannot swallow one.** A program that stops
+///   mid-sequence, or a link that dies there, would otherwise hold a note
+///   for ever. The wait is bounded by `ACS_NOTE_HOLD_MS` (500 ms), after
+///   which the note is written where it stands, and leaving [`serve`]
+///   flushes what is left whatever the stream was doing.
+mod notes {
+    use std::cell::RefCell;
+
+    use crate::sys;
+
+    /// How long a note waits for the stream to reach a boundary before it
+    /// is written anyway (`ACS_NOTE_HOLD_MS`). Long enough for the rest of
+    /// a sequence a frame boundary cut in half to arrive over a slow link;
+    /// short enough that a diagnostic is never lost for long.
+    fn hold_ms() -> u64 {
+        crate::reconnect::env_ms("ACS_NOTE_HOLD_MS", 500)
+    }
+
+    thread_local! {
+        /// Open while the frame loop is relaying; `None` everywhere else,
+        /// where every note goes straight out.
+        static GATE: RefCell<Option<Gate>> = const { RefCell::new(None) };
+        /// Where notes go in this crate's own tests, in place of fd 2.
+        #[cfg(test)]
+        static SINK: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Default)]
+    struct Gate {
+        /// The last frame written left the terminal inside a sequence or a
+        /// character: a note written now would land in the middle of it.
+        mid_sequence: bool,
+        /// Notes waiting for the boundary, oldest first.
+        held: Vec<String>,
+        /// When the oldest of them started waiting.
+        since: u64,
+    }
+
+    /// The frame loop is relaying: notes raised mid-sequence wait. Dropping
+    /// it writes whatever is still held and hands the terminal back.
+    pub struct Relaying(());
+
+    impl Relaying {
+        pub fn open() -> Relaying {
+            GATE.with(|g| *g.borrow_mut() = Some(Gate::default()));
+            Relaying(())
+        }
+    }
+
+    impl Drop for Relaying {
+        fn drop(&mut self) {
+            flush();
+            GATE.with(|g| *g.borrow_mut() = None);
+        }
+    }
+
+    /// Print `line`, or hold it if the program's stream is mid-sequence.
+    pub fn raise(line: String) {
+        let straight_out = GATE.with(|g| {
+            let mut g = g.borrow_mut();
+            match g.as_mut() {
+                Some(gate) if gate.mid_sequence => {
+                    if gate.held.is_empty() {
+                        gate.since = sys::now_ms();
+                    }
+                    gate.held.push(line);
+                    None
+                }
+                _ => Some(line),
+            }
+        });
+        if let Some(line) = straight_out {
+            write(&line);
+        }
+    }
+
+    /// Whether anything is waiting for a boundary, so the writer knows to
+    /// look for one inside the frame it is about to write.
+    pub fn waiting() -> bool {
+        GATE.with(|g| {
+            g.borrow()
+                .as_ref()
+                .is_some_and(|gate| !gate.held.is_empty())
+        })
+    }
+
+    /// Where the program's stream stands after a frame was written to the
+    /// terminal. A boundary releases what was held for it.
+    pub fn at_boundary(at: bool) {
+        let release = GATE.with(|g| {
+            let mut g = g.borrow_mut();
+            match g.as_mut() {
+                Some(gate) => {
+                    gate.mid_sequence = !at;
+                    at && !gate.held.is_empty()
+                }
+                None => false,
+            }
+        });
+        if release {
+            flush();
+        }
+    }
+
+    /// When the oldest held note is written whatever the stream is doing.
+    pub fn deadline() -> Option<u64> {
+        GATE.with(|g| {
+            g.borrow()
+                .as_ref()
+                .filter(|gate| !gate.held.is_empty())
+                .map(|gate| gate.since + hold_ms())
+        })
+    }
+
+    /// Write the held notes if they have waited long enough: the program
+    /// stopped mid-sequence, or the bytes that would finish it are not
+    /// coming.
+    pub fn flush_due(now: u64) {
+        if deadline().is_some_and(|d| now >= d) {
+            flush();
+        }
+    }
+
+    fn flush() {
+        let held = GATE.with(|g| {
+            let mut g = g.borrow_mut();
+            g.as_mut()
+                .map(|gate| std::mem::take(&mut gate.held))
+                .unwrap_or_default()
+        });
+        for line in &held {
+            write(line);
+        }
+    }
+
+    fn write(line: &str) {
+        #[cfg(test)]
+        {
+            let captured = SINK.with(|s| match s.borrow_mut().as_mut() {
+                Some(lines) => {
+                    lines.push(line.to_string());
+                    true
+                }
+                None => false,
+            });
+            if captured {
+                return;
+            }
+        }
+        let _ = sys::write_all(2, line.as_bytes());
+    }
+
+    /// Collect this thread's notes instead of printing them.
+    #[cfg(test)]
+    pub fn capture() {
+        SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// The notes written since the last call.
+    #[cfg(test)]
+    pub fn written() -> Vec<String> {
+        SINK.with(|s| {
+            s.borrow_mut()
+                .as_mut()
+                .map(std::mem::take)
+                .expect("capture() first")
+        })
+    }
 }
 
 // ---- links -----------------------------------------------------------------
@@ -923,23 +1128,45 @@ pub fn follow_detector(state: &mut State, was_armed: bool) {
     }
 }
 
-/// Write session output to the terminal, with a waiting bell at the first
-/// boundary in it.
+/// Write session output to the terminal, with a waiting bell — and a note
+/// waiting for the same thing (acs-z22) — at the first boundary in it.
 fn write_output(state: &mut State, bytes: &[u8]) -> io::Result<()> {
-    if !state.bell_pending {
+    let r = write_frame(state, bytes);
+    // Where the frame left the stream is where the next note may go, until
+    // a frame moves it on.
+    notes::at_boundary(state.observer.at_boundary());
+    r
+}
+
+fn write_frame(state: &mut State, bytes: &[u8]) -> io::Result<()> {
+    if !state.bell_pending && !notes::waiting() {
         sys::write_all(STDOUT, bytes)?;
         state.observer.observe(bytes);
         return Ok(());
     }
+    // Nowhere in this frame may acs put anything of its own: it is all one
+    // unfinished sequence, and what is waiting waits for the next.
     let Some(n) = state.observer.observe_to_boundary(bytes) else {
         return sys::write_all(STDOUT, bytes);
     };
-    state.bell_pending = false;
-    let mut buf = Vec::with_capacity(bytes.len() + 1);
-    buf.extend_from_slice(&bytes[..n]);
-    buf.push(0x07);
-    buf.extend_from_slice(&bytes[n..]);
-    sys::write_all(STDOUT, &buf)?;
+    // Up to the boundary, with the bell spliced in as one write.
+    let head = &bytes[..n];
+    if state.bell_pending {
+        state.bell_pending = false;
+        let mut buf = Vec::with_capacity(n + 1);
+        buf.extend_from_slice(head);
+        buf.push(0x07);
+        sys::write_all(STDOUT, &buf)?;
+    } else {
+        sys::write_all(STDOUT, head)?;
+    }
+    // The held notes go here, between the two halves of the frame: on fd 2
+    // rather than fd 1, so they cannot be part of that one write, but the
+    // terminal sees them in the order they are written. The rest of the
+    // frame follows and may open a sequence of its own; that is the next
+    // note's problem, not this one's.
+    notes::at_boundary(true);
+    sys::write_all(STDOUT, &bytes[n..])?;
     state.observer.observe(&bytes[n..]);
     Ok(())
 }
@@ -993,6 +1220,12 @@ fn serve(
     let mut welcomed = false;
     let mut exiting = false;
     let mut liveness = crate::reconnect::Liveness::new();
+    // From here until this call returns, a note raised while the program
+    // is halfway through a sequence waits for the frame that finishes it
+    // (acs-z22). Dropped on every way out, which writes what is still
+    // held: the notes that *end* a link — a protocol error, an ERROR
+    // frame, the takeover — are raised in here too.
+    let _notes = notes::Relaying::open();
 
     // Every way out of here that is not an exit code says *why*, because
     // the redial ends the shared master on some of them and not on others
@@ -1186,12 +1419,19 @@ fn serve(
         }
 
         let now = sys::now_ms();
+        // A note waiting for the program to finish its sequence is not
+        // waiting for ever: a program that stopped mid-sequence, or a link
+        // that died there, must not swallow it (acs-z22).
+        notes::flush_due(now);
         let mut timeout: i64 = -1;
         let mut consider = |deadline: u64| {
             let d = deadline.saturating_sub(now) as i64;
             timeout = if timeout < 0 { d } else { timeout.min(d) };
         };
         if let Some(d) = state.detector.deadline() {
+            consider(d);
+        }
+        if let Some(d) = notes::deadline() {
             consider(d);
         }
         if welcomed {
@@ -1377,6 +1617,74 @@ mod tests {
         // the master when it is given `None`.
         let unknown: Option<LinkEnd> = None;
         assert!(unknown.map_or(true, LinkEnd::failed_the_connection));
+    }
+
+    /// acs-z22: a note goes where the bell goes — at a boundary of the
+    /// program's stream — and only while a frame loop is relaying one.
+    ///
+    /// The delay is the whole risk of this: a note about a dial that is
+    /// still hanging is worth nothing once the dial has finished. So the
+    /// gate holds a note in exactly one case, and this says which.
+    #[test]
+    fn a_note_waits_for_a_boundary_only_while_a_frame_loop_is_relaying() {
+        notes::capture();
+        // Outside the frame loop — the dial, the offline wait, alias
+        // resolution — there is no frame in flight and nothing waits.
+        note("dialling");
+        assert_eq!(notes::written(), ["acs: dialling\r\n"]);
+
+        let relaying = notes::Relaying::open();
+        // Inside it, but between frames (and before the first one), the
+        // stream is at a boundary: still nothing waits.
+        note("between frames");
+        assert_eq!(notes::written(), ["acs: between frames\r\n"]);
+
+        // A frame that ended halfway through an escape sequence.
+        notes::at_boundary(false);
+        note("first");
+        note("second");
+        assert!(notes::written().is_empty(), "written into the sequence");
+        // The frame that finishes it releases both, oldest first.
+        notes::at_boundary(true);
+        assert_eq!(notes::written(), ["acs: first\r\n", "acs: second\r\n"]);
+
+        // And nothing is held behind them afterwards.
+        note("after");
+        assert_eq!(notes::written(), ["acs: after\r\n"]);
+        drop(relaying);
+        note("outside again");
+        assert_eq!(notes::written(), ["acs: outside again\r\n"]);
+    }
+
+    /// acs-z22: what is held is delayed, never dropped. A program that
+    /// stops mid-sequence, or a link that dies there, must not swallow a
+    /// note — which is what makes the wait bounded rather than open-ended.
+    #[test]
+    fn a_held_note_survives_a_program_that_stops_mid_sequence() {
+        notes::capture();
+        let relaying = notes::Relaying::open();
+        notes::at_boundary(false);
+        note("held");
+        // Nothing is due while the bytes that would finish the sequence
+        // may still be on their way.
+        let raised = sys::now_ms();
+        notes::flush_due(raised);
+        assert!(notes::written().is_empty());
+        assert!(notes::deadline().is_some_and(|d| d > raised));
+        // The sequence never finishes: `ACS_NOTE_HOLD_MS` later the note
+        // is written where it stands rather than lost.
+        notes::flush_due(raised + 60_000);
+        assert_eq!(notes::written(), ["acs: held\r\n"]);
+        assert_eq!(notes::deadline(), None);
+
+        // The way out of the frame loop writes what is still held, so the
+        // notes that end a link — a protocol error, an ERROR frame, the
+        // takeover — arrive even when the last frame left a sequence open.
+        notes::at_boundary(false);
+        note("on the way out");
+        assert!(notes::written().is_empty());
+        drop(relaying);
+        assert_eq!(notes::written(), ["acs: on the way out\r\n"]);
     }
 
     #[test]

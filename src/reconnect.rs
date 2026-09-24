@@ -13,7 +13,7 @@ use crate::sys;
 use crate::timing::Timing;
 use crate::tty::RawMode;
 
-fn env_ms(name: &str, default: u64) -> u64 {
+pub(crate) fn env_ms(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
