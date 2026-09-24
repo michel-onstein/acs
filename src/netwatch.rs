@@ -25,6 +25,16 @@
 //! hint cut the backoff short — and each redial threw away what had been
 //! typed into it (DESIGN §5.2).
 //!
+//! **The networks held move when the caller acts, not when it reads**
+//! (acs-0n8). [`NetWatch::changed`] hands out a [`Change`]; the set it was
+//! judged against is only replaced by [`Change::acted`]. A caller that
+//! cannot act on the answer — mid-handshake, or inside the offline wait's
+//! rate limit — drops it instead, and the next hint offers the same change
+//! again rather than being answered "not a change" against a set that has
+//! already moved. Nothing is queued by that: it is one comparison against
+//! the networks of the moment however many hints went by, so a flapping
+//! interface still costs one redial and not one per hint.
+//!
 //! **Under `-v` the watcher says what it made of every hint** (acs-4i2).
 //! Silence is otherwise ambiguous in the one direction that costs: a
 //! watcher that is working and a network that did not move look exactly
@@ -46,9 +56,10 @@ pub struct NetWatch {
     kind: Kind,
     /// `-v`: say what each hint was judged to be ([`NetWatch::trace`]).
     verbose: bool,
-    /// The networks as of the last hint that was reported as a change —
-    /// or as of the moment the watcher was made, so the first hint of an
-    /// outage is judged like any other rather than taken on trust.
+    /// The networks as of the last change a caller **acted on**
+    /// ([`Change::acted`], acs-0n8) — or as of the moment the watcher was
+    /// made, so the first hint of an outage is judged like any other
+    /// rather than taken on trust.
     nets: RefCell<Vec<String>>,
 }
 
@@ -141,9 +152,11 @@ impl NetWatch {
     /// (acs-4i2).
     ///
     /// Strictly a reader of the decision: every call site below is reached
-    /// after the answer is settled, and nothing here touches the networks
-    /// held, the rate limit the caller keeps (`EARLY_EVERY`), or the value
-    /// returned. That is the whole point — the trace exists to make a
+    /// after the answer is settled — [`Change`]'s included, which says
+    /// only that the caller did not act — and nothing here touches the
+    /// networks held, the rate limit the caller keeps
+    /// ([`crate::reconnect`]'s `early_every`), or the value returned. That
+    /// is the whole point — the trace exists to make a
     /// watcher that stopped emitting visible, not to change what a hint is
     /// worth.
     fn trace(&self, msg: &str) {
@@ -152,15 +165,17 @@ impl NetWatch {
         }
     }
 
-    /// Drain the pending messages; true if the network this machine dials
-    /// from is not the one it was on.
+    /// Drain the pending messages; a [`Change`] if the network this machine
+    /// dials from is not the one it was on.
     ///
     /// Draining is unconditional — the descriptor has to be emptied for the
     /// poll it woke to sleep again — but a hint is only a reason to look
     /// (acs-6p8). What makes it a change is [`networks`] differing, and the
-    /// answer is remembered, so a kernel that repeats itself is answered
-    /// once.
-    pub fn changed(&self) -> bool {
+    /// answer is remembered **when the caller acts on it**
+    /// ([`Change::acted`], acs-0n8), so a kernel that repeats itself is
+    /// answered once and a change nobody could act on is offered again
+    /// instead of being spent.
+    pub fn changed(&self) -> Option<Change<'_>> {
         let mut buf = [0u8; 8192];
         let mut hinted = false;
         let mut bytes = 0usize;
@@ -189,24 +204,77 @@ impl NetWatch {
                     "network: {bytes} bytes from the kernel, no address or interface message — not a change"
                 ));
             }
-            return false;
+            return None;
         }
         let now = networks();
-        let mut held = self.nets.borrow_mut();
-        if *held == now {
+        {
+            let held = self.nets.borrow();
+            if *held == now {
+                self.trace(&format!(
+                    "network hint: still on {} — not a change",
+                    show(&now)
+                ));
+                return None;
+            }
             self.trace(&format!(
-                "network hint: still on {} — not a change",
+                "network changed: {} → {}",
+                show(held.as_slice()),
                 show(&now)
             ));
-            return false;
         }
-        self.trace(&format!(
-            "network changed: {} → {}",
-            show(held.as_slice()),
-            show(&now)
-        ));
-        *held = now;
-        true
+        Some(Change {
+            watch: self,
+            now,
+            acted: false,
+        })
+    }
+}
+
+/// A change the caller has been told about and has not acted on yet
+/// (acs-0n8).
+///
+/// The networks the watcher holds move on [`Change::acted`] and nowhere
+/// else. A caller that cannot act on the answer drops this instead — the
+/// handshake has its own deadline ([`crate::client`], acs-xo1 is acting on
+/// it), and the offline wait allows one early redial per `ACS_EARLY_MS`
+/// ([`crate::reconnect`]) — and the set stays where it was, so the next
+/// hint reports the same change rather than answering "not a change"
+/// against a set that has already moved. Before this the hint was consumed
+/// either way and only a covering deadline recovered it.
+///
+/// Dropping it queues nothing. The change is not a message held in a box:
+/// it is [`networks`] compared against the last set anybody acted on, made
+/// afresh on each hint. However many a flapping interface sends, acting
+/// once is one redial, and acs-6p8's contract is untouched — a hint that
+/// moved no network is not a change at all.
+#[must_use = "a change is only remembered once the caller says it acted on it"]
+pub struct Change<'a> {
+    watch: &'a NetWatch,
+    /// The networks as of this change, held until [`Change::acted`].
+    now: Vec<String>,
+    acted: bool,
+}
+
+impl Change<'_> {
+    /// The caller acted on the change — a redial, a ping — so these are the
+    /// networks to judge the next hint against, and this change is not
+    /// reported twice.
+    pub fn acted(mut self) {
+        *self.watch.nets.borrow_mut() = std::mem::take(&mut self.now);
+        self.acted = true;
+    }
+}
+
+impl Drop for Change<'_> {
+    /// Under `-v`, say that the change is still standing: a reader who saw
+    /// `network changed` and no redial would otherwise have to guess
+    /// whether it was spent (acs-4i2's whole point). Nothing here decides
+    /// anything — the set has simply not moved.
+    fn drop(&mut self) {
+        if !self.acted {
+            self.watch
+                .trace("network change not acted on — the next hint reports it again");
+        }
     }
 }
 
@@ -288,63 +356,122 @@ mod tests {
         assert!(!route_messages_matter(&[1, 2]));
     }
 
+    /// The two stand-ins are process-wide, so a test that wants them takes
+    /// this first. They are set and removed in [`Standin`] and nowhere else
+    /// in this binary, one test at a time: two of them at once would race
+    /// over which machine the other one is on.
+    static STANDIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The stand-ins acs-6p8 left, held for as long as one test needs them:
+    /// `ACS_NETWATCH_FIFO` for the kernel's hint (read once, by
+    /// `NetWatch::new`) and `ACS_NETWATCH_NETS` for the machine's networks
+    /// (read afresh by every `changed()`).
+    struct Standin {
+        dir: crate::testutil::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Standin {
+        /// A watcher on a machine that is on `nets`, with a FIFO of this
+        /// test's own for the hints.
+        fn watching(nets: &str) -> (Standin, NetWatch) {
+            // A test that fails while holding it poisons nothing that
+            // matters: the next one sets both variables itself.
+            let lock = STANDIN.lock().unwrap_or_else(|e| e.into_inner());
+            let s = Standin {
+                dir: crate::testutil::TempDir::new(),
+                _lock: lock,
+            };
+            let c = std::ffi::CString::new(s.fifo().to_str().unwrap()).unwrap();
+            // SAFETY: a path in this test's own temporary directory.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            s.set(nets);
+            std::env::set_var("ACS_NETWATCH_FIFO", s.fifo());
+            std::env::set_var("ACS_NETWATCH_NETS", s.dir.path().join("nets"));
+            let w = NetWatch::new(false).unwrap();
+            // Spent: the watcher has its descriptor, and nothing else in
+            // this process should open the FIFO.
+            std::env::remove_var("ACS_NETWATCH_FIFO");
+            (s, w)
+        }
+
+        fn fifo(&self) -> std::path::PathBuf {
+            self.dir.path().join("net")
+        }
+
+        /// The machine is on these networks from now on.
+        fn set(&self, nets: &str) {
+            std::fs::write(self.dir.path().join("nets"), nets).unwrap();
+        }
+
+        /// The kernel said something about the network.
+        fn hint(&self) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(self.fifo())
+                .and_then(|mut f| std::io::Write::write_all(&mut f, b"x"))
+                .unwrap();
+        }
+
+        /// Give the machine its real networks back, for the assertions that
+        /// are about `getifaddrs` itself.
+        fn release(&self) {
+            std::env::remove_var("ACS_NETWATCH_NETS");
+        }
+    }
+
+    impl Drop for Standin {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
     /// acs-6p8: a hint is a reason to look at the network, not a network
     /// change. Only the networks this machine could dial from say that, so
     /// the kernel may be as chatty as it likes for nothing.
-    ///
-    /// Both stand-ins are set here and nowhere else in this binary, and
-    /// both are read while this test holds them: `ACS_NETWATCH_FIFO` by
-    /// `NetWatch::new`, and `ACS_NETWATCH_NETS` by every `changed()` below.
     #[test]
     fn a_hint_is_a_change_only_when_the_networks_are_not_the_same() {
-        let t = crate::testutil::TempDir::new();
-        let fifo = t.path().join("net");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let nets = t.path().join("nets");
-        let set = |text: &str| std::fs::write(&nets, text).unwrap();
-        let hint = || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&fifo)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, b"x"))
-                .unwrap()
+        let (s, w) = Standin::watching("192.168.1.5/24\nfd00::5/64\n");
+        // Acting on whatever a hint turns out to be, which is what every
+        // caller in this binary does when it can (acs-0n8).
+        let changed = || match w.changed() {
+            Some(c) => {
+                c.acted();
+                true
+            }
+            None => false,
         };
-        set("192.168.1.5/24\nfd00::5/64\n");
-        std::env::set_var("ACS_NETWATCH_FIFO", &fifo);
-        std::env::set_var("ACS_NETWATCH_NETS", &nets);
-        let w = NetWatch::new(false).unwrap();
-        std::env::remove_var("ACS_NETWATCH_FIFO");
         // Nothing has been said at all.
-        assert!(!w.changed());
+        assert!(!changed());
         // The kernel speaks up while the machine is on the same networks —
         // an unrelated interface, a route churning, a probe. Twice, to say
         // that it is not merely the second one that is quiet.
-        hint();
-        assert!(!w.changed(), "a hint that changed nothing");
-        hint();
-        assert!(!w.changed(), "and the next one");
+        s.hint();
+        assert!(!changed(), "a hint that changed nothing");
+        s.hint();
+        assert!(!changed(), "and the next one");
         // Order is not identity.
-        set("fd00::5/64\n192.168.1.5/24\n");
-        hint();
-        assert!(!w.changed(), "the same networks in another order");
+        s.set("fd00::5/64\n192.168.1.5/24\n");
+        s.hint();
+        assert!(!changed(), "the same networks in another order");
         // Wi-Fi switched: a new address, and the same prefix on a new
         // lease is a change too.
-        set("10.0.0.5/24\nfd00::5/64\n");
-        hint();
-        assert!(w.changed());
-        // Reported once: the kernel has more to say about the same change.
-        hint();
-        assert!(!w.changed());
+        s.set("10.0.0.5/24\nfd00::5/64\n");
+        s.hint();
+        assert!(changed());
+        // Reported once — to a caller that acted on it: the kernel has
+        // more to say about the same change.
+        s.hint();
+        assert!(!changed());
         // An interface went away.
-        set("fd00::5/64\n");
-        hint();
-        assert!(w.changed());
-        std::env::remove_var("ACS_NETWATCH_NETS");
+        s.set("fd00::5/64\n");
+        s.hint();
+        assert!(changed());
+        s.release();
         // And this machine's own, read twice with nothing touched in
         // between: the same answer, or every hint would be a change again.
-        // In the same test as the stand-in so the two cannot race over the
-        // variable that tells them apart.
+        // Still holding `STANDIN`, so nothing else in this binary can set
+        // the variable that tells the two apart while this reads them.
         let own = networks();
         assert_eq!(own, networks());
         let mut sorted = own.clone();
@@ -352,6 +479,53 @@ mod tests {
         assert_eq!(
             own, sorted,
             "sorted: the order interfaces come in is not it"
+        );
+    }
+
+    /// Regression (acs-0n8): a change the caller could not act on is not
+    /// spent — the next hint reports it again — and a flap that produces
+    /// several of them is still one change when somebody finally acts.
+    ///
+    /// Before this, `changed()` moved the networks held whether or not the
+    /// answer was used, so the second hint of the same change compared
+    /// against a set that had already moved and said "not a change". The
+    /// change was not deferred, it was gone, and only a covering deadline
+    /// (the dial timeout, the backoff) recovered it.
+    ///
+    /// The same stand-ins as the test above, one test at a time.
+    #[test]
+    fn a_change_nobody_acted_on_is_offered_again() {
+        let (s, w) = Standin::watching("192.168.1.5/24\n");
+        // Wi-Fi switched while the caller could do nothing with it — it was
+        // mid-handshake, or its last early redial was too recent. The
+        // change is read and dropped.
+        s.set("10.0.0.5/24\n");
+        s.hint();
+        assert!(w.changed().is_some(), "the networks moved");
+        // The kernel speaks again about the very same state of the world.
+        // This is the drop path: the answer has to be the change again.
+        s.hint();
+        assert!(
+            w.changed().is_some(),
+            "the change was spent by a caller that could not use it"
+        );
+
+        // A flapping interface: three more changes in a row, none of them
+        // acted on. Nothing queues — what is offered is always the
+        // networks of the moment against the last set acted on.
+        for n in ["10.0.0.6/24\n", "10.0.0.7/24\n", "10.0.0.8/24\n"] {
+            s.set(n);
+            s.hint();
+            assert!(w.changed().is_some(), "{n} is a change from 192.168.1.5");
+        }
+        // Somebody acts at last: one redial's worth, not four.
+        s.set("10.0.0.9/24\n");
+        s.hint();
+        w.changed().expect("still a change").acted();
+        s.hint();
+        assert!(
+            w.changed().is_none(),
+            "the flap left changes behind to be reported again"
         );
     }
 

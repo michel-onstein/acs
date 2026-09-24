@@ -843,6 +843,226 @@ fn under_v_a_real_change_names_the_networks_and_still_redials() {
     remote.wait_more_connections(dialled, 1, T);
 }
 
+/// Regression (acs-0n8): a change the early-redial rate limit suppressed is
+/// **not spent**. The kernel's next word about the same move is the same
+/// change again, instead of being answered "not a change" against a set of
+/// networks that has already moved.
+///
+/// The drop path is driven rather than waited for. `ACS_EARLY_MS` is two
+/// minutes here, so the rate limit is open for exactly one early redial and
+/// shut for everything after it — no wall clock decides which side of it a
+/// change lands on. The first change takes that redial (refused, so the
+/// client is back in the wait with the limit now closed); the second is
+/// read and suppressed; and the third hint moves nothing at all, so what
+/// the client says about it is the whole assertion:
+///
+/// - as it was, the second change was committed as it was read, so this
+///   hint compared 172.16.0.5/24 against 172.16.0.5/24 and said *not a
+///   change* — the change was not deferred, it was gone, and only the
+///   backoff (two minutes here, 30 s at worst in life) recovered it;
+/// - now the networks held still say 10.0.0.5/24, so the same change is
+///   named again.
+///
+/// `-v` for those lines, which is why the session announcement is waited
+/// for first (acs-ryz). And the change offered again does *not* redial: the
+/// rate limit is still what it was, which the connection count and the
+/// detach at the end say together.
+#[test]
+fn a_change_the_rate_limit_suppressed_is_offered_again() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![
+        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
+        ("ACS_EARLY_MS".to_string(), "120000".to_string()),
+    ];
+    env.extend(watch.env());
+    let mut c = Client::start_env(
+        &remote,
+        &["-v", "devbox", "ea", "--", "/bin/sh", "-c", TICKER],
+        &refs(&env),
+    );
+    c.wait_session("ea");
+    c.wait_for("#10#", T);
+    remote.refuse_one_dial();
+    remote.cut_link();
+    c.wait_for("reconnecting in 120s", T);
+    let dialled = remote.connections();
+
+    // The first change takes the one early redial the limit allows. It is
+    // refused, so nothing connects and the client is back in the wait —
+    // which is what the second status line says.
+    remote.refuse_one_dial();
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    c.wait_for("reconnecting in 120s", T);
+
+    // A second genuine change, inside the two minutes: read, and dropped.
+    watch.set_networks("172.16.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network changed: 10.0.0.5/24 → 172.16.0.5/24", T);
+    c.wait_for("acs: network change not acted on", T);
+
+    // The kernel says something more while the machine is on exactly the
+    // networks that change left it on. The same change, named again.
+    watch.hint();
+    c.wait_for("acs: network changed: 10.0.0.5/24 → 172.16.0.5/24", T);
+
+    // Offered again is not acted on again: the rate limit is untouched, so
+    // nothing dialled. The refusal above is spent, so a second early redial
+    // would have connected — and a wait cut short puts the client in a
+    // redial, where what is typed is flushed rather than read, so the
+    // detach would not arrive either (acs-6p8).
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/ea", T);
+    assert_eq!(
+        remote.connections(),
+        dialled,
+        "the change offered again redialled inside the rate limit: {}",
+        c.text()
+    );
+}
+
+/// Regression (acs-0n8), the other drop path: a change that arrives between
+/// the dial and the `WELCOME` is not spent either.
+///
+/// The host accepts the connection, prints its marker and then says nothing
+/// (as `a_silent_host_is_given_up_on` uses it), so the client sits in the
+/// handshake with a generous dial timeout — long enough that nothing here
+/// is racing it. There the netwatch descriptor is polled and the hint is
+/// read, and **that is all that happens**: acting on it is acs-xo1, which
+/// has the blocking dial to deal with and is still open. What this asserts
+/// is only that the hint is not thrown away, and the connection count says
+/// the dial was neither abandoned nor replaced.
+///
+/// Same shape as the test above: two hints for one move, and the second one
+/// has to name the change again rather than answer "not a change".
+#[test]
+fn a_change_during_the_handshake_is_offered_again() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![
+        // The free first redial goes at once (acs-iyq), so the hints below
+        // cannot be read by an offline wait: there is not one.
+        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
+        ("ACS_DIAL_TIMEOUT_MS".to_string(), "60000".to_string()),
+    ];
+    env.extend(watch.env());
+    let mut c = Client::start_env(
+        &remote,
+        &[
+            "-v",
+            "devbox",
+            "hs",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo up; sleep 60",
+        ],
+        &refs(&env),
+    );
+    c.wait_session("hs");
+    c.wait_for("up", T);
+    // Every connection from here on goes quiet once accepted.
+    remote.silence(Some(&acs::proto::ready_line()));
+    remote.cut_link();
+    // The redial's own marker, which `-v` prints: the link is made and the
+    // client is in it waiting for a WELCOME that never comes. Hinting
+    // before this point would be read by the link that is *still up* — the
+    // client examines the watcher in the same pass it notices the cut —
+    // and acted on as acs-ft1's ping instead.
+    c.wait_for("timing: redial: ACS-READY seen", T);
+    let handshaking = remote.connections();
+
+    // The machine's addresses move while that dial is still owed a WELCOME.
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    c.wait_for("acs: network change not acted on", T);
+
+    // The kernel's next word about the same move.
+    watch.hint();
+    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    assert_eq!(
+        remote.connections(),
+        handshaking,
+        "the handshake acted on the change (acs-xo1, not this): {}",
+        c.text()
+    );
+    // The client is left in its handshake, which is where this bead ends;
+    // dropping it kills it.
+}
+
+/// A flapping interface is still **one** redial (acs-6p8's storm, kept out
+/// by acs-0n8).
+///
+/// Deferring a change rather than dropping it would be a storm again if the
+/// deferred ones queued. They cannot: what a hint offers is the networks of
+/// the moment compared against the set of the last redial, made afresh
+/// every time, so four changes with nobody acting on them are still one
+/// change when somebody does. `src/netwatch.rs`'s own test says that
+/// against the watcher; this one says it of the client, which is where the
+/// redial actually happens.
+///
+/// `ACS_EARLY_MS` is two minutes so the whole flap lands inside one
+/// interval, with no wall clock deciding it. The first change spends the
+/// one early redial and is refused — so the refusal is spent too, and any
+/// second redial would connect and show in the count.
+#[test]
+fn a_flapping_interface_is_one_redial() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![
+        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
+        ("ACS_EARLY_MS".to_string(), "120000".to_string()),
+    ];
+    env.extend(watch.env());
+    let mut c = Client::start_env(
+        &remote,
+        &["-v", "devbox", "fl", "--", "/bin/sh", "-c", TICKER],
+        &refs(&env),
+    );
+    c.wait_session("fl");
+    c.wait_for("#10#", T);
+    remote.refuse_one_dial();
+    remote.cut_link();
+    c.wait_for("reconnecting in 120s", T);
+    let dialled = remote.connections();
+
+    // The interface comes and goes: every step of it moves an address, so
+    // every one of them is a change and not a mention.
+    remote.refuse_one_dial();
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    // The one redial the limit allows, refused: back in the wait.
+    c.wait_for("reconnecting in 120s", T);
+
+    // Three more changes with nobody able to act on any of them. Each is
+    // named against 10.0.0.5/24 — the set the *redial* left held — which
+    // is the whole of why nothing queues: there is one comparison, not a
+    // list of changes waiting their turn.
+    for to in ["10.0.0.6/24", "10.0.0.7/24", "10.0.0.8/24"] {
+        watch.set_networks(&format!("{to}\n"));
+        watch.hint();
+        // Waited for one at a time, so each hint is a drain of its own and
+        // the three are three changes rather than one.
+        c.wait_for(&format!("acs: network changed: 10.0.0.5/24 → {to}"), T);
+        c.wait_for("acs: network change not acted on", T);
+    }
+
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/fl", T);
+    assert_eq!(
+        remote.connections(),
+        dialled,
+        "a flap of four changes dialled more than once: {}",
+        c.text()
+    );
+}
+
 // ---- bug hunt 2026-09-18 -----------------------------------------------------
 
 /// Regression (acs-znr): a host that accepts the connection and then says

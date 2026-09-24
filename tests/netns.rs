@@ -142,7 +142,10 @@ fn the_kernel_drives_the_watcher() {
     ip(&["link", "add", ADDRESSED, "type", "dummy"]);
     wait_readable(&w, "an interface appearing");
     assert_eq!(nets(), before, "a down, unaddressed interface moved one");
-    assert!(!w.changed(), "an interface with no address is not a change");
+    assert!(
+        w.changed().is_none(),
+        "an interface with no address is not a change"
+    );
 
     // It comes up and gets an address: now something moved.
     ip(&["link", "set", ADDRESSED, "up"]);
@@ -153,20 +156,46 @@ fn the_kernel_drives_the_watcher() {
         with.contains(&ADDRESS.to_string()),
         "getifaddrs does not report {ADDRESS}: {with:?}"
     );
-    assert!(
-        w.changed(),
-        "an address this machine can dial from appeared"
-    );
+    // Acted on, as the client does with a change it can use: the networks
+    // the watcher holds move here and nowhere else (acs-0n8), so the
+    // assertions below are against this set and not the one before it.
+    w.changed()
+        .expect("an address this machine can dial from appeared")
+        .acted();
 
     // A second bare interface: the kernel speaks again for nothing.
     ip(&["link", "add", BARE, "type", "dummy"]);
     wait_readable(&w, "a second interface appearing");
     assert_eq!(nets(), with, "a down, unaddressed interface moved one");
-    assert!(!w.changed(), "the same networks, so not a change");
+    assert!(w.changed().is_none(), "the same networks, so not a change");
 
     // And the address goes away with its interface.
     ip(&["link", "del", ADDRESSED]);
     wait_readable(&w, "an interface going away");
     assert_eq!(nets(), before, "{ADDRESS} outlived its interface");
-    assert!(w.changed(), "the address this machine dialled from went");
+    w.changed()
+        .expect("the address this machine dialled from went")
+        .acted();
+
+    // And the kernel's second word about a change nobody acted on is the
+    // same change (acs-0n8), here against the real thing: another address
+    // arrives, the answer is read and dropped, and the next message —
+    // whatever the kernel sends about the interface going away again —
+    // finds the networks still held where the last acted-on change left
+    // them.
+    ip(&["link", "add", ADDRESSED, "type", "dummy"]);
+    ip(&["link", "set", ADDRESSED, "up"]);
+    ip(&["addr", "add", ADDRESS, "dev", ADDRESSED]);
+    wait_readable(&w, "an address arriving again");
+    assert!(
+        w.changed().is_some(),
+        "the address came back and that is a change"
+    );
+    ip(&["link", "del", ADDRESSED]);
+    wait_readable(&w, "that interface going away");
+    assert_eq!(nets(), before, "{ADDRESS} outlived its interface");
+    assert!(
+        w.changed().is_none(),
+        "back on the networks the last acted-on change left held"
+    );
 }

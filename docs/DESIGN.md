@@ -696,7 +696,27 @@ sequenceDiagram
     longer shortens the wait. The backoff does that instead, within 30 s.
     Joining a network, waking, a VPN coming up or going away all move an
     address, so the case the watcher exists for is as fast as it was. Two
-    changes inside two seconds are still one redial (`EARLY_EVERY`).
+    changes inside two seconds are still one redial (`early_every()`,
+    `ACS_EARLY_MS`).
+  - **The networks held move when a caller acts, not when it reads**
+    (acs-0n8). `changed()` hands out a `Change`; the set it was judged
+    against is replaced by `Change::acted` and nowhere else. The two
+    callers that cannot always act — the offline wait inside its rate
+    limit, and the serving loop before the `WELCOME` — drop it instead,
+    and the next hint about the same move names the same change rather
+    than being answered "not a change" against a set that has already
+    moved. Before this the hint was spent either way: the change was not
+    deferred but lost, and only a covering deadline recovered it (the dial
+    timeout, the backoff). It is the one way a hint can go missing, which
+    made it the standing suspect whenever something that should have
+    reacted did not.
+    - **Nothing is queued by that**, so acs-6p8's storm stays fixed: a
+      change is not a message in a box, it is `local_networks()` compared
+      against the last set anybody acted on, made afresh on each hint.
+      Four changes with nobody acting are one change when somebody does,
+      and the rate limit is untouched — a flapping interface still costs
+      at most one redial per `ACS_EARLY_MS`, exactly as when the change
+      was thrown away.
   - The tests drive both halves rather than the developer's laptop:
     `ACS_NETWATCH_FIFO` is the hint (one per write) and `ACS_NETWATCH_NETS`
     a file of the machine's networks, one CIDR per line. The harness points
@@ -728,9 +748,12 @@ sequenceDiagram
     `network changed: <old> → <new>`, `network hint: still on <nets> — not
     a change`, or, on macOS where the filter can reject everything read,
     `network: N bytes from the kernel, no address or interface message`.
-    The lines read the decision and are no part of it: they touch neither
-    the networks held nor `EARLY_EVERY`, and the tests that assert the
-    decision run beside the ones that assert the text.
+    A change that is read and not acted on adds `network change not acted
+    on — the next hint reports it again`, so a reader who sees a change
+    named and no redial follow is not left guessing whether it was spent
+    (acs-0n8). The lines read the decision and are no part of it: they
+    touch neither the networks held nor the rate limit, and the tests that
+    assert the decision run beside the ones that assert the text.
 - **A network change while the link is up shortens the dead-link timeout;
   it does not redial** (acs-ft1). The watcher is polled by the serving loop
   too, not only by the offline wait, because the two cases a laptop
@@ -759,7 +782,7 @@ sequenceDiagram
     `ACS_DEAD_MS` of silence, and a second change while the question is
     outstanding is the same question — a flapping interface neither pushes
     the deadline out nor spends another round trip. (The offline wait's own
-    rate limit, `EARLY_EVERY`, is separate and untouched: that one guards a
+    rate limit, `early_every()`, is separate and untouched: that one guards a
     redial, this one a ping.)
   - **The wake case needs this, not a shorter `ACS_DEAD_MS`.** The client's
     clock is monotonic and stops with the machine (`sys::now_ms`), so the

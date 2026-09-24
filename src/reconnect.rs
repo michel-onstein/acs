@@ -332,14 +332,26 @@ enum Offline {
     Detach,
 }
 
-/// At most one early redial per this interval. A chatty network is no
-/// longer what this guards against — the watcher answers a hint that
-/// changed nothing with `false` (acs-6p8) — but a link coming up and going
-/// down again can change the machine's addresses twice in a second, and
-/// dialling on each would drop what was typed in between for nothing. The
-/// change suppressed here is not queued: the backoff (30 s at worst) is
-/// what covers it, as it did before there was a watcher at all.
-const EARLY_EVERY: Duration = Duration::from_secs(2);
+/// At most one early redial per this interval (`ACS_EARLY_MS`). A chatty
+/// network is no longer what this guards against — the watcher answers a
+/// hint that changed nothing with `None` (acs-6p8) — but a link coming up
+/// and going down again can change the machine's addresses twice in a
+/// second, and dialling on each would drop what was typed in between for
+/// nothing.
+///
+/// A change suppressed here is **not spent** (acs-0n8): it is dropped
+/// rather than accepted, so the watcher still holds the networks of the
+/// last redial and the kernel's next word about the flap is the same
+/// change again. What that is not is a queue. Nothing fires without a
+/// hint, and a hint is one comparison against the networks of the moment
+/// however many changes went by — so a flapping interface still costs one
+/// redial per interval, exactly as it did when the change was thrown away.
+/// What it buys is that the change is no longer lost to the machine
+/// settling quietly: any later hint carries it, instead of the backoff
+/// (30 s at worst) having to cover for it.
+fn early_every() -> Duration {
+    Duration::from_millis(env_ms("ACS_EARLY_MS", 2000))
+}
 
 /// Wait `wait` before the next redial with the link down: show `msg` as the
 /// status, drop typed keys, but honour the command keys. A `wait` of zero
@@ -384,11 +396,17 @@ fn offline(
         if fds[1].revents != 0 {
             sys::signals::drain(signals.as_raw_fd());
         }
-        if fds[2].revents != 0 && netwatch.is_some_and(|w| w.changed()) {
-            let quiet = last_early.map_or(true, |t| t.elapsed() >= EARLY_EVERY);
-            if quiet {
-                *last_early = Some(Instant::now());
-                return Offline::NetworkChanged;
+        if fds[2].revents != 0 {
+            if let Some(change) = netwatch.and_then(|w| w.changed()) {
+                let quiet = last_early.map_or(true, |t| t.elapsed() >= early_every());
+                if quiet {
+                    // Accepted, so the networks it was judged against are
+                    // these from now on; a rate-limited one is dropped
+                    // instead and offered again (acs-0n8, [`early_every`]).
+                    change.acted();
+                    *last_early = Some(Instant::now());
+                    return Offline::NetworkChanged;
+                }
             }
         }
         let was = state.detector.armed();
