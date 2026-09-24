@@ -83,6 +83,14 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
             false => crate::list::run_all(&args),
         };
     }
+    // The master acs keeps for this host, if it may have one: decided once,
+    // before anything dials, so every call this client makes agrees about
+    // it (acs-9n3). Never for `acs list` over every alias, which asks a
+    // dozen hosts at once and would leave a master on each.
+    let decided = crate::mux::configure(&mut args.transport);
+    if args.verbose > 0 {
+        note(&decided);
+    }
     let name = args.transport.destination.clone();
     let mut timing = Timing::start(args.verbose > 0, "first connection");
     if let Err(e) = resolve_alias(&mut args, &name) {
@@ -324,6 +332,10 @@ pub struct Link {
     /// [`serve`] takes them as the first thing it writes, so nothing can
     /// overtake them.
     pending: Vec<u8>,
+    /// Whether this connection is a channel on the master acs keeps for
+    /// the host (`mux.rs`). When such a link dies, the master's own TCP is
+    /// the one that failed, so the redial takes the master down with it.
+    pub muxed: bool,
 }
 
 impl Link {
@@ -365,7 +377,50 @@ pub fn answer_timeout(redial: bool) -> Duration {
 /// reads nothing until it has printed the marker, so a HELLO left waiting
 /// in the pipe saves a round trip on every dial and redial. Whatever does
 /// not fit stays in [`Link::pending`] for [`serve`] to write.
+///
+/// **A master must answer fast or not at all** (acs-9n3). Where this dial
+/// would join a master acs already has up, it is given
+/// `ACS_CONTROL_FALLBACK_MS` rather than `timeout`: joining costs one
+/// round trip, so anything slower is a master whose connection has died
+/// without noticing. That one is killed and the dial made again on a
+/// connection of its own, with the whole `timeout` — where a password or
+/// a key touch may legitimately take a minute.
 pub fn dial(
+    args: &ClientArgs,
+    call: Call,
+    remote: &str,
+    timeout: Duration,
+    timing: &mut Timing,
+    first: Vec<u8>,
+) -> io::Result<(Link, Marker)> {
+    if crate::mux::joinable(&args.transport, call) {
+        timing.mark("shared ssh master checked");
+        let window = timeout.min(crate::mux::fallback_window());
+        match dial_once(args, call, remote, window, timing, first.clone()) {
+            Ok(x) => return Ok(x),
+            // A master that is up but cannot carry a channel is worse than
+            // none: take it down, so the dial below and the next client
+            // both make their own connection.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                note(&format!(
+                    "the shared ssh master for {} did not answer within {} s — dialing its own connection",
+                    args.transport.destination,
+                    window.as_secs_f32()
+                ));
+                crate::mux::stop(&args.transport);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    dial_once(args, call, remote, timeout, timing, first)
+}
+
+fn dial_once(
     args: &ClientArgs,
     call: Call,
     remote: &str,
@@ -454,6 +509,7 @@ pub fn dial(
             to,
             from,
             pending,
+            muxed: args.transport.multiplexes(call),
         },
         marker,
     ))
@@ -497,6 +553,16 @@ pub struct State {
     /// who was attached when it was given, so it is spent by the attach it
     /// was given for rather than riding along on every later redial.
     pub force_next: bool,
+    /// The transport of the link now in hand, when that link is a channel
+    /// on acs's shared ssh master (acs-9n3) — the redial after it ends
+    /// that master.
+    ///
+    /// The transport, not a flag: an alias is resolved again **before**
+    /// every redial (DESIGN §7.3), so by the time the redial runs
+    /// `ssh -O exit` the destination may already be another host — whose
+    /// master is somebody else's live connection, and whose socket is not
+    /// the one that just died.
+    pub master: Option<ssh::Transport>,
 }
 
 /// How serving a link ended.
@@ -607,6 +673,10 @@ pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
         paste: keys::PasteTracker::default(),
         detector: Detector::new(escape_config()),
         force_next: args.force,
+        master: picked
+            .as_ref()
+            .filter(|p| p.link.muxed)
+            .map(|_| args.transport.clone()),
     };
     let mut raw: Option<RawMode> = None;
     let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals, picked, timing);
@@ -654,10 +724,36 @@ pub fn connect_and_serve(
         // the proxy read the list's frames from it first (DESIGN §4.4).
         let mut link = p.link;
         link.pending = greeting;
+        state.master = link.muxed.then(|| args.transport.clone());
         return serve(
             args, state, raw, signals, link, p.rest, timeout, timing, size, netwatch,
         );
     }
+    // The link that just died was a channel on acs's master, so the
+    // master's own connection is the one that failed: take it down before
+    // dialing, or it would answer the next client with a dead path
+    // (acs-9n3). A sibling session sharing it is dropped too, and redials
+    // onto a connection of its own — the same recovery it would make if
+    // the master had noticed by itself.
+    //
+    // The transport the link *ran on*, which is not `args.transport` any
+    // more if the alias resolved to another host a moment ago: that host's
+    // master is a live connection of somebody else's.
+    if let Some(old) = state.master.take().filter(|_| resuming) {
+        if args.verbose > 0 {
+            note(&format!(
+                "ending the shared ssh master the lost link ran on ({})",
+                old.destination
+            ));
+        }
+        crate::mux::stop(&old);
+    }
+    // A redial never multiplexes (DESIGN §3): its whole job is to get a
+    // connection of its own after one was lost.
+    let call = match resuming {
+        true => Call::Redial,
+        false => Call::Session,
+    };
     let pargs = proxy_args(args, state, resuming);
     let pargs: Vec<&str> = pargs.iter().map(String::as_str).collect();
     let remote = ssh::remote_acs(crate::VERSION, &pargs);
@@ -665,7 +761,7 @@ pub fn connect_and_serve(
     if let Some(r) = raw.as_mut() {
         let _ = r.suspend();
     }
-    let (link, marker) = match dial(args, Call::Session, &remote, timeout, timing, greeting) {
+    let (link, marker) = match dial(args, call, &remote, timeout, timing, greeting) {
         Ok(x) => x,
         Err(e) => {
             if resuming {
@@ -710,6 +806,7 @@ pub fn connect_and_serve(
             };
         }
     };
+    state.master = link.muxed.then(|| args.transport.clone());
     serve(
         args, state, raw, signals, link, rest, timeout, timing, size, netwatch,
     )

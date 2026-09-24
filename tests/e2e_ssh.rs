@@ -300,6 +300,7 @@ fn e2e_09_list_shows_the_sessions() {
         .args(&args)
         .env("XDG_CONFIG_HOME", NO_CONFIG)
         .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+        .env("ACS_CONTROL_PERSIST", NO_MASTER)
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
@@ -326,6 +327,7 @@ fn e2e_09b_list_without_a_host_asks_every_alias() {
         .envs(env)
         .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
         .env("ACS_NO_UPDATE_CHECK", "1")
+        .env("ACS_CONTROL_PERSIST", NO_MASTER)
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
@@ -560,6 +562,7 @@ fn e2e_14_a_local_forward_is_the_session_connections_alone() {
         .env("XDG_CONFIG_HOME", NO_CONFIG)
         .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
         .env("ACS_NO_UPDATE_CHECK", "1")
+        .env("ACS_CONTROL_PERSIST", NO_MASTER)
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
@@ -595,5 +598,137 @@ fn e2e_14_a_local_forward_is_the_session_connections_alone() {
     eprintln!(
         "VERIFIED -L over ssh: {banner} through 127.0.0.1:{port}, \
          no forward on the acs list side call, rebound after a redial"
+    );
+}
+
+/// The socket the master listens on. There is one per destination, so the
+/// directory names it.
+fn one_socket(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    found.pop().unwrap()
+}
+
+/// `acs: timing: <what>: <phase> … (N ms total)` out of a client's output.
+fn total_ms(text: &str, what: &str, phase: &str) -> Option<u64> {
+    let head = format!("timing: {what}: {phase} ");
+    let line = text.lines().find(|l| l.contains(&head))?;
+    line.split('(').nth(1)?.split(' ').next()?.parse().ok()
+}
+
+/// acs-9n3, over real ssh — the one thing a fake transport cannot test.
+///
+/// Three claims, in order: a detached session leaves a master behind and
+/// the next `acs` rides it rather than handshaking again; the socket it
+/// rides is a `0600` file in a `0700` directory of this user's; and a lost
+/// link takes the master down with it, because the master's own connection
+/// is the one that failed.
+#[test]
+fn e2e_15_a_shared_master_carries_the_second_connection_and_dies_with_the_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(h) = host() else { return };
+    let dir = acs::testutil::TempDir::new();
+    let mux = dir.path().join("mux");
+    let dir_s = mux.to_str().unwrap().to_string();
+    let env: Vec<(&str, &str)> = vec![
+        ("ACS_CONTROL_DIR", &dir_s),
+        ("ACS_CONTROL_PERSIST", "300"),
+        ("ACS_BACKOFF_MS", "300"),
+    ];
+
+    // `ssh -O <op>` against whatever master is on `sock`.
+    let control = |sock: &std::path::Path, op: &str| -> std::process::Output {
+        let mut args = vec!["-o".to_string(), format!("ControlPath={}", sock.display())];
+        args.extend(h.ssh_args());
+        args.extend(["-O".to_string(), op.to_string(), "--".into()]);
+        args.push("dev@127.0.0.1".into());
+        Command::new("ssh").args(&args).output().unwrap()
+    };
+
+    // A first connection: it starts the master.
+    let mut args = vec!["-v".to_string()];
+    args.extend(h.ssh_args());
+    args.extend(["dev@127.0.0.1", "mux", "--", "/bin/sh", "-c"].map(String::from));
+    args.push(TICKER.to_string());
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut c = Client::spawn(std::path::Path::new(&h.client), &argv, &env);
+    c.wait_for("#10#", T);
+    let first = c.text();
+    assert!(first.contains("shared ssh master at"), "{first}");
+
+    let sock = one_socket(&mux);
+    assert_eq!(
+        std::fs::metadata(&mux).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "the directory a control socket sits in"
+    );
+    assert_eq!(
+        std::fs::metadata(&sock).unwrap().permissions().mode() & 0o077,
+        0,
+        "a control socket is a shell on the far end: {sock:?}"
+    );
+
+    // Detached, the master stays: that is the whole point — the reattach
+    // pays no handshake.
+    c.send(&command(b'd'));
+    c.wait(T);
+    let check = control(&sock, "check");
+    assert!(
+        check.status.success(),
+        "no master after detaching: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let pid = String::from_utf8_lossy(&check.stderr).trim().to_string();
+
+    // The reattach rides it. The ticker kept running while the session was
+    // detached, so what comes back is whatever it has reached by now.
+    let mut c = Client::spawn(std::path::Path::new(&h.client), &argv, &env);
+    c.wait_until("the ticker is back", |c| numbers(&c.text()).len() > 5, T);
+    let second = c.text();
+    assert!(second.contains("shared ssh master at"), "{second}");
+    assert!(!second.contains("did not answer"), "{second}");
+    let again = control(&sock, "check");
+    assert!(again.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&again.stderr).trim(),
+        pid,
+        "a second master was started instead of the first being used"
+    );
+
+    let cold = total_ms(&first, "first connection", "ACS-READY seen");
+    let warm = total_ms(&second, "first connection", "ACS-READY seen");
+    eprintln!("MEASURED handshake to ACS-READY: cold {cold:?} ms, on the master {warm:?} ms");
+    assert!(cold.is_some() && warm.is_some(), "{first}\n---\n{second}");
+
+    // The link dies: the master's own connection is the one that failed,
+    // so the redial takes it down and dials its own.
+    h.docker(&[
+        "exec",
+        &h.container,
+        "sh",
+        "-c",
+        "pkill -f '[s]shd-session: dev@' || pkill -f '[s]shd: dev@'",
+    ]);
+    c.wait_resumed();
+    let last = *numbers(&c.text()).last().unwrap();
+    c.wait_for(&format!("#{}#", last + 50), T);
+    assert_consecutive(&c.text());
+    let gone = control(&sock, "check");
+    assert!(
+        !gone.status.success(),
+        "the master the lost link ran on is still up: {}",
+        String::from_utf8_lossy(&gone.stderr)
+    );
+
+    c.send(&command(b'x'));
+    c.wait(T);
+    // Nothing of ours is left holding a connection to the host.
+    let _ = control(&sock, "exit");
+    eprintln!(
+        "VERIFIED shared ssh master over ssh: {pid} carried the reattach, \
+         socket 0600 in a 0700 directory, ended with the lost link"
     );
 }

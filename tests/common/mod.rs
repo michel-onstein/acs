@@ -36,9 +36,16 @@ pub fn acs_cmd_as(path: &Path) -> Command {
     let mut c = Command::new(path);
     c.env("ACS_NO_UPDATE_CHECK", "1")
         .env("XDG_CONFIG_HOME", NO_CONFIG)
-        .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"));
+        .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+        .env("ACS_CONTROL_PERSIST", NO_MASTER);
     c
 }
+
+/// No shared ssh master by default (acs-9n3): a test that is not about one
+/// must not make, or join, a master in the developer's own
+/// `/tmp/acs-mux-<uid>`. `tests/mux.rs` sets its own directory and window,
+/// applied after this one.
+pub const NO_MASTER: &str = "0";
 
 /// Write `yaml` as the client's local configuration under `dir`; returns the
 /// environment that makes the client read it.
@@ -704,6 +711,9 @@ impl Client {
             .env("XDG_CONFIG_HOME", NO_CONFIG)
             .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
             .env("ACS_IDENTITY", "tester@local")
+            // And never a shared ssh master in the developer's own
+            // /tmp/acs-mux-<uid> (acs-9n3); tests/mux.rs sets its own.
+            .env("ACS_CONTROL_PERSIST", NO_MASTER)
             // And never the developer's own network. A path that does not
             // exist leaves the client with no watcher at all, so a Wi-Fi
             // roam or a VPN coming up on the machine running the suite
