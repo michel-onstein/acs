@@ -282,6 +282,13 @@ asks the host straight away and gives it **2 seconds** to be heard from: a
 link that came through the change answers and costs you nothing, and one
 that did not is replaced in a second or two instead of ten.
 
+Both of those rest on your machine's addresses really moving when you roam,
+so `-v` says what each thing the kernel mentioned was worth: `network
+changed: 192.168.1.5/24 → 10.0.0.5/24` for one that counted, `network hint:
+still on 192.168.1.5/24 — not a change` for one that did not. If you switch
+network and see no line at all, the watcher is not seeing your machine's
+network move — that is worth reporting.
+
 ### Never giving up on a host
 
 acs gives up (exit 255) where there is no session to keep: the host

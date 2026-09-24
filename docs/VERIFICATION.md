@@ -1,12 +1,13 @@
 # acs — verification
 
-**Status:** Automated end-to-end checks pass (2026-09-23); the checks that
+**Status:** Automated end-to-end checks pass (2026-09-24); the checks that
 need a person at a real terminal are listed at the end, not yet done.
 
 What the unit and integration tests cannot show is checked here: acs over a
 real ssh connection, against a real host, with real terminal programs and
 real interruptions. `scripts/e2e_ssh.sh` automates everything that can be
-automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
+automated; `scripts/test_linux.sh` covers Linux, multi-user isolation, and
+the network watcher against the real kernel.
 
 ## Environment
 
@@ -43,6 +44,7 @@ automated; `scripts/test_linux.sh` covers Linux and multi-user isolation.
 | Session menu | plain `acs dev@127.0.0.1` with sessions `menu-a` and `menu-b` detached: cursor to `menu-b`, `x`, `y`, then `menu-a`'s number | Pass — `menu-b` ended and gone from the menu, `menu-a` attached (2026-09-18); with `-v`, one `running ssh … _proxy --pick` from the list to the attach (2026-09-19) |
 | The prelude's check of the binary it execs | `ssh::tests` on macOS (BSD `ls`) and in `rust:alpine` (busybox `ls`), plus the shell walked by hand against GNU coreutils 9.1 in Debian (2026-09-24, acs-gov): a real binary and a symlinked one, each with a safe and an unsafe target, and a relative link, a chain of links, a link into a world-writable directory, a link *in* one, and a dangling link | Pass on both platforms — the mode and owner examined are the target's, and every directory the link passes through is checked. Shown red first by putting the old check back: it refused the safe symlink on Linux (with a message about permissions that were not the problem) and ran the world-writable one on macOS without a word. `ls -ldnL` follows the link identically on busybox 1.36.1, coreutils 9.1 and BSD `ls`; the three differ only on a dangling link, which `[ -x ]` rejects before the mode is ever read |
 | The system-wide install path, really populated by root | `tests/multiuser.rs` under `scripts/test_linux.sh` (2026-09-24, acs-6w9): root writes `/usr/local/lib/acs/<version>/acs` and alice and bob run the prelude against it; then the directory made `0777` and `0775`, the binary made `0775`, the file chowned to bob, and the directory chowned to bob; and the same owners tried at the `$HOME` candidate | Pass — both users exec root's binary, and every loosening is refused by name: the writable cases say "is writable by others" with the mode, the third-uid cases say "is owned by uid N, not by you or root", and each prints `ACS-NEED` so the client installs instead. Shown red first by putting acs-08m's `= $acs_u` back alone: root's binary was refused to alice at both paths, which is the defect |
+| The network watcher's platform half, Linux netlink | `tests/netns.rs` under `scripts/test_linux.sh` (2026-09-24, acs-4i2): a dummy interface created, brought up, addressed with `192.0.2.7/24` and torn down again in the container's own network namespace (`--cap-add NET_ADMIN`), against a real `NETLINK_ROUTE` watcher | Pass — the descriptor becomes readable after each `ip` command, and the test never writes to it, so the message is the kernel's own multicast; a bare interface is a message and not a change, an addressed one is both, and the address going away is a change again. Shown red both ways first: subscribed to no netlink group, the kernel "said nothing about an interface appearing"; with acs-6p8's comparison removed, "an interface with no address is not a change" failed |
 | Full test suite on Linux | `scripts/test_linux.sh` (2026-09-24, acs-cu8) | Pass, 36 tests back from red — found and fixed two Linux-only bugs first (a master stall under backpressure; a replaced binary breaking master start), and later 36 failures that were the *harness* being platform dependent: `ssh-keygen` is not in `rust:alpine` (25), and the fake remote's acs was a symlink, whose mode is `lrwxrwxrwx` on Linux, so the prelude's safety check refused it and every one of those remotes looked uninstalled (11) |
 | Multi-user isolation | squatted and symlinked socket directories, foreign peer uid, per-user `main`, and (acs-9n3) a control-socket directory alice created before bob | Pass — bob refuses alice's directory by name and dials with no control path at all; his own comes up `0700` and his, and alice cannot list it (`rust:alpine` as root, `cargo test --test multiuser`, 2026-09-23) |
 | Static Linux binaries run | `dist/*-linux-musl/acs --version` in Alpine (aarch64 native, x86_64 emulated) | Pass |
@@ -71,19 +73,34 @@ claimed as verified:
   reconnect and in order; how each program repaints has not been looked at.
 - **htop and less** interactively. Covered only indirectly (vim, raw mouse and
   key paths).
-- **A real Wi-Fi switch and laptop sleep/wake.** Simulated by killing and
-  freezing the connection and by the network-change stand-ins
-  (`ACS_NETWATCH_FIFO` for the kernel's hint, `ACS_NETWATCH_NETS` for the
-  machine's networks); the real events have not been exercised. Worth a
-  hand check since acs-6p8: a hint now only redials when this machine's own
-  addresses differ, so what is unproven is that a real roam, wake or VPN
-  moves an address on the platform's own watcher — not merely that the
-  client reacts when one does. Since acs-ft1 the same evidence also shortens
-  the dead-link timeout on a link that is still up, so the hand check has a
-  second question: a real switch to a network the session survives (a VPN
-  coming up, a second interface appearing) must leave the session alone,
-  and a real switch it does not survive must be back inside a couple of
-  seconds instead of ten.
+- **A real Wi-Fi switch and laptop sleep/wake, on macOS.** Narrowed by
+  acs-4i2, and no longer the same item on both platforms:
+  - **Linux netlink is no longer by hand.** `tests/netns.rs` (the row
+    above) makes the kernel create, address and remove a real interface and
+    checks that the watcher's socket hears it and that `local_networks()`
+    moves with it.
+  - **macOS `PF_ROUTE` stays by hand**, and there is no prospect of
+    automating it: the test would need the machine running it to really
+    join another network, which CI cannot do. What is unproven is that a
+    real roam, wake or VPN on macOS emits a message
+    `netwatch::route_messages_matter` accepts **and** moves an address
+    `LocalNet::usable` accepts — not merely that the client reacts when one
+    does (that is covered by the stand-ins, `ACS_NETWATCH_FIFO` for the
+    kernel's hint and `ACS_NETWATCH_NETS` for the machine's networks).
+    Since acs-ft1 the same evidence also shortens the dead-link timeout on
+    a link that is still up, so the hand check has a second question: a
+    real switch to a network the session survives (a VPN coming up, a
+    second interface appearing) must leave the session alone, and a real
+    switch it does not survive must be back inside a couple of seconds
+    instead of ten.
+  - **How to run it, and what a dead watcher now looks like.** Attach a
+    session with `-v` and change network. Every hint leaves a line —
+    `acs: network changed: <old> → <new>` for one that counted, `acs:
+    network hint: still on <nets> — not a change` for one that did not, and
+    `acs: network: N bytes from the kernel, no address or interface
+    message` where the `PF_ROUTE` filter rejected everything read. *No line
+    at all* across a roam is the failure this check exists for: before
+    acs-4i2 it was indistinguishable from a network that did not move.
 - **A real host that needs `-i`, such as corello.** The container host proves
   `-i` passthrough; connecting to a work host installs acs there, which is
   the owner's call.

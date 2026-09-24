@@ -31,7 +31,8 @@ options:
       --persist       never give up on a lost host: ping it every reachability_interval
                       (default 5s) and dial as soon as it answers, from the first connect on
       --force         take over a session attached by someone else
-  -v                  verbose: show ssh commands, remote login noise and connect timings
+  -v                  verbose: show ssh commands, remote login noise, connect timings
+                      and what each network change the kernel reports was worth
       --ssh <path>    ssh program to run (also ACS_SSH)
   -h, --help          this help
   -V, --version       print the version

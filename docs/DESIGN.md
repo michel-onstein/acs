@@ -700,6 +700,35 @@ sequenceDiagram
     a file of the machine's networks, one CIDR per line. The harness points
     every other client at a watcher path that does not exist, so no test
     but the watcher's own is exposed to the host's network.
+  - **The platform half is the kernel's, and on Linux the kernel does it**
+    (acs-4i2). Everything above tests the *decision*; what neither stand-in
+    can say is that a real roam emits a message the socket is subscribed to
+    **and** moves an address `local_networks()` reports — and both have to
+    hold or the feature is dead with nothing to show for it.
+    `tests/netns.rs`, a step of `scripts/test_linux.sh` with
+    `CAP_NET_ADMIN`, creates a dummy interface in the container's own
+    network namespace, brings it up, gives it an address and tears it down
+    again. Nothing in the test ever writes to the netlink socket, so a
+    descriptor that becomes readable after an `ip` command is the kernel's
+    own multicast; it is polled for before every decision, which is what
+    separates a watcher that saw nothing from one that saw something and
+    judged it. Both cases are covered against the real kernel: a bare
+    interface is a message and not a change, an addressed one is both.
+    macOS `PF_ROUTE` has no equivalent — a Mac's network cannot be moved
+    from inside CI — and stays a by-hand item in
+    [VERIFICATION.md](VERIFICATION.md).
+  - **`-v` says what every hint was worth**, because the interesting
+    failure is silent (acs-4i2). A watcher that is working while nothing
+    moves and a watcher that has stopped emitting are the same thing seen
+    from outside, and the second now costs more than a slow redial: since
+    acs-ft1 it also removes the evidence that shortens the dead-link
+    timeout on a wake. So `netwatch.rs` writes one line per hint —
+    `network changed: <old> → <new>`, `network hint: still on <nets> — not
+    a change`, or, on macOS where the filter can reject everything read,
+    `network: N bytes from the kernel, no address or interface message`.
+    The lines read the decision and are no part of it: they touch neither
+    the networks held nor `EARLY_EVERY`, and the tests that assert the
+    decision run beside the ones that assert the text.
 - **A network change while the link is up shortens the dead-link timeout;
   it does not redial** (acs-ft1). The watcher is polled by the serving loop
   too, not only by the offline wait, because the two cases a laptop
