@@ -75,7 +75,12 @@ claimed as verified:
   hand check since acs-6p8: a hint now only redials when this machine's own
   addresses differ, so what is unproven is that a real roam, wake or VPN
   moves an address on the platform's own watcher — not merely that the
-  client reacts when one does.
+  client reacts when one does. Since acs-ft1 the same evidence also shortens
+  the dead-link timeout on a link that is still up, so the hand check has a
+  second question: a real switch to a network the session survives (a VPN
+  coming up, a second interface appearing) must leave the session alone,
+  and a real switch it does not survive must be back inside a couple of
+  seconds instead of ten.
 - **A real host that needs `-i`, such as corello.** The container host proves
   `-i` passthrough; connecting to a work host installs acs there, which is
   the owner's call.

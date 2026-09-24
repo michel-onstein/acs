@@ -257,6 +257,13 @@ While it is waiting a status line shows at the bottom of the screen, typed
 keys are dropped, and Ctrl-] Ctrl-] `d` still detaches. `--no-reconnect` exits
 instead.
 
+When your addresses change while a session is **connected** — the Wi-Fi
+switch and the wake from sleep, where the old connection goes quiet rather
+than closing — acs does not drop the session on the strength of that. It
+asks the host straight away and gives it **2 seconds** to be heard from: a
+link that came through the change answers and costs you nothing, and one
+that did not is replaced in a second or two instead of ten.
+
 ### Never giving up on a host
 
 acs gives up (exit 255) where there is no session to keep: the host

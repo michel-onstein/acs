@@ -631,7 +631,10 @@ sequenceDiagram
 
 - Each side sends `PING` after 3 s of silence. The client declares the link
   dead after **10 s** with no frame received, kills its ssh child, and redials.
-  Drop detection falls from dsh's 45 s to 10 s.
+  Drop detection falls from dsh's 45 s to 10 s — and to **2 s** when this
+  machine's own network changed under the link, which is the one moment acs
+  has independent evidence that the silence means something (acs-ft1,
+  below).
 - **Bytes count, not only decoded frames**: anything read from the link marks
   the host heard. Writing output to the terminal blocks while the terminal is
   not reading (an emulator stalled, flow control), and the frames read in that
@@ -689,6 +692,42 @@ sequenceDiagram
     a file of the machine's networks, one CIDR per line. The harness points
     every other client at a watcher path that does not exist, so no test
     but the watcher's own is exposed to the host's network.
+- **A network change while the link is up shortens the dead-link timeout;
+  it does not redial** (acs-ft1). The watcher is polled by the serving loop
+  too, not only by the offline wait, because the two cases a laptop
+  actually has — a Wi-Fi switch and a wake from sleep — change the network
+  *while acs believes it is connected*, and the connection they break
+  neither closes nor errors: it simply goes quiet. Waiting out the full
+  10 s for silence that is already certain is the delay this removes.
+  - What happens is a **question, not a redial**: a `PING` goes out at once
+    and the host has `ACS_NETCHECK_MS` (**2 s**) to be heard from —
+    anything read from the link counts, as everywhere in this section, so a
+    program that is producing output has already answered. If it is, the
+    change cost nothing whatever: the link stands, and no byte of what was
+    typed is anywhere near a `WELCOME`. If it is not, the link is dead and
+    the redial of the rule above follows, which is immediate, so a real
+    drop is replaced in 1–2 s rather than 10.
+  - **Why not redial on the change itself.** Keys typed into a redial are
+    discarded (§5.2), so a redial the link did not need is directly
+    user-visible: the session blinks, the screen repaints and what was
+    being typed at that moment is gone. A change the link survived is
+    common — a VPN coming up, a second interface appearing, a phone
+    tethering while Wi-Fi keeps working — and on those the address moves
+    while the path does not. Probing costs one frame and makes the
+    difference observable instead of guessed at.
+  - **Bounded by the dead interval either way.** `ACS_NETCHECK_MS` only
+    ever brings the deadline *forward*: a change cannot extend a link past
+    `ACS_DEAD_MS` of silence, and a second change while the question is
+    outstanding is the same question — a flapping interface neither pushes
+    the deadline out nor spends another round trip. (The offline wait's own
+    rate limit, `EARLY_EVERY`, is separate and untouched: that one guards a
+    redial, this one a ping.)
+  - **The wake case needs this, not a shorter `ACS_DEAD_MS`.** The client's
+    clock is monotonic and stops with the machine (`sys::now_ms`), so the
+    hours a laptop spends asleep are not silence that anything measured:
+    on wake the 10 s window starts from zero however long the sleep was.
+    The address that moved is the only evidence available at that moment,
+    and it is what this uses.
 - Authentication prompts on reconnect (password, hardware key touch) are
   passed through, because ssh gets the controlling tty for prompts even with
   `-T`; the client restores cooked mode while ssh is authenticating. With
@@ -742,7 +781,8 @@ of ssh dials:
 Anything the client prints corrupts the screen the remote program drew, and a
 lossless resume will not repaint it. So:
 
-1. While the link is merely quiet (< 10 s), print nothing.
+1. While the link is merely quiet (< 10 s, or < 2 s when this machine's
+   network has just changed under it, §5.3), print nothing.
 2. Once declared dead, write one status line on the bottom row using
    save-cursor / restore-cursor, and set the window title with the xterm title
    stack (push `CSI 22;0 t`, pop `CSI 23;0 t`) so the remote's title comes

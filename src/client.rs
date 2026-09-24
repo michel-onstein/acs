@@ -628,7 +628,10 @@ pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
 /// Connect once: dial, handshake, and serve until the link ends.
 /// `resuming` is true for a redial after a lost link. `picked`, a
 /// connection the session menu opened, is used instead of dialing.
-/// `timing` is this connection's clock.
+/// `timing` is this connection's clock. `netwatch` is the client's network
+/// watcher, polled here too so a change is noticed while the link is up and
+/// not only while it is down (acs-ft1).
+#[allow(clippy::too_many_arguments)]
 pub fn connect_and_serve(
     args: &ClientArgs,
     state: &mut State,
@@ -637,6 +640,7 @@ pub fn connect_and_serve(
     resuming: bool,
     picked: Option<Picked>,
     timing: &mut Timing,
+    netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> Outcome {
     let timeout = answer_timeout(resuming);
     // Built before the dial so it can go out with it (acs-trw); the size
@@ -651,7 +655,7 @@ pub fn connect_and_serve(
         let mut link = p.link;
         link.pending = greeting;
         return serve(
-            args, state, raw, signals, link, p.rest, timeout, timing, size,
+            args, state, raw, signals, link, p.rest, timeout, timing, size, netwatch,
         );
     }
     let pargs = proxy_args(args, state, resuming);
@@ -697,7 +701,7 @@ pub fn connect_and_serve(
             return match crate::install::install(args, &os, &arch) {
                 Ok(()) => {
                     timing.mark("acs installed");
-                    connect_and_serve(args, state, raw, signals, resuming, None, timing)
+                    connect_and_serve(args, state, raw, signals, resuming, None, timing, netwatch)
                 }
                 Err(e) => {
                     note(&e);
@@ -706,7 +710,9 @@ pub fn connect_and_serve(
             };
         }
     };
-    serve(args, state, raw, signals, link, rest, timeout, timing, size)
+    serve(
+        args, state, raw, signals, link, rest, timeout, timing, size, netwatch,
+    )
 }
 
 fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -790,6 +796,7 @@ fn serve(
     handshake: Duration,
     timing: &mut Timing,
     mut sent_size: proto::WinSize,
+    netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> Outcome {
     // The host has until then to WELCOME us (acs-znr): liveness only starts
     // with the WELCOME.
@@ -1022,6 +1029,7 @@ fn serve(
                 },
             ),
             sys::pollfd(to, if out.is_empty() { 0 } else { libc::POLLOUT }),
+            sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
         ];
         if sys::poll(&mut fds, timeout.min(i32::MAX as i64) as i32).is_err() {
             return lost(link);
@@ -1034,6 +1042,24 @@ fn serve(
                         Msg::Resize(s).encode(&mut out);
                     }
                 }
+            }
+        }
+
+        // This machine's network moved under a link that is still up
+        // (acs-ft1). The drain is unconditional — the descriptor has to be
+        // emptied or the poll it woke would never sleep again — and a hint
+        // that changed no network is not a change at all (acs-6p8).
+        //
+        // What it buys is a question, not a redial: the host is pinged now
+        // and has `ACS_NETCHECK_MS` to answer, so a link that survived the
+        // change costs nothing and one that did not is replaced in about a
+        // second rather than after ten of silence. Before the WELCOME the
+        // handshake deadline is already the one that applies, so the hint
+        // is only drained.
+        if fds[4].revents != 0 {
+            let changed = netwatch.is_some_and(|w| w.changed());
+            if changed && welcomed {
+                liveness.netcheck(&mut out);
             }
         }
 

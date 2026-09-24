@@ -30,6 +30,14 @@ fn dead_after() -> u64 {
     env_ms("ACS_DEAD_MS", 10_000)
 }
 
+/// How long the host has to answer the PING a network change sends while
+/// the link is up (`ACS_NETCHECK_MS`, acs-ft1). Short, because the question
+/// is only "is this link still the one" and the answer is one round trip;
+/// the full `ACS_DEAD_MS` stands for every other kind of silence.
+fn netcheck_after() -> u64 {
+    env_ms("ACS_NETCHECK_MS", 2000)
+}
+
 /// Waits between redials (acs-iyq): **the first attempt after a drop goes
 /// at once**, and only then the exponential backoff 1 s → 30 s
 /// (`ACS_BACKOFF_MS` sets its first step), reset after a connection that
@@ -113,7 +121,16 @@ pub fn run(
         let first = picked.take();
         let was_picked = first.is_some();
         let outcome = if reachable {
-            client::connect_and_serve(&args, state, raw, signals, resuming, first, &mut timing)
+            client::connect_and_serve(
+                &args,
+                state,
+                raw,
+                signals,
+                resuming,
+                first,
+                &mut timing,
+                netwatch.as_ref(),
+            )
         } else {
             Outcome::LinkLost
         };
@@ -486,6 +503,11 @@ pub struct Liveness {
     pinged: u64,
     ping_after: u64,
     dead_after: u64,
+    netcheck_after: u64,
+    /// A network change is being asked about (acs-ft1): when the PING went
+    /// out, and when the link is dead if nothing has been heard since.
+    /// `None` when no question is outstanding.
+    probe: Option<(u64, u64)>,
 }
 
 impl Liveness {
@@ -497,6 +519,8 @@ impl Liveness {
             pinged: now,
             ping_after: ping_after(),
             dead_after: dead_after(),
+            netcheck_after: netcheck_after(),
+            probe: None,
         }
     }
 
@@ -505,9 +529,41 @@ impl Liveness {
         self.heard = sys::now_ms();
     }
 
+    /// This machine's network changed under a link that is still up
+    /// (DESIGN §5.3, acs-ft1): ask the host now and give it
+    /// `ACS_NETCHECK_MS` to answer instead of the whole dead interval.
+    ///
+    /// A link that came through the change answers, and the change costs
+    /// nothing at all — not a redial, and so not a byte of what was typed.
+    /// One that did not is replaced in about a second instead of ten, which
+    /// is what a Wi-Fi switch and a laptop wake are. On a wake the ten
+    /// would not even have started: the clock is monotonic and stops with
+    /// the machine (`sys::now_ms`), so the silence the sleep contains is
+    /// not silence anything measured.
+    ///
+    /// A second change while the question is outstanding is the same
+    /// question — an interface flapping cannot push the deadline out, nor
+    /// spend another round trip.
+    pub fn netcheck(&mut self, out: &mut Vec<u8>) {
+        self.netcheck_at(sys::now_ms(), out)
+    }
+
+    fn netcheck_at(&mut self, now: u64, out: &mut Vec<u8>) {
+        if self.probe.is_some() {
+            return;
+        }
+        Msg::Ping(now).encode(out);
+        self.pinged = now;
+        self.probe = Some((now, now + self.netcheck_after));
+    }
+
     pub fn next_deadline_ms(&self) -> u64 {
         let ping = self.heard.max(self.pinged) + self.ping_after;
-        ping.min(self.heard + self.dead_after)
+        let next = ping.min(self.heard + self.dead_after);
+        match self.probe {
+            Some((_, until)) => next.min(until),
+            None => next,
+        }
     }
 
     pub fn tick(&mut self, out: &mut Vec<u8>) -> Health {
@@ -517,6 +573,15 @@ impl Liveness {
     fn tick_at(&mut self, now: u64, out: &mut Vec<u8>) -> Health {
         if now >= self.heard + self.dead_after {
             return Health::Dead;
+        }
+        if let Some((since, until)) = self.probe {
+            if self.heard >= since {
+                // The host answered — or is talking anyway, which is the
+                // same proof (bytes count, §5.3). The link came through.
+                self.probe = None;
+            } else if now >= until {
+                return Health::Dead;
+            }
         }
         if now >= self.heard.max(self.pinged) + self.ping_after {
             Msg::Ping(now).encode(out);
@@ -573,14 +638,72 @@ mod tests {
         assert_eq!(b.step(), Duration::from_millis(1000));
     }
 
+    fn liveness(heard: u64, ping_after: u64, dead_after: u64) -> Liveness {
+        Liveness {
+            heard,
+            pinged: heard,
+            ping_after,
+            dead_after,
+            netcheck_after: 50,
+            probe: None,
+        }
+    }
+
+    /// acs-ft1: a network change under a link that is still up asks the
+    /// host at once and gives it `ACS_NETCHECK_MS` to answer. A link that
+    /// answers costs nothing — no redial, so not a byte of what was typed;
+    /// one that does not is dead well inside the dead interval.
+    #[test]
+    fn a_network_change_asks_the_host_and_shortens_the_deadline() {
+        // Ten seconds of silence would be the ordinary death; the network
+        // change's own deadline is 50 ms.
+        let mut l = liveness(1000, 3000, 10_000);
+        let mut out = Vec::new();
+        l.netcheck_at(1100, &mut out);
+        assert_eq!(out, Msg::Ping(1100).to_bytes(), "the host is asked at once");
+        // The deadline the poll sleeps to is the change's, not the ping's.
+        assert_eq!(l.next_deadline_ms(), 1150);
+        // A second change while the question is outstanding is the same
+        // question: no second round trip, and the deadline does not move.
+        let n = out.len();
+        l.netcheck_at(1140, &mut out);
+        assert_eq!(out.len(), n, "a flapping interface asks once");
+        assert_eq!(l.next_deadline_ms(), 1150);
+        assert_eq!(l.tick_at(1149, &mut out), Health::Ok);
+        assert_eq!(l.tick_at(1150, &mut out), Health::Dead);
+
+        // And the link that answers: the deadline is forgotten and the
+        // ordinary timers are back.
+        let mut l = liveness(1000, 3000, 10_000);
+        let mut out = Vec::new();
+        l.netcheck_at(1100, &mut out);
+        l.heard = 1120;
+        assert_eq!(l.tick_at(1200, &mut out), Health::Ok);
+        assert_eq!(l.probe, None);
+        assert_eq!(l.next_deadline_ms(), 1120 + 3000);
+        // Long past what the change's deadline would have been.
+        assert_eq!(l.tick_at(5000, &mut out), Health::Ok);
+        // The dead interval still applies, counted from the last frame.
+        assert_eq!(l.tick_at(11_120, &mut out), Health::Dead);
+    }
+
+    /// The change's deadline never outlives the dead interval: a machine
+    /// configured with a longer `ACS_NETCHECK_MS` than `ACS_DEAD_MS` is
+    /// still given up on after `ACS_DEAD_MS` of silence.
+    #[test]
+    fn the_dead_interval_is_the_outer_bound_whatever_the_change_asks_for() {
+        let mut l = Liveness {
+            netcheck_after: 60_000,
+            ..liveness(1000, 3000, 300)
+        };
+        let mut out = Vec::new();
+        l.netcheck_at(1050, &mut out);
+        assert_eq!(l.tick_at(1300, &mut out), Health::Dead);
+    }
+
     #[test]
     fn liveness_pings_then_declares_dead() {
-        let mut l = Liveness {
-            heard: 1000,
-            pinged: 1000,
-            ping_after: 100,
-            dead_after: 300,
-        };
+        let mut l = liveness(1000, 100, 300);
         let mut out = Vec::new();
         // Not yet: nothing sent.
         assert_eq!(l.tick_at(1050, &mut out), Health::Ok);
