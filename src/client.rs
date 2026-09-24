@@ -1236,13 +1236,22 @@ fn serve(
         // What it buys is a question, not a redial: the host is pinged now
         // and has `ACS_NETCHECK_MS` to answer, so a link that survived the
         // change costs nothing and one that did not is replaced in about a
-        // second rather than after ten of silence. Before the WELCOME the
-        // handshake deadline is already the one that applies, so the hint
-        // is only drained.
+        // second rather than after ten of silence.
+        //
+        // Before the WELCOME the handshake deadline is already the one that
+        // applies, so the change is read and nothing is done with it —
+        // acting on it there is acs-xo1, which has the blocking dial to
+        // deal with as well. It is *not* spent by being read (acs-0n8):
+        // the change is dropped rather than accepted, so the networks held
+        // stay where they were and the kernel's next word about the same
+        // move is the same change again, instead of "not a change" against
+        // a set that has already moved.
         if fds[4].revents != 0 {
-            let changed = netwatch.is_some_and(|w| w.changed());
-            if changed && welcomed {
-                liveness.netcheck(&mut out);
+            if let Some(change) = netwatch.and_then(|w| w.changed()) {
+                if welcomed {
+                    liveness.netcheck(&mut out);
+                    change.acted();
+                }
             }
         }
 
