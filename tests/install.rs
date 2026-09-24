@@ -287,7 +287,7 @@ fn finisher_rejects_a_corrupt_upload() {
 #[test]
 fn old_unused_versions_are_pruned_at_proxy_start() {
     let remote = Remote::new();
-    remote.install_copy(acs::VERSION);
+    remote.install(acs::VERSION);
     let root = remote.home().join(".local/share/acs");
     let old = root.join("0.0.1-old");
     std::fs::create_dir_all(&old).unwrap();
