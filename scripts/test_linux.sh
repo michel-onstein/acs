@@ -25,7 +25,10 @@ exec docker run --rm $platform \
     -e CARGO_TARGET_DIR=/target \
     -w /src \
     rust:alpine sh -euc '
-        apk add --no-cache musl-dev >/dev/null
+        # musl-dev to link; ssh-keygen because the release signature is made
+        # and checked with it (acs-o9v), so src/signature.rs and every
+        # upgrade and update-check test needs it on PATH.
+        apk add --no-cache musl-dev openssh-keygen >/dev/null
         adduser -D alice 2>/dev/null || true
         adduser -D bob 2>/dev/null || true
         # Test binaries and the acs they exec must be reachable by alice/bob.

@@ -15,6 +15,11 @@ const FAST: &[(&str, &str)] = &[
     ("ACS_DEAD_MS", "800"),
 ];
 
+/// The dead interval `frozen_link_is_declared_dead_and_replaced` runs with,
+/// in place of `FAST`'s: long enough that the bound it reads against has
+/// room, and the only test here that waits out a whole one.
+const DEAD: Duration = Duration::from_secs(4);
+
 const TICKER: &str = "i=0; while true; do i=$((i+1)); printf '#%d#\\n' $i; sleep 0.01; done";
 
 fn start(remote: &Remote, session: &str, cmd: &str, env: &[(&str, &str)]) -> Client {
@@ -125,20 +130,43 @@ fn a_client_busy_with_output_answers_the_masters_ping() {
     );
 }
 
+/// A link that goes quiet without closing is replaced — after the dead
+/// interval, not the moment it goes quiet.
+///
+/// "Not the moment" is a *lower* bound on elapsed time, and a lower bound is
+/// the one direction a loaded machine cannot break: starving the client only
+/// makes the redial later. What it can break is the anchor. The client's
+/// clock runs from the last byte it heard, not from the `SIGSTOP`, so a
+/// client that had been starved for most of the interval *before* the freeze
+/// declares the link dead almost at once and is right to. So the room
+/// between the bound and the interval is what has to be generous (acs-7wu,
+/// acs-o8h): the interval is four seconds and the bound one of them, where
+/// it used to be 800 ms and 500 — the same statement with ten times the
+/// slack. For this to fire without the bug, the client would have to have
+/// heard nothing for three seconds while the link was still up, the ticker
+/// printing every 10 ms and its own PING going out every 200.
 #[test]
 fn frozen_link_is_declared_dead_and_replaced() {
     let remote = Remote::installed();
-    let mut c = start(&remote, "frz", TICKER, FAST);
+    // The master keeps its own liveness (acs-ode); a minute of it, so the
+    // one judgement on trial here is the client's.
+    remote.remote_env(&[("ACS_DEAD_MS", "60000")]);
+    let mut env: Vec<(String, String)> = FAST
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    env.push(("ACS_DEAD_MS".to_string(), DEAD.as_millis().to_string()));
+    let mut c = start(&remote, "frz", TICKER, &refs(&env));
     c.wait_for("#20#", T);
+    // Counted from here, not from one: a remote that has to install acs
+    // first spends a connection or two before the session (acs-cu8).
+    let dialled = remote.transport_pids().len();
     // Freeze the connection: nothing flows, nothing closes.
     let pid = *remote.transport_pids().last().unwrap();
     acs::sys::kill(pid, libc::SIGSTOP).unwrap();
     let t0 = Instant::now();
-    remote.wait_connections(2, T);
-    assert!(
-        t0.elapsed() >= Duration::from_millis(500),
-        "declared dead too early"
-    );
+    remote.wait_connections(dialled + 1, T);
+    assert!(t0.elapsed() >= DEAD / 4, "declared dead too early");
     let _ = acs::sys::kill(pid, libc::SIGKILL);
     let target = last_number(&c) + 100;
     c.wait_for(&format!("#{target}#"), T);
@@ -239,6 +267,10 @@ fn a_stalled_terminal_is_not_a_dead_link() {
         FAST,
     );
     c.wait_for("up", T);
+    // Counted from here, not from one: a remote that has to install acs
+    // first spends a connection or two before the session (acs-cu8), and
+    // what this test is about is whether the stall costs one *more*.
+    let dialled = remote.transport_pids().len();
     // Nothing is read for well past ACS_DEAD_MS (800 ms).
     c.set_paused(true);
     std::thread::sleep(Duration::from_secs(8));
@@ -246,7 +278,11 @@ fn a_stalled_terminal_is_not_a_dead_link() {
     // Only now, so every RESUMED is output made after the stall.
     std::fs::write(&go, "").unwrap();
     c.wait_for("RESUMED", T);
-    assert_eq!(remote.transport_pids().len(), 1, "the link was given up on");
+    assert_eq!(
+        remote.transport_pids().len(),
+        dialled,
+        "the link was given up on"
+    );
     assert!(!c.text().contains("reconnecting"), "{}", c.text());
 }
 

@@ -365,20 +365,36 @@ impl Remote {
         self.root.path().join("s")
     }
 
+    /// Install this acs as `version`: a real file, which is what a real host
+    /// has — `acs _install` writes one — and what `current_exe()` on the
+    /// remote side must name to behave like one.
+    ///
+    /// It was a *symlink* once, and that made the whole suite platform
+    /// dependent (acs-cu8). Before exec'ing the remote binary the prelude
+    /// reads its mode (acs-08m) and refuses anything group- or
+    /// other-writable. A symlink's own mode is `lrwxrwxrwx` on Linux and
+    /// `lrwxr-xr-x` on macOS, so a symlinked install is refused there and
+    /// accepted here: in the container every one of these remotes looked
+    /// *uninstalled*, paid a first-contact install, and every assertion
+    /// counting connections or reading "not installed" said something
+    /// different from what it says on a developer's laptop.
     pub fn install(&self, version: &str) {
         let dir = self.home().join(format!(".local/share/acs/{version}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let _ = std::fs::remove_file(dir.join("acs"));
-        std::os::unix::fs::symlink(exe(), dir.join("acs")).unwrap();
-    }
-
-    /// Install a real copy (not a symlink): `current_exe()` must then be
-    /// the versioned path, as on a real host.
-    pub fn install_copy(&self, version: &str) {
-        let dir = self.home().join(format!(".local/share/acs/{version}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let _ = std::fs::remove_file(dir.join("acs"));
-        std::fs::copy(exe(), dir.join("acs")).unwrap();
+        let acs = dir.join("acs");
+        // Not onto the file: it may be the acs a client of this remote is
+        // still running, and Linux answers that with ETXTBSY.
+        let _ = std::fs::remove_file(&acs);
+        // A hard link where the temp directory and the build share a
+        // filesystem, so that every remote's acs is the one inode the suite
+        // already has warm — a hundred and thirty-odd private copies would
+        // be a hundred and thirty cold execs of four megabytes. A copy
+        // where they do not: the Linux container mounts the target
+        // directory as a volume of its own, and `link` across that is
+        // EXDEV.
+        if std::fs::hard_link(exe(), &acs).is_err() {
+            std::fs::copy(exe(), &acs).unwrap();
+        }
     }
 
     /// File where the transport wrapper records the pid of every
@@ -933,6 +949,13 @@ pub fn complete_client(dir: &Path, target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) 
     (path, slim, blob)
 }
 
+/// What a missing `ssh-keygen` is reported as. `Command::status()` answers
+/// one with a bare `No such file or directory` that does not say which file
+/// — on a stripped image that reading cost an afternoon (acs-cu8), so the
+/// tool is named here.
+const NEEDS_KEYGEN: &str =
+    "ssh-keygen must be on PATH: the release signature is made and checked with it (acs-o9v)";
+
 /// A stand-in for GitHub Releases over plain HTTP, for `ACS_RELEASES_URL`:
 /// the real `curl` downloads from it. Paths are as on GitHub
 /// (`/latest/download/…`, `/download/v<version>/…`).
@@ -1026,7 +1049,7 @@ impl ReleaseServer {
                 .args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"])
                 .arg(&key)
                 .status()
-                .unwrap();
+                .expect(NEEDS_KEYGEN);
             assert!(st.success());
         }
         key
@@ -1045,7 +1068,7 @@ impl ReleaseServer {
             .arg(key)
             .arg(&file)
             .status()
-            .unwrap();
+            .expect(NEEDS_KEYGEN);
         assert!(st.success());
         let sig = std::fs::read(self.root.path().join("to-sign.sig")).unwrap();
         std::fs::remove_file(self.root.path().join("to-sign.sig")).unwrap();
@@ -1062,7 +1085,7 @@ impl ReleaseServer {
                 .args(["-q", "-t", "ed25519", "-N", "", "-C", "them", "-f"])
                 .arg(&other)
                 .status()
-                .unwrap();
+                .expect(NEEDS_KEYGEN);
             assert!(st.success());
         }
         let paths: Vec<String> = (self.files.lock().unwrap().keys())
