@@ -98,7 +98,7 @@ pub fn run(
     mut timing: Timing,
 ) -> u8 {
     let mut backoff = Backoff::new(env_ms("ACS_BACKOFF_MS", 1000));
-    let netwatch = crate::netwatch::NetWatch::new();
+    let netwatch = crate::netwatch::NetWatch::new(args.verbose > 0);
     let mut last_early: Option<Instant> = None;
     let mut resuming = false;
     // A dial after a wait; `gated`: the host has just answered the ping

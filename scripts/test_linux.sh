@@ -1,6 +1,7 @@
 #!/bin/sh
 # Run the whole test suite on Linux (musl, in a container), then the
-# multi-user isolation tests as root with two real users (DESIGN §4.5).
+# multi-user isolation tests as root with two real users (DESIGN §4.5), then
+# the network watcher against the real kernel (acs-4i2).
 #
 #   scripts/test_linux.sh [--platform linux/amd64]
 #
@@ -8,6 +9,13 @@
 # directory live in named volumes so later runs are fast. The target volume
 # is per checkout: every checkout mounts at /src, so in a shared one cargo
 # cannot tell one worktree's sources from another's and runs a stale build.
+#
+# CAP_NET_ADMIN is for tests/netns.rs alone: a container has a network
+# namespace of its own, so with that capability an interface can genuinely
+# be created, addressed and torn down inside it, which is what makes the
+# kernel emit the NETLINK_ROUTE messages netwatch.rs subscribes to. Nothing
+# reaches the host's network — the namespace is the isolation — and no
+# other step uses it.
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
@@ -19,6 +27,7 @@ fi
 
 # shellcheck disable=SC2086
 exec docker run --rm $platform \
+    --cap-add NET_ADMIN \
     -v "$root:/src:ro" \
     -v acs-cargo-registry:/usr/local/cargo/registry \
     -v "acs-linux-target-$id:/target" \
@@ -37,5 +46,10 @@ exec docker run --rm $platform \
         cargo test -p acs
         echo "== multi-user isolation"
         ACS_MULTIUSER_TEST=1 cargo test -p acs --test multiuser -- --test-threads=1
+        # A step of its own: it adds and removes interfaces, which moves
+        # what getifaddrs reports process-wide, and netwatch and netmatch
+        # have tests that read that while asserting it holds still.
+        echo "== the kernel drives the network watcher"
+        ACS_NETNS_TEST=1 cargo test -p acs --test netns -- --test-threads=1 --nocapture
         echo "== ok"
     '

@@ -24,6 +24,16 @@
 //! Without the second half a laptop redialled all through an outage — every
 //! hint cut the backoff short — and each redial threw away what had been
 //! typed into it (DESIGN §5.2).
+//!
+//! **Under `-v` the watcher says what it made of every hint** (acs-4i2).
+//! Silence is otherwise ambiguous in the one direction that costs: a
+//! watcher that is working and a network that did not move look exactly
+//! like a watcher that has stopped emitting — a macOS release changing
+//! which messages accompany a roam, a VPN coming up without moving an
+//! address [`crate::netmatch::LocalNet::usable`] accepts — and the feature
+//! is load-bearing twice over (a wait cut short, acs-6p8; a dead link
+//! found in 2 s instead of 10, acs-ft1). The lines read the decision and
+//! never make it.
 
 use std::cell::RefCell;
 use std::io;
@@ -34,6 +44,8 @@ use crate::sys;
 pub struct NetWatch {
     fd: OwnedFd,
     kind: Kind,
+    /// `-v`: say what each hint was judged to be ([`NetWatch::trace`]).
+    verbose: bool,
     /// The networks as of the last hint that was reported as a change —
     /// or as of the moment the watcher was made, so the first hint of an
     /// outage is judged like any other rather than taken on trust.
@@ -51,7 +63,8 @@ enum Kind {
 
 impl NetWatch {
     /// Start watching; `None` where the platform offers nothing cheap.
-    pub fn new() -> Option<NetWatch> {
+    /// `verbose` is the client's `-v` ([`NetWatch::trace`]).
+    pub fn new(verbose: bool) -> Option<NetWatch> {
         if let Some(path) = std::env::var_os("ACS_NETWATCH_FIFO") {
             use std::os::unix::fs::OpenOptionsExt;
             // Read-write so the FIFO never reports end of file.
@@ -64,14 +77,15 @@ impl NetWatch {
             return Some(NetWatch {
                 fd: f.into(),
                 kind: Kind::Fifo,
+                verbose,
                 nets: RefCell::new(networks()),
             });
         }
-        Self::platform().ok()
+        Self::platform(verbose).ok()
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn platform() -> io::Result<NetWatch> {
+    fn platform(verbose: bool) -> io::Result<NetWatch> {
         // SAFETY: plain socket creation.
         let fd =
             sys::cvt(unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) })?;
@@ -82,12 +96,13 @@ impl NetWatch {
         Ok(NetWatch {
             fd,
             kind: Kind::Route,
+            verbose,
             nets: RefCell::new(networks()),
         })
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn platform() -> io::Result<NetWatch> {
+    fn platform(verbose: bool) -> io::Result<NetWatch> {
         // SAFETY: plain socket creation.
         let fd = sys::cvt(unsafe {
             libc::socket(
@@ -113,12 +128,28 @@ impl NetWatch {
         Ok(NetWatch {
             fd,
             kind: Kind::Netlink,
+            verbose,
             nets: RefCell::new(networks()),
         })
     }
 
     pub fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+
+    /// One line on the terminal under `-v`, and nothing at all without it
+    /// (acs-4i2).
+    ///
+    /// Strictly a reader of the decision: every call site below is reached
+    /// after the answer is settled, and nothing here touches the networks
+    /// held, the rate limit the caller keeps (`EARLY_EVERY`), or the value
+    /// returned. That is the whole point — the trace exists to make a
+    /// watcher that stopped emitting visible, not to change what a hint is
+    /// worth.
+    fn trace(&self, msg: &str) {
+        if self.verbose {
+            crate::client::note(msg);
+        }
     }
 
     /// Drain the pending messages; true if the network this machine dials
@@ -132,10 +163,12 @@ impl NetWatch {
     pub fn changed(&self) -> bool {
         let mut buf = [0u8; 8192];
         let mut hinted = false;
+        let mut bytes = 0usize;
         while let Ok(n) = sys::read(self.fd(), &mut buf) {
             if n == 0 {
                 break;
             }
+            bytes += n;
             hinted |= match self.kind {
                 Kind::Fifo => true,
                 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -146,16 +179,43 @@ impl NetWatch {
             };
         }
         if !hinted {
+            // Only `Kind::Route` reaches this with anything read: the
+            // kernel spoke and every message was route churn (ARP,
+            // neighbour discovery). Worth a line — a macOS release that
+            // changed which messages accompany a roam would show up here
+            // and nowhere else.
+            if bytes > 0 {
+                self.trace(&format!(
+                    "network: {bytes} bytes from the kernel, no address or interface message — not a change"
+                ));
+            }
             return false;
         }
         let now = networks();
         let mut held = self.nets.borrow_mut();
         if *held == now {
+            self.trace(&format!(
+                "network hint: still on {} — not a change",
+                show(&now)
+            ));
             return false;
         }
+        self.trace(&format!(
+            "network changed: {} → {}",
+            show(held.as_slice()),
+            show(&now)
+        ));
         *held = now;
         true
     }
+}
+
+/// A set of networks as one line, for [`NetWatch::trace`].
+fn show(nets: &[String]) -> String {
+    if nets.is_empty() {
+        return "no network of its own".to_string();
+    }
+    nets.join(" ")
 }
 
 /// The networks this machine can dial from, as text, sorted: the address
@@ -253,7 +313,7 @@ mod tests {
         set("192.168.1.5/24\nfd00::5/64\n");
         std::env::set_var("ACS_NETWATCH_FIFO", &fifo);
         std::env::set_var("ACS_NETWATCH_NETS", &nets);
-        let w = NetWatch::new().unwrap();
+        let w = NetWatch::new(false).unwrap();
         std::env::remove_var("ACS_NETWATCH_FIFO");
         // Nothing has been said at all.
         assert!(!w.changed());
@@ -297,6 +357,18 @@ mod tests {
 
     #[test]
     fn platform_watcher_opens() {
-        assert!(NetWatch::platform().is_ok());
+        assert!(NetWatch::platform(false).is_ok());
+    }
+
+    /// The trace's own text, so the line a reader looks for is pinned
+    /// somewhere a change to it has to be deliberate (acs-4i2).
+    #[test]
+    fn a_set_of_networks_reads_as_a_line() {
+        assert_eq!(show(&[]), "no network of its own");
+        assert_eq!(show(&["192.168.1.5/24".to_string()]), "192.168.1.5/24");
+        assert_eq!(
+            show(&["192.168.1.5/24".to_string(), "fd00::5/64".to_string()]),
+            "192.168.1.5/24 fd00::5/64"
+        );
     }
 }

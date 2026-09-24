@@ -15,7 +15,8 @@ Work is tracked as beads (`br`, prefix `acs`): start with `bv --robot-triage`.
   Linux build (needs `zig`).
 - `cargo xtask dist` — every target plus the embedded payloads (DESIGN §8.1).
 - `scripts/test_linux.sh` — the suite on Linux in a container, plus
-  multi-user isolation as root.
+  multi-user isolation as root and the network watcher against the real
+  kernel (`tests/netns.rs`, needs `CAP_NET_ADMIN`).
 - `scripts/e2e_ssh.sh` — end to end over real ssh against a container host.
 - `scripts/test_install.sh` — the one-line installer against the real
   releases, locally and in Alpine and Ubuntu containers.

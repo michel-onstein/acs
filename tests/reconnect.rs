@@ -589,6 +589,10 @@ fn a_hint_that_changed_no_network_does_not_cut_the_wait_short() {
         "the wait was cut short by a hint that changed nothing: {}",
         c.text()
     );
+    // And without `-v` the watcher says nothing at all (acs-4i2): the
+    // trace is for a person looking for it, not a line on every hint.
+    let text = c.text();
+    assert!(!text.contains("network hint"), "{text}");
 }
 
 /// acs-ft1: the watcher is polled while the link is *up* too, and what a
@@ -665,6 +669,97 @@ fn a_network_change_on_a_live_link_costs_nothing() {
         c.text()
     );
     assert_consecutive(&c.text());
+}
+
+/// acs-4i2: under `-v` the watcher says what it made of a hint, so a
+/// watcher that has quietly stopped emitting is no longer indistinguishable
+/// from a network that did not move.
+///
+/// That is the whole failure mode the bead is about. The hint is not merely
+/// a shortcut any more: since acs-6p8 it decides whether an offline wait is
+/// cut short, and since acs-ft1 whether a connected session is probed and
+/// replaced in 1–2 s instead of 10. If the platform stopped delivering — a
+/// macOS release changing which messages accompany a roam, a VPN coming up
+/// without moving an address `LocalNet::usable` accepts — there is no error
+/// and no log: the absence of a hint looks exactly like a quiet network.
+///
+/// The line is a reader of the decision and not part of it, which is what
+/// the rest of this test says: the hint that produced it changed no
+/// network, so the wait it landed in still runs to its deadline. Two
+/// minutes of backoff against `T`, as acs-7wu left it, and nothing is timed
+/// — the detach at the end is the proof, since a wait cut short puts the
+/// client in a redial where what is typed is flushed rather than read.
+#[test]
+fn under_v_a_hint_that_changed_nothing_says_so_and_still_ends_nothing() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![("ACS_BACKOFF_MS".to_string(), "120000".to_string())];
+    env.extend(watch.env());
+    let mut c = Client::start_env(
+        &remote,
+        &[
+            "-v",
+            "devbox",
+            "vq",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo up; sleep 60",
+        ],
+        &refs(&env),
+    );
+    c.wait_for("up", T);
+    remote.refuse_one_dial();
+    remote.cut_link();
+    c.wait_for("reconnecting in 120s", T);
+    let dialled = remote.transport_pids().len();
+    // The kernel says something while this machine is on the networks it
+    // was on. Without `-v` that is silence; with it, a line.
+    watch.hint();
+    c.wait_for(
+        "acs: network hint: still on 192.168.1.5/24 — not a change",
+        T,
+    );
+    // And still not a change: the wait was never cut short.
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/vq", T);
+    assert_eq!(
+        remote.transport_pids().len(),
+        dialled,
+        "the wait was cut short by a hint that changed nothing: {}",
+        c.text()
+    );
+}
+
+/// The other half of acs-4i2's line: a hint that *did* move an address
+/// names both sets, and is still the change it was — the redial follows.
+///
+/// Read together with the test above, the pair is what makes the trace
+/// usable as evidence: one line for every hint, saying which of the two it
+/// was, and neither of them changing what the hint is worth.
+#[test]
+fn under_v_a_real_change_names_the_networks_and_still_redials() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![("ACS_BACKOFF_MS".to_string(), "120000".to_string())];
+    env.extend(watch.env());
+    let mut c = Client::start_env(
+        &remote,
+        &["-v", "devbox", "vc", "--", "/bin/sh", "-c", TICKER],
+        &refs(&env),
+    );
+    c.wait_for("#10#", T);
+    remote.refuse_one_dial();
+    remote.cut_link();
+    c.wait_for("reconnecting in 120s", T);
+    let dialled = remote.transport_pids().len();
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    // Inside `T`, against two minutes of backoff: only the change can have
+    // brought this on.
+    remote.wait_connections(dialled + 1, T);
 }
 
 // ---- bug hunt 2026-09-18 -----------------------------------------------------
