@@ -473,19 +473,17 @@ fn modes_of_a_restarted_session_are_reset() {
 /// A network change redials out of the offline wait instead of sitting it
 /// out — again a statement about elapsed time, and again with two minutes of
 /// backoff against `T` rather than 20 s against 5 s (acs-7wu).
+///
+/// The change is a real one: the machine is on different networks than it
+/// was when the client started, which is what makes the kernel's hint a
+/// change rather than a mention (acs-6p8, below).
 #[test]
 fn a_network_change_redials_at_once() {
     let remote = Remote::installed();
-    let fifo = remote.root.path().join("netchange");
-    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-    let fifo_s = fifo.to_str().unwrap().to_string();
-    let mut c = start(
-        &remote,
-        "net",
-        TICKER,
-        &[("ACS_BACKOFF_MS", "120000"), ("ACS_NETWATCH_FIFO", &fifo_s)],
-    );
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![("ACS_BACKOFF_MS".to_string(), "120000".to_string())];
+    env.extend(watch.env());
+    let mut c = start(&remote, "net", TICKER, &refs(&env));
     c.wait_for("#10#", T);
     // The network is down: the free first redial (acs-iyq) is refused, and
     // the two minutes of backoff behind it are what the watcher then has to
@@ -494,14 +492,67 @@ fn a_network_change_redials_at_once() {
     remote.cut_link();
     c.wait_for("reconnecting in 120s", T);
     let t0 = Instant::now();
-    // Wi-Fi came back: the watcher fires, the client redials now.
-    let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-    std::io::Write::write_all(&mut w, b"up").unwrap();
+    // Wi-Fi came back on another network: the watcher fires, and this
+    // machine's own addresses are not the ones it had, so the client
+    // redials now.
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
     remote.wait_connections(2, T);
     assert!(t0.elapsed() < T, "{:?}", t0.elapsed());
     let target = last_number(&c) + 20;
     c.wait_for(&format!("#{target}#"), T);
     assert_consecutive(&c.text());
+}
+
+/// Regression (acs-6p8): the kernel *mentioning* the network is not the
+/// network changing.
+///
+/// The watcher used to report every address and interface message as a
+/// change, and the first one of a wait was always taken. A laptop emits
+/// those the whole time — an unrelated interface appearing, a VPN route
+/// churning, an interface flapping while the link's own path is untouched
+/// — so a client sitting out an outage redialled over and over, and every
+/// key typed at one of those moments was discarded on the `WELCOME` that
+/// followed (DESIGN §5.2). That is what made three tests in this file fail
+/// together on a cold full-parallel run with two minutes of backoff
+/// configured, and on a real laptop it is the promise of §5.2 broken:
+/// `d` typed during an outage does nothing at all.
+///
+/// Nothing here is timed, and nothing waits for a laptop to roam. The hint
+/// goes in before the keys, and the client examines the watcher ahead of
+/// stdin in the same pass of its poll — a descriptor stays readable — so
+/// the detach cannot overtake the hint however starved the machine is. A
+/// wait cut short by it puts the client in a redial, where what was typed
+/// is flushed rather than read, and then it never detaches.
+#[test]
+fn a_hint_that_changed_no_network_does_not_cut_the_wait_short() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![("ACS_BACKOFF_MS".to_string(), "120000".to_string())];
+    env.extend(watch.env());
+    // The program outlasts `T`, so exiting 0 can only be the detach and
+    // not the session ending under a client that redialled and resumed.
+    let mut c = start(&remote, "nk", "echo up; sleep 60", &refs(&env));
+    c.wait_for("up", T);
+    remote.refuse_one_dial();
+    remote.cut_link();
+    c.wait_for("reconnecting in 120s", T);
+    // Counted from here, not from one: getting this far can take a
+    // connection or two of its own — a remote that has to install acs
+    // first spends them before the session.
+    let dialled = remote.transport_pids().len();
+    // The kernel says something about the network, and this machine is on
+    // exactly the networks it was on: nothing to redial for.
+    watch.hint();
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/nk", T);
+    assert_eq!(
+        remote.transport_pids().len(),
+        dialled,
+        "the wait was cut short by a hint that changed nothing: {}",
+        c.text()
+    );
 }
 
 // ---- bug hunt 2026-09-18 -----------------------------------------------------

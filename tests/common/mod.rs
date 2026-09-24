@@ -153,6 +153,75 @@ impl Net {
     }
 }
 
+/// A stand-in for the platform's network watcher (`netwatch.rs`, DESIGN
+/// §5.3), in the two halves the client's decision is made of:
+///
+/// - the **hints** the kernel sends — a FIFO for `ACS_NETWATCH_FIFO`, where
+///   the real client has a `PF_ROUTE` or `NETLINK_ROUTE` socket;
+/// - the **networks** this machine is on — a file for `ACS_NETWATCH_NETS`,
+///   where the real client has `getifaddrs`.
+///
+/// Both are needed to drive the decision rather than wait for a laptop to
+/// roam (acs-6p8): a hint on its own says only that the kernel mentioned
+/// the network, and whether that was a *change* is what the networks say.
+pub struct NetWatch {
+    dir: TempDir,
+}
+
+impl NetWatch {
+    /// A watcher on a machine that is on `nets` (CIDR per line, as
+    /// `getifaddrs` would report them).
+    pub fn new(nets: &str) -> NetWatch {
+        let w = NetWatch {
+            dir: TempDir::new(),
+        };
+        let path = std::ffi::CString::new(w.fifo().to_str().unwrap()).unwrap();
+        // SAFETY: a path in this test's own temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        w.set_networks(nets);
+        w
+    }
+
+    fn fifo(&self) -> PathBuf {
+        self.dir.path().join("hints")
+    }
+
+    fn nets_file(&self) -> PathBuf {
+        self.dir.path().join("networks")
+    }
+
+    /// The machine is on these networks from now on.
+    pub fn set_networks(&self, nets: &str) {
+        std::fs::write(self.nets_file(), nets).unwrap();
+    }
+
+    /// The kernel said something about the network: an address came or
+    /// went, an interface changed state. Whether that is a *change* is for
+    /// the client to work out from the networks.
+    pub fn hint(&self) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.fifo())
+            .unwrap();
+        f.write_all(b"x").unwrap();
+    }
+
+    /// The environment that points a client at this watcher.
+    pub fn env(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "ACS_NETWATCH_FIFO".into(),
+                self.fifo().display().to_string(),
+            ),
+            (
+                "ACS_NETWATCH_NETS".into(),
+                self.nets_file().display().to_string(),
+            ),
+        ]
+    }
+}
+
 /// A fake `ssh` for `--ssh`: runs the remote command on the fake remote its
 /// destination stands for, and refuses any other destination as a dead host
 /// would. It records each call's arguments.
@@ -634,7 +703,15 @@ impl Client {
             .env("ACS_NO_UPDATE_CHECK", "1")
             .env("XDG_CONFIG_HOME", NO_CONFIG)
             .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
-            .env("ACS_IDENTITY", "tester@local");
+            .env("ACS_IDENTITY", "tester@local")
+            // And never the developer's own network. A path that does not
+            // exist leaves the client with no watcher at all, so a Wi-Fi
+            // roam or a VPN coming up on the machine running the suite
+            // cannot cut an offline wait short under a test that is not
+            // about the watcher (acs-6p8). The tests that *are* about it
+            // pass their own `ACS_NETWATCH_FIFO` in `env` below, which is
+            // applied after this one and wins.
+            .env("ACS_NETWATCH_FIFO", "/nonexistent/acs-test-netwatch");
         for (k, v) in env {
             cmd.env(k, v);
         }

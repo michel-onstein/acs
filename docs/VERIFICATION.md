@@ -69,8 +69,13 @@ claimed as verified:
 - **htop and less** interactively. Covered only indirectly (vim, raw mouse and
   key paths).
 - **A real Wi-Fi switch and laptop sleep/wake.** Simulated by killing and
-  freezing the connection and by the network-change hook (`ACS_NETWATCH_FIFO`);
-  the real events have not been exercised.
+  freezing the connection and by the network-change stand-ins
+  (`ACS_NETWATCH_FIFO` for the kernel's hint, `ACS_NETWATCH_NETS` for the
+  machine's networks); the real events have not been exercised. Worth a
+  hand check since acs-6p8: a hint now only redials when this machine's own
+  addresses differ, so what is unproven is that a real roam, wake or VPN
+  moves an address on the platform's own watcher — not merely that the
+  client reacts when one does.
 - **A real host that needs `-i`, such as corello.** The container host proves
   `-i` passthrough; connecting to a work host installs acs there, which is
   the owner's call.
