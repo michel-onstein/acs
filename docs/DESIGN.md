@@ -1773,12 +1773,19 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
     signature that does not verify, and a build with no key in it all stop
     the upgrade. There is deliberately no path that skips the check, and a
     test asserts the built-in key is not empty. The same key is in
-    `install.sh`, and a test asserts the two have not drifted.
+    `install.sh` — `cargo xtask package` substitutes this build's key and
+    releases URL into the copy it publishes, so the installer beside a
+    release always agrees with the binaries in it (acs-x57) — and two tests
+    assert the two have not drifted: one on the checked-in script, one on
+    the packaged copy. There is no `ACS_RELEASE_KEY` for the installer, and
+    VERSIONING.md "The packaged installer" says why: a script piped into
+    `sh` has no command line to put the opt-out on.
   - **Which key is built in is itself a choice**: a build with
     `ACS_DEFAULT_RELEASE_KEY` set bakes in another one, beside the
     `ACS_DEFAULT_RELEASES_URL` it belongs to, for a fork that signs its own
-    releases (VERSIONING.md, "Forking"). Unset it is acs's own key — the
-    one `install.sh` carries — an empty value counts as unset, and a value
+    releases (VERSIONING.md, "Forking"); whichever it is, it is the key the
+    packaged `install.sh` carries. Unset it is acs's own key — the one the
+    checked-in `install.sh` carries — an empty value counts as unset, and a value
     that is not an ssh public key line fails the build. What the variable
     means lives in `src/release_key.rs`, which `build.rs` includes as
     source: a build script is not a test target, so the rule sits where the
@@ -1808,8 +1815,10 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   nothing, so there the scheme is not load-bearing. The default it overrides
   is itself a choice: a build with `ACS_DEFAULT_RELEASES_URL` set bakes in
   another releases URL, for a fork that publishes its own (VERSIONING.md,
-  "Forking"). That one is the builder's decision rather than the
-  environment's, so it carries none of these limits.
+  "Forking") — and the release tasks follow it, into the packaged
+  `install.sh`, the Homebrew formula and the notes (acs-x57). That one is
+  the builder's decision rather than the environment's, so it carries none
+  of these limits.
 - **Downloads use `curl`** (or `wget` when there is no curl, as on Alpine):
   an HTTP and TLS client of our own would cost more than the whole binary
   (§9).

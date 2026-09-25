@@ -40,4 +40,4 @@ updates the Homebrew tap (`michel-onstein/homebrew-acs`). Rules in
 | [README.md](README.md) | Install, usage, command keys, environment | Current |
 | [DESIGN.md](docs/DESIGN.md) | Architecture, protocol, command mode, remote install | Built |
 | [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning, release binaries on GitHub, the Homebrew tap, what a fork must point at itself | Built |
-| [VERIFICATION.md](docs/VERIFICATION.md) | End-to-end results over real ssh; checks still to do by hand | Automated checks pass |
+| [VERIFICATION.md](docs/VERIFICATION.md) | End-to-end results over real ssh; checks still to do by hand | Automated checks pass, bar the stale installer suite |

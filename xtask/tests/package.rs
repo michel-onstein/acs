@@ -79,17 +79,43 @@ fn packages_every_target_with_checksums_and_notes() {
         String::from_utf8_lossy(&check.stdout)
     );
 
-    // The installer ships as is, executable.
+    // The installer ships executable, and carrying this build's releases
+    // URL and release key rather than whatever the checked-in script says
+    // (acs-x57) — here through the real command, not the function.
     use std::os::unix::fs::PermissionsExt;
     let meta = std::fs::metadata(out.join("install.sh")).unwrap();
     assert_eq!(meta.permissions().mode() & 0o777, 0o755);
-    assert!(std::fs::read_to_string(out.join("install.sh"))
-        .unwrap()
-        .starts_with("#!/bin/sh\n"));
+    let installer = std::fs::read_to_string(out.join("install.sh")).unwrap();
+    assert!(installer.starts_with("#!/bin/sh\n"));
+    assert!(
+        installer.contains(&format!(
+            "default_releases='{}'\n",
+            acs::release::DEFAULT_RELEASES_URL
+        )),
+        "the packaged installer does not carry this build's releases"
+    );
+    assert!(
+        installer.contains(&format!("release_key='{}'\n", acs::signature::RELEASE_KEY)),
+        "the packaged installer does not carry this build's release key"
+    );
+    // And it is still a script `sh` will read.
+    let syntax = Command::new("sh")
+        .arg("-n")
+        .arg(out.join("install.sh"))
+        .status()
+        .unwrap();
+    assert!(syntax.success(), "the packaged installer does not parse");
 
     let notes = std::fs::read_to_string(out.join("NOTES.md")).unwrap();
     assert!(notes.contains("acs 0.9.1"));
     assert!(notes.contains("- fix: something"));
+    assert!(
+        notes.contains(&format!(
+            "curl -fsSL {}/latest/download/install.sh | sh",
+            acs::release::DEFAULT_RELEASES_URL
+        )),
+        "{notes}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
