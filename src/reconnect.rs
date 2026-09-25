@@ -533,9 +533,9 @@ pub struct Liveness {
     ping_after: u64,
     dead_after: u64,
     netcheck_after: u64,
-    /// A network change is being asked about (acs-ft1): when the PING went
-    /// out, and when the link is dead if nothing has been heard since.
-    /// `None` when no question is outstanding.
+    /// A network change is being asked about (acs-ft1): the nonce of the
+    /// PING that asked, and when the link is dead if it has not been
+    /// answered. `None` when no question is outstanding.
     probe: Option<(u64, u64)>,
 }
 
@@ -573,8 +573,29 @@ impl Liveness {
     /// A second change while the question is outstanding is the same
     /// question — an interface flapping cannot push the deadline out, nor
     /// spend another round trip.
+    ///
+    /// **Only the PONG for this PING answers it** ([`Liveness::pong`],
+    /// acs-br2): other bytes from the host do not, however fresh they look.
+    /// Everywhere else in liveness a byte is proof the host is there, and
+    /// here it is not — the frames already in the pipe when the network
+    /// moved were written before it moved, so they are the frozen link's
+    /// last gasp rather than an answer to a question asked after it. A
+    /// starved client reads them in the same pass of its poll that sends
+    /// the PING, and counting them left a link that was gone standing for
+    /// the whole `ACS_DEAD_MS`, which is the one thing this deadline
+    /// exists to avoid.
     pub fn netcheck(&mut self, out: &mut Vec<u8>) {
         self.netcheck_at(sys::now_ms(), out)
+    }
+
+    /// The host answered a PING with this nonce. It resolves an outstanding
+    /// netcheck when it is that netcheck's own PING or a later one
+    /// (acs-br2) — a PONG for a PING sent *before* the network moved
+    /// travelled the old path and says nothing about the new one.
+    pub fn pong(&mut self, nonce: u64) {
+        if self.probe.is_some_and(|(asked, _)| nonce >= asked) {
+            self.probe = None;
+        }
     }
 
     fn netcheck_at(&mut self, now: u64, out: &mut Vec<u8>) {
@@ -603,12 +624,11 @@ impl Liveness {
         if now >= self.heard + self.dead_after {
             return Health::Dead;
         }
-        if let Some((since, until)) = self.probe {
-            if self.heard >= since {
-                // The host answered — or is talking anyway, which is the
-                // same proof (bytes count, §5.3). The link came through.
-                self.probe = None;
-            } else if now >= until {
+        // A question a network change asked, and nothing answering it: the
+        // link is gone. The answer is a PONG and nothing else
+        // ([`Liveness::pong`], acs-br2).
+        if let Some((_, until)) = self.probe {
+            if now >= until {
                 return Health::Dead;
             }
         }
@@ -701,12 +721,14 @@ mod tests {
         assert_eq!(l.tick_at(1149, &mut out), Health::Ok);
         assert_eq!(l.tick_at(1150, &mut out), Health::Dead);
 
-        // And the link that answers: the deadline is forgotten and the
+        // And the link that answers — the PONG for that PING, which is what
+        // answering means here (acs-br2): the deadline is forgotten and the
         // ordinary timers are back.
         let mut l = liveness(1000, 3000, 10_000);
         let mut out = Vec::new();
         l.netcheck_at(1100, &mut out);
         l.heard = 1120;
+        l.pong(1100);
         assert_eq!(l.tick_at(1200, &mut out), Health::Ok);
         assert_eq!(l.probe, None);
         assert_eq!(l.next_deadline_ms(), 1120 + 3000);
@@ -714,6 +736,50 @@ mod tests {
         assert_eq!(l.tick_at(5000, &mut out), Health::Ok);
         // The dead interval still applies, counted from the last frame.
         assert_eq!(l.tick_at(11_120, &mut out), Health::Dead);
+    }
+
+    /// acs-br2: the question a network change asks is answered by its own
+    /// PONG and by nothing else. Frames that were already in the pipe when
+    /// the network moved were written before it moved — a frozen link's last
+    /// gasp — and an answer to a PING sent before it travelled the path
+    /// that has gone.
+    ///
+    /// This is the bug the integration test of the same name reproduces.
+    /// The client reads those frames in the same pass of its poll that
+    /// sends the PING, so `heard` lands *after* the question was asked
+    /// however stale the bytes are; taking that for an answer left a link
+    /// that was already gone standing for the whole `ACS_DEAD_MS`, which is
+    /// the one thing the change's deadline exists to prevent. It showed up
+    /// as a test failing only on a cold, fully parallel container run,
+    /// because an idle machine drains the pipe before the hint arrives.
+    #[test]
+    fn only_the_pong_for_its_own_ping_answers_a_network_change() {
+        let mut l = liveness(1000, 3000, 10_000);
+        let mut out = Vec::new();
+        // A PING of the ordinary kind went out before the network moved.
+        assert_eq!(l.tick_at(4000, &mut out), Health::Ok);
+        assert_eq!(out, Msg::Ping(4000).to_bytes());
+        // The network moves, and the question goes out: 50 ms to answer it.
+        l.netcheck_at(4100, &mut out);
+        // Bytes arrive — the frames the host wrote before it froze, read in
+        // the same pass of the poll that sent the PING, so they are *newer*
+        // than the question by the clock.
+        l.heard = 4100;
+        assert_eq!(l.tick_at(4149, &mut out), Health::Ok);
+        assert_eq!(
+            l.tick_at(4150, &mut out),
+            Health::Dead,
+            "bytes written before the network moved answered the netcheck"
+        );
+        // Nor does the PONG for the PING that went out before it: that one
+        // came back over the path that has gone.
+        let mut l = liveness(1000, 3000, 10_000);
+        let mut out = Vec::new();
+        assert_eq!(l.tick_at(4000, &mut out), Health::Ok);
+        l.netcheck_at(4100, &mut out);
+        l.pong(4000);
+        l.heard = 4100;
+        assert_eq!(l.tick_at(4150, &mut out), Health::Dead);
     }
 
     /// The change's deadline never outlives the dead interval: a machine

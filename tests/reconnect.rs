@@ -680,6 +680,91 @@ fn a_network_change_ends_a_frozen_link_without_the_dead_timeout() {
     assert_consecutive(&c.text());
 }
 
+/// acs-br2: bytes that were **already in flight** when the network moved
+/// are not an answer to the question the change asks.
+///
+/// This is the test above with the race taken out of it. There, the client
+/// has usually drained the link by the time the hint arrives, so the PING
+/// the change sends is outstanding and the link is dead in
+/// `ACS_NETCHECK_MS`. On a loaded machine it has not: the client is off the
+/// CPU while the host freezes and the hint goes in, so it wakes with the
+/// host's last frames still in the pipe and reads them in the same pass of
+/// the poll that sends the PING. Those frames were written *before* the
+/// network moved — they are the link's last gasp, not proof it survived —
+/// and counting them as the answer left the frozen link standing for the
+/// whole `ACS_DEAD_MS`. That is the failure acs-br2 saw twice on a cold
+/// full-parallel Linux run, and never on an idle laptop.
+///
+/// Nothing here is timed. `SIGSTOP` on the client *is* the starved
+/// machine, applied on purpose rather than waited for, and the host is
+/// frozen before the hint so it can answer nothing after it: inside `T`,
+/// against a minute of `ACS_DEAD_MS`, only the change can end this link.
+///
+/// Two things make the order the scheduler's business rather than luck.
+/// The host is held at a gate of its own until the client has been
+/// stopped, so the link is empty at that moment and the client is sitting
+/// in its poll — there is no readiness left over from before the stop for
+/// it to drain the pipe with on the way past. And what it prints
+/// afterwards is counted on the remote's own filesystem (the client's
+/// terminal cannot say what arrived while it was stopped), fifty lines of
+/// it rather than a handful: what the program has printed is not yet what
+/// has reached the client's pipe — the master and the proxy are two hops
+/// in between, each with a buffer — and with five the freeze landed before
+/// the hops had caught up about one run in five, leaving the pipe empty
+/// and the bug unprovoked.
+#[test]
+fn bytes_in_flight_when_the_network_moved_do_not_answer_the_netcheck() {
+    let remote = Remote::installed();
+    // The master keeps a client that is not reading (it has its own
+    // liveness, acs-ode); this is about the client's judgement of the host.
+    remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
+    let ticks = remote.root.path().join("ticks");
+    let gate = remote.root.path().join("gate");
+    make_fifo(&gate);
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![
+        ("ACS_BACKOFF_MS".to_string(), "100".to_string()),
+        ("ACS_PING_MS".to_string(), "20000".to_string()),
+        ("ACS_DEAD_MS".to_string(), "60000".to_string()),
+    ];
+    env.extend(watch.env());
+    // The ticker of the test above, tapping the remote's own filesystem for
+    // each line, and holding at `gate` after the twentieth: the client is
+    // stopped for part of this, so its terminal cannot say what the host
+    // has printed.
+    let cmd = format!(
+        "i=0; while true; do i=$((i+1)); printf '#%d#\\n' $i; printf . >> '{ticks}'; \
+         [ $i = 20 ] && head -c 1 '{gate}' > /dev/null; sleep 0.01; done",
+        ticks = ticks.display(),
+        gate = gate.display(),
+    );
+    let mut c = start(&remote, "flight", &cmd, &refs(&env));
+    // The twentieth line is on the terminal, so the client has read
+    // everything there was and the host is waiting at the gate: nothing is
+    // in flight, and the client is in its poll with nothing to do.
+    c.wait_for("#20#", T);
+    let dialled = remote.connections();
+    let pid = *remote.transport_pids().last().unwrap();
+    let client = c.pid();
+    acs::sys::kill(client, libc::SIGSTOP).unwrap();
+    // Only now the host goes on printing, into a client that cannot read,
+    // until enough of it is in the link on the remote's own evidence.
+    let base = frames(&ticks);
+    release_fifo(&gate);
+    wait_frames(&ticks, base, 50);
+    // And only now the link freezes and the machine wakes on another
+    // network, so the client comes back to both at once.
+    acs::sys::kill(pid, libc::SIGSTOP).unwrap();
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    acs::sys::kill(client, libc::SIGCONT).unwrap();
+    remote.wait_more_connections(dialled, 1, T);
+    let _ = acs::sys::kill(pid, libc::SIGKILL);
+    let target = last_number(&c) + 100;
+    c.wait_for(&format!("#{target}#"), T);
+    assert_consecutive(&c.text());
+}
+
 /// acs-ft1, the other half: a network change under a link that is *still
 /// working* costs nothing — no redial, and so not a byte of what was typed
 /// (keys typed into a redial are discarded, DESIGN §5.2). Dropping a live
