@@ -1289,27 +1289,58 @@ aliases:
         );
     }
 
+    /// The deadline ends the ping, and the ping is killed rather than left
+    /// running to answer into nothing.
+    ///
+    /// **Neither half now reads a clock it can lose** (acs-2dc).
+    ///
+    /// The first is an upper bound, which is the one direction load
+    /// breaks, so the two things it tells apart are put absurdly far
+    /// apart instead of tightly: half a minute of ping against a tenth of
+    /// a second of deadline, and ten seconds to say which happened — a
+    /// hundred deadlines, and still a third of the ping. It used to be 800
+    /// ms against a ping of one second, which is 700 ms of slack for a
+    /// `fork`, an `exec` and a shell's startup on a host running three
+    /// hundred tests twelve at a time (acs-cu8's move, the same shape as
+    /// `ping_is_one_packet_with_a_backstop_past_the_deadline` above).
+    ///
+    /// The second used to sleep a fixed 1.3 s and then look for a `touch`
+    /// that must not have happened. Now it waits for a shell of its own,
+    /// started *after* the kill and sleeping as long as the ping would
+    /// have, to finish: if the host is starved, both are starved, which is
+    /// what a wall-clock sleep cannot say (acs-o6x).
     #[test]
     fn ping_is_killed_at_the_deadline() {
         let dir = TempDir::new();
+        let never = script(&dir, "never", "sleep 30");
+        let start = Instant::now();
+        assert_eq!(
+            ping_with(never.as_os_str(), "h", Duration::from_millis(100)),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+
         let late = dir.path().join("late");
         let p = script(
             &dir,
             "ping",
-            &format!("sleep 1; touch '{}'", late.display()),
+            &format!("sleep 2; touch '{}'", late.display()),
         );
-        let start = Instant::now();
         assert_eq!(
             ping_with(p.as_os_str(), "h", Duration::from_millis(100)),
             None
         );
-        assert!(
-            start.elapsed() < Duration::from_millis(800),
-            "{:?}",
-            start.elapsed()
-        );
-        // Killed, not left to answer late.
-        std::thread::sleep(Duration::from_millis(1300));
+        let same = Command::new("/bin/sh")
+            .args(["-c", "sleep 2"])
+            .status()
+            .unwrap();
+        assert!(same.success());
+        // Killed, not left to answer late: a shell that started later has
+        // already finished the wait this one was cut off in.
         assert!(!late.exists());
     }
 }

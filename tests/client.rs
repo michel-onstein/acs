@@ -105,6 +105,18 @@ fn the_programs_exit_status_is_the_clients() {
     assert!(c.echo_on());
 }
 
+/// A lone Ctrl-], and the key after it, reach the program unchanged.
+///
+/// **Neither pause is a window this can fall out of** (acs-2dc). They type
+/// the four bytes as four keystrokes rather than one paste, and the
+/// detector forwards the same four either way: a held escape press is
+/// flushed by [`acs::keys`]'s timer when the window runs out *and* by the
+/// next key that is not another press, so a machine slow enough to miss
+/// the window sends `1d 7a` exactly as a fast one does. Waiting longer
+/// than either pause is what a loaded host does, and it changes nothing
+/// here. The one thing that has gone red in this test under load is the
+/// wait for `armed` — the dial, not the keys; there is no partial read of
+/// the `od` to be had.
 #[test]
 fn single_escape_press_and_other_keys_reach_the_program() {
     let remote = Remote::installed();
@@ -131,15 +143,50 @@ fn single_escape_press_and_other_keys_reach_the_program() {
     );
 }
 
+/// A resize reaches the program, which reports it.
+///
+/// **The program answers every line, so the test can ask again**
+/// (acs-2dc). It used to settle for 200 ms and then send one `\r`, and the
+/// one answer it then got had to be the new size.
+///
+/// That settle was not, in the end, a window this could fall out of — and
+/// the reason is worth writing down, because it is not obvious and it is
+/// what the old shape quietly rested on. The client's frame loop drains
+/// the signal descriptor *before* it reads stdin, into the same outgoing
+/// buffer (`src/client.rs`), and the kernel delivers SIGWINCH on the way
+/// out of the `poll` the `TIOCSWINSZ` interrupted. So the RESIZE is
+/// encoded ahead of the keystroke whether the client saw the signal a
+/// pass earlier or in the very same one: a `\r` cannot overtake it,
+/// however starved the host is. Deliberately sleeping three seconds in
+/// that branch did not make the old test fail.
+///
+/// What is left is that the old form asked its one question on a guess
+/// and, if the answer had ever been the old size, would have waited out
+/// [`T`] for a second answer that was never coming. Asking again tests
+/// what the name says — the program is told the new size — instead of
+/// testing it through an ordering property that is somebody else's
+/// subject, and it costs one extra `\r` in the case where the resize is
+/// already there.
 #[test]
 fn resize_reaches_the_program() {
     let remote = Remote::installed();
-    let mut c = start(&remote, "rsz", "echo ready; read x; stty size");
+    let mut c = start(
+        &remote,
+        "rsz",
+        "echo ready; while read x; do stty size; done",
+    );
     c.wait_for("ready", T);
     c.resize(101, 33);
-    std::thread::sleep(Duration::from_millis(200));
-    c.send(b"\r");
-    c.wait_for("33 101", T);
+    let deadline = std::time::Instant::now() + T;
+    while !c.text().contains("33 101") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the program never reported the new size:\n{}",
+            c.text()
+        );
+        c.send(b"\r");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]

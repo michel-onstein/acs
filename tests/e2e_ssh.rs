@@ -73,27 +73,8 @@ impl Host {
 
 const TICKER: &str = "i=0; while true; do i=$((i+1)); printf '#%d#\\n' $i; sleep 0.02; done";
 
-fn numbers(text: &str) -> Vec<u64> {
-    let mut clean = String::new();
-    let mut rest = text;
-    while let Some(i) = rest.find("\x1b7") {
-        clean.push_str(&rest[..i]);
-        rest = match rest[i..].find("\x1b8") {
-            Some(j) => &rest[i + j + 2..],
-            None => "",
-        };
-    }
-    clean.push_str(rest);
-    clean.split('#').filter_map(|p| p.parse().ok()).collect()
-}
-
-fn assert_consecutive(text: &str) {
-    let n = numbers(text);
-    assert!(n.len() > 10, "too little output");
-    for w in n.windows(2) {
-        assert_eq!(w[1], w[0] + 1, "lost or repeated output");
-    }
-}
+// `numbers` and `assert_consecutive` live in tests/common, with
+// tests/reconnect.rs, which reads the same ticker (acs-2dc).
 
 /// A local port with nothing on it: taken from the kernel and let go again,
 /// as the host's ssh port is, so two runs at once never pick the same one.

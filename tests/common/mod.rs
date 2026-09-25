@@ -972,6 +972,130 @@ impl Drop for Client {
     }
 }
 
+/// The client's terminal with everything the *client* wrote taken out, so
+/// that what is left is the program's own stream and a `#175#` the client
+/// wrote through still reads as one number.
+///
+/// Two things land in the middle of it, and neither loses a byte:
+///
+/// - **the status line**, whose save/restore-cursor span (`ESC 7` … `ESC 8`)
+///   is written wherever the cursor happens to be;
+/// - **an `acs: …` note**, which goes to fd 2 while the session's bytes go
+///   to fd 1, so on one terminal it arrives wherever the stream has got to.
+///   acs-z22 holds a note until the program's stream is at a boundary, and
+///   that ended the corruption it was raised for — but every byte position
+///   in a plain-ASCII `#175#` *is* a boundary, so a note still comes out
+///   between the `#17` and the `5#` (acs-2dc).
+///
+/// A note is recognised the way the client decides where one may go: at a
+/// **boundary** of the stream, by the same [`acs::modes::ModeObserver`].
+/// `acs: ` inside an escape sequence is not a note but somebody's text —
+/// the status line's own window title says `ESC ] 2 ; acs: <host> — …`,
+/// and reading that as a note cut the line, and the next number with it.
+///
+/// A span still being written when the snapshot was taken ends the text:
+/// what follows it has not arrived yet.
+pub fn program_output(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut kept: Vec<u8> = Vec::with_capacity(b.len());
+    // What "a note" means is what it means to the client: text at a
+    // boundary of the stream, not five characters that happen to read
+    // `acs: `. The status line writes its own message into an OSC title
+    // (`ESC ] 2 ; acs: <host> — …`, src/reconnect.rs) where those five
+    // characters are the title's body, and cutting the line from there
+    // took the next number with it.
+    let mut stream = acs::modes::ModeObserver::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i..].starts_with(b"\x1b7") {
+            match b[i..].windows(2).position(|w| w == b"\x1b8") {
+                Some(j) => i += j + 2,
+                None => return String::from_utf8_lossy(&kept).into_owned(),
+            }
+            continue;
+        }
+        if stream.at_boundary() && b[i..].starts_with(b"acs: ") {
+            match b[i..].iter().position(|&c| c == b'\n') {
+                Some(j) => i += j + 1,
+                None => return String::from_utf8_lossy(&kept).into_owned(),
+            }
+            continue;
+        }
+        stream.observe(&b[i..i + 1]);
+        kept.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// The `#n#` numbers a ticker printed, in order.
+///
+/// **A number counts only once both its `#`s are there.** The text is a
+/// snapshot of a stream still being written, so its last bytes are as
+/// likely as not to be the first half of one — and `#17` read as 17 where
+/// `#175#` was being written is how acs-ryz's one unexplained failure
+/// reported itself, as `lost or repeated output around 174 → 17`. A
+/// trailing fragment is not output that was lost; it is output that has
+/// not arrived yet, and reading it as a number turns the next wait into a
+/// hunt for a `#37#` the program printed long ago.
+pub fn numbers(text: &str) -> Vec<u64> {
+    let clean = program_output(text);
+    let mut parts: Vec<&str> = clean.split('#').collect();
+    // Whatever follows the last `#` has no `#` of its own yet.
+    parts.pop();
+    parts.iter().filter_map(|p| p.parse().ok()).collect()
+}
+
+/// Every number the ticker printed is there, once, in order.
+pub fn assert_consecutive(text: &str) {
+    let n = numbers(text);
+    assert!(n.len() > 10, "too little output: {n:?}");
+    for w in n.windows(2) {
+        assert!(
+            w[1] == w[0] + 1,
+            "lost or repeated output around {} → {}\n{}",
+            w[0],
+            w[1],
+            around(text, w[0]),
+        );
+    }
+}
+
+/// The raw stream either side of `#n#`, escaped — what a failure needs to
+/// say **which** of two different things happened (acs-2dc):
+///
+/// - output **torn**: the bytes are all there, with something the client
+///   wrote sitting in the middle of a number;
+/// - output **lost**: the stream steps from one number to another with
+///   nothing between them, which is the protocol failure this suite is
+///   actually guarding.
+///
+/// From the numbers alone the two are indistinguishable, and acs-ryz spent
+/// its one unexplained burst on the wrong one.
+fn around(text: &str, n: u64) -> String {
+    let needle = format!("#{n}#");
+    let Some(i) = text.rfind(&needle) else {
+        return format!("({needle:?} is not in the stream at all)");
+    };
+    let from = text[..i]
+        .char_indices()
+        .rev()
+        .take(160)
+        .last()
+        .map_or(0, |(j, _)| j);
+    let to = text[i..]
+        .char_indices()
+        .take(160)
+        .last()
+        .map_or(text.len(), |(j, c)| i + j + c.len_utf8());
+    format!("the stream around {needle}: {:?}", &text[from..to])
+}
+
+/// The last whole number the client has printed.
+pub fn last_number(c: &Client) -> u64 {
+    *numbers(&c.text()).last().unwrap_or(&0)
+}
+
 /// Ctrl-] Ctrl-] then `key`.
 pub fn command(key: u8) -> Vec<u8> {
     vec![0x1d, 0x1d, key]

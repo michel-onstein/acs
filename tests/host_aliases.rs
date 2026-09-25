@@ -107,14 +107,35 @@ fn no_reachable_host_is_an_error_with_exit_255() {
     assert!(remote.transport_pids().is_empty(), "no connection is made");
 }
 
+/// devbox.lan would answer, but only after 30 s: at the alias's own 5 s
+/// deadline acs gives up on it and takes the next host.
+///
+/// **The next host is not pinged at all**, and that is deliberate
+/// (acs-2dc). It used to be, which quietly gave the alias's deadline a
+/// second job: covering the fake ping's own fork, exec and shell startup
+/// on a machine running the whole suite. Five seconds is a long time for
+/// the first job and not always enough for the second — eight runs in
+/// sixty-three failed here under load, with the fallback reported down
+/// because its shell had not been scheduled yet. `reachability_check:
+/// false` takes the deadline out of the fallback's way altogether. The
+/// pinged fallback is `falls_back_to_the_next_host_and_its_user`'s to
+/// cover, and its deadline is the minute [`Net::env`] gives a
+/// configuration that sets none.
+///
+/// **What is left of the clock is one lower bound**, which load cannot
+/// break: starving the machine only makes the give-up later, never
+/// earlier. The two things the old `took < 25s` stood for are said by the
+/// output instead, and said better:
+///
+/// - *the alias's 5 s was used, not the file's 20 s* — the line names the
+///   deadline it applied, so a global one would read `within 20s` and the
+///   wait for this one would fail;
+/// - *the 30 s ping was not waited out* — had it been, devbox.lan answers
+///   and is chosen, and the line below is never printed at all.
 #[test]
 fn a_host_slower_than_the_deadline_is_passed_over() {
-    // devbox.lan would answer, but only after 30 s: at the alias's 5 s
-    // deadline acs gives up on it and takes the next host, which answered
-    // at once — about 5 s, not 30. (5 s, not less: the other host's fake
-    // ping must answer within it while every other test is running.)
     let remote = Remote::installed();
-    let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    let net = Net::new(&["devbox.lan"]);
     net.set_slow(&["devbox.lan"]);
     let config = "\
 reachability_timeout: 20s
@@ -125,19 +146,31 @@ aliases:
       - host: devbox.lan
       - host: devbox.example.com
         user: me
+        reachability_check: false
 ";
     let env = net.env(config);
     let t0 = std::time::Instant::now();
     let mut c = Client::start_env(&remote, &session("devbox"), &refs(&env));
     c.wait_for("devbox: devbox.lan does not answer ping within 5s", T);
     c.wait_for(
-        "devbox: devbox.example.com answers ping, using me@devbox.example.com",
+        "devbox: using me@devbox.example.com (reachability_check is off, ",
         T,
     );
     wait_up(&mut c, "s");
     let took = t0.elapsed();
-    assert!(took < std::time::Duration::from_secs(25), "{took:?}");
     assert!(took >= std::time::Duration::from_secs(5), "{took:?}");
+    // The chosen host was never pinged — which is the line above's own
+    // claim, read back from the ping's side. Only the negative half is
+    // asserted: the slow host's ping is killed at the deadline, and on a
+    // machine this busy the shell may not have reached its own first line
+    // by then, so "devbox.lan is in the log" is not a thing this can wait
+    // for (acs-2dc). "devbox.example.com is not" only ever fails when
+    // something really did ping it.
+    assert!(
+        !net.pinged().iter().any(|h| h == "devbox.example.com"),
+        "{:?}",
+        net.pinged()
+    );
 }
 
 #[test]
