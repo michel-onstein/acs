@@ -1392,7 +1392,10 @@ fn serve(
                     }
                 }
                 Msg::Ack { seq } => state.unacked.ack(seq),
-                Msg::Pong(_) => {}
+                // The answer to a question a network change asked, and the
+                // only thing that is (acs-br2): bytes the host wrote before
+                // the network moved are not evidence the link survived it.
+                Msg::Pong(n) => liveness.pong(n),
                 // The master checks on us too (DESIGN §5.3, acs-ode).
                 Msg::Ping(n) => Msg::Pong(n).encode(&mut out),
                 Msg::Exit { status } => {

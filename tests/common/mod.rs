@@ -849,6 +849,13 @@ impl Client {
         self.paused.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The client's own process id, for a test that has to take the CPU
+    /// away from it (`SIGSTOP`) at a moment of its choosing rather than
+    /// hope a loaded machine does it — which is how acs-br2 was reproduced.
+    pub fn pid(&self) -> i32 {
+        self.child.id() as i32
+    }
+
     /// Type bytes.
     pub fn send(&self, bytes: &[u8]) {
         sys::write_all(self.pty.as_raw_fd(), bytes).unwrap();

@@ -650,6 +650,9 @@ sequenceDiagram
   not reading (an emulator stalled, flow control), and the frames read in that
   time are only decoded on the next pass — so judging by the last decode alone
   turned a stalled terminal into a lost link, with `PONG`s waiting in the pipe.
+  The one exception is the deadline a network change brings forward, which
+  only its own `PONG` clears (acs-br2, below): there the bytes in the pipe may
+  be older than the question.
 - The master does the same for its attached client, which answers `PING`
   with `PONG`: a client silent for 10 s is dropped, freeing the pty from
   its backpressure (§4.2). Without it a client that vanished without closing
@@ -762,13 +765,24 @@ sequenceDiagram
   neither closes nor errors: it simply goes quiet. Waiting out the full
   10 s for silence that is already certain is the delay this removes.
   - What happens is a **question, not a redial**: a `PING` goes out at once
-    and the host has `ACS_NETCHECK_MS` (**2 s**) to be heard from —
-    anything read from the link counts, as everywhere in this section, so a
-    program that is producing output has already answered. If it is, the
-    change cost nothing whatever: the link stands, and no byte of what was
-    typed is anywhere near a `WELCOME`. If it is not, the link is dead and
-    the redial of the rule above follows, which is immediate, so a real
+    and the host has `ACS_NETCHECK_MS` (**2 s**) to answer it. If it does,
+    the change cost nothing whatever: the link stands, and no byte of what
+    was typed is anywhere near a `WELCOME`. If it does not, the link is dead
+    and the redial of the rule above follows, which is immediate, so a real
     drop is replaced in 1–2 s rather than 10.
+  - **The answer is the `PONG` for that `PING`, and nothing else**
+    (acs-br2). This is the one place in this section where a byte from the
+    host is *not* proof that it is there, and it took a test failing only
+    on a loaded machine to see why: the frames already in flight when the
+    network moved were written before it moved. They are the frozen link's
+    last gasp. A client that has just lost the CPU — a laptop waking is
+    exactly that — reads them in the same pass of its poll that sends the
+    `PING`, so by the clock they arrive *after* the question was asked
+    however stale they are, and taking them for the answer left a link that
+    was already gone standing for the whole `ACS_DEAD_MS`. A `PONG` for an
+    earlier `PING` is refused on the same ground: it came back over the
+    path that has gone. The nonce is the `PING`'s own timestamp, so the
+    match is a comparison and costs nothing.
   - **Why not redial on the change itself.** Keys typed into a redial are
     discarded (§5.2), so a redial the link did not need is directly
     user-visible: the session blinks, the screen repaints and what was
