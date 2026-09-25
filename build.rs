@@ -25,16 +25,18 @@ fn main() {
     // the usual case — leaves `signature::RELEASE_KEY` at acs's own key,
     // and blank counts as unset, so neither can leave a build with nothing
     // to verify against. A value that is not an ssh public key line fails
-    // the build rather than producing a binary that refuses every release
-    // (`check_release_key`). This is not the runtime `ACS_RELEASE_KEY`,
-    // which keeps its guards (acs-o9v).
+    // the build rather than producing a binary that refuses every release.
+    // What the variable means is `default_release_key`, in the file
+    // included below so the tests can reach it; all that is left here is
+    // the wiring. This is not the runtime `ACS_RELEASE_KEY`, which keeps
+    // its guards (acs-o9v).
     println!("cargo:rerun-if-env-changed=ACS_DEFAULT_RELEASE_KEY");
-    if let Ok(key) = std::env::var("ACS_DEFAULT_RELEASE_KEY") {
-        let key = key.trim();
-        if !key.is_empty() {
-            check_release_key(key);
-            println!("cargo:rustc-env=ACS_DEFAULT_RELEASE_KEY={key}");
-        }
+    println!("cargo:rerun-if-changed=src/release_key.rs");
+    let set = std::env::var("ACS_DEFAULT_RELEASE_KEY").ok();
+    match default_release_key(set.as_deref()) {
+        Ok(Some(key)) => println!("cargo:rustc-env=ACS_DEFAULT_RELEASE_KEY={key}"),
+        Ok(None) => {}
+        Err(why) => panic!("{why}"),
     }
     println!("cargo:rerun-if-env-changed=ACS_PAYLOADS_FILE");
     if std::env::var_os("CARGO_FEATURE_EMBED_PAYLOADS").is_some() {
@@ -46,29 +48,9 @@ fn main() {
     }
 }
 
-/// Stop the build unless `key` is one ssh public key line — a known key
-/// type and a base64 body, as `ssh-keygen` writes into a `.pub` file.
-///
-/// The key *is* the check (`src/signature.rs`): a mistyped one does not
-/// weaken verification — every release then fails to verify, which is the
-/// safe direction — but it is a whole release nobody can install, found by
-/// a user rather than by the person who built it. A second line would be a
-/// second allowed signer, which nobody means to write. Cheaper to refuse
-/// here; the key is read once, when the binary is built.
-fn check_release_key(key: &str) {
-    let mut fields = key.split_whitespace();
-    let kind = fields.next().unwrap_or_default();
-    let body = fields.next().unwrap_or_default();
-    let known = kind.starts_with("ssh-") || kind.starts_with("ecdsa-") || kind.starts_with("sk-");
-    let base64 = body.len() >= 16
-        && body
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=');
-    if key.lines().count() != 1 || !known || !base64 {
-        panic!(
-            "ACS_DEFAULT_RELEASE_KEY must be one ssh public key line, as in \
-             `ssh-ed25519 AAAA... you@example.com` — the contents of a .pub file \
-             (docs/VERSIONING.md, \"Forking\"); got {key:?}"
-        );
-    }
-}
+// `default_release_key`, the one piece of judgement in this file. It is a
+// source include rather than a function here because a build script is not
+// part of the crate and so is not a test target: the crate compiles the
+// same file (`#[cfg(test)] mod release_key`) to test it (acs-okz). Its own
+// `#[cfg(test)]` tests are not compiled into this build script.
+include!("src/release_key.rs");
