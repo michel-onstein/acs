@@ -263,6 +263,9 @@ pub fn identity() -> String {
     })
 }
 
+/// The command key and its window (DESIGN §6.1). `ACS_ESCAPE_TIMEOUT_MS` is
+/// the one window setting: it sets the gap allowed between the two presses,
+/// and `keys::Config` reads the window to choose the command key off it too.
 pub(crate) fn escape_config() -> keys::Config {
     let mut cfg = keys::Config::default();
     if let Some(k) = std::env::var("ACS_ESCAPE_KEY")

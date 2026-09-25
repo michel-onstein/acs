@@ -16,14 +16,18 @@ pub enum Action {
     Exit,
 }
 
+/// The shortest the window to choose the command key ever gets — the old
+/// bare constant, now a floor rather than the whole answer (acs-mq0).
+const COMMAND_FLOOR_MS: u64 = 2000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     /// The legacy control byte of the escape key (Ctrl-] = 0x1D).
     pub byte: u8,
-    /// Max gap between the two escape presses.
+    /// The escape window (`ACS_ESCAPE_TIMEOUT_MS`): the max gap between the
+    /// two escape presses, and — through `command_window_ms` — the window
+    /// to then choose the command key.
     pub window_ms: u64,
-    /// How long command mode waits for the command key.
-    pub command_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -31,12 +35,24 @@ impl Default for Config {
         Config {
             byte: 0x1d,
             window_ms: 400,
-            command_timeout_ms: 2000,
         }
     }
 }
 
 impl Config {
+    /// How long command mode waits for the command key: the configured
+    /// escape window, never less than 2 s (DESIGN §6.1).
+    ///
+    /// One setting covers both halves of the gesture, because someone who
+    /// widens the escape window has said they are slower than the default
+    /// and means the choice too (acs-mq0). It is a floor and not the value
+    /// itself so that *tightening* the double tap — which says nothing
+    /// about how fast the user can pick a key — never takes the 2 s to
+    /// choose away with it.
+    fn command_window_ms(&self) -> u64 {
+        self.window_ms.max(COMMAND_FLOOR_MS)
+    }
+
     /// Codepoint kitty and modifyOtherKeys report for Ctrl+<this key>: the
     /// unshifted character (`^]` → `]`, `^A` → `a`).
     fn codepoint(&self) -> u32 {
@@ -469,7 +485,7 @@ impl Detector {
                 held.extend_from_slice(&bytes);
                 State::Command {
                     bytes: held,
-                    until: now + self.cfg.command_timeout_ms,
+                    until: now + self.cfg.command_window_ms(),
                 }
             }
             (
@@ -676,6 +692,52 @@ mod tests {
         assert_eq!(d.deadline(), Some(2000));
         assert!(d.tick(1999).forward.is_empty());
         assert_eq!(d.tick(2000).forward, vec![CB, CB]);
+    }
+
+    /// Regression (acs-mq0): the configured escape window is the window to
+    /// choose the command key too, not only the gap between the two
+    /// presses. It used to be a bare 2 s constant, so widening the setting
+    /// because 400 ms was too quick relaxed one half of the gesture and
+    /// left the other exactly as it was.
+    #[test]
+    fn the_escape_window_is_also_the_window_to_choose_the_command_key() {
+        let cfg = Config {
+            window_ms: 30_000,
+            ..Config::default()
+        };
+        let mut d = Detector::new(cfg);
+        d.feed(&[CB], 0);
+        d.feed(&[CB], 20_000);
+        assert!(d.armed());
+        assert_eq!(d.deadline(), Some(50_000));
+        // Long past the old 2 s, well inside the configured window.
+        assert!(d.tick(49_999).forward.is_empty());
+        assert_eq!(d.feed(b"d", 49_999).action, Some(Action::Detach));
+
+        // And it still ends: the configured window, not forever.
+        let mut d = Detector::new(cfg);
+        d.feed(&[CB, CB], 0);
+        assert_eq!(d.tick(30_000).forward, vec![CB, CB]);
+        assert!(!d.armed());
+    }
+
+    /// The other direction of acs-mq0: a *tighter* escape window says the
+    /// user wants the double tap crisp, not that they pick a command key in
+    /// under 400 ms — so 2 s is a floor, and the default is untouched.
+    #[test]
+    fn a_tighter_escape_window_keeps_the_two_seconds_to_choose() {
+        let mut d = Detector::new(Config {
+            window_ms: 100,
+            ..Config::default()
+        });
+        d.feed(&[CB, CB], 0);
+        assert_eq!(d.deadline(), Some(2000));
+        assert_eq!(d.feed(b"d", 1999).action, Some(Action::Detach));
+
+        // Unset, both windows are what they always were.
+        let cfg = Config::default();
+        assert_eq!(cfg.window_ms, 400);
+        assert_eq!(cfg.command_window_ms(), 2000);
     }
 
     #[test]
@@ -913,7 +975,6 @@ mod tests {
         let cfg = Config {
             byte: Config::parse_key("^A").unwrap(),
             window_ms: 100,
-            command_timeout_ms: 2000,
         };
         assert_eq!(cfg.byte, 0x01);
         let mut d = Detector::new(cfg);
