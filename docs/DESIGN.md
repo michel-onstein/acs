@@ -1207,7 +1207,7 @@ to the session's ssh alone:
 | `-J <destination>` | jump host(s) |
 | `-F <configfile>` | alternative ssh config file |
 | `-o <option=value>` | any ssh config option; repeatable (e.g. `-o IdentitiesOnly=yes` to use **only** the `-i` key rather than the agent's keys first) |
-| `-L [bind_address:]port:host:hostport` | forward a local port; repeatable — but on the session's connection only, see below |
+| `-L [bind_address:]port:host:hostport` | forward a local port; repeatable — but on the session's connection only, see below. `-L none` drops what the configuration forwards |
 | `[user@]host` | login name in the destination, as with ssh |
 
 - **No `-l`**: ssh's `-l <login>` is not accepted (and `dsh`'s `-l`, its
@@ -1324,7 +1324,32 @@ call, and the one whose value it checks before running any:
   across the session's screen. `acs` parses
   `[bind_address:]port:host:hostport` — an IPv6 literal in `[…]`, an empty
   bind address or `*` for every interface — and refuses a bad one with its
-  own error before spawning anything.
+  own error before spawning anything. A spec from the configuration
+  (`local_forwards`, below) goes through the **same** checker, when the file
+  is read: a bad one is an ordinary configuration error naming its line, not
+  ssh stderr in the middle of a reconnect.
+- **`local_forwards`: the standing case** (acs-odd, §7.2, §7.4). "This host
+  always needs its database forwarded" is a fact about the host, so it
+  belongs in the configuration beside the other per-host facts, not in a
+  command line retyped every time. `local_forwards` is a list of the same
+  specs, globally and per alias, and the alias's list replaces the global
+  one the way every other alias setting does.
+  - **The command line merges with it rather than replacing it**, because
+    `-L` is already repeatable and ssh adds repeated forwards up: naming a
+    port for one session is no reason to lose the standing one. A spec given
+    on both sides is passed once — ssh would bind the first and warn about
+    the second.
+  - **Saying "none".** Merging needs a way to say *no* forward, and there is
+    one spelling of it everywhere: the value `none`. On an alias
+    (`local_forwards: none`, equivalently `[]`) it is a *set* value that
+    replaces the global list with nothing, for good. On the command line
+    `-L none` drops what is configured for that run only, and any other `-L`
+    beside it still applies.
+  - **The order of the two decisions in `client.rs` is load-bearing**: the
+    setting is merged into the `Transport` *before* `mux::configure` looks at
+    it, so a configured forward vetoes the shared master exactly as a typed
+    one does (the bullet below). The other order joins a master happily and
+    leaves the listener bound after acs has gone.
 - **`-o LocalForward=…` still works, and differs.** It is an unchecked
   pass-through like any other `-o`, so it reaches *every* ssh call (the
   duplicate bind above is exactly what it gets wrong), and it takes the
@@ -1339,7 +1364,9 @@ call, and the one whose value it checks before running any:
   bullet promises. Rather than special-case the teardown, a transport
   carrying `-L` (or a `-o LocalForward`/`RemoteForward`/`DynamicForward`)
   starts and joins no master at all, and keeps the connection of its own it
-  has always had. `acs` says which under `-v`.
+  has always had. `acs` says which under `-v`. It makes no difference where
+  the forward came from: a `local_forwards` out of the configuration is on
+  the transport before the master is decided, so it vetoes it the same way.
 - **The forward drops briefly across a redial.** It belongs to the ssh child,
   which dies with the link, and the listening socket goes with it; the next
   dial rebinds it, since the argv is rebuilt from `Transport` every time
@@ -1378,6 +1405,8 @@ redraw_on_reconnect: true      # send Ctrl-L after reconnecting (§5.2)
 reachability_timeout: 500ms    # how long hosts have to answer a ping (§7.3)
 persist: false                 # wait for a lost host, pinging it (§5.3)
 reachability_interval: 5s      # how often a lost host is pinged (§5.3)
+local_forwards:                # ports every session forwards, as -L (§7.1)
+  - 8080:localhost:80
 aliases:                       # acs devbox tries its hosts in order
   devbox:
     - host: devbox.lan
@@ -1397,6 +1426,8 @@ aliases:                       # acs devbox tries its hosts in order
     persist: true              # and this, unless an entry says otherwise
     reachability_interval: 30s # and this
     prefer_local_network: true # hosts on this machine's networks first
+    local_forwards:            # over the global list; `none` for no forward
+      - 5432:db.internal:5432
     hosts:
       - host: lab.lan
 ```
@@ -1425,7 +1456,7 @@ aliases:                       # acs devbox tries its hosts in order
 - **An alias's own settings**: an alias is a list of entries (or one entry,
   a mapping with `host`), or a mapping of its settings — `identity_file`,
   `redraw_on_reconnect`, `reachability_timeout`, `persist`,
-  `reachability_interval` and `prefer_local_network` —
+  `reachability_interval`, `prefer_local_network` and `local_forwards` —
   and its `hosts`, that list. The list form
   stays the usual one; the mapping is only needed for a setting shared by
   the entries. A file may give the mapping without
@@ -1442,6 +1473,17 @@ aliases:                       # acs devbox tries its hosts in order
 - **`persist`** (§5.3) is true or false at three levels: a host entry's
   beats its alias's, which beats the global one; `--persist` and
   `ACS_PERSIST` beat them all.
+- **`local_forwards`** (§7.1, acs-odd) is a list of `-L` specs, globally and
+  on an alias, written as a YAML list or as one value with commas between
+  the specs (`8080:localhost:80, 5432:db:5432`) — a spec has no comma in it,
+  so the two forms mean the same. The alias's list replaces the global one;
+  the value `none` (or `[]`) is the empty list, which is a *setting* and so
+  says "nothing at all", where an empty value (`local_forwards:`) sets
+  nothing and leaves the global list in place. Each spec is checked when the
+  file is read, by the checker `-L` uses, and the command line's own `-L`
+  specs are added to whatever is left. It is never a **host entry's**
+  setting: a forward belongs to the session, not to one of the addresses
+  the session might be reached at.
 - Only the local client reads the files; `_proxy`, `_master` and `_install`
   never do.
 
@@ -1715,13 +1757,17 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`); `set` checks the type |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`); `set` checks the type |
 | `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
 | `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check] [--prefer] [--persist] [--local-networks N,N]` | append an entry, so repeated adds give an alias its fallback hosts in order. `--local-networks` is checked as the file form is (§7.3) and written back masked |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
-| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
+| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false`, `local_forwards <spec>,<spec>\|none` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
 | `path` | the two files and whether they exist |
 
+- A setting that is a **list** — `local_forwards` (§7.1) — is given to `set`
+  as one value with commas between its items, since an argument is one
+  value; it is written back as a one-line YAML list, read back by `get` in
+  the comma form again, and `none` is the empty list at both ends.
 - Edits go to the local file; `--global` edits the global one (and needs
   write access to it — the error says to use sudo).
 - An edit changes the YAML tree (`yaml.rs`), not the text, so comments,

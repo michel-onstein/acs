@@ -43,7 +43,8 @@ ssh options:
                       passed to every ssh call acs makes
   -L [bind:]port:host:hostport
                       forward a local port, as ssh -L does; repeatable,
-                      and on the session's own connection alone
+                      and on the session's own connection alone. Joins the
+                      local_forwards of the configuration; -L none drops those
 
 in a session: Ctrl-] Ctrl-] then  d  detach (session keeps running)
                                   x  exit (ends the session)
@@ -89,6 +90,9 @@ pub struct ClientArgs {
     pub alias: Option<String>,
     /// The index of the alias's entry in use, once one was chosen.
     pub entry: Option<usize>,
+    /// `-L none`: the configuration's `local_forwards` (§7.2) do not apply
+    /// to this session, only the `-L` specs given here (acs-odd).
+    pub no_configured_forwards: bool,
 }
 
 impl ClientArgs {
@@ -135,6 +139,7 @@ where
     let mut p = lexopt::Parser::from_args(args);
     let mut user_opts: Vec<OsString> = Vec::new();
     let mut local_forwards: Vec<String> = Vec::new();
+    let mut no_configured_forwards = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut new = false;
     let mut reconnect = true;
@@ -175,8 +180,14 @@ where
             // ssh, per dial, on the session's terminal.
             Short('L') => {
                 let spec = text(p.value().map_err(|e| e.to_string())?, "-L")?;
-                crate::ssh::check_local_forward(&spec)?;
-                local_forwards.push(spec);
+                // `-L none` drops the configured `local_forwards` (acs-odd)
+                // rather than naming a forward; any other -L still applies.
+                if spec.eq_ignore_ascii_case(crate::config::NO_FORWARDS) {
+                    no_configured_forwards = true;
+                } else {
+                    crate::ssh::check_local_forward(&spec)?;
+                    local_forwards.push(spec);
+                }
             }
             // Listing is the `acs list` command; ssh's -l <login> was never
             // taken.
@@ -263,6 +274,7 @@ where
         config: Config::default(),
         alias: None,
         entry: None,
+        no_configured_forwards,
     });
     Ok(match host {
         Some(_) => Parsed::Run(args),
@@ -439,6 +451,29 @@ mod tests {
         assert!(e.contains("bad -L"), "{e}");
         let e = run(&["-L", "box"]).unwrap_err();
         assert!(e.contains("bad -L 'box'"), "{e}");
+    }
+
+    /// acs-odd: `-L none` names no forward — it says the configuration's
+    /// `local_forwards` do not apply to this run. Any other `-L` beside it
+    /// still does.
+    #[test]
+    fn dash_l_none_drops_the_configured_forwards() {
+        let a = run(&["box"]).unwrap();
+        assert!(!a.no_configured_forwards);
+
+        for spelling in ["none", "NONE", "None"] {
+            let a = run(&["-L", spelling, "box"]).unwrap();
+            assert!(a.no_configured_forwards, "{spelling}");
+            assert!(a.transport.local_forwards.is_empty(), "{spelling}");
+        }
+        let a = run(&["-L", "none", "-L", "9000:localhost:9000", "box"]).unwrap();
+        assert!(a.no_configured_forwards);
+        assert_eq!(a.transport.local_forwards, ["9000:localhost:9000"]);
+        // `acs list` may attach the session it picks, so it takes it too.
+        match list(&["-L", "none"]).unwrap() {
+            Parsed::ListAll(a) => assert!(a.no_configured_forwards),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

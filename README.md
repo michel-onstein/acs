@@ -235,9 +235,9 @@ ends the shared one on its way, but only when what ended the link says the
 link that broke while bytes were still arriving on it took nothing else
 with it, and any other session sharing that connection keeps it rather than
 being dropped and losing what you had typed. A session that forwards a port
-(`-L`, below) does not use it either — a forward opened on a shared
-connection would outlive the session. `ACS_CONTROL_PERSIST=0` turns the
-whole thing off, and `-v`
+(`-L` or `local_forwards`, below) does not use it either — a forward opened
+on a shared connection would outlive the session. `ACS_CONTROL_PERSIST=0`
+turns the whole thing off, and `-v`
 says what acs decided and how long each phase took.
 
 ### Forwarding a port
@@ -269,6 +269,30 @@ once a session is running.
 `-o LocalForward="8080 localhost:80"` still works too, and is the way to
 forward a unix socket, but it goes to *every* ssh call acs makes (so
 several may fight over one port) and is passed to ssh unchecked.
+
+**A forward a host always needs** belongs in the configuration rather than
+in a command line you retype: `local_forwards` takes the same specs,
+globally or on one alias.
+
+```yaml
+local_forwards: [8080:localhost:80]   # every session
+aliases:
+  db:
+    local_forwards: 5432:db.internal:5432   # this alias instead
+    hosts:
+      - host: db.lan
+  quiet:
+    local_forwards: none                    # this one forwards nothing
+    hosts:
+      - host: quiet.lan
+```
+
+The two **add up**: `acs -L 9000:localhost:9000 db` forwards 9000 as well as
+the configured 5432, the way repeated `-L` does. To say *no* forward there
+is one word, `none`: on an alias it replaces the global list with nothing,
+and `acs -L none db` drops the configured ones for that run (any other `-L`
+you give still applies). A bad spec in the file is an error the moment acs
+reads it, naming the line — not ssh complaining on every dial.
 
 ### When the network drops
 
@@ -392,7 +416,8 @@ into it (`host unset` of its last setting turns it back into a list).
 | `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
 | `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
-| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist` and `local_networks` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`) and its `hosts` |
+| `local_forwards` | ports every session forwards, as `-L` spells them: a list, or one value with commas (`8080:localhost:80,5432:db:5432`); `none` for no forward (default). An alias's own list replaces the global one, and `-L` on the command line adds to it |
+| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist` and `local_networks` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`) and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -539,6 +564,10 @@ acs config host set devbox prefer_local_network true  # devbox.lan first at home
 acs config host add devbox devbox.site --local-networks 172.16.0.0/16
                                                       # first when I am on that
 acs config set reachability_timeout 250ms             # pings must answer within 250 ms
+acs config set local_forwards 8080:localhost:80       # every session forwards it
+acs config host set db local_forwards 5432:db.internal:5432,8080:localhost:80
+                                                      # db's own, over the global list
+acs config host set quiet local_forwards none         # quiet forwards nothing
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default
 acs config show                                       # everything, and where it is from
