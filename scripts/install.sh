@@ -20,9 +20,25 @@
 #                         Must be https unless ACS_ALLOW_INSECURE_URL=1, and
 #                         it is ignored when running through sudo (acs-95w).
 #   ACS_ALLOW_INSECURE_URL=1  accept a releases URL that is not https
+#
+# There is deliberately no ACS_RELEASE_KEY (acs-x57). acs itself takes one,
+# but only for a channel that ACS_RELEASES_URL has already redirected, and
+# only because the guards that make that safe -- https, no privilege
+# boundary, --allow-insecure-url on the *command line* -- exist there. This
+# script is fetched over the network and piped into sh, often as root: it
+# has no command line to put an explicit opt-out on, so every knob it could
+# offer is an environment variable, which is what acs refused. It therefore
+# checks against the key baked in below, and nothing else; a release signed
+# by another key is refused, not installed (docs/VERSIONING.md, "Forking").
 set -eu
 
-default_releases=https://github.com/michel-onstein/acs/releases
+# `cargo xtask package` rewrites this assignment and the release_key one
+# below when it copies this script into a release, so a fork's packaged
+# installer points at the fork's releases and carries the fork's key with
+# no edit to this file (acs-x57, docs/VERSIONING.md "Forking"). Each must
+# stay a single assignment at the start of a line of its own: packaging
+# fails rather than shipping a stale value if either moves.
+default_releases='https://github.com/michel-onstein/acs/releases'
 releases=${ACS_RELEASES_URL:-$default_releases}
 # What is fetched from here is checked only against a SHA256SUMS from the
 # same place, and is then installed and run. So: not across a privilege
@@ -91,7 +107,8 @@ fi
 # cannot run it cannot run acs -- and the key below is the public half of
 # the key that signs acs releases. It is in the binary too, and in the
 # Homebrew tap, which is a repository of its own to check it against.
-release_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILbxQW5C9X7CdwcQ4bab0gsQi4Evk2xfgmI/972dlHCb acs release signing"
+# Rewritten by `cargo xtask package`, like default_releases above.
+release_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILbxQW5C9X7CdwcQ4bab0gsQi4Evk2xfgmI/972dlHCb acs release signing'
 command -v ssh-keygen >/dev/null 2>&1 ||
     die "need ssh-keygen to check the release signature (it comes with ssh, which acs requires)"
 

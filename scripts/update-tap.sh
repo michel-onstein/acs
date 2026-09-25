@@ -10,6 +10,8 @@
 # is unchanged, or older than the tap's, is left alone. --dry-run shows the
 # change and pushes nothing. ACS_TAP_REPO names another tap repository (the
 # tests use a local one). Pushing to GitHub uses gh's token (GH_TOKEN works).
+# ACS_RELEASES_URL says where a vX.Y.Z argument's SHA256SUMS is fetched from,
+# for a fork rendering its own formula (acs-x57).
 set -eu
 
 usage() {
@@ -28,6 +30,7 @@ for a in "$@"; do
 done
 [ -n "$arg" ] || usage
 repo=${ACS_TAP_REPO:-https://github.com/michel-onstein/homebrew-acs.git}
+releases=${ACS_RELEASES_URL:-https://github.com/michel-onstein/acs/releases}
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/acs-tap.XXXXXX")
 trap 'rm -rf "$work"' EXIT
@@ -35,8 +38,7 @@ trap 'rm -rf "$work"' EXIT
 case "$arg" in
     v[0-9]*)
         # A version: render its formula from the published SHA256SUMS.
-        curl -fsSL -o "$work/SHA256SUMS" \
-            "https://github.com/michel-onstein/acs/releases/download/$arg/SHA256SUMS"
+        curl -fsSL -o "$work/SHA256SUMS" "$releases/download/$arg/SHA256SUMS"
         (cd "$(dirname "$0")/.." && cargo xtask formula --version "$arg" \
             --sums "$work/SHA256SUMS" --out "$work/acs.rb")
         formula=$work/acs.rb

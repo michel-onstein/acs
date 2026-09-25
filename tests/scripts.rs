@@ -378,36 +378,43 @@ fn the_installer_takes_only_an_x_y_z_version_from_the_sums() {
     }
 }
 
-/// acs-o9v: the installer carries the same release key as the binary, and
-/// checks the signature before it reads the checksums. Two copies of a key
-/// drift; this is the guard against that.
+/// acs-o9v, acs-x57: the installer in the repository carries acs's own
+/// release key and acs's own releases, and checks the signature before it
+/// reads the checksums. Two copies of a key drift; this is the guard
+/// against that.
+///
+/// These are the *source* script's values — what someone who fetches
+/// `scripts/install.sh` from this repository gets. The copy published with
+/// a release is not this file: `cargo xtask package` substitutes the
+/// build's URL and key into it, and the other half of this guard —
+/// `package::the_packaged_installer_carries_this_builds_url_and_key` —
+/// holds that copy against the binary for *every* build, a fork's
+/// included, which this test cannot do from here.
 #[test]
 fn the_installer_carries_the_same_release_key_and_checks_before_reading() {
     let script =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
             .unwrap();
-    let key = script
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("release_key="))
-        .expect("the installer names a release key")
-        .trim_matches('"')
-        .to_string();
-    // The script is copied into each release as it is, so it carries acs's
-    // own key rather than this build's: a fork edits that line as it edits
-    // the script's default releases URL (acs-ktm, VERSIONING.md
-    // "Forking"). In every build but a fork's the two are one key.
+    // Both values sit in one single-quoted assignment at the start of a
+    // line, which is what lets them be substituted; `install_script`
+    // refuses to package a script where that has stopped being true.
+    let value = |name: &str| {
+        let prefix = format!("{name}='");
+        script
+            .lines()
+            .find_map(|l| l.strip_prefix(&prefix)?.strip_suffix('\''))
+            .unwrap_or_else(|| panic!("the installer has no single-quoted {name} assignment"))
+    };
     assert_eq!(
-        key,
+        value("release_key"),
         acs::signature::UPSTREAM_RELEASE_KEY,
         "the installer's release key is not acs's own"
     );
-    if acs::signature::RELEASE_KEY == acs::signature::UPSTREAM_RELEASE_KEY {
-        assert_eq!(
-            key,
-            acs::signature::RELEASE_KEY,
-            "the installer's release key is not the one built into acs"
-        );
-    }
+    assert_eq!(
+        value("default_releases"),
+        acs::release::UPSTREAM_RELEASES_URL,
+        "the installer's default releases are not acs's own"
+    );
     // The identity and the namespace must match too, or a signature this
     // binary accepts is one the installer rejects.
     assert!(

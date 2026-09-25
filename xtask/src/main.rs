@@ -24,6 +24,7 @@ use std::process::{exit, Command};
 mod bump;
 mod formula;
 mod package;
+mod upstream;
 
 const LINUX: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
 const MAC: &[&str] = &["aarch64-apple-darwin", "x86_64-apple-darwin"];

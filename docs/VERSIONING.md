@@ -2,9 +2,10 @@
 
 **Status:** Built — `scripts/version-bump.sh` (`cargo xtask bump`),
 `scripts/release-binaries.sh` (`cargo xtask package`) and
-`scripts/update-tap.sh` (`cargo xtask formula`). Of the fork knobs
-("Forking"), the build-time releases URL, the build-time signing key and
-`ACS_TAP_REPO` are built; the rest are source edits.
+`scripts/update-tap.sh` (`cargo xtask formula`). The fork knobs ("Forking")
+are all built: a fork publishes a complete release — binaries, packaged
+installer, Homebrew formula and notes — without editing a tracked source
+file (acs-x57).
 
 acs follows semantic versioning, and the version moves **automatically** after
 every merge to `main`. The version lives in `Cargo.toml` (and so in
@@ -80,8 +81,10 @@ Every release is published on
   `aarch64-unknown-linux-musl` — the complete builds, each holding
   `acs-<version>-<target>/acs` and the README;
 - `SHA256SUMS` over the archives;
-- `install.sh`, the one-line installer (`scripts/install.sh` at the tag), so
-  `…/releases/latest/download/install.sh` always names the newest one;
+- `install.sh`, the one-line installer (`scripts/install.sh` at the tag, with
+  this build's releases URL and release key substituted in — "The packaged
+  installer"), so `…/releases/latest/download/install.sh` always names the
+  newest one;
 - notes with install instructions and the changes since the previous release.
 
 `scripts/version-bump.sh` publishes them right after it tags a release;
@@ -116,7 +119,14 @@ renders the formula from the release's `SHA256SUMS`
 - `scripts/update-tap.sh vX.Y.Z` renders and pushes that release's formula
   from its published `SHA256SUMS` — the way to retry if the push failed
   after the release was published. `ACS_TAP_REPO` points it at another
-  repository (the tests use a local one).
+  repository (the tests use a local one) and `ACS_RELEASES_URL` at another
+  release channel to read that `SHA256SUMS` from.
+
+The formula's homepage and download URLs are the build's
+`DEFAULT_RELEASES_URL` ("Forking"), so a fork's tap points at the fork. It
+reads a release back out of those URLs to decide whether the tap would move
+backwards, which wants the `…/releases/download/vX.Y.Z/…` shape GitHub and
+GitLab both publish under.
 
 The formula is generated: change `xtask/src/formula.rs`, not the tap. A
 Homebrew install is brew's to replace — its real path is in a `Cellar` —
@@ -125,24 +135,32 @@ update message (DESIGN §7.5, §7.6).
 
 ## Forking
 
-A fork that publishes its own releases has to point five things at itself.
-The first two are decided when the binary is built, and belong together; the
-rest are the release machinery, and are read from the environment or edited
-in the fork's source.
+A fork that publishes its own releases points **three** things at itself, and
+**edits no tracked source file**. Two are decided when the binary is built and
+belong together; the third is the tap.
 
-| Knob | Where | How |
+| Knob | Reaches | How |
 | --- | --- | --- |
-| The releases a binary updates from | `release::DEFAULT_RELEASES_URL` | build with `ACS_DEFAULT_RELEASES_URL=https://github.com/you/acs/releases` |
-| The release signing key | `signature::RELEASE_KEY` | build with `ACS_DEFAULT_RELEASE_KEY="$(cat release_key.pub)"` |
-| The tap that is pushed | `scripts/update-tap.sh` | `ACS_TAP_REPO=https://github.com/you/homebrew-acs.git` |
-| The formula's homepage and download URLs | `REPO` in `xtask/src/formula.rs` | edit |
-| The install instructions in the release notes | `xtask/src/package.rs` | edit |
+| The releases a binary updates from | `release::DEFAULT_RELEASES_URL`, the packaged `install.sh`, the formula's homepage and download URLs, the notes' install instructions | build with `ACS_DEFAULT_RELEASES_URL=https://github.com/you/acs/releases` |
+| The release signing key | `signature::RELEASE_KEY`, the packaged `install.sh`, the formula's comment header | build with `ACS_DEFAULT_RELEASE_KEY="$(cat release_key.pub)"` |
+| The tap that is pushed | `scripts/update-tap.sh`, the notes' `brew install` line | `ACS_TAP_REPO=https://github.com/you/homebrew-acs.git`, or `ACS_NO_TAP=1` for no tap at all |
 
 ```sh
-ACS_DEFAULT_RELEASES_URL=https://github.com/you/acs/releases \
-ACS_DEFAULT_RELEASE_KEY="$(cat release_key.pub)" \
-    cargo xtask dist
+export ACS_DEFAULT_RELEASES_URL=https://github.com/you/acs/releases
+export ACS_DEFAULT_RELEASE_KEY="$(cat release_key.pub)"
+export ACS_TAP_REPO=https://github.com/you/homebrew-acs.git
+scripts/release-binaries.sh
 ```
+
+**Set them for the whole release, not for one step.** `cargo xtask package`
+and `cargo xtask formula` read the same two build-time values as the
+binaries — xtask links the `acs` library, so `build.rs` gives it the same
+`DEFAULT_RELEASES_URL` and `RELEASE_KEY` — which is what lets the packaged
+installer, the formula and the notes follow a fork with no edit. A `dist`
+built with the variables and a `package` run without them would produce
+binaries that update from the fork beside an installer that installs
+upstream; `scripts/release-binaries.sh` runs every step in one environment,
+and `package` prints the URL and key it substituted.
 
 The build-time URL is what `acs upgrade` and the weekly update check look at
 when nothing overrides them, and the one-line installer named in the "acs is
@@ -176,11 +194,52 @@ it carries none of the limits on the runtime `ACS_RELEASE_KEY` override —
 which is read only for a channel that has itself been redirected, and is
 untouched here (DESIGN §7.5).
 
-`scripts/install.sh` has its own default releases URL, the upstream one, and
-its own copy of acs's key, and honours `ACS_RELEASES_URL` (over https, not
-under sudo) but nothing for the key. A fork publishing its own installer as a
-release asset edits those two lines; neither build-time variable reaches
-them, because the script is copied into the release as it is.
+### The packaged installer
+
+`scripts/install.sh` in the repository carries the upstream releases URL and
+acs's own key — it is upstream's installer, and someone who fetches it from
+here gets upstream's acs. The copy published as a release asset is **not**
+that file: `cargo xtask package` substitutes the build's
+`DEFAULT_RELEASES_URL` and `RELEASE_KEY` into the two assignments it names,
+so a fork's `…/releases/latest/download/install.sh` installs the fork's acs
+and checks the fork's signature (acs-x57).
+
+- Each value is written as **one single-quoted assignment at the start of a
+  line**. Single quotes are what make the substitution safe: `sh` expands
+  nothing inside them, so a build-time value becomes exactly that string and
+  can never become a command, whatever is in it. A value with a line break
+  is refused, because it could not be read back.
+- If either line ever moves, or comes to be written twice, **packaging
+  fails** rather than publishing an installer that quietly kept acs's key.
+  `package` also reads both values back out of what it is about to write and
+  compares them with what it meant to put there.
+- Two tests hold the ends together:
+  `scripts::the_installer_carries_the_same_release_key_and_checks_before_reading`
+  keeps the checked-in script on acs's own URL and key, and
+  `package::the_packaged_installer_carries_this_builds_url_and_key` holds the
+  packaged copy against `RELEASE_KEY` and `DEFAULT_RELEASES_URL` for every
+  build, a fork's included.
+
+**There is deliberately no `ACS_RELEASE_KEY` for the installer**, although
+`ACS_RELEASES_URL` is honoured (https only, ignored under sudo) and acs
+itself takes a key override. It is not an oversight, and the substitution
+does not change the answer:
+
+- acs reads `ACS_RELEASE_KEY` **only for a channel `ACS_RELEASES_URL` has
+  already redirected**, and only because the guards that make that safe exist
+  there: https, ignored across a privilege boundary, and `--allow-insecure-url`
+  **on the command line** — deliberately not an environment variable, since
+  whoever set the URL would set that too.
+- The installer has no command line. It is fetched over the network and piped
+  into `sh`, often as root, so every knob it could offer is an environment
+  variable — exactly the thing acs refused for the key. The one guard it
+  could not reproduce is the one that matters.
+- It costs nothing. A mirror signed by another key is still installable: the
+  fork packages its own installer with its own key baked in, or a user
+  downloads the archive and checks `SHA256SUMS` by hand. Without an override
+  the installer fails closed — a release signed by another key is refused,
+  not installed — and exactly one key is ever in play in a packaged
+  installer, which is what lets the drift guard be an equality.
 
 ## Options
 
