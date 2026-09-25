@@ -10,7 +10,10 @@
 //! bytes to the terminal and hands the same bytes to [`ModeObserver::observe`].
 //! It also knows where the stream is between sequences and characters
 //! ([`ModeObserver::at_boundary`]), the only place the client may put a byte
-//! of its own, the command-mode bell (DESIGN §6.1).
+//! of its own, the command-mode bell (DESIGN §6.1) — and, for a write that
+//! cannot wait for one, how to step out of the sequence the stream is in and
+//! back into it ([`ModeObserver::interrupt_sequence`],
+//! [`ModeObserver::reopen_sequence`], DESIGN §7, acs-p4u).
 
 use std::collections::BTreeMap;
 
@@ -50,6 +53,9 @@ enum Lex {
 pub struct ModeObserver {
     lex: Option<Lex>,
     seq: Vec<u8>,
+    /// The CSI now being read was longer than `seq` keeps, so its bytes
+    /// are no longer all here to write again ([`ModeObserver::reopen_sequence`]).
+    seq_full: bool,
     /// DEC modes currently different from their default: mode → value.
     dec: BTreeMap<u16, bool>,
     /// Kitty keyboard flags pushed with `CSI > flags u` and not popped.
@@ -64,6 +70,8 @@ pub struct ModeObserver {
     scroll_region: bool,
     /// Continuation bytes still due for a UTF-8 character.
     utf8_left: u8,
+    /// The bytes of that character seen so far.
+    utf8: Vec<u8>,
 }
 
 impl ModeObserver {
@@ -83,7 +91,9 @@ impl ModeObserver {
     pub fn resync(&mut self) {
         self.lex = None;
         self.seq.clear();
+        self.seq_full = false;
         self.utf8_left = 0;
+        self.utf8.clear();
     }
 
     /// True when the terminal is believed to be in its default state.
@@ -122,19 +132,86 @@ impl ModeObserver {
         }
     }
 
+    /// Bytes that end whatever the stream has left unfinished, for a write
+    /// of acs's own that cannot wait for a boundary — the status line, the
+    /// resets on the way out, the clear a reattach writes (DESIGN §7,
+    /// acs-p4u). Empty at a boundary.
+    ///
+    /// `ESC \` (ST) is the one answer that works for every state: it is the
+    /// defined terminator of an OSC, DCS, APC, PM or SOS string, and its ESC
+    /// alone cancels a half-written CSI or character, since ESC starts a new
+    /// sequence from any state. Written at a boundary it would be an ST with
+    /// no string open, which terminals ignore — but it is not written there.
+    pub fn interrupt_sequence(&self) -> &'static [u8] {
+        match self.at_boundary() {
+            true => b"",
+            false => b"\x1b\\",
+        }
+    }
+
+    /// Bytes that put the terminal back inside the sequence
+    /// [`ModeObserver::interrupt_sequence`] ended, for a caller whose write
+    /// is only passing through and whose stream carries on afterwards: the
+    /// program's next byte then means what the program meant by it.
+    ///
+    /// `None` where acs cannot do that faithfully, and the rest of the
+    /// sequence will be read as text:
+    ///
+    /// - an OSC/DCS/APC/PM/SOS string, whose body the terminal may already
+    ///   have acted on (a DCS is passed through as it arrives, and ending
+    ///   one dispatches what there is of it) — writing it again would do it
+    ///   twice, which is worse than the junk;
+    /// - a CSI longer than the 64 parameter bytes kept here, whose bytes are
+    ///   no longer all known.
+    pub fn reopen_sequence(&self) -> Option<Vec<u8>> {
+        match self.lex.unwrap_or(Lex::Ground) {
+            // Nothing open, or a character half read: its bytes have done
+            // nothing yet, so writing them again costs only the replacement
+            // character the interrupted one leaves behind.
+            Lex::Ground => match self.utf8_left {
+                0 => Some(Vec::new()),
+                _ => Some(self.utf8.clone()),
+            },
+            Lex::Esc => Some(b"\x1b".to_vec()),
+            Lex::Csi if !self.seq_full => {
+                let mut out = b"\x1b[".to_vec();
+                out.extend_from_slice(&self.seq);
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// An ESC starts a sequence: forget the one it interrupted, if any.
+    fn start_seq(&mut self) {
+        self.seq.clear();
+        self.seq_full = false;
+    }
+
     fn step(&mut self, b: u8) {
         let lex = self.lex.unwrap_or(Lex::Ground);
         self.lex = Some(match lex {
             Lex::Ground => {
-                self.utf8_left = match b {
-                    0x80..=0xbf => self.utf8_left.saturating_sub(1),
-                    0xc2..=0xdf => 1,
-                    0xe0..=0xef => 2,
-                    0xf0..=0xf4 => 3,
-                    _ => 0,
-                };
+                match b {
+                    0x80..=0xbf => {
+                        if self.utf8_left > 0 {
+                            self.utf8.push(b);
+                        }
+                        self.utf8_left = self.utf8_left.saturating_sub(1);
+                    }
+                    0xc2..=0xf4 => {
+                        self.utf8_left = match b {
+                            0xc2..=0xdf => 1,
+                            0xe0..=0xef => 2,
+                            _ => 3,
+                        };
+                        self.utf8.clear();
+                        self.utf8.push(b);
+                    }
+                    _ => self.utf8_left = 0,
+                }
                 if b == 0x1b {
-                    self.seq.clear();
+                    self.start_seq();
                     Lex::Esc
                 } else {
                     Lex::Ground
@@ -163,14 +240,17 @@ impl ModeObserver {
                 if (0x20..=0x3f).contains(&b) {
                     if self.seq.len() < 64 {
                         self.seq.push(b);
+                    } else {
+                        self.seq_full = true;
                     }
                     Lex::Csi
                 } else if (0x40..=0x7e).contains(&b) {
                     let body = std::mem::take(&mut self.seq);
+                    self.seq_full = false;
                     self.csi(&body, b);
                     Lex::Ground
                 } else if b == 0x1b {
-                    self.seq.clear();
+                    self.start_seq();
                     Lex::Esc
                 } else {
                     // C0 controls inside CSI are executed; keep lexing.
@@ -404,6 +484,68 @@ mod tests {
         // What follows is read from the ground, not as the old title.
         o.observe(b"\x1b[?2004h");
         assert!(o.reset_sequence().starts_with(b"\x1b[?1000l\x1b[?2004l"));
+    }
+
+    /// acs-p4u: what acs writes around a write of its own that cannot wait
+    /// for a boundary. At a boundary there is nothing to write; inside a
+    /// sequence, an ST ends it, and it is re-opened byte for byte where the
+    /// terminal cannot have acted on it yet.
+    #[test]
+    fn a_sequence_is_ended_and_given_back() {
+        let around = |bytes: &[u8]| {
+            let mut o = ModeObserver::new();
+            o.observe(bytes);
+            (o.interrupt_sequence().to_vec(), o.reopen_sequence())
+        };
+        let ended = |give_back: &[u8]| (b"\x1b\\".to_vec(), Some(give_back.to_vec()));
+        let open = (Vec::new(), Some(Vec::new()));
+        // Nothing open: nothing written, either side.
+        assert_eq!(around(b"plain \x1b[1;31m text"), open);
+        // A CSI: its parameters and intermediates, in order, with the C0
+        // controls the terminal has already executed left out.
+        assert_eq!(around(b"\x1b[1;31"), ended(b"\x1b[1;31"));
+        assert_eq!(around(b"\x1b[?1049"), ended(b"\x1b[?1049"));
+        assert_eq!(around(b"\x1b[1;\r31"), ended(b"\x1b[1;31"));
+        // A lone ESC, and an ESC that ended a CSI of its own.
+        assert_eq!(around(b"\x1b"), ended(b"\x1b"));
+        assert_eq!(around(b"\x1b[1;2\x1b"), ended(b"\x1b"));
+        // A character half read: the bytes of it that came.
+        assert_eq!(around("caf\u{e9}".as_bytes()), open);
+        assert_eq!(around(b"caf\xc3"), ended(b"\xc3"));
+        assert_eq!(around(b"\xf0\x9f\x98"), ended(b"\xf0\x9f\x98"));
+        // A string: ended, never given back — the terminal may already
+        // have acted on its body.
+        for string in [
+            &b"\x1b]2;half a tit"[..],
+            b"\x1bPq#0;2;0;0;0",
+            b"\x1b_Gf=100,a=T;AAAA",
+            b"\x1b]2;title\x1b",
+        ] {
+            let (interrupt, reopen) = around(string);
+            assert_eq!(interrupt, b"\x1b\\", "{string:?}");
+            assert_eq!(reopen, None, "{string:?}");
+        }
+        // A CSI longer than the parameters kept here is no longer all
+        // known, so it is not written again either.
+        let long = format!("\x1b[{}", "1;".repeat(40));
+        assert_eq!(around(long.as_bytes()), (b"\x1b\\".to_vec(), None));
+        // And the sequence that fills it is forgotten when it ends.
+        let mut o = ModeObserver::new();
+        o.observe(long.as_bytes());
+        o.observe(b"m\x1b[1;2");
+        assert_eq!(o.reopen_sequence().unwrap(), b"\x1b[1;2");
+    }
+
+    /// The bytes of a half-read character are forgotten with the rest of
+    /// the stream's place in it (acs-xk4, acs-p4u).
+    #[test]
+    fn resync_forgets_a_half_read_character() {
+        let mut o = ModeObserver::new();
+        o.observe(b"caf\xc3");
+        o.resync();
+        assert!(o.at_boundary());
+        assert_eq!(o.interrupt_sequence(), b"");
+        assert_eq!(o.reopen_sequence().unwrap(), b"");
     }
 
     #[test]

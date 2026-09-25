@@ -435,6 +435,12 @@ fn offline(
 
 /// One line on the bottom row (cursor saved and restored) and the window
 /// title, pushed on the xterm title stack so the program's comes back.
+///
+/// The cursor and the title come back; so does the stream. The line goes up
+/// **because** the link died, which may well have been in the middle of a
+/// sequence the last frame opened, and a line written into one is read as
+/// part of it. So it goes out through [`client::write_over_stream`], which
+/// ends that sequence first and re-opens it afterwards (acs-p4u, DESIGN §7).
 fn show_status(state: &mut State, msg: &str) {
     let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
     let mut out = Vec::new();
@@ -445,7 +451,7 @@ fn show_status(state: &mut State, msg: &str) {
     out.extend_from_slice(
         format!("\x1b7\x1b[{rows};1H\x1b[2K\x1b[7macs: {msg}\x1b[0m\x1b8").as_bytes(),
     );
-    let _ = sys::write_all(1, &out);
+    client::write_over_stream(state, &out);
     state.status_shown = true;
     crate::tty::set_status_shown(true);
 }
@@ -453,11 +459,16 @@ fn show_status(state: &mut State, msg: &str) {
 /// Take the title back (pop the stack) and blank the status row, if we
 /// drew them. Every way out of the client passes here (`client::leave`),
 /// so a session that ends during an outage leaves no trace (acs-qrn).
+///
+/// Written the way the line itself was (acs-p4u): a resume carries on where
+/// the stream stopped, so this hands it back there. On the way out
+/// `client::leave` ends it instead, and a reattach that is not a resume ends
+/// it too — both after this.
 pub fn clear_status(state: &mut State) {
     if state.status_shown {
         let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
         let out = format!("\x1b[23;0t\x1b7\x1b[{rows};1H\x1b[2K\x1b8");
-        let _ = sys::write_all(1, out.as_bytes());
+        client::write_over_stream(state, out.as_bytes());
         state.status_shown = false;
         crate::tty::set_status_shown(false);
     }
