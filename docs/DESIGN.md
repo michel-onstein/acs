@@ -862,7 +862,11 @@ lossless resume will not repaint it. So:
 2. Once declared dead, write one status line on the bottom row using
    save-cursor / restore-cursor, and set the window title with the xterm title
    stack (push `CSI 22;0 t`, pop `CSI 23;0 t`) so the remote's title comes
-   back afterwards.
+   back afterwards. The link died where it died, which may be inside a
+   sequence the last frame opened, so the line is written **over** that
+   sequence and not into it: ended with an `ST` before it and written again
+   after it (§7, acs-p4u). The cursor, the title and the stream all come
+   back.
 3. After a successful resume that followed a printed status line, force one
    redraw to clean up the line: the client sends two RESIZE frames (one row
    fewer, then the real size), since an unchanged size raises no `SIGWINCH`.
@@ -1064,6 +1068,11 @@ still in them, so a later detach still resets them. A **fresh** attach to
 another program (the session was restarted) writes the old program's resets
 before clearing the screen and forgetting them.
 
+The observer also knows *where in a sequence* the stream is: between them
+(the boundary a bell or an `acs:` note waits for, §6.1, §7), and, for a write
+that cannot wait, which bytes end the open sequence and which write it again
+(§7, acs-p4u).
+
 ## 7. Client
 
 - Argument parsing matches `dsh`: `acs [ssh options] [user@]<host> [session]
@@ -1112,13 +1121,65 @@ before clearing the screen and forgetting them.
     the wait ends after `ACS_NOTE_HOLD_MS` (500 ms) or when the frame loop
     does, whichever comes first, and the note is then written where it
     stands. Late and ugly beats lost.
-  - The status line (§5.4) writes to fd 1 and has a convention of its own —
-    the bottom row, cursor saved and restored, the title pushed on the xterm
-    stack — but it is about *placement*, not about boundaries, and it is put
-    up after a link is lost, which may be in the middle of a sequence the
-    last frame opened. Same for the reset `leave` writes and the clear a
-    resume writes. That is the same hazard in a narrower window and is not
-    fixed here.
+  - The status line (§5.4) and the other writes acs makes to fd 1 cannot
+    wait for a boundary at all, and step out of the sequence and back in
+    instead — next bullet.
+- **acs's own writes step out of the program's sequence and back into it**
+  (acs-p4u, §5.4, §6.4). A note can wait, and waiting is the whole of the
+  rule above. The status line cannot: it goes up **because** a link was
+  lost, it exists to explain a terminal that has just stopped responding,
+  and the boundary it would wait for may never come — the decoder delivers
+  whole frames, so the frame the drop cut in half is discarded and the last
+  one delivered may well end mid-CSI or mid-OSC. Written straight out, the
+  explanation the frozen terminal is owed is itself what corrupts it.
+
+  So these writes are made **over** the stream rather than into it: an `ST`
+  (`ESC \`) ends whatever is open before them, and where acs can do it
+  faithfully the sequence is written again afterwards, byte for byte, so the
+  program's next byte still means what the program meant by it. The mode
+  observer (§6.4) already knows which sequence is open and has its bytes.
+
+  - **A CSI, a bare `ESC` and a half-read character are handed back.** None
+    of them has done anything to the terminal yet — a CSI acts on its final
+    byte — so writing the parameters again is exact. A colour split across
+    the drop (`ESC [ 1;31` … `m`) still arrives as one colour, minutes and
+    a reconnect later. C0 controls the terminal already executed inside the
+    CSI are not repeated, and a CSI longer than the 64 parameter bytes the
+    observer keeps is not handed back, because its bytes are no longer all
+    known.
+  - **A string is ended and not handed back.** The body of an OSC, DCS, APC,
+    PM or SOS may already have had its effect — a DCS is passed through as
+    it arrives, and ending one dispatches what there is of it — so writing
+    it again would do it twice, which is worse than the junk. **This is the
+    cost that was chosen:** the rest of the program's string arrives on the
+    resume and is printed as text. What ending it buys is that acs's own
+    line is readable at all, and that is not hypothetical — a terminal that
+    reads `ESC` as part of the string (which is how acs's own observer reads
+    it) swallowed the title push, acs's title and the whole status line as
+    the body of the program's title.
+  - **The three writes are not treated alike, because their streams are
+    not.** The status line and its clearing hand the sequence back: a
+    `Resumed` attach carries the stream on from exactly where it stopped.
+    The resets `leave` writes do not: acs is going, nothing more of that
+    stream will ever arrive, and a terminal left inside a CSI would eat the
+    first bytes of whatever runs next — including acs's own parting `acs:`
+    note, which is raised after the frame loop and so is not covered by the
+    hold above. Neither does the clear a `Fresh` or `Gap` attach writes:
+    another program is talking now, or the same one across a gap whose next
+    byte may start anywhere (§6.4). Those three end the sequence and stop
+    there; the end is written even when there is no reset and no clear,
+    since the status line may have put the terminal back inside it.
+  - **The save/restore around the line does not help with this.** `ESC 7` /
+    `ESC 8` bring back the cursor, the SGR attributes, the character set,
+    origin mode and the wrap flag, and the xterm title stack brings back the
+    title — which is why the line leaves no trace of *what it drew*. Neither
+    of them is a parser state: the sequence the line is written inside of is
+    outside everything they save.
+  - **One write cannot ask the observer**: the emergency restore in the
+    signal handler (a Ctrl-C while ssh redials, §7). It is async-signal-safe
+    and writes static bytes, so it opens with an unconditional `ST` — an
+    `ST` with no string open is ignored — and, being a way out, hands
+    nothing back.
 - **Connect timings** under `-v` (acs-pgn, `timing.rs`): one line per phase
   of a connection, `acs: timing: <connection>: <phase> +<step> ms (<total>
   ms total)`, for the first connection and for every redial. The phases, in

@@ -25,7 +25,14 @@ static STATUS_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Pop the title pushed for the status line and blank the bottom row (a row
 /// past the last is taken as the last), cursor saved and restored.
-const CLEAR_STATUS: &[u8] = b"\x1b[23;0t\x1b7\x1b[9999;1H\x1b[2K\x1b8";
+///
+/// It opens with an ST (acs-p4u): the status line above it went up after a
+/// link was lost, which may have been inside a sequence the program's last
+/// frame opened, and this is the one write that cannot ask the mode observer
+/// — it runs from a signal handler, with static bytes. So it ends anything
+/// open unconditionally, as every write on the way out does; an ST with no
+/// string open is ignored.
+const CLEAR_STATUS: &[u8] = b"\x1b\\\x1b[23;0t\x1b7\x1b[9999;1H\x1b[2K\x1b8";
 
 /// Whether the reconnect status line is showing, so a fatal signal — a
 /// Ctrl-C while ssh redials in cooked mode — takes it away too (acs-qty).

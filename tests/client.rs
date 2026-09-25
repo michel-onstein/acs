@@ -462,6 +462,44 @@ fn a_note_is_not_swallowed_by_a_session_that_goes_quiet() {
     );
 }
 
+/// acs-p4u: the third of acs's own writes, and the one treated differently
+/// from the status line. When the client leaves, a sequence the program
+/// left open is **ended** and never handed back: nothing of that stream
+/// will ever arrive again, and a terminal left inside a CSI would swallow
+/// the first bytes of whatever runs next — the shell's own prompt.
+#[test]
+fn leaving_ends_a_sequence_the_program_left_open() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "open",
+        "printf 'ready'; printf '\\033[1;31'; sleep 60",
+    );
+    c.wait_for("ready", T);
+    c.wait_for("\x1b[1;31", T);
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/open", T);
+    // The colour was never finished; what follows it on the terminal is
+    // the ST that ends it, and nothing re-opens it afterwards.
+    //
+    // The note behind it is what that used to cost. It is raised after the
+    // frame loop, so acs-z22's hold does not cover it, and it went straight
+    // into the CSI: `ESC [ 1;31 a` is a complete sequence — `a` is a valid
+    // final byte — so the terminal moved the cursor and ate the first
+    // letter of `acs: detached from …`.
+    let text = c.text();
+    let tail = &text[text.rfind("\x1b[1;31").unwrap()..];
+    assert!(
+        tail.starts_with("\x1b[1;31\x1b\\acs: detached from devbox/open"),
+        "the sequence was left open: {tail:?}"
+    );
+    assert!(
+        !tail[6..].contains("\x1b[1;31"),
+        "it was re-opened: {tail:?}"
+    );
+}
+
 /// acs-gov: `-v` names the whole ssh command line, and that line carries
 /// the remote prelude — 1046 bytes since the symlink check, against 518
 /// before it. `note`'s cap ended the line in the middle of the prelude,

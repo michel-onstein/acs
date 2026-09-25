@@ -956,14 +956,38 @@ pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
 }
 
 /// Put the local terminal back the way we found it.
+///
+/// A sequence the program left unfinished is **ended** here and not handed
+/// back (acs-p4u, unlike [`write_over_stream`]): acs is going, nothing more
+/// of that stream will ever arrive, and a terminal left inside a CSI would
+/// eat the first bytes of whatever runs next — the shell's own prompt.
 pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
     crate::reconnect::clear_status(state);
-    let reset = state.observer.reset_sequence();
-    if !reset.is_empty() {
-        let _ = sys::write_all(STDOUT, &reset);
+    let mut out = state.observer.interrupt_sequence().to_vec();
+    out.extend_from_slice(&state.observer.reset_sequence());
+    if !out.is_empty() {
+        let _ = sys::write_all(STDOUT, &out);
     }
     state.observer.clear();
     *raw = None;
+}
+
+/// Write bytes of acs's own — the status line (DESIGN §5.4) — over a stream
+/// that carries on afterwards (acs-p4u).
+///
+/// They cannot wait for a boundary the way a bell or an `acs:` note does
+/// (§7): the status line explains a terminal that has just stopped
+/// responding, and the boundary it would wait for may never come. So the
+/// program's unfinished sequence is ended before them and re-opened after,
+/// leaving the stream where acs found it — for the CSI or the character
+/// that can be re-opened, which is the common case; where it cannot be
+/// ([`ModeObserver::reopen_sequence`]), ending it is still better than
+/// writing into it.
+pub fn write_over_stream(state: &State, bytes: &[u8]) {
+    let mut out = state.observer.interrupt_sequence().to_vec();
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(&state.observer.reopen_sequence().unwrap_or_default());
+    let _ = sys::write_all(STDOUT, &out);
 }
 
 /// Connect once: dial, handshake, and serve until the link ends.
@@ -1288,24 +1312,34 @@ fn serve(
                     }
                     match w.kind {
                         AttachKind::Resumed => {}
+                        // Neither of these two streams carries on where it
+                        // stopped, so a sequence left unfinished is ended
+                        // and not re-opened (acs-p4u): another program is
+                        // talking now, or the same one across a gap whose
+                        // next byte may start anywhere. The status line put
+                        // the terminal back inside it, so the end of it is
+                        // written here even when nothing else is.
                         AttachKind::Fresh => {
                             // Another program: undo the modes the last one
                             // left on before forgetting them, or leave()
                             // could not (acs-xk4).
-                            let reset = state.observer.reset_sequence();
-                            if !reset.is_empty() {
-                                let _ = sys::write_all(STDOUT, &reset);
-                            }
+                            let mut out = state.observer.interrupt_sequence().to_vec();
+                            out.extend_from_slice(&state.observer.reset_sequence());
                             if !w.created {
                                 // dtach's attach: clear, the program redraws.
-                                let _ = sys::write_all(STDOUT, b"\x1b[H\x1b[J");
+                                out.extend_from_slice(b"\x1b[H\x1b[J");
+                            }
+                            if !out.is_empty() {
+                                let _ = sys::write_all(STDOUT, &out);
                             }
                             state.observer.clear();
                         }
                         AttachKind::Gap => {
                             // The same program, still in its modes: keep
                             // them for leave(), but not a half-seen sequence.
-                            let _ = sys::write_all(STDOUT, b"\x1b[H\x1b[J");
+                            let mut out = state.observer.interrupt_sequence().to_vec();
+                            out.extend_from_slice(b"\x1b[H\x1b[J");
+                            let _ = sys::write_all(STDOUT, &out);
                             state.observer.resync();
                         }
                     }

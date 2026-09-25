@@ -1367,6 +1367,123 @@ fn a_held_command_key_survives_a_redial_attempt() {
     c.wait_for("detached from devbox/hk", T);
 }
 
+// ---- the status line over an unfinished sequence (acs-p4u) -----------------
+
+/// A program that stops in the middle of an escape sequence and stays
+/// there until this test lets it past a fifo: `open` is written, then
+/// nothing, then `rest`. The link is cut while it is stopped, which is
+/// where the status line goes up — in the middle of `open`.
+///
+/// Nothing here is timed. The window is held open by the program, not by a
+/// sleep, and every wait is on something the client has printed.
+fn stopped_mid_sequence(gate: &Path, open: &str, rest: &str) -> String {
+    make_fifo(gate);
+    format!(
+        "printf 'ready\\n'; printf '{open}'; cat '{}' >/dev/null; printf '{rest}'; sleep 60",
+        gate.display()
+    )
+}
+
+/// Ctrl-L after a resume is the program's own stream — echoed back by the
+/// remote pty — and it may land anywhere in it. These tests are about the
+/// bytes **acs** writes, so they leave it out.
+fn no_redraw() -> Vec<(&'static str, &'static str)> {
+    let mut env = FAST.to_vec();
+    env.push(("ACS_REDRAW_ON_RECONNECT", "0"));
+    env
+}
+
+/// acs-p4u: the status line goes up **because** the link died, which may
+/// have been in the middle of a sequence the last frame opened — the
+/// decoder delivers whole frames, so the one that was cut is discarded and
+/// the last one delivered may well end mid-CSI. Written straight out, the
+/// explanation the frozen terminal is owed is what destroys that sequence:
+/// its leading ESC cancels the CSI, and the byte that would have finished
+/// it arrives on the resume and is printed as a letter.
+///
+/// So the line is written over the stream and not into it: the sequence is
+/// ended first (ST) and re-opened after, byte for byte, and the program's
+/// final byte still means what the program meant by it.
+#[test]
+fn the_status_line_gives_back_the_csi_it_interrupted() {
+    let remote = Remote::installed();
+    let gate = remote.root.path().join("csi-gate");
+    // A colour, split: everything but the final `m`.
+    let prog = stopped_mid_sequence(&gate, "\\033[1;31", "mRED");
+    let mut c = start(&remote, "csi", &prog, &no_redraw());
+    c.wait_for("ready", T);
+    // On the terminal and unfinished: the client's observer is inside this
+    // CSI until the program ends it, which it cannot until the fifo goes.
+    c.wait_for("\x1b[1;31", T);
+    remote.cut_link();
+    c.wait_for("\x1b[22;0t", T);
+    // The whole first status line, bracketed: ST before it, the sequence
+    // again after it.
+    let line = status_line("connection lost — reconnecting now (Ctrl-] Ctrl-] d to detach)");
+    let want = format!("\x1b[1;31\x1b\\{line}\x1b[1;31");
+    let text = c.text();
+    assert!(
+        text.contains(&want),
+        "the status line was not written over the program's CSI:\n{:?}",
+        &text[text.find("ready").unwrap_or(0)..]
+    );
+    // And after the resume the program's `m` completes that colour rather
+    // than printing as an `m`: the last thing the client wrote was the
+    // status line being taken away, which hands the sequence back.
+    c.wait_resumed();
+    release_fifo(&gate);
+    c.wait_for("RED", T);
+    let text = c.text();
+    assert!(
+        text.contains("\x1b8\x1b[1;31mRED"),
+        "the program's colour did not survive the status line:\n{:?}",
+        &text[text.rfind("\x1b[23;0t").unwrap_or(0)..]
+    );
+}
+
+/// acs-p4u, the other half of the rule: a sequence acs cannot hand back is
+/// still **ended** rather than written into.
+///
+/// The terminal may already have acted on the body of an OSC, a DCS or an
+/// APC — a DCS is passed through as it arrives — so acs cannot write one
+/// again; and ending one is what makes its own line readable at all, since
+/// a terminal that takes ESC as part of the string would otherwise swallow
+/// the title, the status line and all as the body of the program's.
+///
+/// What is given up is the rest of the program's string, which arrives on
+/// the resume and is printed as text. That is the accepted cost, and this
+/// test is where it is visible.
+#[test]
+fn the_status_line_ends_a_string_it_cannot_give_back() {
+    let remote = Remote::installed();
+    let gate = remote.root.path().join("osc-gate");
+    // A window title, split: the ST that ends it never comes in time.
+    let prog = stopped_mid_sequence(&gate, "\\033]2;half a tit", "le\\033\\\\DONE");
+    let mut c = start(&remote, "osc", &prog, &no_redraw());
+    c.wait_for("ready", T);
+    c.wait_for("\x1b]2;half a tit", T);
+    remote.cut_link();
+    c.wait_for("\x1b[22;0t", T);
+    let line = status_line("connection lost — reconnecting now (Ctrl-] Ctrl-] d to detach)");
+    let text = c.text();
+    assert!(
+        text.contains(&format!("half a tit\x1b\\{line}")),
+        "acs's own title was written inside the program's:\n{:?}",
+        &text[text.find("ready").unwrap_or(0)..]
+    );
+    // Nothing re-opens it: the status line is followed by the program's
+    // stream, `le` and all, as printable text.
+    c.wait_resumed();
+    release_fifo(&gate);
+    c.wait_for("DONE", T);
+    let text = c.text();
+    let tail = &text[text.rfind("\x1b[23;0t").unwrap()..];
+    assert!(
+        !tail.contains("\x1b]2;half"),
+        "the string was re-opened: {tail:?}"
+    );
+}
+
 // ---- the helper that says whether anything was lost (acs-2dc) ---------------
 
 /// `#1#…#n#` as [`TICKER`] prints them.
