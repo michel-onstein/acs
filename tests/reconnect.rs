@@ -31,39 +31,8 @@ fn start(remote: &Remote, session: &str, cmd: &str, env: &[(&str, &str)]) -> Cli
     )
 }
 
-/// The `#n#` numbers in the client's output, in order. A status line may
-/// land in the middle of a number, so its save/restore-cursor span goes.
-fn numbers(text: &str) -> Vec<u64> {
-    let mut clean = String::new();
-    let mut rest = text;
-    while let Some(i) = rest.find("\x1b7") {
-        clean.push_str(&rest[..i]);
-        rest = match rest[i..].find("\x1b8") {
-            Some(j) => &rest[i + j + 2..],
-            None => "",
-        };
-    }
-    clean.push_str(rest);
-    clean.split('#').filter_map(|p| p.parse().ok()).collect()
-}
-
-fn assert_consecutive(text: &str) {
-    let n = numbers(text);
-    assert!(n.len() > 10, "too little output: {n:?}");
-    for w in n.windows(2) {
-        assert_eq!(
-            w[1],
-            w[0] + 1,
-            "lost or repeated output around {} → {}",
-            w[0],
-            w[1]
-        );
-    }
-}
-
-fn last_number(c: &Client) -> u64 {
-    *numbers(&c.text()).last().unwrap_or(&0)
-}
+// `numbers`, `assert_consecutive` and `last_number` live in tests/common:
+// tests/e2e_ssh.rs reads the same ticker and had a copy of them.
 
 /// A program that prints 2001 bytes at a time after `prologue`, and ticks
 /// a file on the remote's own filesystem for each frame, so a test can
@@ -1311,4 +1280,112 @@ fn a_held_command_key_survives_a_redial_attempt() {
     c.send(&[0x1d, b'd']);
     assert_eq!(c.wait(T), 0, "{}", c.text());
     c.wait_for("detached from devbox/hk", T);
+}
+
+// ---- the helper that says whether anything was lost (acs-2dc) ---------------
+
+/// `#1#…#n#` as [`TICKER`] prints them.
+fn ticks(from: u64, to: u64) -> String {
+    (from..=to).map(|i| format!("#{i}#\r\n")).collect()
+}
+
+/// An `acs: …` note, as the client writes one to fd 2 (`src/client.rs`).
+const NOTE: &str = "acs: network hint: still on 192.168.1.5/24 — not a change\r\n";
+
+/// The status line the client draws while it is redialling, byte for byte
+/// as `src/reconnect.rs` writes it: a window title **and** a reverse-video
+/// line, each carrying the word `acs:`, and only the second of them inside
+/// the save/restore span.
+fn status_line(msg: &str) -> String {
+    format!(
+        "\x1b[22;0t\x1b]2;acs: devbox — {msg}\x07\
+         \x1b7\x1b[24;1H\x1b[2K\x1b[7macs: {msg}\x1b[0m\x1b8"
+    )
+}
+
+/// The message an assertion failed with.
+///
+/// The panic is caught, not silenced: its own report goes to this test's
+/// captured output, where it is shown only if the test itself fails.
+fn failure(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+    let e = std::panic::catch_unwind(f).expect_err("that should have failed");
+    match e.downcast::<String>() {
+        Ok(s) => *s,
+        Err(e) => (*e.downcast::<&str>().unwrap()).to_string(),
+    }
+}
+
+/// [`numbers`] reads through everything the *client* wrote into the
+/// program's stream, because none of it lost a byte: the status line's
+/// save/restore span, and an `acs: …` note, which lands wherever the
+/// stream has got to — and every byte of a plain-ASCII `#175#` is a
+/// boundary, so acs-z22's hold does not keep one out of the middle of a
+/// number.
+#[test]
+fn numbers_reads_through_what_the_client_wrote() {
+    // Nothing in the way.
+    assert_eq!(numbers(&ticks(1, 3)), [1, 2, 3]);
+    // A status line drawn in the middle of the `2`.
+    assert_eq!(
+        numbers("#1#\r\n#\x1b7reconnecting in 2s\x1b82#\r\n#3#\r\n"),
+        [1, 2, 3]
+    );
+    // A note written between the `#17` and the `4#`.
+    assert_eq!(
+        numbers(&format!("#173#\r\n#17{NOTE}4#\r\n#175#\r\n")),
+        [173, 174, 175]
+    );
+    // A note on a line of its own, between two numbers.
+    assert_eq!(numbers(&format!("#1#\r\n{NOTE}#2#\r\n")), [1, 2]);
+    // The whole status line, which carries the word `acs:` twice: once in
+    // its window title, where it is the title's text and not a note at
+    // all, and once inside the span. Reading the title as a note swallowed
+    // the line and the number behind it — every run of
+    // `cut_link_mid_stream_resumes_without_loss` under load reported
+    // `20 → 22` (acs-2dc).
+    let line = status_line("connection lost — reconnecting now (Ctrl-] Ctrl-] d to detach)");
+    assert_eq!(
+        numbers(&format!("#20#\r\n{line}#21#\r\n#22#\r\n")),
+        [20, 21, 22]
+    );
+    // And a note behind that title, which is one.
+    assert_eq!(
+        numbers(&format!("#20#\r\n{line}#2{NOTE}1#\r\n#22#\r\n")),
+        [20, 21, 22]
+    );
+}
+
+/// The snapshot is of a stream that is still being written, so its last
+/// bytes are as likely as not to be half of a number. That is output that
+/// has not arrived, not output that was lost — and reading it as a number
+/// is how acs-ryz's one unexplained failure reported itself, `174 → 17`.
+#[test]
+fn numbers_leaves_out_what_the_snapshot_cut_in_half() {
+    assert_eq!(numbers("#173#\r\n#174#\r\n#17"), [173, 174]);
+    assert_eq!(numbers("#173#\r\n#174#\r\n#"), [173, 174]);
+    // Cut inside a note, or inside a status line, is the same statement.
+    assert_eq!(numbers(&format!("#173#\r\n#17{}", &NOTE[..12])), [173]);
+    assert_eq!(numbers("#173#\r\n#17\x1b7reconn"), [173]);
+    // And the assertion that reads them is not tripped by it.
+    assert_consecutive(&format!("{}#21", ticks(1, 20)));
+}
+
+/// What a failure says. Torn output and lost output look identical in the
+/// numbers alone, so the failure carries the bytes either side: the reader
+/// can see whether the stream steps straight from one number to the next
+/// (lost) or has something sitting inside a number (torn).
+#[test]
+fn a_failure_shows_the_stream_around_the_gap() {
+    // Lost: no `#17#` was ever written.
+    let lost = ticks(1, 20).replace("#17#\r\n", "");
+    let msg = failure(move || assert_consecutive(&lost));
+    assert!(msg.contains("around 16 → 18"), "{msg}");
+    assert!(msg.contains("#16#\\r\\n#18#"), "{msg}");
+
+    // Torn by something [`numbers`] does not know: the same failure, but
+    // the bytes say the `17` is there in two halves and nothing was lost.
+    let torn = ticks(1, 20).replace("#17#", "#1\x1b[2K7#");
+    let msg = failure(move || assert_consecutive(&torn));
+    assert!(msg.contains("around 16 → 18"), "{msg}");
+    assert!(msg.contains("#1\\u{1b}[2K7#"), "{msg}");
 }
