@@ -245,6 +245,21 @@ mod tests {
         assert!(!RELEASE_KEY.trim().is_empty());
     }
 
+    /// The key this build actually carries is one `build.rs` would accept,
+    /// so the check and the key it guards cannot drift apart (acs-okz).
+    #[test]
+    fn the_built_in_key_passes_the_build_time_check() {
+        use crate::release_key::default_release_key;
+        assert_eq!(
+            default_release_key(Some(UPSTREAM_RELEASE_KEY)),
+            Ok(Some(UPSTREAM_RELEASE_KEY))
+        );
+        assert_eq!(
+            default_release_key(Some(RELEASE_KEY)),
+            Ok(Some(RELEASE_KEY))
+        );
+    }
+
     #[test]
     fn a_signature_from_the_release_key_verifies() {
         let dir = TempDir::new();

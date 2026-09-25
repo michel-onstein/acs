@@ -1779,9 +1779,12 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
     `ACS_DEFAULT_RELEASES_URL` it belongs to, for a fork that signs its own
     releases (VERSIONING.md, "Forking"). Unset it is acs's own key — the
     one `install.sh` carries — an empty value counts as unset, and a value
-    that is not an ssh public key line fails the build. Like the URL, that
-    is the builder's decision rather than the environment's, so it carries
-    none of the limits the runtime overrides below do.
+    that is not an ssh public key line fails the build. What the variable
+    means lives in `src/release_key.rs`, which `build.rs` includes as
+    source: a build script is not a test target, so the rule sits where the
+    tests can reach it and only the wiring is left in `build.rs`. Like the
+    URL, that is the builder's decision rather than the environment's, so
+    it carries none of the limits the runtime overrides below do.
   - **What it does not cover**: the first fetch of `install.sh` itself is
     unsigned — signing the checksums cannot fix trust on first use. The
     public key is published in the Homebrew tap, a repository of its own,
