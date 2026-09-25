@@ -87,6 +87,11 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     // before anything dials, so every call this client makes agrees about
     // it (acs-9n3). Never for `acs list` over every alias, which asks a
     // dozen hosts at once and would leave a master on each.
+    // The configured forwards join the command line's (acs-odd, DESIGN
+    // §7.1) before the master is decided, so a forward that arrives from
+    // the configuration hits the same carve-out a `-L` does: a session that
+    // forwards anything gets no shared master (acs-9n3).
+    apply_local_forwards(&mut args);
     let decided = crate::mux::configure(&mut args.transport);
     if args.verbose > 0 {
         note(&decided);
@@ -121,6 +126,46 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
             Err(c) => return ExitCode::from(c),
         }
     }
+}
+
+/// Add the configuration's `local_forwards` (DESIGN §7.1, §7.2) to the
+/// transport's `-L` list (acs-odd): the alias's own setting, else the global
+/// one, **merged** with what the command line gave rather than replacing it
+/// — `-L` is already repeatable and ssh adds repeated forwards up, so the
+/// command line naming one is no reason to drop a standing one. `-L none`
+/// drops them all for this run, and an alias whose own `local_forwards` is
+/// `none` drops the global list for good. A spec the command line already
+/// gave is not added twice: ssh would bind the port once and warn about the
+/// other.
+///
+/// Called before [`crate::mux::configure`], so a forward that arrives from
+/// the configuration hits the same carve-out a command-line one does — a
+/// session that forwards anything gets no shared ssh master (acs-9n3),
+/// because a master's forward outlives the session.
+fn apply_local_forwards(args: &mut ClientArgs) {
+    if args.no_configured_forwards {
+        return;
+    }
+    let name = args.transport.destination.clone();
+    let setting = args.config.local_forwards_for(Some(&name));
+    let at = setting
+        .origin
+        .as_ref()
+        .map(|o| o.to_string())
+        .unwrap_or_default();
+    let add: Vec<String> = setting
+        .value
+        .iter()
+        .filter(|s| !args.transport.local_forwards.contains(s))
+        .cloned()
+        .collect();
+    if add.is_empty() {
+        return;
+    }
+    if args.verbose > 0 {
+        note(&format!("{name}: local_forwards {} ({at})", add.join(", ")));
+    }
+    args.transport.local_forwards.extend(add);
 }
 
 /// Whether a lost host is waited for (DESIGN §5.3): `--persist`, then
@@ -1657,6 +1702,61 @@ mod tests {
         // the master when it is given `None`.
         let unknown: Option<LinkEnd> = None;
         assert!(unknown.map_or(true, LinkEnd::failed_the_connection));
+    }
+
+    /// acs-odd: the configured `local_forwards` join the command line's
+    /// `-L` rather than replacing it; an alias's own list beats the global
+    /// one; `none` on either side says no forward at all; and a spec given
+    /// on both sides is bound once.
+    #[test]
+    fn the_configured_forwards_merge_with_the_command_lines() {
+        let dir = crate::testutil::TempDir::new();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(
+            &file,
+            "local_forwards: [8080:localhost:80]\n\
+             aliases:\n  \
+               db:\n    local_forwards: 5432:db.internal:5432\n    hosts: [{host: a}]\n  \
+               quiet:\n    local_forwards: none\n    hosts: [{host: b}]\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::load_files(&[file]).unwrap();
+        let forwards = |argv: &[&str]| {
+            let parsed = cli::parse(argv.iter().map(OsString::from), None).unwrap();
+            let Parsed::Run(mut a) = parsed else {
+                panic!("{argv:?}")
+            };
+            a.config = config.clone();
+            apply_local_forwards(&mut a);
+            a.transport.local_forwards.clone()
+        };
+        // A plain host, and an alias with no list of its own, take the
+        // global one.
+        assert_eq!(forwards(&["box"]), ["8080:localhost:80"]);
+        // The alias's own list replaces it, `user@` and all.
+        assert_eq!(forwards(&["db"]), ["5432:db.internal:5432"]);
+        assert_eq!(forwards(&["me@db"]), ["5432:db.internal:5432"]);
+        // `none` on the alias: nothing is forwarded.
+        assert!(forwards(&["quiet"]).is_empty());
+        // The command line's own -L is kept, and the configured one added
+        // after it — repeated -L adds up, for ssh and here.
+        assert_eq!(
+            forwards(&["-L", "9000:localhost:9000", "db"]),
+            ["9000:localhost:9000", "5432:db.internal:5432"]
+        );
+        // The same spec on both sides binds the port once; ssh would bind
+        // the first and warn about the second.
+        assert_eq!(
+            forwards(&["-L", "8080:localhost:80", "box"]),
+            ["8080:localhost:80"]
+        );
+        // `-L none` drops what is configured, and only that.
+        assert!(forwards(&["-L", "none", "box"]).is_empty());
+        assert!(forwards(&["-L", "none", "db"]).is_empty());
+        assert_eq!(
+            forwards(&["-L", "none", "-L", "9000:localhost:9000", "db"]),
+            ["9000:localhost:9000"]
+        );
     }
 
     /// acs-z22: a note goes where the bell goes — at a boundary of the

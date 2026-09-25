@@ -493,6 +493,52 @@ fn a_session_that_forwards_a_port_keeps_its_own_connection() {
     assert!(c.text().contains("no shared ssh master"), "{:?}", c.text());
 }
 
+/// acs-odd over acs-9n3: a forward that arrives from the **configuration**
+/// hits the same carve-out a `-L` does.
+///
+/// Only one order gets this right — the setting is merged into the
+/// transport before `mux::configure` ever looks at it — and there is
+/// nothing in the merge itself to say so. The other order joins a master
+/// happily, and then the master opens the listener and keeps it bound after
+/// acs has exited, which is exactly what DESIGN §7.1 promises never
+/// happens. So this is the test for the ordering, not for the veto.
+#[test]
+fn a_forward_from_the_configuration_keeps_its_own_connection_too() {
+    let remote = Remote::installed();
+    let fake = Fake::new("devbox.lan", &remote);
+    let net = Net::new(&["devbox.lan"]);
+    let mut env = net
+        .env("local_forwards: [45995:localhost:9]\naliases:\n  devbox:\n    - host: devbox.lan\n");
+    env.extend(self::env(&fake));
+    let mut args = vec![
+        "-v".to_string(),
+        "--ssh".into(),
+        fake.path().display().to_string(),
+        "devbox".into(),
+        "fwd".into(),
+    ];
+    args.extend(UP.iter().map(|s| s.to_string()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut c = Client::spawn(&exe(), &args, &refs(&env));
+    c.wait_for("MUX-UP", T);
+    // Not one call names a control socket: none was started, and none was
+    // joined.
+    for call in fake.calls() {
+        assert!(Fake::control_path(&call).is_none(), "{call:?}");
+    }
+    assert!(
+        c.text()
+            .contains("no shared ssh master: -L is on this session"),
+        "{:?}",
+        c.text()
+    );
+    // And the forward really is on the session's ssh: the veto above would
+    // also read as "no master" if the setting had simply been dropped.
+    let dial = fake.calls().pop().unwrap();
+    let opts = dial.split_once(" -- ").expect("a destination after --").0;
+    assert!(opts.contains("-L 45995:localhost:9"), "{dial:?}");
+}
+
 /// `acs list` asks every alias at once (DESIGN §7.3). Starting a master on
 /// each would leave a dozen authenticated connections behind a listing.
 #[test]

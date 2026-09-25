@@ -39,12 +39,14 @@ settings: install_on_remote, update_check, command_bell, redraw_on_reconnect,
           500ms, 0.5s, 2s; default 500ms),
           reachability_interval (how often a lost host is pinged; default 5s),
           prefer_local_network (true|false: try an alias's hosts on a network
-          this machine is on first; default false)
+          this machine is on first; default false),
+          local_forwards (ports every session forwards, as -L spells them:
+          8080:localhost:80,5432:db:5432 — or none)
 alias settings: identity_file <key> (the ssh key of its hosts that name none),
                 redraw_on_reconnect, persist, prefer_local_network
                 (true|false, over the global setting),
-                reachability_timeout, reachability_interval
-                (over the global setting)
+                reachability_timeout, reachability_interval,
+                local_forwards (over the global setting; none for no forward)
 host settings: --local-networks lists the networks that make a host the local
                one: it is tried first when this machine is on one of them
                (172.16.0.0/16, fd00::/48; acs config host add)
@@ -64,6 +66,10 @@ fn scalar(c: &Config, key: &str) -> Option<(Node, Option<config::Origin>)> {
     if let Some(s) = c.bool_setting(key) {
         return Some((Node::bool(s.value), s.origin.clone()));
     }
+    if config::FORWARDS.contains(&key) {
+        let s = &c.local_forwards;
+        return Some((forwards_node(&s.value), s.origin.clone()));
+    }
     let s = c.duration_setting(key)?;
     Some((
         Node::string(&config::format_timeout(s.value)),
@@ -81,6 +87,21 @@ fn networks_node(nets: &[LocalNet]) -> Node {
     }
 }
 
+/// A list of `-L` forwards as a one-line YAML list
+/// (`[8080:localhost:80, 5432:db:5432]`), or the scalar `none` for an empty
+/// one — the spelling that says "no forward" wherever a value is taken
+/// (acs-odd), and which reads back as the empty list.
+fn forwards_node(specs: &[String]) -> Node {
+    if specs.is_empty() {
+        return Node::string(config::NO_FORWARDS);
+    }
+    let items = specs.iter().map(|s| Node::string(s)).collect();
+    Node {
+        flow: true,
+        ..Node::new(Value::Seq(items))
+    }
+}
+
 /// `value` as the node for setting `key`, global or an alias's, checked
 /// against its type.
 fn typed(key: &str, value: &str) -> Result<Node, String> {
@@ -89,6 +110,9 @@ fn typed(key: &str, value: &str) -> Result<Node, String> {
     } else if config::DURATIONS.contains(&key) {
         let d = config::parse_duration(key, value).map_err(|e| format!("{key}: {e}"))?;
         Ok(Node::string(&config::format_timeout(d)))
+    } else if config::FORWARDS.contains(&key) {
+        let specs = config::parse_forwards(value).map_err(|e| format!("{key}: {e}"))?;
+        Ok(forwards_node(&specs))
     } else {
         Ok(Node::string(value))
     }
@@ -102,9 +126,14 @@ fn text(n: &Node) -> &str {
     }
 }
 
-/// A setting's value on one line, as `get` prints it and `set` reports it.
+/// A setting's value on one line, as `get` prints it and `set` reports it:
+/// a list comes back in the comma-separated form `set` takes (acs-odd).
 fn value_text(n: &Node) -> String {
-    text(n).to_string()
+    match &n.value {
+        Value::Seq(items) if items.is_empty() => config::NO_FORWARDS.to_string(),
+        Value::Seq(items) => items.iter().map(text).collect::<Vec<_>>().join(","),
+        _ => text(n).to_string(),
+    }
 }
 
 /// Settings of an alias that `host set`/`host unset` know: every key of the
@@ -517,6 +546,15 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
                     },
                 ));
             }
+        }
+        if let Some(f) = &a.local_forwards {
+            settings.push((
+                "local_forwards".to_string(),
+                Node {
+                    comment: Some(from(&f.origin)),
+                    ..forwards_node(&f.value)
+                },
+            ));
         }
         let node = if settings.is_empty() {
             list
@@ -1496,7 +1534,7 @@ aliases:
         );
         let e = parse(&args("host set d command_bell false")).unwrap_err();
         assert!(
-            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network)"),
+            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards)"),
             "{e}"
         );
     }
@@ -1570,6 +1608,141 @@ aliases:
             host_list(&Config::default()),
             "no host aliases (add one with: acs config host add <alias> <host>)\n"
         );
+    }
+
+    /// acs-odd: `local_forwards` is a list, so it is set, read and written
+    /// back in the comma-separated form one argument can hold, and shown as
+    /// a one-line YAML list. `none` is the empty list, both ways.
+    #[test]
+    fn local_forwards_are_set_checked_and_written_one_way() {
+        // Globally and on an alias, one forward or several.
+        assert_eq!(
+            apply("", "set local_forwards 8080:localhost:80").unwrap(),
+            "local_forwards: [8080:localhost:80]\n"
+        );
+        assert_eq!(
+            apply(
+                "",
+                "set local_forwards 8080:localhost:80,5432:db.internal:5432"
+            )
+            .unwrap(),
+            "local_forwards: [8080:localhost:80, 5432:db.internal:5432]\n"
+        );
+        assert_eq!(
+            apply(
+                "aliases:\n  d:\n    - host: a\n",
+                "host set d local_forwards 5432:db:5432"
+            )
+            .unwrap(),
+            "aliases:\n  d:\n    local_forwards: [5432:db:5432]\n    hosts:\n      - host: a\n"
+        );
+        // `none` is how an alias says it forwards nothing over the global
+        // setting; it reads back as the empty list rather than as unset.
+        let out = apply(
+            "aliases:\n  d:\n    - host: a\n",
+            "host set d local_forwards none",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "aliases:\n  d:\n    local_forwards: none\n    hosts:\n      - host: a\n"
+        );
+        let doc = yaml::parse(&out).unwrap();
+        let mut c = Config::default();
+        c.apply(Path::new("x"), &doc.root).unwrap();
+        let set = c.hosts[0].local_forwards.as_ref().unwrap();
+        assert!(set.value.is_empty(), "{set:?}");
+        assert!(c.local_forwards_for(Some("d")).value.is_empty());
+
+        // A bad spec is refused by `set`, by the checker `-L` uses, so a
+        // file acs would refuse is never written.
+        let e = apply("", "set local_forwards 8080:localhost").unwrap_err();
+        assert!(e.contains("local_forwards: bad -L '8080:localhost'"), "{e}");
+        let e = apply(
+            "aliases:\n  d:\n    - host: a\n",
+            "host set d local_forwards nope",
+        )
+        .unwrap_err();
+        assert!(e.contains("bad -L 'nope'"), "{e}");
+
+        // `set` reports, and `get` prints, what `set` takes back.
+        let mut doc = yaml::parse("").unwrap();
+        assert_eq!(
+            edit(
+                &mut doc,
+                &cmd("set local_forwards 8080:localhost:80,5432:db:5432")
+            )
+            .unwrap(),
+            "set local_forwards to 8080:localhost:80,5432:db:5432"
+        );
+        let mut doc = yaml::parse("").unwrap();
+        assert_eq!(
+            edit(&mut doc, &cmd("set local_forwards none")).unwrap(),
+            "set local_forwards to none"
+        );
+        assert_eq!(
+            value_text(&typed("local_forwards", "none").unwrap()),
+            "none"
+        );
+
+        // And it is unset like any other top-level setting.
+        assert_eq!(
+            apply(
+                "local_forwards: [8080:localhost:80]\n",
+                "unset local_forwards"
+            )
+            .unwrap(),
+            ""
+        );
+    }
+
+    /// acs-odd: `show` prints the setting globally and per alias, with its
+    /// origin, and what it prints reads back as the same configuration.
+    #[test]
+    fn show_has_local_forwards_globally_and_per_alias() {
+        let dir = crate::testutil::TempDir::new();
+        let g = dir.path().join("g.yaml");
+        let l = dir.path().join("l.yaml");
+        std::fs::write(&g, "local_forwards: [8080:localhost:80]\n").unwrap();
+        std::fs::write(
+            &l,
+            "aliases:\n  d:\n    local_forwards: 5432:db:5432\n    hosts:\n      - host: a\n  \
+             e:\n    local_forwards: none\n    hosts:\n      - host: b\n",
+        )
+        .unwrap();
+        let files = [g.clone(), l.clone()];
+        let c = Config::load_files(&files).unwrap();
+        let out = show(&c, &files);
+        assert!(
+            out.contains(&format!(
+                "local_forwards: [8080:localhost:80] # {}:1\n",
+                g.display()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "    local_forwards: [5432:db:5432] # {}:3\n",
+                l.display()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("    local_forwards: none # {}:7\n", l.display())),
+            "{out}"
+        );
+        // The default prints too, and reads back as no forward.
+        let empty = show(&Config::default(), &files);
+        assert!(
+            empty.contains("local_forwards: none # default\n"),
+            "{empty}"
+        );
+        let doc = yaml::parse(&out).unwrap();
+        let mut again = Config::default();
+        again.apply(Path::new("x"), &doc.root).unwrap();
+        assert_eq!(again.local_forwards.value, ["8080:localhost:80"]);
+        assert_eq!(again.local_forwards_for(Some("d")).value, ["5432:db:5432"]);
+        assert!(again.local_forwards_for(Some("e")).value.is_empty());
     }
 
     #[test]
@@ -1700,7 +1873,7 @@ aliases:
         );
         let e = apply("", "set nope 1").unwrap_err();
         assert!(
-            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network)"),
+            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards)"),
             "{e}"
         );
     }

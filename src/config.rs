@@ -101,6 +101,10 @@ pub struct Alias {
     /// How often to ping a lost host while waiting; `None` leaves it to the
     /// global setting.
     pub reachability_interval: Option<Setting<Duration>>,
+    /// The `-L` specs every session to this alias forwards (acs-odd); `None`
+    /// leaves it to the global setting, an empty list (`none`) forwards
+    /// nothing whatever the global setting says.
+    pub local_forwards: Option<Setting<Vec<String>>>,
     /// Where the alias is first defined.
     pub origin: Origin,
 }
@@ -127,6 +131,9 @@ pub struct Config {
     pub prefer_local_network: Setting<bool>,
     /// How often a lost host is pinged while waiting (default 5 s).
     pub reachability_interval: Setting<Duration>,
+    /// The `-L` specs every session forwards (acs-odd, DESIGN §7.1); empty
+    /// by default. They join the ones given on the command line.
+    pub local_forwards: Setting<Vec<String>>,
     /// Aliases in the order first defined, each with its hosts in order.
     pub hosts: Vec<Alias>,
     /// The files that were read, global first.
@@ -144,6 +151,7 @@ impl Default for Config {
             persist: Setting::default(false),
             prefer_local_network: Setting::default(false),
             reachability_interval: Setting::default(DEFAULT_REACHABILITY_INTERVAL),
+            local_forwards: Setting::default(Vec::new()),
             hosts: Vec::new(),
             files: Vec::new(),
         }
@@ -160,6 +168,7 @@ pub const KEYS: &[&str] = &[
     "persist",
     "reachability_interval",
     "prefer_local_network",
+    "local_forwards",
     "aliases",
 ];
 
@@ -193,6 +202,7 @@ pub const ALIAS_KEYS: &[&str] = &[
     "persist",
     "reachability_interval",
     "prefer_local_network",
+    "local_forwards",
     "hosts",
 ];
 
@@ -201,6 +211,15 @@ pub const ALIAS_BOOLS: &[&str] = &["redraw_on_reconnect", "persist", "prefer_loc
 
 /// The settings, global or an alias's, that are a duration.
 pub const DURATIONS: &[&str] = &["reachability_timeout", "reachability_interval"];
+
+/// The settings, global or an alias's, that are a list of `-L` forwards
+/// (acs-odd).
+pub const FORWARDS: &[&str] = &["local_forwards"];
+
+/// The value that spells "no forward at all" wherever a `local_forwards` is
+/// taken — in a file, in `acs config set`, and as `-L none` on the command
+/// line. A forward spec can never be this word, so nothing is shadowed.
+pub const NO_FORWARDS: &str = "none";
 
 /// `reachability_timeout` when nothing sets it.
 pub const DEFAULT_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -321,6 +340,17 @@ impl Config {
                         origin: Some(at(node)),
                     }
                 }
+                // Checked here, once, rather than by ssh on every dial
+                // (acs-odd, DESIGN §7.1): a bad spec is a configuration
+                // error naming its line, not ssh stderr mid-reconnect.
+                k if FORWARDS.contains(&k) => {
+                    let value =
+                        forwards_value(node).map_err(|e| fail(node, format!("{key}: {e}")))?;
+                    self.local_forwards = Setting {
+                        value,
+                        origin: Some(at(node)),
+                    }
+                }
                 "aliases" => {
                     let aliases = node.value.map().ok_or_else(|| {
                         fail(
@@ -346,6 +376,7 @@ impl Config {
                                     persist: None,
                                     prefer_local_network: None,
                                     reachability_interval: None,
+                                    local_forwards: None,
                                     origin: at(n),
                                 });
                                 self.hosts.len() - 1
@@ -472,6 +503,16 @@ impl Config {
             .prefer_local_network
             .as_ref()
             .unwrap_or(&self.prefer_local_network)
+    }
+
+    /// `local_forwards` for a session reached as `name` (`[user@]<alias>`,
+    /// or `None` for a plain host): the alias's own setting, else the
+    /// global one (acs-odd). An alias that sets `none` — an empty list —
+    /// forwards nothing whatever the global setting says.
+    pub fn local_forwards_for(&self, name: Option<&str>) -> &Setting<Vec<String>> {
+        name.and_then(|n| self.alias(crate::alias::split_user(n).1))
+            .and_then(|a| a.local_forwards.as_ref())
+            .unwrap_or(&self.local_forwards)
     }
 }
 
@@ -613,6 +654,48 @@ pub fn parse_networks(text: &str) -> Result<Vec<LocalNet>, String> {
         .collect()
 }
 
+/// A `local_forwards` (acs-odd): a list of `-L` specs, or one value holding
+/// them separated by commas (as `acs config set` takes them). Each is
+/// checked with [`crate::ssh::check_local_forward`], the very checker the
+/// command line's `-L` uses, so a spec is refused when the file is read
+/// rather than by ssh on every dial.
+fn forwards_value(n: &Node) -> Result<Vec<String>, String> {
+    match &n.value {
+        Value::Seq(items) => items
+            .iter()
+            .map(|i| match &i.value {
+                Value::Scalar(s) => crate::ssh::check_local_forward(&s.text)
+                    .map(|()| s.text.clone())
+                    .map_err(|e| format!("{e} (line {})", i.line)),
+                other => Err(format!(
+                    "expected a forward such as 8080:localhost:80, found {} (line {})",
+                    other.kind(),
+                    i.line
+                )),
+            })
+            .collect(),
+        Value::Scalar(s) => parse_forwards(&s.text),
+        other => Err(format!(
+            "expected a list of forwards such as [8080:localhost:80], found {}",
+            other.kind()
+        )),
+    }
+}
+
+/// `-L` specs separated by commas, as `acs config set local_forwards` takes
+/// them; [`NO_FORWARDS`] (any case) is no forward at all, which is how an
+/// alias suppresses the global list.
+pub fn parse_forwards(text: &str) -> Result<Vec<String>, String> {
+    if text.trim().eq_ignore_ascii_case(NO_FORWARDS) {
+        return Ok(Vec::new());
+    }
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| crate::ssh::check_local_forward(s).map(|()| s.to_string()))
+        .collect()
+}
+
 fn string_value(n: &Node) -> Result<String, String> {
     match &n.value {
         Value::Scalar(s) if !s.text.is_empty() => Ok(s.text.clone()),
@@ -660,6 +743,7 @@ struct AliasSettings {
     persist: Option<Setting<bool>>,
     reachability_interval: Option<Setting<Duration>>,
     prefer_local_network: Option<Setting<bool>>,
+    local_forwards: Option<Setting<Vec<String>>>,
 }
 
 impl AliasSettings {
@@ -693,6 +777,7 @@ impl AliasSettings {
         over(&mut alias.persist, self.persist);
         over(&mut alias.prefer_local_network, self.prefer_local_network);
         over(&mut alias.reachability_interval, self.reachability_interval);
+        over(&mut alias.local_forwards, self.local_forwards);
     }
 }
 
@@ -716,7 +801,9 @@ fn alias_parts(
                         settings.identity_file = identity_file(v, at)
                             .map_err(|e| fail(v, format!("identity_file: {e}")))?
                     }
-                    k if (ALIAS_BOOLS.contains(&k) || DURATIONS.contains(&k))
+                    k if (ALIAS_BOOLS.contains(&k)
+                        || DURATIONS.contains(&k)
+                        || FORWARDS.contains(&k))
                         && v.value == Value::Null => {}
                     k if ALIAS_BOOLS.contains(&k) => {
                         let value = bool_value(v).map_err(|e| fail(v, format!("{k}: {e}")))?;
@@ -729,6 +816,13 @@ fn alias_parts(
                         let value =
                             duration_value(k, v).map_err(|e| fail(v, format!("{k}: {e}")))?;
                         *settings.duration_mut(k) = Some(Setting {
+                            value,
+                            origin: Some(at(v)),
+                        })
+                    }
+                    k if FORWARDS.contains(&k) => {
+                        let value = forwards_value(v).map_err(|e| fail(v, format!("{k}: {e}")))?;
+                        settings.local_forwards = Some(Setting {
                             value,
                             origin: Some(at(v)),
                         })
@@ -950,7 +1044,7 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, aliases)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards, aliases)",
             ),
             ("aliases: [a]\n", ":1: aliases: expected a mapping"),
             // acs-9yv: a bad network on a host entry, and the setting's
@@ -1129,7 +1223,7 @@ aliases:
             ),
             (
                 "aliases:\n  d:\n    user: me\n",
-                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, hosts; a single host entry needs 'host: <name>')",
+                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards, hosts; a single host entry needs 'host: <name>')",
             ),
             (
                 "aliases:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
@@ -1419,6 +1513,138 @@ aliases:
         assert!(!KEYS.contains(&"local_networks"));
         assert!(!ALIAS_KEYS.contains(&"local_networks"));
         assert!(HOST_KEYS.contains(&"local_networks"));
+    }
+
+    /// acs-odd: `local_forwards` globally and per alias, in every form it
+    /// is written, and the precedence between them.
+    #[test]
+    fn local_forwards_read_globally_and_per_alias() {
+        let for_ = |c: &Config, n: &str| c.local_forwards_for(Some(n)).value.clone();
+        // A block sequence, a flow one, and one value with commas all read
+        // the same. A `-L` spec has no comma in it, so splitting is safe.
+        for text in [
+            "local_forwards:\n  - 8080:localhost:80\n  - 5432:db:5432\n",
+            "local_forwards: [8080:localhost:80, 5432:db:5432]\n",
+            "local_forwards: 8080:localhost:80, 5432:db:5432\n",
+        ] {
+            let c = load("", text).unwrap();
+            assert_eq!(
+                c.local_forwards.value,
+                ["8080:localhost:80", "5432:db:5432"],
+                "{text:?}"
+            );
+            assert!(c.local_forwards.origin.is_some(), "{text:?}");
+            // A plain host, and an alias with no list of its own, take it.
+            assert_eq!(for_(&c, "box"), ["8080:localhost:80", "5432:db:5432"]);
+        }
+        // One forward needs no list around it, quoted or not: the colons
+        // are only YAML's when one is followed by a space.
+        for value in [
+            "8080:localhost:80",
+            "\"8080:localhost:80\"",
+            "[8080:localhost:80]",
+        ] {
+            let c = load("", &format!("local_forwards: {value}\n")).unwrap();
+            assert_eq!(c.local_forwards.value, ["8080:localhost:80"], "{value:?}");
+        }
+        // The alias's own list replaces the global one, `user@` and all…
+        let src = "local_forwards: [8080:localhost:80]\n\
+                   aliases:\n  \
+                     db:\n    local_forwards: 5432:db.internal:5432\n    hosts: [{host: a}]\n  \
+                     quiet:\n    local_forwards: none\n    hosts: [{host: b}]\n  \
+                     empty:\n    local_forwards: []\n    hosts: [{host: c}]\n  \
+                     plain:\n    - host: d\n";
+        let c = load("", src).unwrap();
+        assert_eq!(for_(&c, "db"), ["5432:db.internal:5432"]);
+        assert_eq!(for_(&c, "me@db"), ["5432:db.internal:5432"]);
+        // … and `none`, like the empty list, is a setting: it says no
+        // forward at all, over the global one.
+        for a in ["quiet", "empty"] {
+            assert!(for_(&c, a).is_empty(), "{a}");
+            assert!(c.alias(a).unwrap().local_forwards.is_some(), "{a}");
+        }
+        // An alias that sets none of its own falls back to the global list.
+        assert_eq!(for_(&c, "plain"), ["8080:localhost:80"]);
+        assert!(c.alias("plain").unwrap().local_forwards.is_none());
+        // No name at all (a `acs list` over every alias) is the global one.
+        assert_eq!(
+            c.local_forwards_for(None).value,
+            ["8080:localhost:80".to_string()]
+        );
+
+        // An empty value sets nothing, globally and on an alias, as any
+        // setting's does — unlike `none`, which sets the empty list.
+        let c = load(
+            "local_forwards: [8080:localhost:80]\n",
+            "local_forwards:\naliases:\n  d:\n    local_forwards:\n    hosts: [{host: a}]\n",
+        )
+        .unwrap();
+        assert_eq!(c.local_forwards.value, ["8080:localhost:80"]);
+        assert!(c.alias("d").unwrap().local_forwards.is_none());
+        assert_eq!(for_(&c, "d"), ["8080:localhost:80"]);
+
+        // The local file replaces the global list rather than adding to it.
+        let c = load(
+            "local_forwards: [8080:localhost:80]\n",
+            "local_forwards: [9000:localhost:9000]\n",
+        )
+        .unwrap();
+        assert_eq!(c.local_forwards.value, ["9000:localhost:9000"]);
+        assert!(c
+            .local_forwards
+            .origin
+            .unwrap()
+            .file
+            .ends_with("local.yaml"));
+
+        // It is a setting of its own at both levels, and never a host
+        // entry's: a forward belongs to the session, not to one address.
+        assert!(KEYS.contains(&"local_forwards"));
+        assert!(ALIAS_KEYS.contains(&"local_forwards"));
+        assert!(!HOST_KEYS.contains(&"local_forwards"));
+        assert!(FORWARDS.contains(&"local_forwards"));
+    }
+
+    /// acs-odd: a bad spec is refused **when the file is read**, by the very
+    /// checker `-L` uses (`ssh::check_local_forward`), so it never reaches
+    /// ssh to be complained about on every dial of a reconnect loop. The
+    /// error names the file and the line, like any other configuration one.
+    #[test]
+    fn a_bad_local_forward_is_a_config_error_naming_the_line() {
+        let cases = [
+            (
+                "local_forwards: [8080:localhost]\n",
+                "local.yaml:1: local_forwards: bad -L '8080:localhost': want 3 or 4 colon-separated fields, not 2",
+            ),
+            (
+                "local_forwards: eighty:localhost:80\n",
+                "local.yaml:1: local_forwards: bad -L 'eighty:localhost:80': port 'eighty' is not a number",
+            ),
+            // A block list points at the item's own line, not the key's.
+            (
+                "local_forwards:\n  - 8080:localhost:80\n  - 0:localhost:80\n",
+                "local.yaml:1: local_forwards: bad -L '0:localhost:80': port '0' is not a number from 1 to 65535 — want [bind_address:]port:host:hostport, as ssh spells it (a unix socket needs -o LocalForward=… instead) (line 3)",
+            ),
+            (
+                "local_forwards: {a: b}\n",
+                "local.yaml:1: local_forwards: expected a list of forwards such as [8080:localhost:80], found a mapping",
+            ),
+            (
+                "aliases:\n  d:\n    local_forwards: [8080:localhost]\n    hosts: [{host: a}]\n",
+                "local.yaml:3: aliases.d: local_forwards: bad -L '8080:localhost'",
+            ),
+            (
+                "aliases:\n  d:\n    - host: a\n      local_forwards: [8080:localhost:80]\n",
+                "aliases.d: unknown key 'local_forwards' in a host entry",
+            ),
+        ];
+        for (src, want) in cases {
+            let e = load("", src).unwrap_err();
+            assert!(e.contains(want), "{src:?}:\n  got  {e}\n  want {want}");
+        }
+        // And the global file is checked the same way.
+        let e = load("local_forwards: [8080:localhost]\n", "").unwrap_err();
+        assert!(e.contains("global.yaml:1: local_forwards: bad -L"), "{e}");
     }
 
     #[test]
