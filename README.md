@@ -194,7 +194,8 @@ In a session, press **Ctrl-] Ctrl-]** quickly, then:
 | `x` | exit — end the session on the remote |
 
 The terminal bell rings when Ctrl-] Ctrl-] has armed command mode, so you
-know the next key is a command (command mode waits 2 seconds for it). acs
+know the next key is a command (command mode waits 2 seconds for it, or as
+long as `ACS_ESCAPE_TIMEOUT_MS` if you have set that longer). acs
 writes the bell to your terminal only, never to the program, and never in
 the middle of a sequence the program is sending. Turn it off with
 `command_bell: false` in the configuration or `ACS_COMMAND_BELL=0`.
@@ -556,7 +557,7 @@ reached as `user@config`.
 | `ACS_DEFAULT_SESSION` | name of the session plain `acs host` creates, and attaches without a terminal (default `main`) |
 | `ACS_IDENTITY` | identity shown to others on a shared account |
 | `ACS_ESCAPE_KEY` | command key in `^X` notation (default `^]`) |
-| `ACS_ESCAPE_TIMEOUT_MS` | window for the double press (default 400) |
+| `ACS_ESCAPE_TIMEOUT_MS` | window for the double press (default 400), and the window to then choose the command key — that one never shorter than 2 s |
 | `ACS_COMMAND_BELL` | `0`: no bell when command mode arms; `1`: a bell even if the configuration turns it off |
 | `ACS_REDRAW_ON_RECONNECT` | `0`: no Ctrl-L after reconnecting; `1`: a Ctrl-L even if the configuration (global or the alias's) turns it off |
 | `ACS_PERSIST` | `1`: never give up on a lost host (as `--persist`); `0`: give up as by default, whatever the configuration says |

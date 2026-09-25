@@ -874,10 +874,37 @@ lossless resume will not repaint it. So:
 | Ctrl-] Ctrl-] within 400 ms | Enter command mode: the next key is a command. The terminal bell rings. |
 | … then `d` | **Detach.** `DETACH` to the master, restore the local terminal, exit 0. The session keeps running. Works even while the link is down (it is purely local then). |
 | … then `x` | **Exit.** `KILL` to the master, wait for `EXIT`, restore the terminal, exit with the child's status. Needs the link; if it is down the client says so and stays in the session. |
-| … then any other key, or nothing for 2 s | All the held keys are sent to the remote as typed. |
+| … then any other key, or nothing for **2 s** (longer if the escape window is, below) | All the held keys are sent to the remote as typed. |
 
 The only cost is that a lone Ctrl-] reaches the remote up to 400 ms late. The
 window is a setting (`ACS_ESCAPE_TIMEOUT_MS`), and so is the key.
+
+**One window setting, covering both halves of the gesture.** The gesture has
+two clocks — the gap allowed *between* the presses, and the time to then
+*choose* a command key — and `ACS_ESCAPE_TIMEOUT_MS` sets both. Precisely:
+it is the gap between the presses outright, and the window to choose is that
+value or **2 s**, whichever is longer.
+
+Until acs-mq0 the second window was a bare 2 s constant with no knob at all,
+which got the person most likely to set the variable exactly backwards:
+someone who widens it because 400 ms is too quick for them has said "I am
+slower than the default", and acs answered by relaxing the half of the
+gesture they had not complained about while leaving the other half as it
+was. Two settings would be more precise — the double tap could stay crisp
+while the choice was relaxed — but that is a distinction nobody has asked
+for, it costs a seventh timer knob (acs-r1k), and "give me longer" is one
+thought, so it is one setting.
+
+The floor is what keeps the single setting honest in the other direction. A
+*tighter* window, `ACS_ESCAPE_TIMEOUT_MS=150` for a user whose Ctrl-] is
+busy in vim, says the double tap should be crisp; it says nothing about how
+fast they can pick `d`, and taking the choice down to 150 ms with it would
+be a worse bug than the one this fixes. So the setting widens both windows
+and narrows only the first.
+
+This widens the meaning of an existing variable, which is a behaviour change
+for anyone already setting it — a small one, since the default is unchanged
+either way (400 ms and 2 s), and in the direction they asked for.
 
 **The detector's lifetime.** There is **one** detector, and it lives as long
 as the client does — not as long as a link, and not as long as one wait
@@ -931,9 +958,10 @@ the file (`0` off, `1` on). The bell does not break the transparent stream:
   lexes the output and knows where it is. If the output is inside such a
   sequence, the bell waits and is written as soon as the output reaches a
   boundary — right after the ST or `BEL` that ends the string. It is dropped
-  if command mode ends first (a key, or the 2 s timeout), so a late bell never
-  announces a command mode that is over. An `acs:` note printed under `-v`
-  waits for the same boundary and is written at the same point (§7), with
+  if command mode ends first (a key, or the window to choose running out),
+  so a late bell never announces a command mode that is over. An `acs:` note
+  printed under `-v` waits for the same boundary and is written at the same
+  point (§7), with
   the difference that it is never dropped: an announcement nobody needs any
   more is noise, a diagnostic that never arrives is a bug.
 - It rings only when command mode arms and then waits: Ctrl-] Ctrl-] and the

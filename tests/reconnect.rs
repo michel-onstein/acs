@@ -1171,13 +1171,14 @@ fn a_session_ending_during_an_outage_leaves_no_status_behind() {
 /// seconds, which is plenty until it is not, and nothing wants it back
 /// (acs-7wu, acs-ryz).
 ///
-/// One wall-clock window is left and cannot be closed from here: `d` has
-/// to reach the client within `keys::Config::command_timeout_ms`, two
-/// seconds, and that constant has no environment knob — `ACS_ESCAPE_TIMEOUT_MS`
-/// widens the window *between the two presses* and not the one after them.
-/// The two writes cannot be merged into one, because a feed that ends with
-/// the action key never leaves the detector armed and so never rings the
-/// bell this test is named for.
+/// Nothing here is timed. The two writes cannot be merged into one, because
+/// a feed that ends with the action key never leaves the detector armed and
+/// so never rings the bell this test is named for — so `d` has to arrive
+/// after the BEL, under the window to choose a command key. That used to be
+/// a bare two-second constant with no knob, the last wall-clock window in
+/// this file (acs-ryz); since acs-mq0 `ACS_ESCAPE_TIMEOUT_MS` sets that
+/// window too, so thirty seconds here buys the second write the same room
+/// every other wait in the suite has.
 #[test]
 fn the_bell_rings_while_the_link_is_down_too() {
     let remote = Remote::installed();
@@ -1185,7 +1186,10 @@ fn the_bell_rings_while_the_link_is_down_too() {
         &remote,
         "ob",
         "echo up; sleep 30",
-        &[("ACS_BACKOFF_MS", "120000")],
+        &[
+            ("ACS_BACKOFF_MS", "120000"),
+            ("ACS_ESCAPE_TIMEOUT_MS", "30000"),
+        ],
     );
     c.wait_for("up", T);
     remote.refuse_one_dial();
@@ -1197,7 +1201,8 @@ fn the_bell_rings_while_the_link_is_down_too() {
     // One write, so the double tap cannot be split across the escape
     // window by a host that deschedules the client between the two presses
     // (acs-o8h): 50 ms of sleep inside the default 400 ms was the tightest
-    // wall-clock gap in this file.
+    // wall-clock gap in this file. The window is thirty seconds here now,
+    // so one write is belt and braces rather than the thing holding it up.
     c.send(&[0x1d, 0x1d]);
     c.wait_for("\x07", T);
     c.send(b"d");
@@ -1216,7 +1221,10 @@ fn the_bell_rings_while_the_link_is_down_too() {
 /// BEL is the client saying it still had the first press a second later.
 /// The configured window is a whole `T` wide so that the end of the gap the
 /// test has no hold over — the two scheduling hops around the second press
-/// — has the room every other wait in the suite has. The backoff outlasts
+/// — has the room every other wait in the suite has. Since acs-mq0 that
+/// same setting is also the window to choose the command key, so the `d`
+/// after the BEL is no longer racing a two-second constant either: the last
+/// wall-clock window acs-ryz had to document here is gone. The backoff outlasts
 /// the gap so that both presses land in the same offline wait, which is
 /// what this test is about; it no longer has to outlast the *window*, now
 /// that a redial attempt under a held press keeps it (acs-e80, below).
