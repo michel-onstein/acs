@@ -540,3 +540,138 @@ fn the_installer_carries_the_same_release_key_and_checks_before_reading() {
         "the installer reads SHA256SUMS before checking its signature"
     );
 }
+
+/// A real git repository at `<dir>/notes` holding `release-changes.sh`, with
+/// one empty commit per subject in `history` (oldest first), and a tag
+/// wherever an entry is a `vX.Y.Z` instead of a subject.
+fn notes_checkout(dir: &Path, history: &[&str]) -> PathBuf {
+    let root = dir.join("notes");
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    let dest = root.join("scripts/release-changes.sh");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/release-changes.sh"),
+        &dest,
+    )
+    .unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    for h in history {
+        let tag = h
+            .strip_prefix('v')
+            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+        if tag {
+            git(&["tag", h]);
+        } else {
+            git(&["commit", "-q", "--allow-empty", "-m", h]);
+        }
+    }
+    root
+}
+
+/// The changes `scripts/release-changes.sh` lists for `tag`.
+fn changes(root: &Path, tag: &str) -> Vec<String> {
+    let out = Command::new("sh")
+        .arg(root.join("scripts/release-changes.sh"))
+        .arg(tag)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "release-changes.sh: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// The notes tell someone about to install the binary what changed in it, so
+/// the bookkeeping stays out: the release's own version bump, and the
+/// `chore(beads):` commits that only open and close issues under `.beads/`.
+/// Every other `chore` is a change to the build or the scripts, and stays.
+#[test]
+fn release_notes_leave_out_the_bookkeeping() {
+    let dir = TempDir::new();
+    let root = notes_checkout(
+        dir.path(),
+        &[
+            "feat: the first thing",
+            "v0.1.0",
+            "feat(timing): name the greeting as its own phase",
+            "chore(beads): close acs-ftn, file the phase-name drift",
+            "fix(e2e): check the client binary",
+            "chore(ci): pin the runner image",
+            "chore(release): v0.2.0",
+            "v0.2.0",
+        ],
+    );
+    assert_eq!(
+        changes(&root, "v0.2.0"),
+        [
+            "- chore(ci): pin the runner image",
+            "- fix(e2e): check the client binary",
+            "- feat(timing): name the greeting as its own phase",
+        ],
+        "a beads chore, the release chore, or an ordinary chore, is in or out wrongly"
+    );
+}
+
+/// With no previous tag the whole history is the release — still without the
+/// bookkeeping — and the list says as much.
+#[test]
+fn a_first_release_says_so_and_still_filters() {
+    let dir = TempDir::new();
+    let root = notes_checkout(
+        dir.path(),
+        &[
+            "feat: the first thing",
+            "chore(beads): file acs-aaa",
+            "v0.1.0",
+        ],
+    );
+    assert_eq!(
+        changes(&root, "v0.1.0"),
+        ["First release.", "", "- feat: the first thing"]
+    );
+}
+
+/// A release that is nothing but bookkeeping lists nothing, rather than
+/// failing: the `grep` matching no line must not end the script (`set -e`).
+#[test]
+fn a_release_of_only_bookkeeping_lists_nothing() {
+    let dir = TempDir::new();
+    let root = notes_checkout(
+        dir.path(),
+        &[
+            "feat: the first thing",
+            "v0.1.0",
+            "chore(beads): close acs-ftn",
+            "chore(release): v0.2.0",
+            "v0.2.0",
+        ],
+    );
+    assert!(changes(&root, "v0.2.0").is_empty());
+}

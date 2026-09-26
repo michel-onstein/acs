@@ -45,15 +45,9 @@ echo "== building $tag"
 git worktree add --quiet --detach "$work/src" "$tag"
 (cd "$work/src" && cargo xtask dist --out "$work/dist")
 
-# What changed: the pull requests since the previous tag.
-prev=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -A1 -x "$tag" | sed -n 2p)
-range=$tag
-[ -n "$prev" ] && range="$prev..$tag"
-git log --first-parent --format='- %s' "$range" | grep -v '^- chore(release):' > "$work/changes.md" || true
-if [ -z "$prev" ]; then
-    { echo "First release."; echo; cat "$work/changes.md"; } > "$work/c2"
-    mv "$work/c2" "$work/changes.md"
-fi
+# What changed: the pull requests since the previous tag, bookkeeping left
+# out (scripts/release-changes.sh).
+scripts/release-changes.sh "$tag" > "$work/changes.md"
 
 echo "== packaging"
 cargo xtask package --dist "$work/dist" --version "$version" --out "$work/assets" \
