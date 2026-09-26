@@ -116,4 +116,7 @@ reuse `dist/`, which takes the suite from about a minute to about 20 s).
 `--no-build` reuses `dist/` only if `dist/source.stamp` — written by
 `cargo xtask dist`, a hash of the sources it built from — matches this tree,
 so an edit made since the build is refused rather than silently tested
-against the old binary (acs-gb4). `--allow-stale-dist` says you mean it.
+against the old binary (acs-gb4). A checkout with no `dist/` at all — a fresh
+worktree — is built once instead: absent is not stale (acs-0pr). A `dist/`
+holding no binary for this host is named and refused. `--allow-stale-dist`
+says you mean it, and needs `--no-build` to mean anything.

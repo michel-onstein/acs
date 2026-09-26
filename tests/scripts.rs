@@ -12,16 +12,42 @@ use acs::testutil::TempDir;
 const FAKE: &str = r#"#!/bin/sh
 # Records one line per call: the program's name and its arguments.
 echo "$(basename "$0") $*" >>"$FAKE_LOG"
-case "$(basename "$0") $1" in
-    "docker port") echo 127.0.0.1:49999 ;;
+case "$(basename "$0") $1 $2" in
+    "docker port "*) echo 127.0.0.1:49999 ;;
     "ssh-keygen "*) while [ $# -gt 1 ]; do shift; done; : >"$1"; : >"$1.pub" ;;
+    # `cargo xtask dist` leaves a binary per target and the source stamp.
+    "cargo xtask dist")
+        for t in aarch64-apple-darwin x86_64-apple-darwin \
+            x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            mkdir -p "dist/$t" && : >"dist/$t/acs"
+        done
+        sh scripts/source_stamp.sh >dist/source.stamp
+        ;;
     "cargo "*) echo "cargo-env port=$ACS_E2E_PORT container=$ACS_E2E_CONTAINER" >>"$FAKE_LOG" ;;
 esac
 "#;
 
+/// The target triple `e2e_ssh.sh` picks for the host running these tests,
+/// and so the client binary it insists on.
+fn host_target() -> &'static str {
+    match (cfg!(target_os = "macos"), cfg!(target_arch = "aarch64")) {
+        (true, true) => "aarch64-apple-darwin",
+        (true, false) => "x86_64-apple-darwin",
+        (false, true) => "aarch64-unknown-linux-musl",
+        (false, false) => "x86_64-unknown-linux-musl",
+    }
+}
+
 /// A copy of the repository's scripts at `<dir>/<name>`, as a checkout, with
 /// a source tree and a `dist/` built from it.
 fn checkout(dir: &Path, name: &str) -> PathBuf {
+    let root = bare_checkout(dir, name);
+    dist(&root);
+    root
+}
+
+/// The same, with no `dist/` at all — a fresh worktree.
+fn bare_checkout(dir: &Path, name: &str) -> PathBuf {
     let root = dir.join(name);
     let scripts = root.join("scripts");
     std::fs::create_dir_all(&scripts).unwrap();
@@ -36,12 +62,11 @@ fn checkout(dir: &Path, name: &str) -> PathBuf {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"acs\"\n").unwrap();
     std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-    dist(&root);
     root
 }
 
-/// What `cargo xtask dist` leaves behind for `--no-build`: the fingerprint of
-/// the checkout's sources as they are now, beside the binaries.
+/// What `cargo xtask dist` leaves behind for `--no-build`: a binary per
+/// target, and the fingerprint of the checkout's sources as they are now.
 fn dist(root: &Path) -> String {
     let out = Command::new("sh")
         .arg(root.join("scripts").join("source_stamp.sh"))
@@ -54,7 +79,15 @@ fn dist(root: &Path) -> String {
     );
     let stamp = String::from_utf8(out.stdout).unwrap();
     assert_eq!(stamp.trim().len(), 64, "not a sha256: {stamp:?}");
-    std::fs::create_dir_all(root.join("dist")).unwrap();
+    for t in [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+    ] {
+        std::fs::create_dir_all(root.join("dist").join(t)).unwrap();
+        std::fs::write(root.join("dist").join(t).join("acs"), "").unwrap();
+    }
     std::fs::write(root.join("dist").join("source.stamp"), &stamp).unwrap();
     stamp
 }
@@ -207,6 +240,75 @@ fn e2e_no_build_refuses_a_dist_that_is_not_this_source_tree() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// acs-0pr: absent is not stale. A fresh worktree — where nearly all work in
+/// this repo happens — has no `dist/` at all, and there is nothing there to
+/// be misled by, so `--no-build` builds it once and says so instead of
+/// refusing a command the caller would only re-run without the flag.
+#[test]
+fn e2e_no_build_builds_a_dist_that_is_not_there() {
+    let dir = TempDir::new();
+    let root = bare_checkout(dir.path(), "a");
+    let out = try_run(dir.path(), &root, "e2e_ssh.sh", &["--no-build"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "refused an absent dist/: {err}");
+    assert!(err.contains("no dist/ yet"), "said nothing: {err}");
+    assert!(!err.contains("REFUSING"), "{err}");
+    let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+    assert!(log.contains("cargo xtask dist"), "{log}");
+    // And having built it, it ran the suite against it.
+    assert!(log.contains("docker run"), "{log}");
+    assert!(log.contains("cargo test"), "{log}");
+    // The stamp that build left makes the next run a reuse, not a rebuild.
+    let again = run(dir.path(), &root, "e2e_ssh.sh", &["--no-build"]);
+    assert!(
+        !again.iter().any(|l| l.starts_with("cargo xtask")),
+        "{again:?}"
+    );
+}
+
+/// acs-0pr: a `dist/` built with `--targets` that leaves this host out
+/// passes the stamp check — it really was built from this tree — and used to
+/// fail much later, inside the harness, on a missing file.
+#[test]
+fn e2e_refuses_a_dist_without_a_client_for_this_host() {
+    let dir = TempDir::new();
+    let root = checkout(dir.path(), "a");
+    let client = root.join("dist").join(host_target()).join("acs");
+    std::fs::remove_file(&client).unwrap();
+
+    for args in [
+        &["--no-build"][..],
+        &["--no-build", "--allow-stale-dist"][..],
+    ] {
+        let out = try_run(dir.path(), &root, "e2e_ssh.sh", args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "ran without a client: {err}");
+        // Named, with a way to get it.
+        assert!(err.contains(&client.display().to_string()), "{err}");
+        assert!(err.contains("cargo xtask dist"), "{err}");
+        // Nothing was started to fail obscurely later.
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
+        assert!(!log.contains("docker run"), "{log}");
+        assert!(!log.contains("cargo test"), "{log}");
+    }
+}
+
+/// acs-0pr: `--allow-stale-dist` only governs how `dist/` is reused, so
+/// without `--no-build` it did nothing at all. A mistyped invocation should
+/// say so rather than quietly rebuild.
+#[test]
+fn e2e_allow_stale_dist_needs_no_build() {
+    let dir = TempDir::new();
+    let root = checkout(dir.path(), "a");
+    let out = try_run(dir.path(), &root, "e2e_ssh.sh", &["--allow-stale-dist"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("--allow-stale-dist does nothing"), "{err}");
+    assert!(err.contains("usage:"), "{err}");
+    let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
+    assert!(log.is_empty(), "{log}");
 }
 
 /// A checkout whose `scripts/` holds version-bump.sh, a release-binaries.sh
