@@ -1,8 +1,9 @@
 //! How long each phase of a connection took, under `-v` (acs-pgn): the
-//! alias resolved, ssh spawned, the `ACS-READY` marker seen, the session
-//! list (the menu's `_proxy --pick`), WELCOME, the first output byte. One
-//! line per phase, for the first connection and for every redial, so it is
-//! known what dominates on a real host before anything is optimised.
+//! alias resolved, ssh spawned, the greeting sent, the `ACS-READY` marker
+//! seen, the session list (the menu's `_proxy --pick`), WELCOME, the first
+//! output byte. One line per phase, for the first connection and for every
+//! redial, so it is known what dominates on a real host before anything is
+//! optimised.
 
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,26 @@ impl Timing {
         self.last = now;
     }
 
+    /// The greeting has gone into the transport (acs-ftn).
+    ///
+    /// `all` is whether the whole of it went: the dial writes the HELLO
+    /// into ssh's stdin the moment ssh is spawned (DESIGN §5.3, acs-trw)
+    /// and that write is non-blocking, so a pipe that would not take all
+    /// of it leaves the rest in `Link::pending` for `serve` to write —
+    /// `HELLO partly sent` there, and `HELLO sent` again where the last of
+    /// it finally goes. The menu's connection owes the whole greeting the
+    /// same way, and is told once, late.
+    ///
+    /// So `HELLO sent` always means the whole greeting is out, wherever in
+    /// the order it lands: before `ACS-READY seen` when it went with the
+    /// dial, which is the point of acs-trw, and after it when it did not.
+    pub fn hello(&mut self, all: bool) {
+        self.mark(match all {
+            true => "HELLO sent",
+            false => "HELLO partly sent",
+        });
+    }
+
     /// The first output byte: the last phase, told once per connection.
     pub fn first_output(&mut self) {
         self.mark("first output byte");
@@ -77,6 +98,23 @@ mod tests {
                 Duration::from_millis(340)
             ),
             "timing: redial: WELCOME received +12 ms (340 ms total)"
+        );
+    }
+
+    #[test]
+    fn the_greeting_is_named_whole_or_partly_sent() {
+        crate::client::capture_notes();
+        let mut t = Timing::start(true, "first connection");
+        t.hello(false);
+        t.hello(true);
+        let told = crate::client::captured_notes();
+        assert!(
+            told[0].contains("first connection: HELLO partly sent +"),
+            "{told:?}"
+        );
+        assert!(
+            told[1].contains("first connection: HELLO sent +"),
+            "{told:?}"
         );
     }
 

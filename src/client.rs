@@ -585,6 +585,11 @@ mod notes {
     }
 }
 
+/// The note sink, for the crate's own tests outside this module
+/// (`timing.rs` asserts the phase lines it raises).
+#[cfg(test)]
+pub(crate) use notes::{capture as capture_notes, written as captured_notes};
+
 // ---- links -----------------------------------------------------------------
 
 /// One connection to the remote: the transport child and its pipes.
@@ -729,6 +734,12 @@ fn dial_once(
         let _ = sys::set_nonblocking(to.as_raw_fd(), true);
         let _ = write_link(to.as_raw_fd(), &mut pending);
         let _ = sys::set_nonblocking(to.as_raw_fd(), false);
+        // The greeting's own phase (acs-ftn). Normally the whole of it
+        // went, here, before the marker is even awaited — which is the
+        // whole of acs-trw, and is what the order of the lines shows. A
+        // pipe that took only part of it says so, because `HELLO sent`
+        // then comes later and a reader is owed the reason.
+        timing.hello(pending.is_empty());
     }
     let mut scanner = MarkerScanner::new();
     let mut buf = [0u8; 4096];
@@ -1259,8 +1270,9 @@ fn queue_input(state: &mut State, out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Serve one link: finish the handshake, then relay until something ends
 /// it. The HELLO is the link's `pending`: written with the dial already
-/// (acs-trw), or still owed by a connection the session menu opened.
-/// `sent_size` is the terminal size that HELLO carried.
+/// (acs-trw), or still owed by a connection the session menu opened —
+/// where it is still owed, the clock is told `HELLO sent` as the last of
+/// it goes (acs-ftn). `sent_size` is the terminal size that HELLO carried.
 #[allow(clippy::too_many_arguments)]
 fn serve(
     args: &ClientArgs,
@@ -1284,6 +1296,14 @@ fn serve(
     let mut dec = Decoder::new();
     dec.push(&early);
     let mut out = std::mem::take(&mut link.pending);
+    // How much of `out` is still the greeting (acs-ftn). Nothing in the
+    // common case, where the dial wrote it whole and has said so; the tail
+    // the dial's pipe would not take; or all of it on the menu's
+    // connection, which owes its HELLO after the list (DESIGN §4.4). It
+    // sits at the front of `out` and is written before anything else, so
+    // it is out once this many bytes have gone, and that is where the
+    // clock is told.
+    let mut owed = out.len();
     let mut buf = vec![0u8; 64 * 1024];
     // The detector is `state`'s: it carries over from the last link and from
     // the offline wait in between (DESIGN §6.1). The bell does not — one
@@ -1499,8 +1519,15 @@ fn serve(
             }
         }
 
+        let before = out.len();
         if let Err(_e) = write_link(to, &mut out) {
             return lost(link, LinkEnd::Transport);
+        }
+        if owed > 0 {
+            owed -= (before - out.len()).min(owed);
+            if owed == 0 {
+                timing.hello(true);
+            }
         }
 
         let now = sys::now_ms();
