@@ -10,7 +10,9 @@
 #
 # Needs docker and `cargo xtask dist` output (built unless --no-build).
 # --no-build reuses dist/ only when `dist/source.stamp` says it was built from
-# this source tree (acs-gb4); --allow-stale-dist reuses it regardless.
+# this source tree (acs-gb4); a dist/ that is not there at all is built once
+# instead, since absent is not stale (acs-0pr). --allow-stale-dist reuses
+# whatever is there regardless, and needs --no-build to mean anything.
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
@@ -26,6 +28,13 @@ for arg in "$@"; do
             ;;
     esac
 done
+# A flag that only governs how dist/ is reused says nothing once dist/ is
+# being rebuilt: silently ignoring it hides a mistyped invocation (acs-0pr).
+if [ "$allow_stale" = 1 ] && [ "$build" = 1 ]; then
+    echo "$0: --allow-stale-dist does nothing without --no-build" >&2
+    echo "usage: $0 [--no-build [--allow-stale-dist]]" >&2
+    exit 2
+fi
 # Per checkout, so worktrees running this at once keep their own host.
 name=acs-e2e-host-$(printf %s "$root" | cksum | cut -d' ' -f1)
 port=${ACS_E2E_PORT:-}
@@ -36,6 +45,15 @@ if [ "$build" = 1 ]; then
     cargo xtask dist
 elif [ "$allow_stale" = 1 ]; then
     echo "e2e: --allow-stale-dist: reusing dist/ unchecked" >&2
+elif [ ! -d dist ]; then
+    # Absent is not stale. acs-gb4's refusal is about *reusing* binaries
+    # whose provenance is wrong; there are none here to reuse, so there is
+    # nothing to be misled by. Nearly all work in this repo happens in a
+    # fresh worktree, which has no dist/ at all, and refusing there asks the
+    # caller to re-run the same command without the flag. Build it once and
+    # say so (acs-0pr).
+    echo "e2e: --no-build: this checkout has no dist/ yet; building it once." >&2
+    cargo xtask dist
 else
     # dist/ is only worth reusing if it was built from what is on disk now:
     # a red run from a binary two edits old reads exactly like a real one
@@ -61,6 +79,17 @@ case "$(uname -s)-$(uname -m)" in
     Linux-aarch64) client=dist/aarch64-unknown-linux-musl/acs ;;
     *) echo "unsupported local platform" >&2; exit 1 ;;
 esac
+# The binary the tests drive. A dist/ built with `--targets` that leaves this
+# host out passes the stamp check — the tree it was built from really is this
+# one — and would otherwise surface much later as whatever the harness says
+# about a missing file (acs-0pr).
+if [ ! -f "$client" ]; then
+    echo >&2
+    echo "e2e: no client binary at $root/$client." >&2
+    echo "dist/ holds no build for this host: run 'cargo xtask dist'" >&2
+    echo "without --targets, or drop --no-build to build it here." >&2
+    exit 1
+fi
 
 ssh-keygen -q -t ed25519 -N '' -f "$work/key"
 docker build -q -t acs-e2e-host scripts/e2e >/dev/null

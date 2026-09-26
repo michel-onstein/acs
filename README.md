@@ -619,8 +619,10 @@ scripts/update-tap.sh vX.Y.Z # point the Homebrew tap at a release
 `scripts/e2e_ssh.sh --no-build` reuses the binaries already in `dist/` (about
 20 s instead of a minute), but only when `dist/source.stamp` says they were
 built from the tree as it is now — otherwise it refuses, since a failure from
-a stale binary looks exactly like a real one. `--allow-stale-dist` runs it
-anyway.
+a stale binary looks exactly like a real one. A checkout with no `dist/` at
+all, such as a fresh worktree, has nothing stale to reuse, so it is built once
+instead of refused. `--allow-stale-dist` reuses `dist/` unchecked, and is a
+usage error without `--no-build`.
 
 Results of the checks that need a real terminal are in
 [docs/VERIFICATION.md](docs/VERIFICATION.md).

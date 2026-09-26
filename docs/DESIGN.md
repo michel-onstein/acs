@@ -2153,7 +2153,16 @@ to reuse `dist/` when it differs: a red end-to-end run from a binary two edits
 old reads exactly like a real one, and the edits that cause it are usually
 uncommitted, so a revision alone would not see them (acs-gb4). The stamp is
 written into the directory the run wipes and refills, last, so it cannot
-outlive the binaries it describes; `--allow-stale-dist` overrides it.
+outlive the binaries it describes; `--allow-stale-dist` overrides it, and is
+a usage error without `--no-build`, where it would do nothing.
+
+The refusal is about *reusing* binaries whose provenance is wrong, so it does
+not cover a checkout with no `dist/` at all — a fresh worktree, which is where
+nearly all work here happens. There `--no-build` builds once and says so
+(acs-0pr). What the stamp cannot see is *which* targets were built: a `dist/`
+built with `--targets` that leaves this host out is this tree's, and the run
+therefore checks the client binary it is about to drive exists, naming it
+rather than failing later inside the harness.
 
 ## 9. Implementation
 
