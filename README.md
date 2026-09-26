@@ -181,9 +181,14 @@ what it does there:
 The list, the menu's `x` and the attach share one ssh connection, so a
 plain `acs host` logs in once (one touch of a hardware key), and `acs -v
 host` shows a single `running ssh …`. `-v` also times each phase of a
-connection — ssh spawned, acs ready on the remote, the session list, the
-attach, the first output — as `acs: timing: …` lines, for every redial
-too. Without a terminal on stdout there is no menu: `acs host` attaches
+connection — ssh spawned, the greeting sent, acs ready on the remote, the
+session list, the attach, the first output — as `acs: timing: …` lines,
+for every redial too. `HELLO sent` is where the *whole* greeting has gone,
+so its place in the list is the answer to whether it went out with the
+dial: normally it is right after `ssh spawned`, and it comes later on the
+menu's connection, which greets after the list, or as `HELLO partly sent`
+then `HELLO sent` when the greeting was too big for one write. Without a
+terminal on stdout there is no menu: `acs host` attaches
 `main`, creating it if needed.
 
 In a session, press **Ctrl-] Ctrl-]** quickly, then:

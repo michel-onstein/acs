@@ -1,5 +1,8 @@
 //! Per-phase connect timings under `-v` (acs-pgn): one line per phase, in
-//! order, for the first connection, the menu's and every redial.
+//! order, for the first connection, the menu's and every redial. The
+//! greeting is one of them (acs-ftn): `HELLO sent` where the whole of it
+//! has gone, which is before `ACS-READY seen` when it went out with the
+//! dial (acs-trw) and after it when it did not.
 
 mod common;
 
@@ -53,6 +56,7 @@ fn the_first_connection_and_a_redial_tell_each_phase_in_order() {
         [
             "alias resolved",
             "ssh spawned",
+            "HELLO sent",
             "ACS-READY seen",
             "WELCOME received",
             "first output byte",
@@ -67,6 +71,7 @@ fn the_first_connection_and_a_redial_tell_each_phase_in_order() {
         [
             "alias resolved",
             "ssh spawned",
+            "HELLO sent",
             "ACS-READY seen",
             "WELCOME received",
             "first output byte",
@@ -75,9 +80,14 @@ fn the_first_connection_and_a_redial_tell_each_phase_in_order() {
         c.text()
     );
     // Told once per connection, not for every output byte after the first.
-    assert_eq!(phases(&c.text(), "first connection").len(), 5);
+    assert_eq!(phases(&c.text(), "first connection").len(), 6);
 }
 
+/// The menu's connection owes its whole greeting to `serve`: the proxy
+/// read the list's frames from it first (DESIGN 4.4), so nothing went
+/// ahead with the dial. `HELLO sent` is told where the greeting actually
+/// goes -- after the list, not between `ssh spawned` and `ACS-READY seen`
+/// as it is on a connection that greeted with its dial (acs-ftn).
 #[test]
 fn the_menus_connection_tells_the_session_list() {
     let remote = Remote::installed();
@@ -106,6 +116,7 @@ fn the_menus_connection_tells_the_session_list() {
             "ssh spawned",
             "ACS-READY seen",
             "session list received",
+            "HELLO sent",
             "WELCOME received",
             "first output byte",
         ],
@@ -123,4 +134,46 @@ fn without_v_no_timing_is_told() {
     );
     c.wait_for("up", T);
     assert!(!c.text().contains("timing:"), "{:?}", c.text());
+}
+
+/// A greeting the transport's stdin pipe cannot take in one write: the
+/// write in `dial` is non-blocking, so what does not fit stays in
+/// `Link::pending` for `serve` (acs-trw). That case is not silent
+/// (acs-ftn) -- `HELLO partly sent` is told at the dial, and `HELLO sent`
+/// only where the last of the greeting goes, which is past the marker.
+/// The HELLO carries the command to run, so a long enough one fills the
+/// pipe; the padding lands on `sh -c` as positional parameters it ignores.
+#[test]
+fn a_greeting_too_big_for_the_pipe_is_told_twice() {
+    let remote = Remote::installed();
+    // Over any pipe buffer acs can be handed: 64 KiB on Linux, at most
+    // that on macOS.
+    let pad = "p".repeat(1024);
+    let mut argv: Vec<&str> = vec![
+        "-v",
+        "devbox",
+        "big",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo up; sleep 30",
+    ];
+    for _ in 0..192 {
+        argv.push(&pad);
+    }
+    let mut c = Client::start(&remote, &argv);
+    c.wait_for("timing: first connection: first output byte", T);
+    assert_eq!(
+        phases(&c.text(), "first connection"),
+        [
+            "ssh spawned",
+            "HELLO partly sent",
+            "ACS-READY seen",
+            "HELLO sent",
+            "WELCOME received",
+            "first output byte",
+        ],
+        "{:?}",
+        c.text()
+    );
 }

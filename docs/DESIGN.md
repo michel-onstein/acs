@@ -811,7 +811,9 @@ sequenceDiagram
 - **The greeting goes out with the dial** (acs-trw): the `HELLO` is written
   into ssh's stdin as it is spawned, before the marker is awaited (§3), so a
   redial costs the ssh handshake and one trip for the `WELCOME` rather than
-  two. The size it carries is the terminal's as of the dial; a `SIGWINCH`
+  two. `-v` names it as a phase of its own, `HELLO sent` (acs-ftn, §7), so
+  that this is readable off one connection rather than measured with a
+  harness. The size it carries is the terminal's as of the dial; a `SIGWINCH`
   while the handshake is in flight sends no `RESIZE` of its own — only a
   welcomed link does — so the client compares the size again on the
   `WELCOME` and sends one then if the window moved.
@@ -1184,12 +1186,25 @@ that cannot wait, which bytes end the open sequence and which write it again
   of a connection, `acs: timing: <connection>: <phase> +<step> ms (<total>
   ms total)`, for the first connection and for every redial. The phases, in
   order: `alias resolved` (an alias's pings and lookups), `ssh spawned`,
-  `ACS-READY seen`, `session list received` (the menu's `_proxy --pick`,
-  §4.4), `WELCOME received`, `first output byte`; a phase a connection does
-  not go through is not told, and nothing is told after the first output
-  byte. They exist to show what dominates connect latency on a real host —
-  the ssh handshake, remote startup files or the reachability deadline —
-  before any of it is optimised.
+  `HELLO sent`, `ACS-READY seen`, `session list received` (the menu's
+  `_proxy --pick`, §4.4), `WELCOME received`, `first output byte`; a phase a
+  connection does not go through is not told, and nothing is told after the
+  first output byte. They exist to show what dominates connect latency on a
+  real host — the ssh handshake, remote startup files or the reachability
+  deadline — before any of it is optimised.
+- **`HELLO sent` is where the *whole* greeting has gone** (acs-ftn), so the
+  order of the lines is what says whether the greeting overlapped the
+  marker's leg (§5.3, acs-trw) or waited behind it — which is the one thing
+  the reader cannot otherwise tell, and it is why the phase is not "the
+  first byte went". On a connection that greets with its dial it therefore
+  lands between `ssh spawned` and `ACS-READY seen`, `+0 ms`, and the win is
+  read off the short `ACS-READY seen` → `WELCOME received` step after it.
+  Two cases put it later, and neither is silent: the menu's connection owes
+  its HELLO until after `session list received` (§4.4), and a greeting the
+  transport's stdin pipe would not take in one write leaves the rest in
+  `Link::pending` — told as `HELLO partly sent` at the dial, with `HELLO
+  sent` only where `serve` writes the last of it. One phase would have to
+  mean one of those two moments and mislead about the other.
 
 ### 7.1 ssh options
 
