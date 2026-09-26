@@ -123,10 +123,67 @@ fn remote_env_helpers_compose_in_any_order() {
         "umask lost: {text:?}"
     );
     assert_eq!(lines[1], "60000", "remote_env lost: {text:?}");
-    assert!(
-        lines[2].ends_with("master.log"),
+    // The exact path, not merely one ending in `master.log` (acs-9jv): the
+    // weaker assertion passes with a path bug sitting under it, and the
+    // path is the one thing `log_master` exists to get right.
+    assert_eq!(
+        lines[2],
+        remote.master_log_file().display().to_string(),
         "log_master lost: {text:?}"
     );
+}
+
+/// acs-9jv: `transport()` writes the script from the remote's current state
+/// on every call instead of trusting whatever is already at the path, so a
+/// setting that one day changes the script *body* cannot silently no-op
+/// because some earlier call had already materialised the file.
+#[test]
+fn the_transport_script_is_rewritten_rather_than_trusted() {
+    let remote = Remote::new();
+    let path = std::path::PathBuf::from(remote.transport());
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        body.contains(&remote.home().display().to_string()),
+        "{body}"
+    );
+
+    std::fs::write(&path, "#!/bin/sh\nexit 7\n").unwrap();
+    assert_eq!(remote.transport(), path.display().to_string());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    // And still executable: the rewrite goes through a fresh file.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755, "{mode:o}");
+}
+
+/// acs-9jv: the one splitter looks at ssh's options only. The remote
+/// prelude after the `--` is full of text shaped exactly like an option —
+/// `ls -ldnL`, `[ -L … ]`, a trailing `-i` — so a test that searches the
+/// whole recorded line finds a forward in a call that carries none, and
+/// passes while asserting something untrue (acs-odd hit this on the
+/// `Call::Session` forwarding gate).
+#[test]
+fn splitting_a_recorded_call_ignores_the_prelude() {
+    let call = "-T -e none -o BatchMode=yes -i /keys/id -p 2222 -- me@devbox.lan \
+                p=$HOME/.local/share/acs/1.2.3/acs; [ -L \"$p\" ] && exit 1; \
+                ls -ldnL \"$p\"; exec \"$p\" _proxy -i";
+    let c = SshCall::of(call);
+    assert_eq!(c.dest, "me@devbox.lan");
+    assert_eq!(c.opts, "-T -e none -o BatchMode=yes -i /keys/id -p 2222");
+    assert!(c.remote.starts_with("p=$HOME/"), "{:?}", c.remote);
+    // The prelude's `-L`s and `-i` are not options.
+    assert!(!c.opts.contains("-L"), "{:?}", c.opts);
+    assert!(c.opt_values("-L").is_empty(), "{:?}", c.opts);
+    assert_eq!(c.opt_values("-i"), ["/keys/id"]);
+
+    // A call that really does carry forwards, in both of ssh's spellings.
+    let f = SshCall::of("-T -L 45997:localhost:9 -L45998:db:5432 -- devbox ls -ldnL x");
+    assert_eq!(f.dest, "devbox");
+    assert_eq!(f.opt_values("-L"), ["45997:localhost:9", "45998:db:5432"]);
+
+    // A call with no remote command at all.
+    let bare = SshCall::of("-T -- devbox");
+    assert_eq!((bare.opts, bare.dest, bare.remote), ("-T", "devbox", ""));
 }
 
 /// Regression: waiting twice for the same text waits for its second

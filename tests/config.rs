@@ -123,14 +123,6 @@ aliases:
     - host: nas.lan
 ";
 
-/// The ssh options of a recorded call: everything before the `--` that
-/// separates them from the destination and the remote command. The prelude
-/// after it is full of `-L` in other senses (`ls -ldnL`, `[ -L … ]`), so a
-/// test asking whether a forward was passed must look at the options only.
-fn opts_of(call: &str) -> &str {
-    call.split_once(" -- ").expect("a destination after --").0
-}
-
 /// acs-odd: a forward that comes from the configuration reaches the
 /// **session's** ssh and no other call — the same `Call::Session` gate
 /// acs-6f5 put the command line's `-L` behind (DESIGN §7.1). Several ssh
@@ -157,7 +149,9 @@ fn a_configured_forward_goes_to_the_session_ssh_and_no_other_call() {
     let session = ssh.calls();
     assert_eq!(session.len(), 1, "{session:?}");
     assert!(
-        opts_of(&session[0]).contains("-L 45997:localhost:9"),
+        SshCall::of(&session[0])
+            .opts
+            .contains("-L 45997:localhost:9"),
         "{session:?}"
     );
     c.send(&command(b'x'));
@@ -174,7 +168,7 @@ fn a_configured_forward_goes_to_the_session_ssh_and_no_other_call() {
     let all = ssh.calls();
     let side = &all[session.len()..];
     assert_eq!(side.len(), 1, "{side:?}");
-    assert!(!opts_of(&side[0]).contains("-L"), "{side:?}");
+    assert!(!SshCall::of(&side[0]).opts.contains("-L"), "{side:?}");
     assert!(!side[0].contains("45997"), "{side:?}");
 
     // Call::Batch — `acs list` asks every alias at once, so the same
@@ -191,7 +185,7 @@ fn a_configured_forward_goes_to_the_session_ssh_and_no_other_call() {
     assert_eq!(batch.len(), 2, "{batch:?}");
     for call in batch {
         assert!(call.contains("-o BatchMode=yes"), "{call:?}");
-        assert!(!opts_of(call).contains("-L"), "{call:?}");
+        assert!(!SshCall::of(call).opts.contains("-L"), "{call:?}");
         assert!(!call.contains("45997"), "{call:?}");
     }
 }
@@ -223,14 +217,16 @@ fn an_aliass_own_forwards_replace_the_global_ones() {
     session("db", "a");
     let call = ssh.calls().pop().unwrap();
     assert!(
-        opts_of(&call).contains("-L 45998:db.internal:5432"),
+        SshCall::of(&call)
+            .opts
+            .contains("-L 45998:db.internal:5432"),
         "{call:?}"
     );
     assert!(!call.contains("45997"), "{call:?}");
 
     session("quiet", "b");
     let call = ssh.calls().pop().unwrap();
-    assert!(!opts_of(&call).contains("-L"), "{call:?}");
+    assert!(!SshCall::of(&call).opts.contains("-L"), "{call:?}");
 }
 
 /// acs-odd: `-L none` drops the configured forwards for one run, and any
@@ -255,17 +251,26 @@ fn dash_l_none_drops_the_configured_forwards_and_keeps_the_rest() {
     };
     session(&["-L", "none"], "a");
     let call = ssh.calls().pop().unwrap();
-    assert!(!opts_of(&call).contains("-L"), "{call:?}");
+    assert!(!SshCall::of(&call).opts.contains("-L"), "{call:?}");
 
     session(&["-L", "none", "-L", "45996:localhost:9"], "b");
     let call = ssh.calls().pop().unwrap();
-    assert!(opts_of(&call).contains("-L 45996:localhost:9"), "{call:?}");
+    assert!(
+        SshCall::of(&call).opts.contains("-L 45996:localhost:9"),
+        "{call:?}"
+    );
     assert!(!call.contains("45997"), "{call:?}");
 
     session(&["-L", "45996:localhost:9"], "c");
     let call = ssh.calls().pop().unwrap();
-    assert!(opts_of(&call).contains("-L 45996:localhost:9"), "{call:?}");
-    assert!(opts_of(&call).contains("-L 45997:localhost:9"), "{call:?}");
+    assert!(
+        SshCall::of(&call).opts.contains("-L 45996:localhost:9"),
+        "{call:?}"
+    );
+    assert!(
+        SshCall::of(&call).opts.contains("-L 45997:localhost:9"),
+        "{call:?}"
+    );
 }
 
 /// acs-odd: a bad spec in the file is a configuration error naming the

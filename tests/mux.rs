@@ -535,8 +535,10 @@ fn a_forward_from_the_configuration_keeps_its_own_connection_too() {
     // And the forward really is on the session's ssh: the veto above would
     // also read as "no master" if the setting had simply been dropped.
     let dial = fake.calls().pop().unwrap();
-    let opts = dial.split_once(" -- ").expect("a destination after --").0;
-    assert!(opts.contains("-L 45995:localhost:9"), "{dial:?}");
+    assert!(
+        SshCall::of(&dial).opts.contains("-L 45995:localhost:9"),
+        "{dial:?}"
+    );
 }
 
 /// `acs list` asks every alias at once (DESIGN §7.3). Starting a master on
