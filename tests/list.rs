@@ -203,10 +203,7 @@ fn every_alias_is_listed_and_a_dead_one_gets_a_line() {
     // Each host was asked once, with nothing to prompt for and with the
     // user's options; the one no ping reached was never dialled.
     let calls = ssh.calls();
-    let mut dests: Vec<&str> = calls
-        .iter()
-        .map(|c| c.split(" -- ").nth(1).unwrap().split(' ').next().unwrap())
-        .collect();
+    let mut dests: Vec<&str> = calls.iter().map(|c| SshCall::of(c).dest).collect();
     dests.sort();
     assert_eq!(
         dests,

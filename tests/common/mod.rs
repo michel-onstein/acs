@@ -273,6 +273,67 @@ pub fn log_call_sh(log: &Path) -> String {
     )
 }
 
+/// One recorded ssh call, split at the `--` that ends ssh's own options.
+///
+/// **Splitting is not optional, and getting it wrong is silent** (acs-9jv).
+/// Everything after the `--` is the destination and then the remote
+/// prelude, and the prelude is full of text shaped exactly like an ssh
+/// option: `ls -ldnL`, `[ -L … ]`, `-i`. A test that asks whether a call
+/// carried `-L` and searches the whole line finds one in a call that
+/// carries no forward at all — and passes, asserting something untrue.
+/// acs-odd hit precisely that while testing the `Call::Session` forwarding
+/// gate, where the false positive would have hidden the thing under test.
+///
+/// This is the one splitter; the three that had grown up beside it
+/// (`Ssh::keys`, an inline split in `tests/mux.rs`, `opts_of` in
+/// `tests/config.rs`) and a fourth in `tests/list.rs` all go through it.
+pub struct SshCall<'a> {
+    /// Everything before the `--`: ssh's own options, and nothing else.
+    pub opts: &'a str,
+    /// The destination — the first word after the `--`.
+    pub dest: &'a str,
+    /// The remote command — the prelude — after the destination.
+    pub remote: &'a str,
+}
+
+impl<'a> SshCall<'a> {
+    /// Split one recorded call. Panics without a `--`: every call the
+    /// client makes has one, so a line without one is a torn log line
+    /// rather than a call to reason about (see [`log_call_sh`]).
+    pub fn of(call: &'a str) -> SshCall<'a> {
+        let (opts, rest) = call
+            .split_once(" -- ")
+            .unwrap_or_else(|| panic!("a destination after -- in {call:?}"));
+        let (dest, remote) = rest.split_once(' ').unwrap_or((rest, ""));
+        SshCall { opts, dest, remote }
+    }
+
+    /// The value of every `flag` (`-i`, `-L`, …) among the **options**, in
+    /// order, and never one from the prelude. Both of ssh's spellings
+    /// count: the value as its own word (`-L 1:h:2`) and attached to the
+    /// flag (`-L1:h:2`), because a user's own options reach the command
+    /// line verbatim.
+    pub fn opt_values(&self, flag: &str) -> Vec<&'a str> {
+        let opts: &'a str = self.opts;
+        let words: Vec<&'a str> = opts.split(' ').collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < words.len() {
+            if words[i] == flag {
+                out.extend(words.get(i + 1).copied());
+                i += 2;
+            } else {
+                match words[i].strip_prefix(flag) {
+                    Some(v) if !v.is_empty() => out.push(v),
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
 /// A fake `ssh` for `--ssh`: runs the remote command on the fake remote its
 /// destination stands for, and refuses any other destination as a dead host
 /// would. It records each call's arguments.
@@ -332,15 +393,13 @@ impl Ssh {
         self.calls()
             .iter()
             .map(|c| {
-                let (opts, rest) = c.split_once(" -- ").expect("a destination after --");
-                let opts: Vec<&str> = opts.split(' ').collect();
-                let keys = opts
-                    .windows(2)
-                    .filter(|w| w[0] == "-i")
-                    .map(|w| w[1].to_string())
+                let call = SshCall::of(c);
+                let keys = call
+                    .opt_values("-i")
+                    .into_iter()
+                    .map(String::from)
                     .collect();
-                let dest = rest.split(' ').next().unwrap().to_string();
-                (dest, keys)
+                (call.dest.to_string(), keys)
             })
             .collect()
     }
@@ -449,43 +508,64 @@ impl Remote {
 
     /// The `--transport-cmd` stand-in for ssh: a script that records its pid
     /// and runs the remote command in a shell with the remote's environment.
+    ///
+    /// **The body is written from this remote's current state on every
+    /// call, not once** (acs-9jv). Every knob a test sets today lands in the
+    /// file the script sources at run time, so the body never actually
+    /// changes — which is exactly why a write-once script was a trap: the
+    /// first setting that had to change the *body* would silently no-op
+    /// whenever an earlier call had already materialised the file, and the
+    /// symptom would be a test that configures something and sees no
+    /// effect, with nothing anywhere saying why. Rewriting also matches how
+    /// the sourced file already behaves: a setting made after an earlier
+    /// `transport()` still reaches the next connection.
+    ///
+    /// The replacement is a rename, never a write in place: connections
+    /// started earlier may still be running this script and `/bin/sh` reads
+    /// it as it goes, so a truncate-and-write under them would hand a live
+    /// shell a torn file. A rename leaves them the old inode and gives
+    /// everyone after them the new one.
     pub fn transport(&self) -> String {
         let script = self.root.path().join("transport.sh");
-        if !script.exists() {
-            let body = format!(
-                "#!/bin/sh\n\
-                 if [ -f '{refuse}' ]; then rm -f '{refuse}'; \
-                 echo 'ssh: connect to host devbox port 22: Connection refused' >&2; \
-                 exit 255; fi\n\
-                 echo $$ >> '{pids}'\n\
-                 [ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\n\
-                 while [ -f '{gate}' ]; do sleep 0.05; done\n\
-                 if [ -f '{mute}' ]; then exec 3<&0; dd bs=1 count=1 of='{mute}'.$$ 2>/dev/null <&3; fi\n\
-                 [ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n\
-                 [ -f '{noise}' ] && cat '{noise}'\n\
-                 export HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n\
-                 [ -f '{renv}' ] && . '{renv}'\n\
-                 if [ -f '{mute}' ]; then\n\
-                 mkfifo '{mute}'.$$.in\n\
-                 {{ cat '{mute}'.$$; cat <&3; }} > '{mute}'.$$.in &\n\
-                 exec /bin/sh -c \"$1\" < '{mute}'.$$.in\n\
-                 fi\n\
-                 exec /bin/sh -c \"$1\"\n",
-                refuse = self.refuse_file().display(),
-                pids = self.pid_file().display(),
-                silent = self.silent_file().display(),
-                delay = self.delay_file().display(),
-                gate = self.gate_file().display(),
-                mute = self.mute_file().display(),
-                noise = self.noise_file().display(),
-                home = self.home().display(),
-                sock = self.sockets().display(),
-                fake = self.fake_bin().display(),
-                renv = self.remote_env_file().display(),
-            );
-            std::fs::write(&script, body).unwrap();
+        let body = format!(
+            "#!/bin/sh\n\
+             if [ -f '{refuse}' ]; then rm -f '{refuse}'; \
+             echo 'ssh: connect to host devbox port 22: Connection refused' >&2; \
+             exit 255; fi\n\
+             echo $$ >> '{pids}'\n\
+             [ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\n\
+             while [ -f '{gate}' ]; do sleep 0.05; done\n\
+             if [ -f '{mute}' ]; then exec 3<&0; dd bs=1 count=1 of='{mute}'.$$ 2>/dev/null <&3; fi\n\
+             [ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n\
+             [ -f '{noise}' ] && cat '{noise}'\n\
+             export HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n\
+             [ -f '{renv}' ] && . '{renv}'\n\
+             if [ -f '{mute}' ]; then\n\
+             mkfifo '{mute}'.$$.in\n\
+             {{ cat '{mute}'.$$; cat <&3; }} > '{mute}'.$$.in &\n\
+             exec /bin/sh -c \"$1\" < '{mute}'.$$.in\n\
+             fi\n\
+             exec /bin/sh -c \"$1\"\n",
+            refuse = self.refuse_file().display(),
+            pids = self.pid_file().display(),
+            silent = self.silent_file().display(),
+            delay = self.delay_file().display(),
+            gate = self.gate_file().display(),
+            mute = self.mute_file().display(),
+            noise = self.noise_file().display(),
+            home = self.home().display(),
+            sock = self.sockets().display(),
+            fake = self.fake_bin().display(),
+            renv = self.remote_env_file().display(),
+        );
+        if std::fs::read_to_string(&script).ok().as_deref() != Some(body.as_str()) {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = self.root.path().join(format!("transport.sh.{n}"));
+            std::fs::write(&tmp, &body).unwrap();
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&tmp, &script).unwrap();
         }
         script.display().to_string()
     }
@@ -563,7 +643,11 @@ impl Remote {
         std::fs::read_to_string(self.master_log_file()).unwrap_or_default()
     }
 
-    fn master_log_file(&self) -> PathBuf {
+    /// Where [`Remote::log_master`] points `ACS_MASTER_LOG`. Public so a
+    /// test can assert the *exact* path the remote side was given (acs-9jv)
+    /// rather than that it merely ends in `master.log` — a weak assertion
+    /// like that passes with a path bug sitting under it.
+    pub fn master_log_file(&self) -> PathBuf {
         self.root.path().join("master.log")
     }
 
