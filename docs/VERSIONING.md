@@ -87,6 +87,25 @@ Every release is published on
   newest one;
 - notes with install instructions and the changes since the previous release.
 
+### What the notes list as the changes
+
+`scripts/release-changes.sh [vX.Y.Z]` prints that list on its own — one line
+per pull request merged since the previous `vX.Y.Z` tag, newest first, taken
+from the first-parent log. Run it to see what a release's notes will say.
+
+The bookkeeping is left out, because the notes are read by someone about to
+install the binary and it tells them nothing about it:
+
+- `chore(release):` — the version bump that *is* this release;
+- `chore(beads):` — the commits that only open and close issues under
+  `.beads/`. Together they are the majority: of the 51 pull requests in
+  v0.17.0, 26 were one of these two and 25 were changes to acs.
+
+Nothing else is filtered. A `chore` that touches the build, the scripts or
+the packaging is a change someone installing may care about, so it stays. A
+release that is *only* bookkeeping lists no changes at all rather than
+failing.
+
 `scripts/version-bump.sh` publishes them right after it tags a release;
 `scripts/release-binaries.sh [vX.Y.Z]` does it on its own (for example to
 publish an existing tag again: it replaces the assets). It builds from the
