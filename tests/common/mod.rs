@@ -99,7 +99,8 @@ impl Net {
                 false => "",
             };
             format!(
-                "#!/bin/sh\nfor h; do :; done\necho \"$h\" >> '{log}'\n{refuse}if grep -qx \"$h\" '{slow}'; then sleep 30; fi\ngrep -qx \"$h\" '{up}'\n",
+                "#!/bin/sh\nfor h; do :; done\nif grep -qx \"$h\" '{lag}'; then sleep 2; fi\necho \"$h\" >> '{log}'\n{refuse}if grep -qx \"$h\" '{slow}'; then sleep 30; fi\ngrep -qx \"$h\" '{up}'\n",
+                lag = n.lag_file().display(),
                 log = n.pinged_file().display(),
                 slow = n.slow_file().display(),
                 up = n.up_file().display()
@@ -112,7 +113,21 @@ impl Net {
         }
         n.set_up(up);
         n.set_slow(&[]);
+        n.set_lagging(&[]);
         n
+    }
+
+    fn lag_file(&self) -> PathBuf {
+        self.dir.path().join("lag")
+    }
+
+    /// Hosts whose ping takes 2 s to get as far as logging itself: what a
+    /// machine too busy to schedule the fake's shell looks like, made to
+    /// happen on every run rather than a few in sixty (acs-uj6).
+    pub fn set_lagging(&self, lagging: &[&str]) {
+        let mut s = lagging.join("\n");
+        s.push('\n');
+        std::fs::write(self.lag_file(), s).unwrap();
     }
 
     fn slow_file(&self) -> PathBuf {
@@ -150,6 +165,12 @@ impl Net {
 
     /// Every host pinged so far, sorted: an alias's hosts are pinged at
     /// once.
+    ///
+    /// **Sound only as a negative** ("X was never pinged"): the fake logs
+    /// a host when its shell gets to run, which on a busy machine can be
+    /// well after acs started it — and after acs has chosen another host
+    /// and stopped waiting for this one. For "X was pinged" use
+    /// [`Net::wait_pinged`] (acs-uj6).
     pub fn pinged(&self) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_to_string(self.pinged_file())
             .unwrap_or_default()
@@ -158,6 +179,29 @@ impl Net {
             .collect();
         v.sort();
         v
+    }
+
+    /// Wait until the hosts pinged are exactly `want`, in any order and a
+    /// host twice for one pinged twice; after [`T`], fail with what was
+    /// pinged instead. A ping acs started but did not wait for — a host
+    /// that lost to the one chosen — logs itself whenever its shell is
+    /// scheduled, so "X was pinged" has to wait for the line rather than
+    /// sample the log once (acs-uj6).
+    pub fn wait_pinged(&self, want: &[&str]) {
+        let mut want: Vec<String> = want.iter().map(|h| h.to_string()).collect();
+        want.sort();
+        let t0 = Instant::now();
+        loop {
+            let got = self.pinged();
+            if got == want {
+                return;
+            }
+            assert!(
+                t0.elapsed() < T,
+                "hosts pinged after {T:?}: {got:?}, want {want:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The environment for a client with `config` as its configuration and
