@@ -23,11 +23,24 @@ const KILL_GRACE: Duration = Duration::from_secs(3);
 /// How often the socket path is checked (tmpfiles may remove it).
 /// `ACS_MASTER_REBIND_MS` shortens it for tests.
 fn rebind_every() -> Duration {
-    std::env::var("ACS_MASTER_REBIND_MS")
+    env_ms("ACS_MASTER_REBIND_MS").unwrap_or(Duration::from_secs(60))
+}
+/// How long a new connection may take to send its first whole message
+/// (HELLO, STATUS or KILL) before it is dropped (acs-3anc).
+/// `ACS_MASTER_HELLO_MS` shortens it for tests.
+fn hello_within() -> Duration {
+    env_ms("ACS_MASTER_HELLO_MS").unwrap_or(Duration::from_secs(10))
+}
+/// How long a master waits for a client to create its session before it
+/// gives up. `ACS_MASTER_ORPHAN_MS` shortens it for tests.
+fn orphan_after() -> Duration {
+    env_ms("ACS_MASTER_ORPHAN_MS").unwrap_or(Duration::from_secs(30))
+}
+fn env_ms(var: &str) -> Option<Duration> {
+    std::env::var(var)
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(60))
 }
 /// Stop filling a client's buffer beyond this; the rest waits in the ring.
 const OUT_HIGH_WATER: usize = 64 * 1024;
@@ -273,6 +286,14 @@ struct Conn {
     /// with the connection, so the debug log says how many liveness rounds
     /// *one* link survived rather than how many went by (acs-o6x).
     answered: u64,
+    /// Until the first whole message arrives: when the connection is given
+    /// up. Without it a connection that never says anything — a stuck or
+    /// hostile process of this uid — stayed Pending for good, and since
+    /// the "nobody is coming" exit waits for no connections, it kept a
+    /// childless master (and its line in `acs list`) alive indefinitely
+    /// (acs-3anc). Cleared by the first message, so a client answered BUSY
+    /// may take its time deciding whether to take over.
+    first_by: Option<Instant>,
 }
 
 impl Conn {
@@ -421,12 +442,19 @@ impl Master {
     fn run(mut self) -> io::Result<()> {
         let mut buf = vec![0u8; 64 * 1024];
         // Without a child after a while nobody is coming: give up.
-        let born = Instant::now();
+        let give_up = Instant::now() + orphan_after();
         loop {
-            if self.child.is_none()
-                && self.conns.is_empty()
-                && born.elapsed() > Duration::from_secs(30)
-            {
+            // A connection that has said nothing in time is dropped, so it
+            // cannot hold off the exit below (acs-3anc).
+            let now = Instant::now();
+            for c in &mut self.conns {
+                if c.state == ConnState::Pending && c.first_by.is_some_and(|d| now >= d) {
+                    mlog!("a connection sent nothing in time: dropping it");
+                    c.dead = true;
+                }
+            }
+            self.conns.retain(|c| !c.dead);
+            if self.child.is_none() && self.conns.is_empty() && now >= give_up {
                 mlog!("no client ever created the session; exiting");
                 self.cleanup();
                 return Ok(());
@@ -504,6 +532,16 @@ impl Master {
             let mut timeout = self.next_rebind.saturating_duration_since(now);
             if let Some(d) = self.kill_deadline {
                 timeout = timeout.min(d.saturating_duration_since(now));
+            }
+            for c in &self.conns {
+                if let Some(d) = c.first_by {
+                    timeout = timeout.min(d.saturating_duration_since(now));
+                }
+            }
+            // Wake for the "nobody is coming" exit too: the rebind check
+            // alone would leave it to the next minute.
+            if self.child.is_none() {
+                timeout = timeout.min(give_up.saturating_duration_since(now));
             }
             if wake != u64::MAX {
                 let ms = wake.saturating_sub(sys::now_ms());
@@ -610,6 +648,7 @@ impl Master {
                         dead: false,
                         live: Liveness::new(),
                         answered: 0,
+                        first_by: Some(Instant::now() + hello_within()),
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -647,7 +686,10 @@ impl Master {
         self.conns[i].dec.push(&buf[..n]);
         loop {
             let msg = match self.conns[i].dec.next_msg() {
-                Ok(Some(m)) => m,
+                Ok(Some(m)) => {
+                    self.conns[i].first_by = None;
+                    m
+                }
                 Ok(None) => break,
                 Err(e) => {
                     mlog!("protocol error: {e}");
