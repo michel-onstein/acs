@@ -1073,7 +1073,7 @@ fn the_session_shell_does_not_inherit_the_creating_logins_environment() {
         ("XDG_SESSION_ID", "7"),
         ("SSH_AGENT_PID", "4242"),
     ];
-    let (mut c, _) = start_env(
+    let (mut c, w) = start_env(
         t.path(),
         "env",
         &[
@@ -1085,18 +1085,42 @@ fn the_session_shell_does_not_inherit_the_creating_logins_environment() {
         &env,
     );
     c.wait_output("armed", T);
-    for (k, _) in env {
-        c.send(&Msg::Input {
-            seq: 0,
-            bytes: format!("{k}\r").into_bytes(),
-        });
+    // One frame carrying every name (acs-dvkg). Ten frames each sent at
+    // seq 0 overlap one another, so the master's input dedupe wrote only
+    // the first name and a stray `\r`: the other nine were never asked
+    // about, and their asserts passed vacuously.
+    let names: String = env.iter().map(|(k, _)| format!("{k}\r")).collect();
+    c.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: names.into_bytes(),
+    });
+    // The shell prints one `got:` line per name, in order. Wait for all ten
+    // to be complete — not for the first and a settle — then every one must
+    // be empty.
+    let lines = |out: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(out)
+            .split("got:")
+            .skip(1)
+            .filter_map(|rest| {
+                rest.find('\n')
+                    .map(|end| rest[..end].trim_end().to_string())
+            })
+            .collect()
+    };
+    let deadline = Instant::now() + T;
+    while lines(&c.output).len() < env.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            c.recv(left).is_some() || Instant::now() < deadline,
+            "timed out waiting for {} got: lines; got {:?}",
+            env.len(),
+            String::from_utf8_lossy(&c.output)
+        );
     }
-    // The shell prints one line per name; every one must be empty.
-    c.wait_output("got:", T);
-    std::thread::sleep(Duration::from_millis(400));
-    let text = String::from_utf8_lossy(&c.output).into_owned();
-    for (k, v) in env {
-        assert!(!text.contains(v), "{k} survived into the session: {text}");
+    let got = lines(&c.output);
+    assert_eq!(got.len(), env.len(), "{got:?}");
+    for ((k, _), value) in env.iter().zip(&got) {
+        assert_eq!(value, "", "{k} survived into the session: {got:?}");
     }
 
     // What a session does need is still there.
