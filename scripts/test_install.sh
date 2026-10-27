@@ -7,12 +7,13 @@
 #   scripts/test_install.sh --here    only in this environment
 #
 # Needs network access to github.com. ACS_TEST_OLD / ACS_TEST_NEW name two
-# published versions (default 0.1.0 and the latest).
+# published versions (default 0.12.0, the first signed release, and the
+# latest); both must carry a SHA256SUMS.sig, which the installer requires.
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
 installer="$root/scripts/install.sh"
-old=${ACS_TEST_OLD:-0.1.0}
+old=${ACS_TEST_OLD:-0.12.0}
 
 fail() {
     echo "FAIL: $*" >&2
@@ -20,12 +21,13 @@ fail() {
 }
 pass() { echo "ok: $*"; }
 
-# Run the installer with a clean environment plus the given assignments;
-# output goes to $t/out, the exit status to $t/status.
+# Run the installer ($script, the repository's unless a case says otherwise)
+# with a clean environment plus the given assignments; output goes to
+# $t/out, the exit status to $t/status.
 run() {
     set +e
     env -i PATH="$fakebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-        HOME="$t/home" SHELL=/bin/zsh TMPDIR="$t" "$@" sh "$installer" >"$t/out" 2>&1
+        HOME="$t/home" SHELL=/bin/zsh TMPDIR="$t" "$@" sh "$script" >"$t/out" 2>&1
     echo $? >"$t/status"
     set -e
 }
@@ -40,6 +42,7 @@ here() {
     t=$(mktemp -d "${TMPDIR:-/tmp}/acs-install-test.XXXXXX")
     trap 'rm -rf "$t"' EXIT
     fakebin="$t/fakebin"
+    script=$installer
     mkdir -p "$fakebin" "$t/home"
     who=$(id -un 2>/dev/null || id -u)
     latest=$(curl -fsSL https://github.com/michel-onstein/acs/releases/latest/download/SHA256SUMS 2>/dev/null ||
@@ -86,13 +89,23 @@ here() {
     case $("$t/own bin/acs" --version) in "acs $new ("*) ;; *) fail "ACS_INSTALL_DIR: wrong binary" ;; esac
     pass "ACS_INSTALL_DIR"
 
-    # A download that does not match SHA256SUMS installs nothing.
+    # A local mirror: the real SHA256SUMS, signed by a throwaway key, and
+    # archives that do not match it. The installer only reads SHA256SUMS
+    # once its signature checks out, so reaching the checksum check takes
+    # a copy of the installer that trusts the throwaway key -- substituted
+    # the way `cargo xtask package` substitutes a fork's (acs-x57).
     mirror="$t/mirror/download/v$new"
     mkdir -p "$mirror"
     echo "$latest" >"$mirror/SHA256SUMS"
     for f in $(echo "$latest" | sed 's/.* //'); do
         echo "not the real archive" >"$mirror/$f"
     done
+    ssh-keygen -q -t ed25519 -N '' -C 'acs test signing' -f "$t/testkey"
+    ssh-keygen -q -Y sign -f "$t/testkey" -n acs-release "$mirror/SHA256SUMS"
+    [ -s "$mirror/SHA256SUMS.sig" ] || fail "cannot sign the mirror"
+    testkey=$(cat "$t/testkey.pub")
+    sed "s|^release_key=.*|release_key='$testkey'|" "$installer" >"$t/install-testkey.sh"
+    grep -qxF "release_key='$testkey'" "$t/install-testkey.sh" || fail "cannot substitute the test key"
     if ! command -v curl >/dev/null; then
         # busybox wget has no file:// URLs: a shim serves the mirror.
         real=$(command -v wget)
@@ -106,7 +119,19 @@ esac
 EOF
         chmod 755 "$fakebin/wget"
     fi
+
+    # Signed, but not by the acs release key: the real installer refuses
+    # before it reads a line of SHA256SUMS.
     run ACS_RELEASES_URL="file://$t/mirror" ACS_ALLOW_INSECURE_URL=1 ACS_VERSION="$new" ACS_INSTALL_DIR="$t/tampered"
+    expect_fail "foreign signature"
+    expect_out "foreign signature" "is not signed by the acs release key; nothing was installed"
+    [ ! -e "$t/tampered/acs" ] || fail "foreign signature: something was installed"
+    pass "SHA256SUMS signed by another key refused"
+
+    # Signed by the key it trusts, so the archive itself is what is wrong.
+    script="$t/install-testkey.sh"
+    run ACS_RELEASES_URL="file://$t/mirror" ACS_ALLOW_INSECURE_URL=1 ACS_VERSION="$new" ACS_INSTALL_DIR="$t/tampered"
+    script=$installer
     rm -f "$fakebin/wget"
     expect_fail "checksum"
     expect_out "checksum" "checksum mismatch for acs-$new-"
@@ -142,9 +167,11 @@ here
 command -v docker >/dev/null || fail "docker is needed for the Linux containers (or use --here)"
 for image in alpine:3 ubuntu:24.04; do
     case $image in
-        alpine*) setup='adduser -D tester' ;;
-        # Ubuntu's image has neither curl nor wget: install one, as a user would.
-        ubuntu*) setup='apt-get -qq update >/dev/null && apt-get -qq install -y curl ca-certificates >/dev/null && useradd -m tester' ;;
+        # Neither image has ssh-keygen, which the installer needs to check
+        # the release signature; a host that runs acs has it with ssh.
+        alpine*) setup='apk add -q --no-cache openssh-keygen && adduser -D tester' ;;
+        # Ubuntu's image has neither curl nor wget either: install one, as a user would.
+        ubuntu*) setup='apt-get -qq update >/dev/null && apt-get -qq install -y curl ca-certificates openssh-client >/dev/null && useradd -m tester' ;;
     esac
     docker run --rm -v "$root:/src:ro" "$image" sh -c "
         set -e
