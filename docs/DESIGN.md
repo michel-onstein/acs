@@ -664,8 +664,10 @@ sequenceDiagram
   `DETACH` acknowledged, `TAKEOVER`) from a drop, so there is nothing to guess.
   `--no-reconnect` restores `dsh`'s default behaviour.
 - **The first redial goes at once** (acs-iyq). Only the attempts after it
-  wait: backoff 1 s → 30 s, reset after a connection that lasted 30 s (as in
-  `dsh`), plus an immediate retry when this machine's own network changes
+  wait: backoff 1 s → 30 s, reset after a connection that served 30 s (as in
+  `dsh`; counted from its `WELCOME`, so a redial that spends its own 30 s
+  timeout on a host that accepts and then says nothing never resets it —
+  acs-omt2), plus an immediate retry when this machine's own network changes
   (Wi-Fi switch, laptop wake) where the platform exposes that cheaply — that
   retry *is* the immediate attempt, so the backoff resumes at its base rather
   than handing out a second dial with nothing in between. A drop has already

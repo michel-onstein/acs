@@ -844,6 +844,11 @@ pub struct State {
     /// master is somebody else's live connection, and whose socket is not
     /// the one that just died.
     pub master: Option<ssh::Transport>,
+    /// When the link now in hand was WELCOMEd, or `None` while it has not
+    /// been (acs-omt2). The backoff resets after a link that *served* 30 s
+    /// — measured from here — so a dial that spent its whole timeout
+    /// waiting on a silent host never counts as a connection that lasted.
+    pub welcomed_at: Option<std::time::Instant>,
 }
 
 /// Why a link ended, so far as this side can tell (acs-n1m). It decides
@@ -1004,6 +1009,7 @@ pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
             .as_ref()
             .filter(|p| p.link.muxed)
             .map(|_| args.transport.clone()),
+        welcomed_at: None,
     };
     let mut raw: Option<RawMode> = None;
     let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals, picked, timing);
@@ -1345,6 +1351,7 @@ fn serve(
             match msg {
                 Msg::Welcome(w) if !welcomed => {
                     welcomed = true;
+                    state.welcomed_at = Some(std::time::Instant::now());
                     timing.mark("WELCOME received");
                     let first = state.instance.is_none();
                     let same = state.instance == Some(w.instance);
