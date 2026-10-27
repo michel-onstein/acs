@@ -724,6 +724,12 @@ impl Remote {
         }
     }
 
+    /// [`Remote::silence`] with bytes, for a host that says a frame or two
+    /// after its marker and then nothing more.
+    pub fn silence_bytes(&self, said: &[u8]) {
+        std::fs::write(self.silent_file(), said).unwrap();
+    }
+
     /// Make every connection print `text` on stdout before the remote
     /// command runs, as a chatty `.bashrc` or motd script would.
     pub fn login_noise(&self, text: &str) {
