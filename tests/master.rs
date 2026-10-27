@@ -1069,3 +1069,51 @@ fn the_socket_is_created_private_whatever_the_umask() {
         mode & 0o777
     );
 }
+
+/// Regression (acs-3anc): a connection that never sends a HELLO used to
+/// stay Pending for good, and since the "nobody is coming" exit waits for
+/// no connections, it kept a childless master — and its line in `acs list`
+/// — alive indefinitely. It is dropped once its first message is overdue,
+/// and the master then exits.
+#[test]
+fn a_silent_connection_does_not_keep_a_childless_master_alive() {
+    let t = TempDir::new();
+    acs::master::spawn_with_env(
+        &exe(),
+        t.path(),
+        "mute",
+        &[
+            ("ACS_MASTER_HELLO_MS", "300"),
+            ("ACS_MASTER_ORPHAN_MS", "500"),
+        ],
+    )
+    .unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(sock(t.path(), "mute")).unwrap();
+    s.set_read_timeout(Some(T)).unwrap();
+    // Say nothing, and keep the connection open: the master hangs up.
+    let mut buf = [0u8; 64];
+    let n = std::io::Read::read(&mut s, &mut buf).expect("the master hung up in time");
+    assert_eq!(n, 0, "the master sent something to a silent connection");
+    wait_gone(&sock(t.path(), "mute"));
+}
+
+/// The HELLO deadline (acs-3anc) is for a connection that has said
+/// nothing: one answered BUSY stays pending while its user decides.
+#[test]
+fn a_client_answered_busy_may_take_its_time() {
+    let t = TempDir::new();
+    let (_a, _) = start_env(
+        t.path(),
+        "slow",
+        &["/bin/sh", "-c", "sleep 30"],
+        "me@one",
+        &[("ACS_MASTER_HELLO_MS", "200")],
+    );
+    let (mut b, m) = attach(t.path(), "slow", "alice@two", None);
+    assert!(matches!(m, Msg::Busy { .. }), "{m:?}");
+    std::thread::sleep(Duration::from_millis(800));
+    let mut h = hello("slow", Mode::Attach, "alice@two");
+    h.force = true;
+    b.send(&Msg::Hello(h));
+    assert!(matches!(b.recv_control(T), Some(Msg::Welcome(_))));
+}
