@@ -48,48 +48,82 @@ pub fn getpid() -> u32 {
     unsafe { libc::getpid() as u32 }
 }
 
-/// Login name for a uid, if the password database knows it.
-pub fn user_name(uid: u32) -> Option<String> {
+/// Run one `getpw*_r` lookup with a buffer that outlives it, and convert
+/// the entry before the buffer goes away. `call` gets the out-parameters
+/// in the order `getpwuid_r` and `getpwnam_r` both take them.
+fn getpw<T>(
+    call: impl FnOnce(
+        *mut libc::passwd,
+        *mut libc::c_char,
+        libc::size_t,
+        *mut *mut libc::passwd,
+    ) -> libc::c_int,
+    convert: unsafe fn(&libc::passwd) -> Option<T>,
+) -> Option<T> {
     let mut buf = vec![0 as libc::c_char; 4096];
     // SAFETY: zeroed passwd is a valid out-parameter; buf outlives the call.
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let r = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut result) };
-    if r != 0 || result.is_null() || pw.pw_name.is_null() {
-        return None;
-    }
-    // SAFETY: pw_name points into buf and is NUL-terminated.
-    Some(
-        unsafe { CStr::from_ptr(pw.pw_name) }
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
-/// `(uid, gid, home)` of a login name, if the password database knows it.
-pub fn user_by_name(name: &str) -> Option<(u32, u32, std::path::PathBuf)> {
-    let c = std::ffi::CString::new(name).ok()?;
-    let mut buf = vec![0 as libc::c_char; 4096];
-    // SAFETY: zeroed passwd is a valid out-parameter; buf outlives the call.
-    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let r = unsafe {
-        libc::getpwnam_r(
-            c.as_ptr(),
-            &mut pw,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut result,
-        )
-    };
+    let r = call(&mut pw, buf.as_mut_ptr(), buf.len(), &mut result);
     if r != 0 || result.is_null() {
         return None;
     }
-    // SAFETY: pw_dir points into buf and is NUL-terminated.
-    let home = unsafe { CStr::from_ptr(pw.pw_dir) }
-        .to_string_lossy()
-        .into_owned();
+    // SAFETY: on success every non-null string field of pw points into
+    // buf, which is still alive, and is NUL-terminated.
+    unsafe { convert(&pw) }
+}
+
+/// A string field of a passwd entry; `None` when the field is null, which
+/// an NSS backend may hand back for an empty or missing value (acs-cwmy).
+///
+/// # Safety
+/// A non-null `p` must point to a NUL-terminated string that outlives the
+/// call.
+unsafe fn pw_str(p: *const libc::c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: non-null, and NUL-terminated by the caller's contract.
+    Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+}
+
+/// The login name of a passwd entry.
+///
+/// # Safety
+/// As [`pw_str`], for every string field of `pw`.
+unsafe fn pw_login(pw: &libc::passwd) -> Option<String> {
+    // SAFETY: forwarded from the caller.
+    unsafe { pw_str(pw.pw_name) }
+}
+
+/// `(uid, gid, home)` of a passwd entry; `None` without a home.
+///
+/// # Safety
+/// As [`pw_str`], for every string field of `pw`.
+unsafe fn pw_ids_home(pw: &libc::passwd) -> Option<(u32, u32, std::path::PathBuf)> {
+    // SAFETY: forwarded from the caller.
+    let home = unsafe { pw_str(pw.pw_dir) }?;
     Some((pw.pw_uid, pw.pw_gid, home.into()))
+}
+
+/// Login name for a uid, if the password database knows it.
+pub fn user_name(uid: u32) -> Option<String> {
+    getpw(
+        // SAFETY: the out-parameters come from getpw and are valid for it.
+        |pw, buf, len, result| unsafe { libc::getpwuid_r(uid, pw, buf, len, result) },
+        pw_login,
+    )
+}
+
+/// `(uid, gid, home)` of a login name, if the password database knows it
+/// and gives it a home.
+pub fn user_by_name(name: &str) -> Option<(u32, u32, std::path::PathBuf)> {
+    let c = std::ffi::CString::new(name).ok()?;
+    getpw(
+        // SAFETY: c outlives the call; the out-parameters come from getpw.
+        |pw, buf, len, result| unsafe { libc::getpwnam_r(c.as_ptr(), pw, buf, len, result) },
+        pw_ids_home,
+    )
 }
 
 /// A path that runs this very binary. On Linux `/proc/self/exe` keeps
@@ -766,6 +800,35 @@ mod tests {
     #[test]
     fn current_user_has_a_name() {
         assert!(user_name(getuid()).is_some_and(|n| !n.is_empty()));
+    }
+
+    /// acs-cwmy: an NSS backend can return an entry whose home or name is
+    /// null. That is "no such user", not `CStr::from_ptr(null)`.
+    #[test]
+    fn a_passwd_entry_with_a_null_field_converts_to_none() {
+        // SAFETY: a zeroed passwd has every pointer null, the case under
+        // test; the strings set below are 'static and NUL-terminated.
+        let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+        pw.pw_uid = 501;
+        pw.pw_gid = 20;
+        assert_eq!(unsafe { pw_ids_home(&pw) }, None);
+        assert_eq!(unsafe { pw_login(&pw) }, None);
+
+        pw.pw_dir = c"/home/someone".as_ptr() as *mut libc::c_char;
+        pw.pw_name = c"someone".as_ptr() as *mut libc::c_char;
+        assert_eq!(
+            unsafe { pw_ids_home(&pw) },
+            Some((501, 20, "/home/someone".into()))
+        );
+        assert_eq!(unsafe { pw_login(&pw) }.as_deref(), Some("someone"));
+    }
+
+    #[test]
+    fn current_user_resolves_by_name() {
+        let name = user_name(getuid()).expect("own name");
+        let (uid, _, home) = user_by_name(&name).expect("own entry");
+        assert_eq!(uid, getuid());
+        assert!(home.is_absolute(), "{}", home.display());
     }
 
     /// Regression (acs-ov1): a pty with no foreground group reports 0, and
