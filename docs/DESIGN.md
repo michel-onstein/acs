@@ -257,6 +257,12 @@ shells).
   `-r winch`.
 - **Child exit**: the master reaps it, sends `EXIT{status}` to the client,
   unlinks the socket, and exits.
+- **Nobody came**: a master that has no child 30 s after it started, and no
+  connection open, unlinks its socket and exits. A new connection has 10 s
+  to send its first message (`HELLO`, `STATUS` or `KILL`) or it is dropped,
+  so one that never speaks cannot keep a childless master — and its line in
+  `acs list` — alive (acs-3anc). Once it has spoken it may wait: a client
+  answered `BUSY` stays connected while its user decides.
 - **Kill** (`x`, §6): `SIGHUP` to the child's process group, then `SIGKILL`
   after 3 s if it is still alive; then as child exit.
 - **Instance id**: a random `u64` minted at creation and sent in `WELCOME`, so

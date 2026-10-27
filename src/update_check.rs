@@ -207,10 +207,11 @@ pub fn check_main() -> ExitCode {
     let Some(path) = state_path() else {
         return ExitCode::from(1);
     };
-    let tmp = std::env::temp_dir().join(format!("acs-update-check.{}", crate::sys::random_token()));
-    if std::fs::create_dir(&tmp).is_err() {
+    // Private, as `acs upgrade`'s is: SHA256SUMS is verified and then
+    // re-read by path (acs-3sae).
+    let Ok(tmp) = crate::upgrade::scratch_dir("acs-update-check") else {
         return ExitCode::from(1);
-    }
+    };
     let target = release::archive_target(crate::payload::OWN_TARGET);
     // This check only reads SHA256SUMS to compare version numbers: it
     // downloads nothing and runs nothing, so the scheme is not load-bearing

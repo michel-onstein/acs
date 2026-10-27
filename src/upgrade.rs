@@ -240,14 +240,27 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// Create a fresh `<prefix>.<token>` directory under the temp directory,
+/// 0700 whatever the umask (acs-3sae). What is downloaded into it is
+/// verified, re-read, unpacked and run by path, so a directory someone else
+/// could write — 0775 under umask 002 with a shared group — would let them
+/// swap a file between its check and its use. The mode is still masked by
+/// the umask, but no umask in use takes the owner's own bits.
+pub(crate) fn scratch_dir(prefix: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let p = std::env::temp_dir().join(format!("{prefix}.{}", crate::sys::random_token()));
+    std::fs::DirBuilder::new().mode(0o700).create(&p)?;
+    Ok(p)
+}
+
 /// A temporary directory removed on drop.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Result<Scratch, String> {
-        let p = std::env::temp_dir().join(format!("acs-upgrade.{}", crate::sys::random_token()));
-        std::fs::create_dir(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-        Ok(Scratch(p))
+        scratch_dir("acs-upgrade")
+            .map(Scratch)
+            .map_err(|e| format!("cannot create a scratch directory: {e}"))
     }
 }
 
@@ -518,6 +531,19 @@ mod tests {
         assert!(parse(&args("now"))
             .unwrap_err()
             .contains("unexpected argument now"));
+    }
+
+    /// acs-3sae: the scratch directory was `create_dir`'d at 0777 & ~umask —
+    /// world-readable under 022, group-writable under 002. The umask is not
+    /// changed here, as it belongs to every test in the process;
+    /// `tests/upgrade.rs` runs `acs upgrade` under 002.
+    #[test]
+    fn the_scratch_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = scratch_dir("acs-test-scratch").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir(&p).unwrap();
+        assert_eq!(mode, 0o700, "{mode:o}");
     }
 
     #[test]
