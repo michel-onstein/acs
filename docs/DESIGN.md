@@ -289,7 +289,9 @@ stays open. It then reads the client's frames:
   and `force` the frame brought** (acs-fbo). Ending a session is as large a
   step as taking it over, so it goes through the same gate: a session
   another identity is attached to answers `BUSY`, which becomes an `ERROR`
-  naming them rather than a dead session. Before that, a five-byte frame
+  (code 6, `BUSY`) naming them rather than a dead session — at once, since
+  the master keeps that connection open for a forced retry and no EOF
+  follows (acs-wwy0). Before that, a five-byte frame
   from any process of this uid ended any session, and a connection that had
   just been refused with `BUSY` could destroy the very session it was
   denied. It does **not** attach on the way — that would send the attached

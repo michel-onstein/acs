@@ -500,8 +500,20 @@ fn end_session(
             Ok(0) => return Ok(()),
             Ok(n) => {
                 dec.push(&buf[..n]);
-                if let Ok(Some(Msg::Error { code, message })) = dec.next_msg() {
-                    return Err((code, message));
+                while let Ok(Some(m)) = dec.next_msg() {
+                    match m {
+                        Msg::Error { code, message } => return Err((code, message)),
+                        // Someone else is attached and the asker has not agreed
+                        // to take the session from them (acs-wwy0). The master
+                        // leaves this connection open for a forced retry, so
+                        // no EOF is coming: answer now, with who holds it,
+                        // rather than wait out KILL_WAIT and call it a timeout.
+                        Msg::Busy { identity, .. } => {
+                            let why = format!("is attached from {identity}, so it was not ended");
+                            return Err((err::BUSY, format!("session '{name}' {why}")));
+                        }
+                        _ => {}
+                    }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
