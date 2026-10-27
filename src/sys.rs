@@ -552,18 +552,20 @@ pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
 
 /// `poll(2)` that sits out signals: an interrupted call is resumed for the
 /// time left, so `Ok(0)` really means the timeout expired with nothing
-/// ready.
+/// ready. A negative `timeout_ms` waits without a deadline, as `poll(2)`
+/// and [`poll`] do (acs-e43p: it used to overflow `Instant` and panic).
 pub fn poll_retry(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    let deadline = u64::try_from(timeout_ms)
+        .ok()
+        .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        let n = unsafe {
-            libc::poll(
-                fds.as_mut_ptr(),
-                fds.len() as libc::nfds_t,
-                left.as_millis() as i32,
-            )
+        let left = match deadline {
+            Some(d) => d
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as i32,
+            None => -1,
         };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, left) };
         if n >= 0 {
             return Ok(n as usize);
         }
@@ -848,6 +850,23 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(poll_retry(&mut fds, 30).unwrap(), 0);
         assert!(t.elapsed() >= std::time::Duration::from_millis(29));
+    }
+
+    /// acs-e43p: a negative timeout means no deadline, as in `poll(2)` and
+    /// [`poll`]; it used to overflow `Instant + Duration` and panic.
+    #[test]
+    fn poll_retry_without_a_deadline_waits_for_readiness() {
+        let (r, w) = pipe().unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+            assert_eq!(n, 1);
+            w
+        });
+        let mut fds = [pollfd(r.as_raw_fd(), libc::POLLIN)];
+        assert_eq!(poll_retry(&mut fds, -1).unwrap(), 1);
+        assert_ne!(fds[0].revents & libc::POLLIN, 0);
+        drop(writer.join().unwrap());
     }
 
     #[test]
