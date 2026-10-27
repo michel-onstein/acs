@@ -180,6 +180,9 @@ struct Parser {
     depth: usize,
 }
 
+/// The only characters YAML treats as whitespace within a line.
+const YAML_WS: [char; 3] = [' ', '\t', '\r'];
+
 /// Parse a configuration file.
 pub fn parse(src: &str) -> Result<Document> {
     // A BOM is not part of the first key: editors that write one produce a
@@ -188,7 +191,9 @@ pub fn parse(src: &str) -> Result<Document> {
     let mut lines = Vec::new();
     for (i, raw) in src.lines().enumerate() {
         let no = i + 1;
-        let raw = raw.trim_end();
+        // YAML whitespace is space and tab only: `str::trim_end` would also
+        // eat a trailing U+00A0 or U+3000 that belongs to the value (acs-m8ts).
+        let raw = raw.trim_end_matches(YAML_WS);
         let text = raw.trim_start_matches(' ');
         if text.starts_with('\t') {
             return err(no, "tabs are not allowed for indentation; use spaces");
@@ -418,7 +423,7 @@ fn split_key(text: &str, line: usize) -> Result<Option<(String, &str)>> {
         else {
             return Ok(None);
         };
-        let key = text[..colon].trim_end();
+        let key = text[..colon].trim_end_matches(YAML_WS);
         if key.is_empty() || key.contains(" #") {
             return Ok(None);
         }
@@ -475,7 +480,7 @@ fn inline(text: &str, line: usize) -> Result<(Option<(Value, bool)>, Option<Stri
         b'@' | b'`' => return err(line, "a value starting with @ or ` must be quoted"),
         _ => {
             let end = t.find(" #").unwrap_or(t.len());
-            let s = t[..end].trim_end();
+            let s = t[..end].trim_end_matches(YAML_WS);
             if s.contains(": ") || s.ends_with(':') {
                 return err(line, format!("a value containing ': ' must be quoted: {s}"));
             }
@@ -674,7 +679,9 @@ impl Flow<'_> {
                     }
                     self.i += 1;
                 }
-                let text = self.text[start..self.i].trim_end().to_string();
+                let text = self.text[start..self.i]
+                    .trim_end_matches(YAML_WS)
+                    .to_string();
                 if text.is_empty() {
                     return err(self.line, "expected a value");
                 }
@@ -698,8 +705,10 @@ fn plain_ok(s: &str, flow: bool) -> bool {
         return false;
     };
     !((flow && s.contains([',', '[', ']', '{', '}', '#']))
-        || s.starts_with(' ')
-        || s.ends_with(' ')
+        // Any Unicode whitespace at an end is quoted, so a reader that trims
+        // more than YAML's space and tab still gets it back (acs-m8ts).
+        || s.starts_with(char::is_whitespace)
+        || s.ends_with(char::is_whitespace)
         || s.ends_with(':')
         || "?:,[]{}#&*!|>'\"%@`".contains(first)
         || s == "-"
@@ -1085,6 +1094,49 @@ list: [a, \"b c\", 3]
             assert_eq!(out, format!("k: {want}\n"), "{s:?}");
             assert_eq!(text(get(&parse(&out).unwrap().root, "k")), s);
         }
+    }
+
+    /// acs-m8ts: YAML whitespace is space and tab only. A value or key
+    /// ending (or starting) in U+00A0, U+3000 or U+2028 is quoted when
+    /// written, and a hand-written plain one keeps the character when read —
+    /// `str::trim_end` used to eat it, so `k<nbsp>` read back as `k`.
+    #[test]
+    fn unicode_whitespace_at_an_end_survives_a_round_trip() {
+        for s in ["k\u{a0}", "k\u{3000}", "k\u{2028}", "\u{a0}k", "a\u{a0}b"] {
+            let mut d = parse("k: v\n").unwrap();
+            d.root.value.map_mut().unwrap()[0] = (s.to_string(), Node::string(s));
+            let out = emit(&d);
+            let back = parse(&out).unwrap();
+            let m = back.root.value.map().unwrap();
+            assert_eq!(m[0].0, s, "{out:?}");
+            assert_eq!(text(&m[0].1), s, "{out:?}");
+
+            // The same inside a flow mapping.
+            let mut d = parse("k: v\n").unwrap();
+            let mut map = Node::new(Value::Map(vec![(s.to_string(), Node::string(s))]));
+            map.flow = true;
+            d.root.value.map_mut().unwrap()[0].1 = map;
+            let out = emit(&d);
+            let back = parse(&out).unwrap();
+            let m = get(&back.root, "k").value.map().unwrap();
+            assert_eq!(m[0].0, s, "{out:?}");
+            assert_eq!(text(&m[0].1), s, "{out:?}");
+        }
+        // Only an inner one stays plain.
+        let mut d = parse("k: v\n").unwrap();
+        d.root.value.map_mut().unwrap()[0].1 = Node::string("a\u{a0}b");
+        assert_eq!(emit(&d), "k: a\u{a0}b\n");
+
+        // Written by hand, unquoted: the reader keeps it, in block and flow.
+        let d = parse("k\u{a0}: v\u{a0}  # c\nf: [x\u{a0} , {y\u{a0}: z\u{a0}}]\n").unwrap();
+        let m = d.root.value.map().unwrap();
+        assert_eq!(m[0].0, "k\u{a0}");
+        assert_eq!(text(&m[0].1), "v\u{a0}");
+        let f = items(get(&d.root, "f"));
+        assert_eq!(text(&f[0]), "x\u{a0}");
+        let inner = f[1].value.map().unwrap();
+        assert_eq!(inner[0].0, "y\u{a0}");
+        assert_eq!(text(&inner[0].1), "z\u{a0}");
     }
 
     /// acs-tacx: inside `[...]`/`{...}` the reader ends a plain scalar at
