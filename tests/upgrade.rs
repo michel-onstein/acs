@@ -28,9 +28,37 @@ fn upgrade(
     server: &ReleaseServer,
     args: &[&str],
 ) -> (i32, String, String) {
+    upgrade_under(path, home, server, args, None)
+}
+
+/// Make `cmd` run under the umask `mask`, as a login shell with that umask
+/// would start it. Set in the child alone: the umask belongs to the whole
+/// test process, shared by every test running beside this one.
+fn with_umask(cmd: &mut Command, mask: u32) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: umask is async-signal-safe and cannot fail.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::umask(mask as libc::mode_t);
+            Ok(())
+        })
+    }
+}
+
+/// [`upgrade`], under the umask `mask` when one is given.
+fn upgrade_under(
+    path: &Path,
+    home: &Path,
+    server: &ReleaseServer,
+    args: &[&str],
+    mask: Option<u32>,
+) -> (i32, String, String) {
+    let mut cmd = Command::new(path);
+    if let Some(mask) = mask {
+        with_umask(&mut cmd, mask);
+    }
     let out = output_of(
-        Command::new(path)
-            .arg("upgrade")
+        cmd.arg("upgrade")
             // The test server speaks http, which acs-95w refuses without
             // an explicit say-so on the command line.
             .arg("--allow-insecure-url")
@@ -379,4 +407,89 @@ fn an_insecure_releases_url_is_refused_without_the_flag() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("cannot be authenticated"), "{err}");
     assert!(err.contains("--allow-insecure-url"), "{err}");
+}
+
+/// The mode bits of `path`, without the file type.
+fn mode_of(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// acs-91q2: under umask 002 the new version's directory was made 0775, and
+/// a client using the upgraded host as a remote refused to run from it
+/// ("is writable by others") and uploaded the same version again.
+#[test]
+fn a_versioned_upgrade_under_a_group_writable_umask_makes_its_directory_0755() {
+    let d = TempDir::new();
+    let home = d.path().join("home");
+    let share = home.join(".local/share/acs");
+    let old = share.join(acs::VERSION).join("acs");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::copy(exe(), &old).unwrap();
+    let link = home.join(".local/bin/acs");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&old, &link).unwrap();
+
+    let server = ReleaseServer::start();
+    server.release(NEW, &ReleaseServer::fake_acs(NEW), true, false);
+    let (code, _, err) = upgrade_under(&link, &home, &server, &[], Some(0o002));
+    assert_eq!(code, 0, "{err}");
+    let new = share.join(NEW).join("acs");
+    assert!(version_of(&new).starts_with(&format!("acs {NEW} ")));
+    assert_eq!(mode_of(new.parent().unwrap()), 0o755);
+    assert_eq!(mode_of(&new), 0o755);
+}
+
+/// acs-91q2: the one-line installer under umask 002 left
+/// `~/.local/share/acs/<version>/` group-writable, so the remote prelude
+/// refused it and the client uploaded the version it was installed to save.
+/// Run against this server by giving a copy of the script the server's
+/// key, as `cargo xtask package` does for a fork.
+#[test]
+fn the_installer_under_a_group_writable_umask_makes_its_directories_0755() {
+    // As root it installs into /usr/local, which a test must not touch;
+    // the directories it makes there come from the same lines.
+    // SAFETY: geteuid cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: running as root");
+        return;
+    }
+    let d = TempDir::new();
+    let home = d.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = ReleaseServer::start();
+    server.release(NEW, &ReleaseServer::fake_acs(NEW), true, false);
+
+    let source =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
+            .unwrap();
+    let key_line = source
+        .lines()
+        .find(|l| l.starts_with("release_key='"))
+        .expect("the installer's release key");
+    let script = d.path().join("install.sh");
+    let ours = format!("release_key='{}'", server.release_key());
+    std::fs::write(&script, source.replace(key_line, &ours)).unwrap();
+
+    let mut cmd = Command::new("sh");
+    with_umask(&mut cmd, 0o002);
+    let out = output_of(
+        cmd.arg(&script)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("TMPDIR", d.path())
+            .env("ACS_RELEASES_URL", &server.url)
+            .env("ACS_ALLOW_INSECURE_URL", "1"),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+
+    let lib = home.join(".local/share/acs");
+    let installed = lib.join(NEW).join("acs");
+    assert!(version_of(&installed).starts_with(&format!("acs {NEW} ")));
+    assert_eq!(mode_of(&lib), 0o755);
+    assert_eq!(mode_of(installed.parent().unwrap()), 0o755);
+    assert_eq!(mode_of(&installed), 0o755);
+    // The prelude checks the link's directory too, on the way through it.
+    assert_eq!(mode_of(&home.join(".local/bin")), 0o755);
 }
