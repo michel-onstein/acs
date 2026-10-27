@@ -20,11 +20,16 @@ use crate::sys;
 
 /// Grace between SIGHUP and SIGKILL when a session is killed.
 const KILL_GRACE: Duration = Duration::from_secs(3);
-/// How often the socket path is checked (tmpfiles may remove it).
-/// `ACS_MASTER_REBIND_MS` shortens it for tests.
+/// How often the socket path is checked (tmpfiles may remove it). A
+/// master starting for this name prods the old one at once (acs-lbba), so
+/// this is the backstop for a cleaner that took the `.master` file too.
+/// `ACS_MASTER_REBIND_MS` changes it for tests.
 fn rebind_every() -> Duration {
-    env_ms("ACS_MASTER_REBIND_MS").unwrap_or(Duration::from_secs(60))
+    env_ms("ACS_MASTER_REBIND_MS").unwrap_or(Duration::from_secs(5))
 }
+/// How often the socket and the `.master` file get their times refreshed,
+/// so an age-based cleaner never sees them as old (acs-lbba).
+const TOUCH_EVERY: Duration = Duration::from_secs(3600);
 /// How long a new connection may take to send its first whole message
 /// (HELLO, STATUS or KILL) before it is dropped (acs-3anc).
 /// `ACS_MASTER_HELLO_MS` shortens it for tests.
@@ -346,6 +351,56 @@ struct Master {
     last_activity: Instant,
     kill_deadline: Option<Instant>,
     next_rebind: Instant,
+    next_touch: Instant,
+    /// `<dir>/<session>.master`, see [`MasterFile`].
+    master_path: PathBuf,
+    master_file: Option<MasterFile>,
+}
+
+/// `<dir>/<session>.master`, flocked by the live master for as long as it
+/// serves the session, with its pid inside (acs-lbba). A cleaner may delete
+/// the socket under a live master; a master starting for the same name then
+/// finds this lock held, prods the holder with `SIGUSR1` to re-bind at once,
+/// and steps aside — instead of starting a second shell beside the first,
+/// which would leave the old one running unreachable for good.
+struct MasterFile {
+    _lock: sys::Flock,
+    ino: (u64, u64),
+}
+
+impl MasterFile {
+    /// Take the lock and write our pid; `Ok(None)` while another master
+    /// holds it.
+    fn take(path: &Path) -> io::Result<Option<MasterFile>> {
+        let Some(lock) = sys::Flock::try_lock(path)? else {
+            return Ok(None);
+        };
+        // SAFETY: plain syscalls on a descriptor we own.
+        if unsafe { libc::ftruncate(lock.fd(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        sys::write_all(lock.fd(), format!("{}\n", sys::getpid()).as_bytes())?;
+        let m = std::fs::metadata(path)?;
+        Ok(Some(MasterFile {
+            _lock: lock,
+            ino: (m.dev(), m.ino()),
+        }))
+    }
+
+    /// Ask the master holding `path` to re-bind its socket now.
+    fn prod_holder(path: &Path) {
+        let pid = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok());
+        // Never 0 or -1: those would signal a group, or everything we own.
+        match pid.filter(|&p| p > 1) {
+            Some(p) => {
+                mlog!("socket gone under live master {p}: asking it to re-bind");
+                let _ = sys::kill(p, libc::SIGUSR1);
+            }
+            None => mlog!("{} is locked but names no pid", path.display()),
+        }
+    }
 }
 
 /// The pty's foreground process group, if it is one we may signal
@@ -405,11 +460,23 @@ impl Master {
         if UnixStream::connect(&sock_path).is_ok() {
             return Err(format!("session '{}' already has a master", args.session));
         }
+        // No socket answers, but the master may still be alive: a cleaner
+        // can delete the socket under it. Then it re-binds, not us.
+        let master_path = dir.master_path(&args.session)?;
+        let master_file = match MasterFile::take(&master_path) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                MasterFile::prod_holder(&master_path);
+                return Err(format!("session '{}' already has a master", args.session));
+            }
+            Err(e) => return Err(format!("lock {}: {e}", master_path.display())),
+        };
         let _ = std::fs::remove_file(&sock_path);
         let (listener, sock_ino) =
             bind(&sock_path).map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
-        let signals = sys::signals::install(&[libc::SIGCHLD, libc::SIGTERM, libc::SIGINT])
-            .map_err(|e| e.to_string())?;
+        let signals =
+            sys::signals::install(&[libc::SIGCHLD, libc::SIGTERM, libc::SIGINT, libc::SIGUSR1])
+                .map_err(|e| e.to_string())?;
         Ok(Master {
             session: args.session.clone(),
             sock_path,
@@ -430,6 +497,9 @@ impl Master {
             last_activity: Instant::now(),
             kill_deadline: None,
             next_rebind: Instant::now() + rebind_every(),
+            next_touch: Instant::now() + TOUCH_EVERY,
+            master_path,
+            master_file: Some(master_file),
         })
     }
 
@@ -557,6 +627,9 @@ impl Master {
                 for sig in sys::signals::drain(self.signals.as_raw_fd()) {
                     match sig {
                         libc::SIGCHLD => self.reap(),
+                        // A master starting for our name found the socket
+                        // gone: re-bind it now (acs-lbba).
+                        libc::SIGUSR1 => self.next_rebind = Instant::now(),
                         _ => {
                             mlog!("signal {sig}: killing session");
                             self.start_kill();
@@ -1220,30 +1293,85 @@ impl Master {
         }
     }
 
+    /// Keep the socket (and the `.master` file) where clients look for
+    /// them (DESIGN §4.1). Runs every [`rebind_every`], and at once when a
+    /// master starting for this name prods us with `SIGUSR1`.
     fn check_socket(&mut self) {
-        self.next_rebind = Instant::now() + rebind_every();
-        match std::fs::metadata(&self.sock_path) {
-            Ok(m) if (m.dev(), m.ino()) == self.sock_ino => {}
-            Ok(_) => mlog!("socket path now belongs to something else; leaving it"),
-            Err(_) => {
-                // A cleaner may have removed the whole directory: recreate
-                // it (with the usual ownership checks) so the session stays
-                // reachable instead of lingering unreachable forever.
-                if let Some(dir) = self.sock_path.parent() {
-                    if let Err(e) = SocketDir::open_at(dir.to_path_buf()) {
-                        mlog!("cannot recreate {}: {e}", dir.display());
-                        return;
-                    }
-                }
-                match bind(&self.sock_path) {
-                    Ok((l, ino)) => {
-                        mlog!("socket was removed; re-bound");
-                        self.listener = l;
-                        self.sock_ino = ino;
-                    }
-                    Err(e) => mlog!("re-bind failed: {e}"),
-                }
+        let now = Instant::now();
+        self.next_rebind = now + rebind_every();
+        let ours = |path: &Path, ino: (u64, u64)| {
+            std::fs::metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == ino)
+        };
+        let master_ino = self.master_file.as_ref().map(|f| f.ino);
+        if ours(&self.sock_path, self.sock_ino)
+            && master_ino.map_or(true, |ino| ours(&self.master_path, ino))
+        {
+            if now >= self.next_touch {
+                self.next_touch = now + TOUCH_EVERY;
+                let _ = sys::touch(&self.sock_path);
+                let _ = sys::touch(&self.master_path);
             }
+            return;
+        }
+        // A cleaner may have removed the whole directory: recreate it
+        // (with the usual ownership checks) so the session stays reachable
+        // instead of lingering unreachable forever.
+        let Some(parent) = self.sock_path.parent() else {
+            return;
+        };
+        let dir = match SocketDir::open_at(parent.to_path_buf()) {
+            Ok(d) => d,
+            Err(e) => {
+                mlog!("cannot recreate {}: {e}", parent.display());
+                return;
+            }
+        };
+        // Re-bind under the create lock, as `Master::bind` binds: unlocked,
+        // a master starting for this name could bind between our look and
+        // our bind. Never block the loop on it; try again shortly.
+        let _lock = match dir.try_create_lock(&self.session) {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                self.next_rebind = now + Duration::from_millis(20);
+                return;
+            }
+            Err(e) => {
+                mlog!("create lock: {e}");
+                return;
+            }
+        };
+        if master_ino.is_some_and(|ino| !ours(&self.master_path, ino)) {
+            match MasterFile::take(&self.master_path) {
+                Ok(Some(f)) => {
+                    mlog!("{} was removed; re-created", self.master_path.display());
+                    self.master_file = Some(f);
+                }
+                Ok(None) => mlog!(
+                    "{} now belongs to another master",
+                    self.master_path.display()
+                ),
+                Err(e) => mlog!("cannot re-create {}: {e}", self.master_path.display()),
+            }
+        }
+        match std::fs::metadata(&self.sock_path) {
+            Ok(m) if (m.dev(), m.ino()) == self.sock_ino => return,
+            Ok(_) if UnixStream::connect(&self.sock_path).is_ok() => {
+                mlog!("socket path now belongs to a live master; leaving it");
+                return;
+            }
+            // Nothing listens on what is there: a stale file, ours to replace.
+            Ok(_) => {
+                let _ = std::fs::remove_file(&self.sock_path);
+            }
+            Err(_) => {}
+        }
+        match bind(&self.sock_path) {
+            Ok((l, ino)) => {
+                mlog!("socket was removed; re-bound");
+                self.listener = l;
+                self.sock_ino = ino;
+            }
+            Err(e) => mlog!("re-bind failed: {e}"),
         }
     }
 
@@ -1270,12 +1398,15 @@ impl Master {
     }
 
     /// Only remove the socket if it is still the one we bound.
-    fn cleanup(&self) {
+    fn cleanup(&mut self) {
         if let Ok(m) = std::fs::metadata(&self.sock_path) {
             if (m.dev(), m.ino()) == self.sock_ino {
                 let _ = std::fs::remove_file(&self.sock_path);
             }
         }
+        // The session is over: a new one may start under this name at once
+        // rather than prod us to re-bind. The file stays, as `.lock` does.
+        self.master_file = None;
     }
 
     /// The child is gone and the pty drained: deliver EXIT and leave.

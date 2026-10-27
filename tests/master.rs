@@ -181,6 +181,74 @@ fn socket_is_rebound_after_deletion() {
     c2.wait_output("got:x", T);
 }
 
+/// The proxy's `connect_or_start`: connect, and start a master while
+/// nothing answers, treating "already has a master" as "try again".
+fn connect_or_start(dir: &Path, name: &str) -> (FrameConn, Vec<String>) {
+    let deadline = Instant::now() + T;
+    let mut refusals = Vec::new();
+    loop {
+        if let Ok(c) = FrameConn::connect(&sock(dir, name)) {
+            return (c, refusals);
+        }
+        assert!(Instant::now() < deadline, "the session never came up");
+        match acs::master::spawn(&exe(), dir, name) {
+            Ok(()) => {}
+            Err(e) if e.to_string().contains("already has a master") => {
+                refusals.push(e.to_string());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("spawn: {e}"),
+        }
+    }
+}
+
+/// A client reconnecting between a cleaner deleting the socket and the
+/// master's next check used to start a second master, and with it a
+/// second shell, leaving the first running unreachable (acs-lbba). The
+/// check is set an hour away here, so only the prod can bring it back.
+#[test]
+fn a_reconnect_after_the_socket_is_deleted_finds_the_same_shell() {
+    let t = TempDir::new();
+    let (mut c, w) = start_env(
+        t.path(),
+        "lb",
+        &["/bin/sh", "-c", "read x; echo got:$x"],
+        "me",
+        &[("ACS_MASTER_REBIND_MS", "3600000")],
+    );
+    std::fs::remove_file(sock(t.path(), "lb")).unwrap();
+    let started = Instant::now();
+    let (c2, refusals) = connect_or_start(t.path(), "lb");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "came back only after {:?}",
+        started.elapsed()
+    );
+    assert!(!refusals.is_empty(), "no master was refused");
+    let (mut c2, m) = attach_conn(c2, "lb", "me", None);
+    assert!(
+        matches!(m, Msg::Welcome(ref w2) if w2.instance == w.instance && !w2.created),
+        "a second session was started: {m:?}"
+    );
+    assert!(matches!(c.recv_control(T), Some(Msg::Takeover)));
+    c2.send(&Msg::Input {
+        seq: 0,
+        bytes: b"x\r".to_vec(),
+    });
+    c2.wait_output("got:x", T);
+}
+
+/// Once the session is over its `.master` lock is free again, so the name
+/// can be started afresh.
+#[test]
+fn a_finished_session_frees_its_name() {
+    let t = TempDir::new();
+    let (mut c, _) = start(t.path(), "fin", &["/bin/sh", "-c", "exit 0"], "me");
+    wait_exit(&mut c);
+    wait_gone(&sock(t.path(), "fin"));
+    acs::master::spawn(&exe(), t.path(), "fin").expect("a fresh master");
+}
+
 #[test]
 fn socket_directory_is_recreated_after_deletion() {
     let t = TempDir::new();
