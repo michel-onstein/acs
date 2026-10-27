@@ -348,6 +348,39 @@ fn pick_lists_ends_on_request_and_attaches_what_the_hello_names() {
     p.conn.wait_output("got:hi", T);
 }
 
+/// Regression (acs-wwy0): ending a session another identity is attached
+/// to, without forcing it, answers at once with who holds it. The master
+/// answers BUSY and keeps the connection open for a forced retry, so the
+/// proxy used to wait out its 10 s KILL_WAIT and report a timeout.
+#[test]
+fn ending_a_session_someone_else_holds_names_them_at_once() {
+    let t = TempDir::new();
+    let mut a = session(t.path(), "a");
+    a.conn.send(&hello_cmd("a", "alice@laptop", "sleep 30"));
+    welcome(&mut a);
+
+    let mut p = proxy(t.path(), &["--pick"]);
+    assert_eq!(names(&pick_list(&mut p)), ["a"]);
+    let asked = std::time::Instant::now();
+    p.conn.send(&Msg::EndSession {
+        name: "a".into(),
+        identity: "bob@desk".into(),
+        force: false,
+    });
+    let answer = pick_list(&mut p);
+    let took = asked.elapsed();
+    assert!(took < Duration::from_secs(5), "took {took:?}");
+    assert!(
+        matches!(&answer[..], [Msg::Error { code, message }, Msg::StatusReply(s)]
+            if *code == err::BUSY
+                && message == "session 'a' is attached from alice@laptop, so it was not ended"
+                && s.name == "a" && s.attached),
+        "{answer:?}"
+    );
+    // Alice was not told anything: no EXIT, no TAKEOVER.
+    assert!(a.conn.recv_control(Duration::from_millis(300)).is_none());
+}
+
 #[test]
 fn pick_creates_a_session_by_name_or_a_new_numbered_one() {
     let t = TempDir::new();
