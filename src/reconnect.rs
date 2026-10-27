@@ -465,23 +465,55 @@ fn show_status(state: &mut State, msg: &str) {
 /// `client::leave` ends it instead, and a reattach that is not a resume ends
 /// it too — both after this.
 pub fn clear_status(state: &mut State) {
+    take_status_down(state, false);
+}
+
+/// [`clear_status`], and with `retitle` the title set again explicitly
+/// after the pop (acs-r3m): to the one the program last set, or else to a
+/// neutral `acs: <host>`. A terminal without the xterm title stack ignores
+/// the push and the pop alike and would keep the outage text for good; one
+/// with it has just popped the program's title, and is given the same title
+/// again.
+///
+/// Only a link that is back does this ([`on_welcome`]). On the way out the
+/// pop stands alone: the program's title belongs to a session the terminal
+/// is leaving, and the neutral one would overwrite the title a stack-aware
+/// terminal had before acs ran.
+fn take_status_down(state: &mut State, retitle: bool) {
     if state.status_shown {
         let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
-        let out = format!("\x1b[23;0t\x1b7\x1b[{rows};1H\x1b[2K\x1b8");
-        client::write_over_stream(state, out.as_bytes());
+        let mut out = b"\x1b[23;0t".to_vec();
+        if retitle {
+            out.extend_from_slice(&restored_title(state));
+        }
+        out.extend_from_slice(format!("\x1b7\x1b[{rows};1H\x1b[2K\x1b8").as_bytes());
+        client::write_over_stream(state, &out);
         state.status_shown = false;
         crate::tty::set_status_shown(false);
     }
 }
 
-/// A WELCOME arrived on a link. After a resume that followed a status line,
-/// ask the program to repaint: two size changes (rows-1, then rows), since
+/// The `OSC 2` that puts the window title back after an outage: the
+/// program's last ([`crate::modes::ModeObserver::title`]), or `acs: <host>`.
+fn restored_title(state: &State) -> Vec<u8> {
+    let mut out = b"\x1b]2;".to_vec();
+    match state.observer.title() {
+        Some(t) => out.extend_from_slice(t),
+        None => out.extend_from_slice(format!("acs: {}", state.host).as_bytes()),
+    }
+    out.push(0x07);
+    out
+}
+
+/// A WELCOME arrived on a link. The status line and the outage title go,
+/// the title set back explicitly (acs-r3m). After a resume that followed a
+/// status line, also ask the program to repaint: two size changes (rows-1, then rows), since
 /// an unchanged size sends no SIGWINCH.
 pub fn on_welcome(state: &mut State, kind: AttachKind, out: &mut Vec<u8>) {
     if !state.status_shown {
         return;
     }
-    clear_status(state);
+    take_status_down(state, true);
     if kind == AttachKind::Resumed {
         if let Ok(s) = sys::get_winsize(0) {
             if s.rows > 1 {

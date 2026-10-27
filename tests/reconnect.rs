@@ -395,6 +395,55 @@ fn ctrl_c_during_a_redial_clears_the_status_line() {
     assert!(c.echo_on());
 }
 
+/// The text written after the last title pop, once the client has resumed.
+fn after_the_pop(c: &mut Client) -> String {
+    c.wait_for("\x1b[23;0t", T);
+    let text = c.text();
+    text[text.rfind("\x1b[23;0t").unwrap()..].to_string()
+}
+
+/// Regression (acs-r3m): a terminal without the xterm title stack ignores
+/// the pop, so after a reconnect the title the program last set is written
+/// again explicitly — straight after `CSI 23;0 t` — rather than leaving
+/// "connection lost" up for good.
+#[test]
+fn a_reconnect_gives_the_program_its_title_back() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "titled",
+        "printf '\\033]2;vim main.rs\\007'; echo ready; sleep 30",
+        FAST,
+    );
+    c.wait_for("ready", T);
+    remote.cut_link();
+    let tail = after_the_pop(&mut c);
+    assert!(
+        tail.starts_with("\x1b[23;0t\x1b]2;vim main.rs\x07"),
+        "title not restored: {tail:?}"
+    );
+    assert!(!tail.contains("connection lost"), "{tail:?}");
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+}
+
+/// acs-r3m: a program that never set a title gets a neutral one back, so
+/// the outage text is gone even where the pop does nothing.
+#[test]
+fn a_reconnect_without_a_program_title_sets_a_neutral_one() {
+    let remote = Remote::installed();
+    let mut c = start(&remote, "untitled", "echo ready; sleep 30", FAST);
+    c.wait_for("ready", T);
+    remote.cut_link();
+    let tail = after_the_pop(&mut c);
+    assert!(
+        tail.starts_with("\x1b[23;0t\x1b]2;acs: devbox\x07"),
+        "no neutral title: {tail:?}"
+    );
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+}
+
 #[test]
 fn exit_needs_the_link() {
     let remote = Remote::installed();

@@ -875,9 +875,20 @@ lossless resume will not repaint it. So:
    Full-screen programs repaint; a plain shell prompt may leave the line in
    scrollback, which is acceptable. The Ctrl-L every resume sends (§5.2,
    unless turned off) makes a shell clear and repaint too.
+   Straight after the pop the title is also set again explicitly (acs-r3m):
+   to the last `OSC 0` or `OSC 2` title the program set, which the mode
+   observer (§6.4) remembers, or to a neutral `acs: <host>` if it never set
+   one — after a fresh attach, the new program's, so none yet. Terminals
+   that ignore the title stack (macOS Terminal.app among them) would
+   otherwise keep the "connection lost" title for good; one that honours it
+   is handed the same title it just popped. This happens on every WELCOME
+   that follows a status line — resume, gap, or fresh attach.
 4. Whatever ends the client — resume, detach, or the session ending while
    the link was down — pops the title and blanks the status row on the way
-   out, so the terminal is left as it was. While offline, the command key
+   out, so the terminal is left as it was. Leaving, the pop is not followed
+   by an explicit title: the program's belongs to a session the terminal is
+   leaving, and a neutral one would overwrite what a stack-aware terminal
+   just restored. While offline, the command key
    uses the same key and window (`ACS_ESCAPE_TIMEOUT_MS`) as online — it is
    the same detector, which outlives both the wait and the link (§6.1), so a
    press held when a backoff expires into a redial is still held when the
