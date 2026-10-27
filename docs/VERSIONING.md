@@ -142,10 +142,13 @@ renders the formula from the release's `SHA256SUMS`
   release channel to read that `SHA256SUMS` from.
 
 The formula's homepage and download URLs are the build's
-`DEFAULT_RELEASES_URL` ("Forking"), so a fork's tap points at the fork. It
-reads a release back out of those URLs to decide whether the tap would move
-backwards, which wants the `…/releases/download/vX.Y.Z/…` shape GitHub and
-GitLab both publish under.
+`DEFAULT_RELEASES_URL` ("Forking"), so a fork's tap points at the fork. To
+decide whether the tap would move backwards, `scripts/update-tap.sh` reads the
+release from the `# acs-version: X.Y.Z` line the generator writes into the
+formula's header, not from those URLs — so a fork whose releases are not
+GitHub-shaped gets a formula the tap takes (acs-u3qn). A formula without that
+line is refused; one already on the tap without it (rendered before the line
+existed) counts as no version and is replaced.
 
 The formula is generated: change `xtask/src/formula.rs`, not the tap. A
 Homebrew install is brew's to replace — its real path is in a `Cellar` —
@@ -178,8 +181,13 @@ binaries — xtask links the `acs` library, so `build.rs` gives it the same
 installer, the formula and the notes follow a fork with no edit. A `dist`
 built with the variables and a `package` run without them would produce
 binaries that update from the fork beside an installer that installs
-upstream; `scripts/release-binaries.sh` runs every step in one environment,
-and `package` prints the URL and key it substituted.
+upstream, so that is refused: `dist` records the releases URL and key it
+built for in `dist/channel.stamp`, and `package` refuses a `dist/` whose
+stamp differs from its own — or that has none — before writing anything
+(acs-u3qn). `dist` likewise refuses to run when the environment would build
+for a different channel than the xtask it is (a cached xtask binary).
+`scripts/release-binaries.sh` runs every step in one environment, and
+`package` prints the URL and key it substituted.
 
 The build-time URL is what `acs upgrade` and the weekly update check look at
 when nothing overrides them, and the one-line installer named in the "acs is

@@ -47,12 +47,18 @@ case "$arg" in
 esac
 [ -f "$formula" ] || { echo "no formula at $formula" >&2; exit 1; }
 
-# The release a formula installs, from its download URLs.
+# The release a formula installs, from the line `cargo xtask formula` writes
+# for it — not from its download URLs, whose shape is whatever a fork's
+# releases URL makes it (acs-u3qn). A tap formula from before that line
+# existed reads as no version, and is replaced.
 version_of() {
-    sed -n 's|.*/releases/download/v\([0-9][0-9.]*\)/.*|\1|p' "$1" | head -n 1
+    sed -n 's|^# acs-version: \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p' "$1" | head -n 1
 }
 version=$(version_of "$formula")
-[ -n "$version" ] || { echo "$formula names no release" >&2; exit 1; }
+[ -n "$version" ] || {
+    echo "$formula names no release (no '# acs-version: X.Y.Z' line; render it with cargo xtask formula)" >&2
+    exit 1
+}
 
 git clone --quiet "$repo" "$work/tap"
 tap=$work/tap

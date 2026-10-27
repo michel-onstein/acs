@@ -7,11 +7,14 @@
 //! - `install.sh`, the one-line installer (`--installer`), carrying this
 //!   build's releases URL and release key (acs-x57);
 //! - `NOTES.md`: install instructions, checksums and the changes.
+//!
+//! It refuses a `dist/` whose `channel.stamp` names another releases URL or
+//! release key than this build's (`channel.rs`, acs-u3qn).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::upstream;
+use crate::{channel, upstream};
 
 /// A short platform name for the install table.
 pub fn platform(target: &str) -> &str {
@@ -211,6 +214,11 @@ pub fn package(
     installer: Option<&Path>,
     changes: &str,
 ) -> Result<Vec<PathBuf>, String> {
+    // Before anything is written: the binaries in `dist` must be for the
+    // channel this package names in the installer, the notes and the
+    // formula, or a fork's archives would ship beside acs's `curl | sh`
+    // line (acs-u3qn).
+    channel::check(dist, &channel::Channel::built())?;
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let mut targets: Vec<String> = std::fs::read_dir(dist)
         .map_err(|e| format!("{}: {e}", dist.display()))?
