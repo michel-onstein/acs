@@ -41,3 +41,4 @@ updates the Homebrew tap (`michel-onstein/homebrew-acs`). Rules in
 | [DESIGN.md](docs/DESIGN.md) | Architecture, protocol, command mode, remote install | Built |
 | [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning, release binaries on GitHub, the Homebrew tap, what a fork must point at itself | Built |
 | [VERIFICATION.md](docs/VERIFICATION.md) | End-to-end results over real ssh; checks still to do by hand | Automated checks pass, bar the stale installer suite |
+| [ACSCP_DESIGN.md](docs/ACSCP_DESIGN.md) | `acscp`: scp for acs — a fourth role of the one binary under a second name, resumable copies, the remote end self-installed | Proposed |
