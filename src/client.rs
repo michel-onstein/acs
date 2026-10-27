@@ -1497,15 +1497,21 @@ fn serve(
                     return Outcome::Exit(exit);
                 }
                 Msg::Data { offset, bytes } if welcomed => {
+                    // A frame whose end does not fit in a u64 is not one
+                    // the master could have sent: undecodable, like any
+                    // other (acs-shj7).
+                    let Some((skip, end)) = data_span(state.offset, offset, bytes.len()) else {
+                        note("protocol error: DATA frame past the end of the stream");
+                        return lost(link, LinkEnd::Channel);
+                    };
                     // Skip anything we already wrote (never expected).
-                    let skip = state.offset.saturating_sub(offset) as usize;
                     if skip < bytes.len() {
                         timing.first_output();
                         if write_output(state, &bytes[skip..]).is_err() {
                             link.close();
                             return Outcome::Exit(code::ERROR);
                         }
-                        state.offset = offset + bytes.len() as u64;
+                        state.offset = end;
                     }
                 }
                 Msg::Ack { seq } => state.unacked.ack(seq),
@@ -1728,9 +1734,38 @@ fn serve(
     }
 }
 
+/// Where a DATA frame at `offset` with `len` bytes stands against the
+/// `have` bytes already written: how many of its leading bytes to skip
+/// (all of them, or more, for a frame already written) and the stream
+/// offset its end reaches.
+///
+/// `None` for a frame whose end does not fit in a `u64` (acs-shj7, the
+/// client's side of acs-hpf): the offset comes off the wire, and
+/// `offset + len` used to be an unguarded addition that aborted a debug
+/// build and wrapped in a release one.
+fn data_span(have: u64, offset: u64, len: usize) -> Option<(usize, u64)> {
+    let end = offset.checked_add(len as u64)?;
+    let skip = usize::try_from(have.saturating_sub(offset)).unwrap_or(usize::MAX);
+    Some((skip, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-shj7: a DATA frame whose end overflows a u64 is refused rather
+    /// than added up — the unguarded sum panicked a debug build.
+    #[test]
+    fn a_data_frame_past_the_end_of_the_stream_is_refused() {
+        assert_eq!(data_span(0, u64::MAX, 1), None);
+        assert_eq!(data_span(10, u64::MAX - 2, 8), None);
+        // The end exactly at u64::MAX still fits.
+        assert_eq!(data_span(0, u64::MAX - 4, 4), Some((0, u64::MAX)));
+        // Ordinary frames: fresh, partly written, already written.
+        assert_eq!(data_span(10, 10, 5), Some((0, 15)));
+        assert_eq!(data_span(12, 10, 5), Some((2, 15)));
+        assert_eq!(data_span(20, 10, 5), Some((10, 15)));
+    }
 
     /// acs-n1m: which endings take the shared ssh master down with them.
     /// A channel that broke while the connection was demonstrably carrying
