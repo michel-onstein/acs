@@ -254,6 +254,45 @@ fn the_menu_ends_and_attaches_over_one_ssh_connection() {
     assert_eq!(running, 1, "{:?}", c.text());
 }
 
+/// acs-xvg: with nothing detached the session is made over the one
+/// `_proxy --pick --eager` connection, with the HELLO that went ahead with
+/// it — and a session detached on the host still brings the menu up.
+#[test]
+fn with_nothing_detached_the_pick_call_attaches_at_once() {
+    let remote = Remote::installed();
+    let ssh = Ssh::new(&[("devbox", &remote)]);
+    let path = ssh.path().display().to_string();
+    let mut c = Client::spawn(
+        &exe(),
+        &[
+            "--ssh",
+            &path,
+            "devbox",
+            "--",
+            "/bin/sh",
+            "-c",
+            &echo("main"),
+        ],
+        &[],
+    );
+    c.wait_for("new session 'main' on devbox", T);
+    c.wait_for("ready-main", T);
+    c.send(b"hi\r");
+    c.wait_for("got-main:hi", T);
+    let calls = ssh.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].contains("_proxy --pick --eager"), "{calls:?}");
+    assert!(!c.text().contains("\x1b[?1049h"), "no menu: {:?}", c.text());
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+
+    // Now `main` is detached: the same call shows the menu.
+    let mut m = Client::spawn(&exe(), &["--ssh", &path, "devbox"], &[]);
+    menu_up(&mut m);
+    m.send(b"1");
+    attached_to(&mut m, "main");
+}
+
 #[test]
 fn without_a_terminal_for_the_menu_it_attaches_main() {
     let remote = Remote::installed();

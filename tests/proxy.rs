@@ -444,3 +444,86 @@ fn leaving_the_pick_closes_the_connection_and_starts_nothing() {
         .collect();
     assert!(left.is_empty(), "{left:?}");
 }
+
+/// `--pick --eager` (acs-xvg): the client's HELLO goes ahead with the dial
+/// and, with nothing detached, the proxy attaches it at once — the WELCOME
+/// follows the list with no second request from the client.
+#[test]
+fn an_eager_pick_with_nothing_detached_attaches_the_hello_sent_ahead() {
+    let t = TempDir::new();
+    let mut p = proxy(t.path(), &["--pick", "--eager"]);
+    p.conn
+        .send(&hello_cmd("main", "me", "read l; echo got:$l; sleep 30"));
+    assert!(pick_list(&mut p).is_empty());
+    let w = welcome(&mut p);
+    assert_eq!((w.session.as_str(), w.created), ("main", true));
+    p.conn.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"hi\r".to_vec(),
+    });
+    p.conn.wait_output("got:hi", T);
+
+    // `main` is attached, so nothing is detached and the name is taken: a
+    // new numbered session, as the client names it from the same list.
+    let mut q = proxy(t.path(), &["--pick", "--eager"]);
+    q.conn.send(&hello_cmd("main", "me", "sleep 30"));
+    let listed = pick_list(&mut q);
+    assert!(
+        matches!(&listed[..], [Msg::StatusReply(s)] if s.name == "main" && s.attached),
+        "{listed:?}"
+    );
+    let w = welcome(&mut q);
+    assert_eq!((w.session.as_str(), w.created), ("1", true));
+}
+
+/// `--pick --eager` with a session detached: the HELLO sent ahead is moot,
+/// and the menu goes on as without `--eager` — nothing attached until the
+/// HELLO of the session the user picks.
+#[test]
+fn an_eager_pick_with_a_session_detached_waits_for_the_menu() {
+    let t = TempDir::new();
+    let mut a = session(t.path(), "a");
+    a.conn
+        .send(&hello_cmd("a", "me", "read l; echo got:$l; sleep 30"));
+    welcome(&mut a);
+    a.conn.close_write();
+    assert!(a.conn.closed(T));
+
+    let mut p = proxy(t.path(), &["--pick", "--eager"]);
+    p.conn.send(&hello_cmd("main", "me", "sleep 30"));
+    assert_eq!(names(&pick_list(&mut p)), ["a"]);
+    assert!(
+        p.conn.recv(Duration::from_millis(300)).is_none(),
+        "nothing attached before the user picks"
+    );
+    assert!(!t.path().join("main.sock").exists());
+    p.conn
+        .send(&Msg::Hello(hello("a", Mode::AttachOrCreate, "me")));
+    let w = welcome(&mut p);
+    assert_eq!((w.session.as_str(), w.created), ("a", false));
+    p.conn.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"hi\r".to_vec(),
+    });
+    p.conn.wait_output("got:hi", T);
+}
+
+#[test]
+fn an_eager_pick_wants_the_hello_first() {
+    let t = TempDir::new();
+    let mut p = proxy(t.path(), &["--pick", "--eager"]);
+    p.conn.send(&Msg::EndSession {
+        name: "a".into(),
+        identity: "me".into(),
+        force: false,
+    });
+    assert!(pick_list(&mut p).is_empty());
+    match p.conn.recv_control(T) {
+        Some(Msg::Error { code, message }) => {
+            assert_eq!(code, err::BAD_REQUEST, "{message}");
+            assert!(message.contains("expected the HELLO first"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(p.conn.closed(T));
+}

@@ -4,7 +4,9 @@
 //! With `--list` it reports every session's STATUS instead. With `--pick`
 //! it serves the session menu on the session's own connection (DESIGN
 //! §4.4): the list first, sessions ended on request, and then the client's
-//! HELLO names the session to relay.
+//! HELLO names the session to relay. With `--pick --eager` the client's
+//! HELLO comes first, and with nothing detached the proxy attaches it at
+//! once, after the list, saving the client a round trip.
 
 use std::ffi::OsString;
 use std::io;
@@ -28,8 +30,12 @@ enum What {
         mode: Mode,
     },
     List,
-    /// The list, then whatever session the client's HELLO names.
-    Pick,
+    /// The list, then whatever session the client's HELLO names. `eager`:
+    /// the client's first frame is a HELLO for the session it would make
+    /// with nothing detached, attached at once if nothing is (acs-xvg).
+    Pick {
+        eager: bool,
+    },
 }
 
 fn parse_args(args: &[OsString]) -> Result<What, String> {
@@ -37,6 +43,8 @@ fn parse_args(args: &[OsString]) -> Result<What, String> {
     let mut mode = Mode::AttachOrCreate;
     let mut new = false;
     let mut list = false;
+    let mut pick = false;
+    let mut eager = false;
     let mut it = args.iter().map(|a| a.to_string_lossy().into_owned());
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -51,9 +59,16 @@ fn parse_args(args: &[OsString]) -> Result<What, String> {
             }
             "--new" => new = true,
             "--list" => list = true,
-            "--pick" => return Ok(What::Pick),
+            "--pick" => pick = true,
+            "--eager" => eager = true,
             other => return Err(format!("unexpected argument {other}")),
         }
+    }
+    if pick {
+        return Ok(What::Pick { eager });
+    }
+    if eager {
+        return Err("--eager needs --pick".into());
     }
     if list {
         return Ok(What::List);
@@ -105,7 +120,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             Ok(code) => code,
             Err(e) => fail(e),
         },
-        What::Pick => match pick(&dir) {
+        What::Pick { eager } => match pick(&dir, eager) {
             Ok(code) => code,
             Err(e) => fail(e),
         },
@@ -205,10 +220,37 @@ fn reply_err(code: u16, message: String) -> Result<ExitCode, String> {
 /// the HELLO of the session it wants — `mode` and name as the proxy's own
 /// arguments would give them, an empty name with `Create` for a new
 /// numbered one. From there it is an ordinary session connection.
-fn pick(dir: &SocketDir) -> Result<ExitCode, String> {
+///
+/// `eager` (acs-xvg): the client's first frame is a HELLO for the session
+/// it would make with nothing detached — its default name, sent ahead with
+/// the dial. With nothing detached in the list just sent that HELLO is
+/// attached at once, so its WELCOME follows the LIST_END and the client
+/// owes no second request; its name is taken by an attached session, a new
+/// numbered one, as the client's own choice would be. Otherwise it is moot
+/// and the menu goes on as without it.
+fn pick(dir: &SocketDir, eager: bool) -> Result<ExitCode, String> {
     sys::write_all(STDOUT, proto::ready_line().as_bytes()).map_err(|e| e.to_string())?;
-    send_list(dir, None)?;
+    let sessions = send_list(dir, None)?;
     let mut dec = Decoder::new();
+    if eager {
+        let mut hello = match next_from_client(&mut dec)? {
+            None => return Ok(ExitCode::SUCCESS),
+            Some(Msg::Hello(h)) => h,
+            Some(other) => {
+                return reply_err(
+                    err::BAD_REQUEST,
+                    format!("expected the HELLO first, got {other:?}"),
+                )
+            }
+        };
+        if !sessions.iter().any(|s| !s.attached) {
+            if sessions.iter().any(|s| s.name == hello.session) {
+                hello.session.clear();
+                hello.mode = Mode::Create;
+            }
+            return attach_picked(dir, hello, dec);
+        }
+    }
     let hello = loop {
         match next_from_client(&mut dec)? {
             // Leaving the menu closes the connection.
@@ -217,7 +259,9 @@ fn pick(dir: &SocketDir) -> Result<ExitCode, String> {
                 name,
                 identity,
                 force,
-            }) => send_list(dir, Some((&name, &identity, force)))?,
+            }) => {
+                send_list(dir, Some((&name, &identity, force)))?;
+            }
             Some(Msg::Hello(h)) => break h,
             Some(other) => {
                 return reply_err(
@@ -227,8 +271,12 @@ fn pick(dir: &SocketDir) -> Result<ExitCode, String> {
             }
         }
     };
-    // A new numbered session is chosen under the directory lock, as
-    // `--new` does.
+    attach_picked(dir, hello, dec)
+}
+
+/// Attach the session a pick's HELLO names: an empty name with `Create` is
+/// a new numbered one, chosen under the directory lock as `--new` does.
+fn attach_picked(dir: &SocketDir, hello: proto::Hello, dec: Decoder) -> Result<ExitCode, String> {
     let new = hello.session.is_empty();
     if new && hello.mode != Mode::Create {
         return reply_err(err::BAD_REQUEST, "HELLO names no session".into());
@@ -413,7 +461,7 @@ fn list(dir: &SocketDir, out: RawFd) -> ExitCode {
         return ExitCode::from(1);
     }
     match write_statuses(dir, out) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             let message = format!("cannot list sessions: {e}");
             let _ = sys::write_all(
@@ -432,8 +480,11 @@ fn list(dir: &SocketDir, out: RawFd) -> ExitCode {
 /// The list for `--pick`: as `--list` sends it, then LIST_END, since the
 /// connection stays open. With `kill` (END_SESSION, the menu's `x`) that
 /// session is ended first, and an ERROR goes ahead of the list if it could
-/// not be.
-fn send_list(dir: &SocketDir, kill: Option<(&str, &str, bool)>) -> Result<(), String> {
+/// not be. Returns the sessions listed.
+fn send_list(
+    dir: &SocketDir,
+    kill: Option<(&str, &str, bool)>,
+) -> Result<Vec<proto::StatusInfo>, String> {
     let mut out = Vec::new();
     if let Some(Err((code, message))) =
         kill.map(|(name, identity, force)| end_session(dir, name, identity, force))
@@ -441,22 +492,28 @@ fn send_list(dir: &SocketDir, kill: Option<(&str, &str, bool)>) -> Result<(), St
         Msg::Error { code, message }.encode(&mut out);
     }
     sys::write_all(STDOUT, &out).map_err(|e| e.to_string())?;
-    write_statuses(dir, STDOUT)?;
-    sys::write_all(STDOUT, &Msg::ListEnd.to_bytes()).map_err(|e| e.to_string())
+    let sessions = write_statuses(dir, STDOUT)?;
+    sys::write_all(STDOUT, &Msg::ListEnd.to_bytes()).map_err(|e| e.to_string())?;
+    Ok(sessions)
 }
 
 /// One STATUS_REPLY frame per live session; stale sockets are removed.
-fn write_statuses(dir: &SocketDir, out: RawFd) -> Result<(), String> {
+/// Returns the sessions written.
+fn write_statuses(dir: &SocketDir, out: RawFd) -> Result<Vec<proto::StatusInfo>, String> {
     let names = dir
         .sessions()
         .map_err(|e| format!("{}: {e}", dir.path().display()))?;
+    let mut listed = Vec::new();
     for name in names {
         let Ok(path) = dir.socket_path(&name) else {
             continue;
         };
         match status_of(&path) {
-            Ok(info) => sys::write_all(out, &Msg::StatusReply(info).to_bytes())
-                .map_err(|e| e.to_string())?,
+            Ok(info) => {
+                sys::write_all(out, &Msg::StatusReply(info.clone()).to_bytes())
+                    .map_err(|e| e.to_string())?;
+                listed.push(info);
+            }
             Err(e) if refused(&e) => {
                 // Nobody listening: a master that died without cleaning up.
                 // Remove it only under the create lock, as a starting master
@@ -471,7 +528,7 @@ fn write_statuses(dir: &SocketDir, out: RawFd) -> Result<(), String> {
             Err(_) => {}
         }
     }
-    Ok(())
+    Ok(listed)
 }
 
 /// How long END_SESSION waits for the session to end: the master's grace
@@ -617,7 +674,9 @@ mod tests {
             })
         );
         assert_eq!(p(&["--list"]), Ok(What::List));
-        assert_eq!(p(&["--pick"]), Ok(What::Pick));
+        assert_eq!(p(&["--pick"]), Ok(What::Pick { eager: false }));
+        assert_eq!(p(&["--pick", "--eager"]), Ok(What::Pick { eager: true }));
+        assert!(p(&["--eager", "--session", "a"]).is_err());
         // The menu ends sessions over its --pick connection now.
         assert!(p(&["--kill", "work"]).is_err());
         assert!(p(&["--session", "../x"]).is_err());
