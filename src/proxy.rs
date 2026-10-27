@@ -239,7 +239,7 @@ fn pick(dir: &SocketDir, eager: bool) -> Result<ExitCode, String> {
             Some(other) => {
                 return reply_err(
                     err::BAD_REQUEST,
-                    format!("expected the HELLO first, got {other:?}"),
+                    format!("expected the HELLO first, got {}", other.kind()),
                 )
             }
         };
@@ -266,7 +266,7 @@ fn pick(dir: &SocketDir, eager: bool) -> Result<ExitCode, String> {
             Some(other) => {
                 return reply_err(
                     err::BAD_REQUEST,
-                    format!("expected HELLO or END_SESSION, got {other:?}"),
+                    format!("expected HELLO or END_SESSION, got {}", other.kind()),
                 )
             }
         }
@@ -311,7 +311,12 @@ fn attach(
 ) -> Result<ExitCode, String> {
     let mut hello = match hello {
         Msg::Hello(h) => h,
-        other => return reply_err(err::BAD_REQUEST, format!("expected HELLO, got {other:?}")),
+        other => {
+            return reply_err(
+                err::BAD_REQUEST,
+                format!("expected HELLO, got {}", other.kind()),
+            )
+        }
     };
     if hello.proto != proto::PROTO_VERSION {
         return reply_err(
