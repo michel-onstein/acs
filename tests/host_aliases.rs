@@ -43,11 +43,15 @@ fn wait_up(c: &mut Client, session: &str) {
 fn an_alias_connects_to_its_first_reachable_host() {
     let remote = Remote::installed();
     let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    net.set_lagging(&["devbox.example.com"]);
     let env = net.env(CONFIG);
     let mut c = Client::start_env(&remote, &session("devbox"), &refs(&env));
     c.wait_for("devbox: devbox.lan answers ping, using devbox.lan", T);
     wait_up(&mut c, "s");
-    assert_eq!(net.pinged(), ["devbox.example.com", "devbox.lan"]);
+    // Both were pinged — but devbox.example.com's answer was never waited
+    // for, so its line lands whenever its shell runs, here 2 s after
+    // devbox.lan has been chosen (acs-uj6).
+    net.wait_pinged(&["devbox.example.com", "devbox.lan"]);
 }
 
 #[test]
@@ -75,11 +79,8 @@ fn an_ipv6_host_is_pinged_with_ping6() {
     let mut c = Client::start_env(&remote, &session("nas"), &refs(&env));
     c.wait_for("nas: fd00:1::20 answers ping, using fd00:1::20", T);
     wait_up(&mut c, "s");
-    assert_eq!(
-        net.pinged(),
-        ["fd00:1::20", "fd00:1::20"],
-        "ping, then ping6"
-    );
+    // Ping, then ping6.
+    net.wait_pinged(&["fd00:1::20", "fd00:1::20"]);
 }
 
 #[test]
@@ -90,7 +91,7 @@ fn an_unchecked_host_is_used_without_a_ping() {
     let mut c = Client::start_env(&remote, &session("lab"), &refs(&env));
     c.wait_for("lab: using lab2 (reachability_check is off, ", T);
     wait_up(&mut c, "s");
-    assert_eq!(net.pinged(), ["lab1"]);
+    net.wait_pinged(&["lab1"]);
 }
 
 #[test]

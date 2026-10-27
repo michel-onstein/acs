@@ -194,6 +194,7 @@ fn an_alias_is_resolved_once_for_the_list_and_the_attach() {
     detached(&remote, "one");
     let ssh = Ssh::new(&[("you@devbox.lan", &remote)]);
     let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    net.set_lagging(&["devbox.example.com"]);
     let env =
         net.env("aliases:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n");
     let path = ssh.path().display().to_string();
@@ -203,7 +204,7 @@ fn an_alias_is_resolved_once_for_the_list_and_the_attach() {
     c.wait_for("> 1  one ", T);
     c.send(b"1");
     attached_to(&mut c, "one");
-    assert_eq!(net.pinged(), ["devbox.example.com", "devbox.lan"]);
+    net.wait_pinged(&["devbox.example.com", "devbox.lan"]);
     let dests: Vec<String> = ssh.keys().into_iter().map(|(d, _)| d).collect();
     assert_eq!(dests, ["you@devbox.lan"], "list and attach on one call");
 }
