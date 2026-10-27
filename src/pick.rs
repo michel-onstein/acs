@@ -417,12 +417,10 @@ pub fn every_host(args: &ClientArgs) -> u8 {
             return code::ERROR;
         }
     };
-    // As `acs <alias> <session>`: the alias resolved again, its key and
-    // user, and the ordinary session call, which may prompt.
-    let mut picked = args.clone();
-    picked.list = false;
-    picked.target = target;
-    picked.force |= force;
+    // As `acs <alias> <session>`: the configured forwards and the master
+    // decision, the alias resolved again, its key and user, and the
+    // ordinary session call, which may prompt.
+    let mut picked = picked_session(args, &names[h], target, force);
     let mut timing = Timing::start(args.verbose > 0, "first connection");
     if let Err(e) = client::resolve_alias(&mut picked, &names[h]) {
         eprintln!("acs: {e}");
@@ -430,6 +428,21 @@ pub fn every_host(args: &ClientArgs) -> u8 {
     }
     timing.mark("alias resolved");
     client::run(picked, None, timing)
+}
+
+/// The arguments for the session picked from the every-host menu on alias
+/// `name`, ready as `acs <name> <session>` would have them before dialing:
+/// its configured `local_forwards` merged in and the shared-master decision
+/// taken (acs-x5wd). The listing itself skipped both on purpose — it asks
+/// every host at once — but the picked session is one ordinary session.
+fn picked_session(args: &ClientArgs, name: &str, target: Target, force: bool) -> ClientArgs {
+    let mut picked = args.clone();
+    picked.list = false;
+    picked.target = target;
+    picked.force |= force;
+    picked.transport.destination = name.to_string();
+    client::prepare_session(&mut picked);
+    picked
 }
 
 /// Ask every alias in parallel, as `acs list` does; each answer comes on
@@ -499,6 +512,49 @@ fn end_on(args: &ClientArgs, alias: &str, menu: &mut Menu, h: usize, session: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-x5wd: a session picked from the every-host menu (`acs list` in a
+    /// terminal) is readied as `acs <alias> <session>` is — its alias's
+    /// configured `local_forwards` merged with the command line's, and a
+    /// session that forwards anything kept off the shared ssh master.
+    #[test]
+    fn a_session_picked_from_every_host_takes_its_aliass_forwards() {
+        let dir = crate::testutil::TempDir::new();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(
+            &file,
+            "local_forwards: [8080:localhost:80]\n\
+             aliases:\n  \
+               db:\n    local_forwards: 5432:db.internal:5432\n    hosts: [{host: a}]\n  \
+               web:\n    hosts: [{host: b}]\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::load_files(&[file]).unwrap();
+        let picked = |argv: &[&str], alias: &str| {
+            let parsed = crate::cli::parse_list(argv.iter().map(std::ffi::OsString::from)).unwrap();
+            let crate::cli::Parsed::ListAll(mut a) = parsed else {
+                panic!("not acs list")
+            };
+            a.config = config.clone();
+            let p = picked_session(&a, alias, Target::Named("main".into()), false);
+            assert!(!p.list);
+            assert_eq!(p.target, Target::Named("main".into()));
+            assert_eq!(p.transport.destination, alias);
+            // A forward of any kind: no shared master (acs-9n3).
+            assert!(p.transport.mux.is_none(), "{argv:?} on {alias}");
+            p.transport.local_forwards
+        };
+        assert_eq!(picked(&[], "db"), ["5432:db.internal:5432"]);
+        assert_eq!(picked(&[], "web"), ["8080:localhost:80"]);
+        assert_eq!(
+            picked(&["-L", "9000:localhost:9000"], "db"),
+            ["9000:localhost:9000", "5432:db.internal:5432"]
+        );
+        assert_eq!(
+            picked(&["-L", "none", "-L", "9000:localhost:9000"], "db"),
+            ["9000:localhost:9000"]
+        );
+    }
 
     fn info(name: &str) -> StatusInfo {
         StatusInfo {
