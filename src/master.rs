@@ -877,7 +877,7 @@ impl Master {
                 self.trail("kill", &clean_identity(&identity));
                 self.start_kill();
             }
-            other => mlog!("ignoring unexpected {other:?}"),
+            other => mlog!("ignoring unexpected {}", other.kind()),
         }
     }
 
