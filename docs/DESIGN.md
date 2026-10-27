@@ -2188,13 +2188,23 @@ written into the directory the run wipes and refills, last, so it cannot
 outlive the binaries it describes; `--allow-stale-dist` overrides it, and is
 a usage error without `--no-build`, where it would do nothing.
 
+Beside it goes `dist/channel.stamp`: the releases URL and release key the
+binaries were built for. `cargo xtask package` refuses a `dist/` whose
+channel is not its own, so a fork's binaries cannot be packaged beside acs's
+installer and notes or the other way round (acs-u3qn, docs/VERSIONING.md
+"Forking"). It is a file of its own because it says nothing about which
+tree the binaries are from.
+
 The refusal is about *reusing* binaries whose provenance is wrong, so it does
 not cover a checkout with no `dist/` at all — a fresh worktree, which is where
 nearly all work here happens. There `--no-build` builds once and says so
 (acs-0pr). What the stamp cannot see is *which* targets were built: a `dist/`
 built with `--targets` that leaves this host out is this tree's, and the run
 therefore checks the client binary it is about to drive exists, naming it
-rather than failing later inside the harness.
+rather than failing later inside the harness. `--targets` itself takes only
+the four targets acs releases, each once, and refuses anything else before a
+build starts, so a mistyped triple cannot leave a `dist/` silently a platform
+short (acs-u3qn).
 
 ## 9. Implementation
 
