@@ -414,7 +414,7 @@ impl Staged {
     fn new(from: &Path, to: &Path, mode: u32) -> Result<Staged, String> {
         use std::os::unix::fs::PermissionsExt;
         let dir = to.parent().ok_or("no directory to install into")?;
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        make_dirs(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         // Created by us, or not at all: `fs::copy` opens the destination
         // with create-and-truncate, which follows a symlink planted at
         // that name and writes through to whatever it points at — as root,
@@ -455,6 +455,29 @@ impl Drop for Staged {
             let _ = std::fs::remove_file(&self.tmp);
         }
     }
+}
+
+/// Create `dir` and any missing parents as 0755 whatever the umask, as the
+/// remote install's `make_dir` does (acs-91q2). The remote prelude refuses a
+/// binary whose directory others can write, so `root/<version>/` made 0775
+/// under umask 002 (Ubuntu's default with user-private groups) was refused
+/// once and re-uploaded on the first connection to an upgraded host.
+/// Directories that already exist are left alone: in the plain layout that
+/// is wherever the binary lives, which is not ours to change.
+fn make_dirs(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let missing: Vec<&Path> = dir.ancestors().take_while(|d| !d.exists()).collect();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)?;
+    // The mode above is still masked by the umask; set it outright, so a
+    // stricter one than 022 cannot leave a system install that only root
+    // can read.
+    for d in missing.iter().rev() {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
 }
 
 /// Point the symlink `link` at `target`, atomically.

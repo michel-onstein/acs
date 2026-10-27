@@ -165,6 +165,12 @@ chmod 755 "$new"
 
 # ---- where it goes -------------------------------------------------------------
 
+# Under umask 002 (Ubuntu's default with user-private groups) what is made
+# below would be group-writable, and acs on a remote refuses to run from a
+# directory others can write (acs-91q2): installed by this script, it was
+# refused and uploaded again on the first connection.
+umask 022
+
 # Copy to a temporary name next to the destination, then rename over it,
 # so the path is never missing or half-written.
 # An unguessable suffix for the temporary names below (acs-721). $$ is the
@@ -215,6 +221,9 @@ else
         bin="$HOME/.local/bin"
     fi
     mkdir -p "$lib/$version" "$bin" || die "cannot create $lib/$version or $bin"
+    # As the remote install does: a client refuses to run a binary whose
+    # directory others can write, and would upload this version again.
+    chmod 755 "$lib" "$lib/$version" || die "cannot set the mode of $lib/$version"
     place "$new" "$lib/$version/acs"
     link "$lib/$version/acs" "$bin/acs"
     installed="$lib/$version/acs"
