@@ -85,6 +85,38 @@ fn a_host_silent_after_its_marker_is_given_up_on() {
     assert!(err.contains("no answer from devbox within 0.5 s"), "{err}");
 }
 
+/// Regression (acs-mum0): a host that answers ERROR (its sessions could not
+/// be read) used to be listed as having no sessions, with exit 0.
+#[test]
+fn a_host_answering_error_is_a_failure_not_an_empty_list() {
+    let remote = Remote::installed();
+    let mut said = acs::proto::ready_line().into_bytes();
+    said.extend(
+        acs::proto::Msg::Error {
+            code: acs::proto::err::INTERNAL,
+            message: "cannot list sessions: /run/acs: Permission denied".into(),
+        }
+        .to_bytes(),
+    );
+    remote.silence_bytes(&said);
+    let t0 = Instant::now();
+    let out = acs_cmd()
+        .env("ACS_DIAL_TIMEOUT_MS", "5000")
+        .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
+        .output()
+        .unwrap();
+    // Answered on the ERROR, not on the host closing or the deadline.
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{err}");
+    assert!(!stdout.contains("no sessions"), "{stdout}");
+    assert!(
+        err.contains("devbox: cannot list sessions: /run/acs: Permission denied"),
+        "{err}"
+    );
+}
+
 // ---- acs list: every alias --------------------------------------------------
 
 /// `acs list [args]` with no host, through `ssh` and `net`: exit code,
