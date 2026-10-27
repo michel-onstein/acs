@@ -208,10 +208,24 @@ shells).
   `KillUserProcesses=yes` the master itself is killed too — as dtach is today;
   the fix there is `loginctl enable-linger`, which `acs` should mention in its
   error when it detects a master died that way.)
-- `systemd-tmpfiles` may age files out of `/tmp`; the master re-checks its
-  socket every minute and re-binds it if the path is gone — recreating the
-  directory, with the same checks, if that went too (tmux's `SIGUSR1`
-  recovery, made automatic).
+- `systemd-tmpfiles` may age files out of `/tmp`. The master refreshes the
+  times on its socket and `.master` file (§4.2) hourly so an age-based
+  cleaner leaves them be, and re-checks both every 5 s, re-binding the
+  socket if the path is gone — recreating the directory, with the same
+  checks, if that went too (tmux's `SIGUSR1` recovery, made automatic). The
+  re-bind takes the create lock and connect-probes whatever is at the path
+  first, as a starting master does (acs-lbba).
+- **A reconnect does not wait for that check.** A proxy that finds the
+  socket gone starts a master, which finds the old master's `.master` lock
+  held, sends it `SIGUSR1` — re-bind now — and steps aside with "already
+  has a master", so the proxy retries the connect and reaches the same
+  shell. Before this the old master learned of the deletion only at its
+  next check, a minute later, and a client reconnecting inside that minute
+  got a second master with a second shell, while the first ran on with no
+  socket, reachable only by pid. A directory watch (inotify, kqueue) would
+  close the same window with two platform back-ends; the prod closes it on
+  demand, and the 5 s check is left only for a cleaner that took the
+  `.master` file too — a whole-directory wipe.
 
 ### 4.2 Master
 
@@ -220,7 +234,10 @@ shells).
   the socket **before** forking the shell, then report readiness to the proxy
   over a pipe so the proxy never races the bind (dtach's `statusfd`).
   Creation holds `flock(<dir>/<session>.lock)` so two simultaneous attaches do
-  not start two masters.
+  not start two masters. For its whole life the master also holds
+  `flock(<dir>/<session>.master)`, with its pid inside, so a master starting
+  under the same name while the socket is gone finds it, prods it to re-bind
+  and steps aside (§4.1). It lets go at child exit, with the socket.
 - Child: `$SHELL -l` in `$HOME` by default (`dsh` hardcodes `zsh -l`),
   overridable with `acs <host> [session] -- <command…>`. Environment gets
   `TERM` and `COLORTERM` from the client's HELLO (ssh `-T` no longer sends

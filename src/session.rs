@@ -237,6 +237,14 @@ impl SocketDir {
         Ok(p)
     }
 
+    /// `<name>.master`: locked by the live master for its whole life, with
+    /// its pid inside, so a master starting for the same name can find it
+    /// when the socket is gone (DESIGN §4.2, acs-lbba).
+    pub fn master_path(&self, name: &str) -> Result<PathBuf, String> {
+        validate_name(name)?;
+        Ok(self.path.join(format!("{name}.master")))
+    }
+
     /// Lock held while a session is being created.
     pub fn create_lock(&self, name: &str) -> io::Result<Flock> {
         Flock::lock(&self.path.join(format!("{name}.lock")))
