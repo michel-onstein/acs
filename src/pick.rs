@@ -5,6 +5,11 @@
 //! (`_proxy --pick`), which the attach then goes on over. `acs list <host>`
 //! in a terminal shows the same menu whatever is detached.
 //!
+//! With nothing detached the attach costs no round trip of its own
+//! (acs-xvg): the HELLO for the session that would then be made goes ahead
+//! with the dial (`_proxy --pick --eager`), and the proxy, finding nothing
+//! detached, attaches it at once — the list and the WELCOME come together.
+//!
 //! `acs list` in a terminal shows the menu over every host alias at once
 //! (§7.3): each host asked in parallel as `acs list` asks it, its rows in as
 //! it answers, a session ended over a short `_proxy --pick` call of its
@@ -56,8 +61,13 @@ pub fn choose(
         f.code()
     };
     let timeout = client::answer_timeout(false);
+    // The HELLO for the session to make if nothing is detached, ahead of
+    // the marker (acs-xvg). Not for `acs list <host>`, which shows the menu
+    // whatever is there.
+    let ahead = (!always).then(|| client::pick_hello(args, &default));
+    let greeted = ahead.as_ref().map(|h| h.size);
     let (mut pick, sessions) =
-        match open_pick(args, Call::Session, timeout, timing).map_err(fail)? {
+        match open_pick(args, Call::Session, timeout, timing, ahead).map_err(fail)? {
             Some(p) => p,
             // acs is not installed there yet: the attach installs it, and
             // there is nothing to pick.
@@ -67,8 +77,10 @@ pub fn choose(
             }
         };
     if !always && !sessions.iter().any(|s| !s.attached) {
+        // The proxy has attached the HELLO that went ahead, named as
+        // `new_session` names it here (`_proxy --pick --eager`).
         args.target = new_session(&sessions, &default);
-        return Ok(Some(pick.into_picked()));
+        return Ok(Some(pick.into_picked(greeted)));
     }
     let mut menu = Menu::new(sessions, args.force);
     let choice = run_menu(&mut menu, &host, None, &mut |menu, _, name| {
@@ -92,27 +104,40 @@ pub fn choose(
             return Err(code::ERROR);
         }
     }
-    if pick.lost {
+    // The HELLO that went ahead was moot; the one for the session picked
+    // must not overtake what of it is still owed.
+    if pick.lost || pick.flush_owed().is_err() {
         pick.link.close();
         return Ok(None);
     }
-    Ok(Some(pick.into_picked()))
+    Ok(Some(pick.into_picked(None)))
 }
 
 /// Dial `_proxy --pick` and read its first list: `Ok(None)` if acs of our
 /// version is not installed there. `timing` is told when the list is in.
+/// `ahead` is the HELLO to send with the dial, for `--eager` (acs-xvg).
 fn open_pick(
     args: &ClientArgs,
     call: Call,
     timeout: Duration,
     timing: &mut Timing,
+    ahead: Option<proto::Hello>,
 ) -> Result<Option<(Pick, Vec<StatusInfo>)>, Failure> {
-    let remote = ssh::remote_acs(crate::VERSION, &["_proxy", "--pick"]);
-    // The menu's connection speaks second: `_proxy --pick` sends the list
-    // before it reads anything, and the HELLO only names the session the
-    // user then chose (DESIGN §4.4), so there is nothing to send ahead.
-    let (link, marker) = client::dial(args, call, &remote, timeout, timing, Vec::new())
+    // `_proxy --pick` sends the list before it reads anything. Plain
+    // `acs <host>` sends the HELLO of the session it would make with
+    // nothing detached ahead of the marker, as a session call does
+    // (acs-trw), and `--eager` has the proxy attach it at once if nothing
+    // is (acs-xvg); otherwise the HELLO only names the session the user
+    // then chose (DESIGN §4.4).
+    let proxy_args: &[&str] = match ahead {
+        Some(_) => &["_proxy", "--pick", "--eager"],
+        None => &["_proxy", "--pick"],
+    };
+    let remote = ssh::remote_acs(crate::VERSION, proxy_args);
+    let first = ahead.map(|h| Msg::Hello(h).to_bytes()).unwrap_or_default();
+    let (mut link, marker) = client::dial(args, call, &remote, timeout, timing, first)
         .map_err(|e| Failure::Unreachable(e.to_string()))?;
+    let owed = link.take_pending();
     let rest = match marker {
         Marker::Ready { proto: p, rest } if p == proto::PROTO_VERSION => rest,
         Marker::Ready { proto: p, .. } => {
@@ -129,6 +154,7 @@ fn open_pick(
     };
     let mut dec = Decoder::new();
     dec.push(&rest);
+    let was_owed = !owed.is_empty();
     let mut pick = Pick {
         link,
         dec,
@@ -136,9 +162,15 @@ fn open_pick(
         lost: false,
         identity: client::identity(),
         force: args.force,
+        owed,
     };
     match pick.list() {
         Ok(a) => {
+            // The last of a HELLO the dial's pipe would not take went
+            // while the list came in (acs-ftn).
+            if was_owed && pick.owed.is_empty() {
+                timing.hello(true);
+            }
             timing.mark("session list received");
             Ok(Some((pick, a.sessions)))
         }
@@ -162,6 +194,10 @@ struct Pick {
     /// the master can judge a kill as it judges a takeover (acs-fbo).
     identity: String,
     force: bool,
+    /// What of the HELLO sent ahead the dial's pipe would not take
+    /// (acs-xvg): written while a list is read, so neither side waits on
+    /// the other, and always before any frame of the menu's own.
+    owed: Vec<u8>,
 }
 
 /// One list from the proxy: every session's STATUS, and the message of an
@@ -172,10 +208,38 @@ struct Listing {
 }
 
 impl Pick {
-    fn into_picked(mut self) -> Picked {
+    /// The connection for the attach. `greeted`: the proxy attached the
+    /// HELLO sent ahead, which carried that terminal size; what of it is
+    /// still owed goes first.
+    fn into_picked(mut self, greeted: Option<proto::WinSize>) -> Picked {
+        self.link.set_pending(std::mem::take(&mut self.owed));
         Picked {
             rest: self.dec.take_rest(),
             link: self.link,
+            greeted,
+        }
+    }
+
+    /// Write whatever of the HELLO sent ahead is still owed. The proxy is
+    /// past its list and reading by the time this is called.
+    fn flush_owed(&mut self) -> io::Result<()> {
+        let owed = std::mem::take(&mut self.owed);
+        sys::write_all(self.link.to_fd().as_raw_fd(), &owed)
+    }
+
+    /// Write some of what is owed without blocking, once the pipe has room.
+    fn write_owed(&mut self) -> io::Result<()> {
+        let to = self.link.to_fd().as_raw_fd();
+        sys::set_nonblocking(to, true)?;
+        let wrote = sys::write(to, &self.owed);
+        sys::set_nonblocking(to, false)?;
+        match wrote {
+            Ok(n) => {
+                self.owed.drain(..n);
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -199,7 +263,7 @@ impl Pick {
                 Ok(Some(other)) => {
                     return Err(Failure::BadReply(format!("unexpected {other:?}")));
                 }
-                Ok(None) => match wait_readable(from, deadline) {
+                Ok(None) => match self.wait(from, deadline) {
                     Ok(true) => match sys::read(from, &mut buf) {
                         Ok(0) => {
                             return Err(Failure::Unreachable(
@@ -232,9 +296,38 @@ impl Pick {
             force: self.force,
         }
         .to_bytes();
-        sys::write_all(self.link.to_fd().as_raw_fd(), &frame)
-            .map_err(|e| Failure::Unreachable(e.to_string()))?;
+        let failed = |e: io::Error| Failure::Unreachable(e.to_string());
+        self.flush_owed().map_err(failed)?;
+        sys::write_all(self.link.to_fd().as_raw_fd(), &frame).map_err(failed)?;
         self.list()
+    }
+
+    /// Wait until `from` is readable (`true`) or `deadline` passes, writing
+    /// what is owed meanwhile as the pipe takes it.
+    fn wait(&mut self, from: RawFd, deadline: Instant) -> io::Result<bool> {
+        while !self.owed.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(false);
+            }
+            let to = self.link.to_fd().as_raw_fd();
+            let mut p = [
+                sys::pollfd(from, libc::POLLIN),
+                sys::pollfd(to, libc::POLLOUT),
+            ];
+            match sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+            if p[0].revents != 0 {
+                return Ok(true);
+            }
+            if p[1].revents != 0 {
+                self.write_owed()?;
+            }
+        }
+        wait_readable(from, deadline)
     }
 }
 
@@ -493,6 +586,7 @@ fn end_on(args: &ClientArgs, alias: &str, menu: &mut Menu, h: usize, session: &s
             Call::Batch,
             client::answer_timeout(true),
             &mut Timing::off(),
+            None,
         ) {
             Ok(Some((mut pick, _))) => {
                 let note = match pick.end(session) {

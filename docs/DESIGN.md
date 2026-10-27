@@ -336,6 +336,22 @@ stays open. It then reads the client's frames:
 - End of input (the user left the menu): it exits, starting nothing.
   Anything else is an `ERROR` (bad request).
 
+`acs _proxy --pick --eager` (acs-xvg), which plain `acs <host>` dials, takes
+the client's first frame as a `HELLO` sent ahead of the marker, as a
+session call's is (§3): the one for the session the client would make with
+nothing detached — `main` (or `$ACS_DEFAULT_SESSION`), attach-or-create.
+The proxy reads it after the first list. If that list has **nothing
+detached**, it attaches that `HELLO` at once — under the name it carries,
+or, when a session already has that name, a new numbered one, exactly as
+the client names it from the same list (§4.4) — so the `WELCOME` follows
+`LIST_END` and the attach costs no round trip of its own. Otherwise the
+`HELLO` is moot and the menu goes on as above; any first frame but a
+`HELLO` is an `ERROR` (bad request). `acs list <host>` and the menu over
+every host dial plain `--pick`, since they show the menu whatever is
+detached. The client and the proxy are always the same version — the
+remote command runs exactly the client's own (§8) — so a client never
+meets a proxy that would take the early `HELLO` for the user's choice.
+
 ### 4.4 Session names and getting back in
 
 "Reconnect" covers two different situations, and only one of them needs you to
@@ -372,6 +388,9 @@ the session, where a separate `_proxy --list` side call used to cost a second
 - **No session detached** (none at all, or all attached elsewhere): a new
   session, without a menu — named `main` (or `$ACS_DEFAULT_SESSION`) if no
   session has that name, otherwise the lowest free number, as `--new`.
+  It costs no round trip after the list (acs-xvg): the `HELLO` for it went
+  ahead with the dial, and `_proxy --pick --eager` attached it on finding
+  nothing detached (§4.3), so the list and the `WELCOME` arrive together.
   A host without acs has no sessions; the attach installs it (§8).
 - **Some detached**: a menu (`menu.rs`, a pure state machine from keys to
   choices; `pick.rs` drives it), drawn on the **alternate screen** so that

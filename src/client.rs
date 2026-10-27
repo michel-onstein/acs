@@ -248,10 +248,13 @@ pub(crate) fn host_answers(args: &mut ClientArgs, name: &str) -> Option<bool> {
 
 /// A session connection already open and past its marker: the pick's
 /// (DESIGN §4.4), which the attach goes on over. `rest` is what arrived
-/// after the pick's last frame.
+/// after the pick's last frame. `greeted` is the terminal size of the HELLO
+/// the proxy has already attached, the one that went ahead with the dial
+/// when nothing was detached (acs-xvg); `None` when the HELLO is still owed.
 pub struct Picked {
     pub link: Link,
     pub rest: Vec<u8>,
+    pub greeted: Option<proto::WinSize>,
 }
 
 /// If `name` is an alias, or `user@<alias>`, point the transport at the host
@@ -636,6 +639,17 @@ impl Link {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// What [`dial`] could not write yet: the menu's connection writes it
+    /// itself, ahead of its own frames (acs-xvg).
+    pub(crate) fn take_pending(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Hand bytes still owed back for [`serve`] to write first.
+    pub(crate) fn set_pending(&mut self, pending: Vec<u8>) {
+        self.pending = pending;
+    }
 }
 
 /// How long a connection may take to answer: to print its marker, and then
@@ -945,34 +959,62 @@ fn proxy_args(args: &ClientArgs, state: &State, resuming: bool) -> Vec<String> {
 }
 
 fn hello(args: &ClientArgs, state: &State, force: bool) -> Hello {
-    let size = sys::get_winsize(STDIN).unwrap_or_default();
     let mode = match (&state.session, &args.target) {
         (Some(_), _) if state.instance.is_some() => Mode::Attach,
         (None, Target::New) => Mode::Create,
         _ => Mode::AttachOrCreate,
     };
+    let session = state
+        .session
+        .clone()
+        .or_else(|| match &args.target {
+            Target::Named(n) | Target::Pick(n) => Some(n.clone()),
+            Target::New => None,
+        })
+        .unwrap_or_default();
+    let mut h = fresh_hello(args, session, mode, state.identity.clone(), force);
+    h.resume = state.instance.map(|instance| Resume {
+        instance,
+        offset: state.offset,
+    });
+    h
+}
+
+/// A HELLO that resumes nothing, for `session` in `mode`: the terminal as
+/// it is now, and the command line's command.
+fn fresh_hello(
+    args: &ClientArgs,
+    session: String,
+    mode: Mode,
+    identity: String,
+    force: bool,
+) -> Hello {
     Hello {
         proto: proto::PROTO_VERSION,
-        session: state
-            .session
-            .clone()
-            .or_else(|| match &args.target {
-                Target::Named(n) | Target::Pick(n) => Some(n.clone()),
-                Target::New => None,
-            })
-            .unwrap_or_default(),
+        session,
         mode,
-        identity: state.identity.clone(),
+        identity,
         force,
         term: std::env::var("TERM").unwrap_or_default(),
         colorterm: std::env::var("COLORTERM").unwrap_or_default(),
-        size,
-        resume: state.instance.map(|instance| Resume {
-            instance,
-            offset: state.offset,
-        }),
+        size: sys::get_winsize(STDIN).unwrap_or_default(),
+        resume: None,
         command: args.command.clone(),
     }
+}
+
+/// The HELLO a plain `acs <host>` sends ahead on its menu's connection
+/// (acs-xvg): the one the first connection would send for `default` —
+/// what `run` builds from a fresh state — which `_proxy --pick --eager`
+/// attaches at once when nothing is detached.
+pub fn pick_hello(args: &ClientArgs, default: &str) -> Hello {
+    fresh_hello(
+        args,
+        default.to_string(),
+        Mode::AttachOrCreate,
+        identity(),
+        args.force,
+    )
 }
 
 // ---- running ---------------------------------------------------------------
@@ -1090,10 +1132,20 @@ pub fn connect_and_serve(
     let size = greeting.size;
     let greeting = Msg::Hello(greeting).to_bytes();
     if let Some(p) = picked {
-        // The menu's connection is past its marker and owes its HELLO:
-        // the proxy read the list's frames from it first (DESIGN §4.4).
         let mut link = p.link;
-        link.pending = greeting;
+        let size = match p.greeted {
+            // The HELLO that went ahead with the dial has been attached
+            // already, nothing being detached (acs-xvg): its WELCOME is on
+            // the way, and only what of it the pipe would not take is
+            // still to write.
+            Some(sent) => sent,
+            // The menu's connection is past its marker and owes the HELLO
+            // of the session the user picked (DESIGN §4.4).
+            None => {
+                link.pending = greeting;
+                size
+            }
+        };
         state.master = link.muxed.then(|| args.transport.clone());
         return serve(
             args, state, raw, signals, link, p.rest, timeout, timing, size, netwatch,
@@ -1316,7 +1368,8 @@ fn serve(
     // How much of `out` is still the greeting (acs-ftn). Nothing in the
     // common case, where the dial wrote it whole and has said so; the tail
     // the dial's pipe would not take; or all of it on the menu's
-    // connection, which owes its HELLO after the list (DESIGN §4.4). It
+    // connection when a session was picked from the menu, which owes that
+    // session's HELLO after the list (DESIGN §4.4). It
     // sits at the front of `out` and is written before anything else, so
     // it is out once this many bytes have gone, and that is where the
     // clock is told.
