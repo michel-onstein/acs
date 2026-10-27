@@ -595,3 +595,53 @@ fn a_host_called_config_is_reachable_with_a_user_or_an_option_first() {
         assert!(String::from_utf8_lossy(&out.stdout).starts_with("no sessions on"));
     }
 }
+
+/// Regression (acs-36l0): with HOME and XDG_CONFIG_HOME both unset, the
+/// local file used to be `.config/acs/config.yaml` under the working
+/// directory — `acs config set` made it there, and the client read a
+/// different configuration in every directory. Now `acs config` refuses,
+/// and the client reads the global file alone.
+#[test]
+fn no_home_means_no_local_file() {
+    let cwd = TempDir::new();
+    let run = |args: &[&str]| {
+        let out = Command::new(exe())
+            .args(args)
+            .current_dir(cwd.path())
+            .env_remove("HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+            .env("ACS_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    for args in [
+        &["config", "path"][..],
+        &["config", "set", "install_on_remote", "false"],
+        &["config", "host", "add", "d", "a"],
+    ] {
+        let (code, out, err) = run(args);
+        assert_eq!(code, 2, "acs {args:?}: {out}{err}");
+        assert!(err.contains("HOME is not set"), "acs {args:?}: {err}");
+    }
+    assert!(
+        !cwd.path().join(".config").exists(),
+        "acs config wrote under the working directory"
+    );
+    let (code, out, err) = run(&["config", "help"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("acs config"), "{out}");
+
+    // A file where the old path pointed is not read by the client.
+    let stray = cwd.path().join(".config/acs/config.yaml");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, "nonsense: [\n").unwrap();
+    let (_, out, err) = run(&["list"]);
+    assert!(!err.contains("config.yaml:"), "{out}{err}");
+    assert!(err.contains("no configuration"), "{out}{err}");
+}
