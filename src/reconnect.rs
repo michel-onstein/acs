@@ -25,6 +25,12 @@ fn ping_after() -> u64 {
     env_ms("ACS_PING_MS", 3000)
 }
 
+/// How long a link must have served, WELCOME to loss, for the backoff to
+/// start over at its free attempt (`ACS_BACKOFF_RESET_MS`, acs-omt2).
+fn backoff_reset_after() -> Duration {
+    Duration::from_millis(env_ms("ACS_BACKOFF_RESET_MS", 30_000))
+}
+
 /// Declare the link dead after this much silence (`ACS_DEAD_MS`).
 fn dead_after() -> u64 {
     env_ms("ACS_DEAD_MS", 10_000)
@@ -41,7 +47,7 @@ fn netcheck_after() -> u64 {
 /// Waits between redials (acs-iyq): **the first attempt after a drop goes
 /// at once**, and only then the exponential backoff 1 s → 30 s
 /// (`ACS_BACKOFF_MS` sets its first step), reset after a connection that
-/// lasted 30 s.
+/// served 30 s ([`Backoff::link_ended`]).
 ///
 /// Most drops are momentary — a Wi-Fi blip, a laptop waking, a NAT that
 /// forgot the flow — and the link is back by the time the drop is noticed
@@ -74,6 +80,19 @@ impl Backoff {
     /// base wait rather than a second dial with nothing in between.
     pub fn spent(&mut self) {
         self.next = Some(self.first);
+    }
+
+    /// A link has ended; `served` is how long it was up from its WELCOME,
+    /// `None` when it never was. Only a link that served `reset_after`
+    /// gives the free attempt back (acs-omt2): the time a dial spent
+    /// waiting on a host that accepted and then said nothing is not a
+    /// connection that lasted — and a redial's timeout is 30 s too, so
+    /// counting it reset the backoff after every silent dial and the next
+    /// one went at once, never leaving a wait where the command keys work.
+    pub fn link_ended(&mut self, served: Option<Duration>, reset_after: Duration) {
+        if served.is_some_and(|d| d >= reset_after) {
+            self.reset();
+        }
     }
 
     pub fn step(&mut self) -> Duration {
@@ -111,7 +130,8 @@ pub fn run(
     let mut ended: Option<LinkEnd> = None;
     let mut args = args.clone();
     loop {
-        let started = Instant::now();
+        // Served time starts at this link's WELCOME, not at the dial.
+        state.welcomed_at = None;
         if redial {
             timing = Timing::start(args.verbose > 0, "redial");
         }
@@ -182,9 +202,8 @@ pub fn run(
                 false => true,
             }
         } else {
-            if started.elapsed() >= Duration::from_secs(30) {
-                backoff.reset();
-            }
+            let served = state.welcomed_at.map(|t| t.elapsed());
+            backoff.link_ended(served, backoff_reset_after());
             let wait = backoff.step();
             // The status line goes up even when nothing is waited for: the
             // dial itself takes as long as it takes, and it is what the
@@ -727,6 +746,28 @@ mod tests {
         // And it is the base that comes back, whatever the backoff had
         // climbed to while the network was down.
         b.spent();
+        assert_eq!(b.step(), Duration::from_millis(1000));
+    }
+
+    /// Regression (acs-omt2): only time served after the WELCOME resets the
+    /// backoff. A dial that ran out its whole timeout against a silent host
+    /// was never welcomed, so the backoff keeps climbing.
+    #[test]
+    fn only_a_link_that_served_long_enough_resets_the_backoff() {
+        let thirty = Duration::from_secs(30);
+        let mut b = Backoff::new(1000);
+        assert_eq!(b.step(), Duration::ZERO);
+        // Silent dials: never welcomed, however long they took.
+        b.link_ended(None, thirty);
+        assert_eq!(b.step(), Duration::from_millis(1000));
+        b.link_ended(None, thirty);
+        assert_eq!(b.step(), Duration::from_millis(2000));
+        // Welcomed but lost again quickly: still the same outage.
+        b.link_ended(Some(Duration::from_secs(5)), thirty);
+        assert_eq!(b.step(), Duration::from_millis(4000));
+        // A link that served the full threshold: a fresh drop.
+        b.link_ended(Some(thirty), thirty);
+        assert_eq!(b.step(), Duration::ZERO);
         assert_eq!(b.step(), Duration::from_millis(1000));
     }
 

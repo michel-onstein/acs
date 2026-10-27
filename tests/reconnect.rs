@@ -1227,6 +1227,38 @@ fn a_redial_into_a_silent_host_returns_to_the_backoff() {
     c.wait_for("hello", T);
 }
 
+/// Regression (acs-omt2): a redial that runs out its whole timeout against
+/// a silent host does not reset the backoff, however long it took. The
+/// reset is for a connection that *served* the threshold, WELCOME to loss;
+/// a redial's timeout is the threshold's 30 s too, so counting the dial
+/// handed out a free immediate attempt after every silent dial and the
+/// backoff never climbed.
+///
+/// Here the dial timeout equals the reset threshold, as the defaults do,
+/// and the waits still go 0 → 1 s → 2 s. Ten seconds of dial timeout for
+/// the reason the test above gives.
+#[test]
+fn a_silent_redial_as_long_as_the_reset_threshold_keeps_the_backoff_climbing() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.retain(|(k, _)| *k != "ACS_BACKOFF_MS");
+    env.push(("ACS_BACKOFF_MS", "1000"));
+    env.push(("ACS_DIAL_TIMEOUT_MS", "10000"));
+    env.push(("ACS_BACKOFF_RESET_MS", "10000"));
+    let mut c = start(&remote, "rb", "echo up; cat", &env);
+    c.wait_for("up", T);
+    remote.silence(Some(""));
+    remote.cut_link();
+    c.wait_for("reconnecting now", T);
+    // Each silent dial takes the full threshold and the wait still grows.
+    c.wait_for("reconnecting in 1s", T);
+    c.wait_for("reconnecting in 2s", T);
+    remote.silence(None);
+    c.wait_for("\x1b[23;0t", T);
+    c.send(b"hello\r");
+    c.wait_for("hello", T);
+}
+
 /// Regression (acs-qrn): when the session ends while the link is down, the
 /// status line and the title pushed for it are taken back.
 #[test]
