@@ -306,12 +306,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let target = if global {
-        config::global_path()
+    let target = if global || matches!(cmd, Cmd::Help) {
+        Ok(config::global_path())
     } else {
-        config::local_path()
+        local_file()
     };
-    match run(&cmd, &target) {
+    match target.and_then(|t| run(&cmd, &t)) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
@@ -354,11 +354,26 @@ impl From<String> for Error {
     }
 }
 
+/// The local file, or a refusal when there is no home to keep it in —
+/// rather than a `.config/acs/config.yaml` under whatever directory acs
+/// was started in (acs-36l0).
+fn local_file() -> Result<PathBuf, Error> {
+    config::local_file().ok_or_else(|| {
+        Error::Usage(
+            "HOME is not set, so there is no local configuration file (set HOME, or XDG_CONFIG_HOME to an absolute path)"
+                .into(),
+        )
+    })
+}
+
 /// Run `cmd`, editing `target` if it edits; returns what to print.
 pub fn run(cmd: &Cmd, target: &Path) -> Result<String, Error> {
-    let files = [config::global_path(), config::local_path()];
+    if let Cmd::Help = cmd {
+        return Ok(format!("{USAGE}\n"));
+    }
+    let files = [config::global_path(), local_file()?];
     match cmd {
-        Cmd::Help => Ok(format!("{USAGE}\n")),
+        Cmd::Help => unreachable!("answered above"),
         Cmd::Path => Ok(paths(&files)),
         Cmd::Show => Ok(show(&Config::load_files(&files)?, &files)),
         Cmd::Get(key) => {
