@@ -111,7 +111,7 @@ impl Node {
 
     /// A string scalar, quoted when plain would read as something else.
     pub fn string(s: &str) -> Node {
-        let style = if plain_ok(s) && !looks_typed(s) {
+        let style = if plain_ok(s, false) && !looks_typed(s) {
             Style::Plain
         } else {
             Style::Double
@@ -690,12 +690,15 @@ impl Flow<'_> {
 
 // ---- writing ---------------------------------------------------------------
 
-/// Whether `s` can be written without quotes and read back as the same text.
-fn plain_ok(s: &str) -> bool {
+/// Whether `s` can be written without quotes and read back as the same text
+/// — in block context, or inside a `[...]`/`{...}` when `flow` is set, where
+/// the reader also ends a plain scalar at any of `,]}#` (acs-tacx).
+fn plain_ok(s: &str, flow: bool) -> bool {
     let Some(first) = s.chars().next() else {
         return false;
     };
-    !(s.starts_with(' ')
+    !((flow && s.contains([',', '[', ']', '{', '}', '#']))
+        || s.starts_with(' ')
         || s.ends_with(' ')
         || s.ends_with(':')
         || "?:,[]{}#&*!|>'\"%@`".contains(first)
@@ -732,9 +735,9 @@ fn quote_double(s: &str) -> String {
     out
 }
 
-fn scalar_text(s: &Scalar) -> String {
+fn scalar_text(s: &Scalar, flow: bool) -> String {
     match s.style {
-        Style::Plain if plain_ok(&s.text) => s.text.clone(),
+        Style::Plain if plain_ok(&s.text, flow) => s.text.clone(),
         Style::Single if !s.text.chars().any(|c| c.is_control()) => {
             format!("'{}'", s.text.replace('\'', "''"))
         }
@@ -742,8 +745,8 @@ fn scalar_text(s: &Scalar) -> String {
     }
 }
 
-fn key_text(k: &str) -> String {
-    if plain_ok(k) {
+fn key_text(k: &str, flow: bool) -> String {
+    if plain_ok(k, flow) {
         k.to_string()
     } else {
         quote_double(k)
@@ -752,14 +755,19 @@ fn key_text(k: &str) -> String {
 
 /// A value written on one line (scalars, empty and flow collections).
 fn flow_text(v: &Value) -> String {
+    one_line_text(v, false)
+}
+
+/// `flow_text`, where `inside` says `v` sits within a flow collection.
+fn one_line_text(v: &Value, inside: bool) -> String {
     match v {
         Value::Null => String::new(),
-        Value::Scalar(s) => scalar_text(s),
+        Value::Scalar(s) => scalar_text(s, inside),
         Value::Seq(items) => format!(
             "[{}]",
             items
                 .iter()
-                .map(|n| flow_text(&n.value))
+                .map(|n| one_line_text(&n.value, true))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -768,8 +776,8 @@ fn flow_text(v: &Value) -> String {
             entries
                 .iter()
                 .map(|(k, n)| match &n.value {
-                    Value::Null => format!("{}:", key_text(k)),
-                    v => format!("{}: {}", key_text(k), flow_text(v)),
+                    Value::Null => format!("{}:", key_text(k, true)),
+                    v => format!("{}: {}", key_text(k, true), one_line_text(v, true)),
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -822,7 +830,7 @@ fn emit_block(out: &mut String, v: &Value, indent: usize) {
             for (k, n) in entries {
                 push_before(out, &n.before, indent);
                 out.push_str(&pad);
-                out.push_str(&key_text(k));
+                out.push_str(&key_text(k, false));
                 out.push(':');
                 line_end(out, n);
                 if !one_line(n) {
@@ -840,7 +848,7 @@ fn emit_block(out: &mut String, v: &Value, indent: usize) {
                         push_before(out, &n0.before, indent);
                         out.push_str(&pad);
                         out.push_str("- ");
-                        out.push_str(&key_text(k0));
+                        out.push_str(&key_text(k0, false));
                         out.push(':');
                         line_end(out, n0);
                         if !one_line(n0) {
@@ -1076,6 +1084,50 @@ list: [a, \"b c\", 3]
             let out = emit(&d);
             assert_eq!(out, format!("k: {want}\n"), "{s:?}");
             assert_eq!(text(get(&parse(&out).unwrap().root, "k")), s);
+        }
+    }
+
+    /// acs-tacx: inside `[...]`/`{...}` the reader ends a plain scalar at
+    /// any of `,]}#`, so such a string is quoted there — an IPv6 `-L` spec
+    /// no longer breaks the re-parse, and `a,b` no longer becomes two
+    /// items. In block context the same strings stay plain.
+    #[test]
+    fn strings_in_a_flow_collection_are_quoted_when_flow_would_split_them() {
+        for (s, want) in [
+            ("8080:[::1]:80", "\"8080:[::1]:80\""),
+            ("a,b", "\"a,b\""),
+            ("a}b", "\"a}b\""),
+            ("a#b", "\"a#b\""),
+            ("a{b", "\"a{b\""),
+            ("8080:localhost:80", "8080:localhost:80"),
+        ] {
+            let mut d = parse("k: v\n").unwrap();
+            let mut seq = Node::new(Value::Seq(vec![Node::string(s), Node::string("x")]));
+            seq.flow = true;
+            d.root.value.map_mut().unwrap()[0].1 = seq;
+            let out = emit(&d);
+            assert_eq!(out, format!("k: [{want}, x]\n"), "{s:?}");
+            let back = parse(&out).unwrap();
+            let got = items(get(&back.root, "k"));
+            assert_eq!(got.len(), 2, "{s:?}: {out}");
+            assert_eq!(text(&got[0]), s);
+
+            // A flow mapping: keys and values alike.
+            let mut d = parse("k: v\n").unwrap();
+            let mut map = Node::new(Value::Map(vec![(s.to_string(), Node::string(s))]));
+            map.flow = true;
+            d.root.value.map_mut().unwrap()[0].1 = map;
+            let out = emit(&d);
+            let back = parse(&out).unwrap();
+            let m = get(&back.root, "k").value.map().unwrap();
+            assert_eq!(m.len(), 1, "{s:?}: {out}");
+            assert_eq!(m[0].0, s, "{out}");
+            assert_eq!(text(&m[0].1), s, "{out}");
+
+            // In block context the same string needs no quotes.
+            let mut d = parse("k: v\n").unwrap();
+            d.root.value.map_mut().unwrap()[0].1 = Node::string(s);
+            assert_eq!(emit(&d), format!("k: {s}\n"));
         }
     }
 
