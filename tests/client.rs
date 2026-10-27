@@ -22,6 +22,24 @@ fn start_env(remote: &Remote, session: &str, cmd: &str, env: &[(&str, &str)]) ->
     Client::start_env(remote, &args, env)
 }
 
+/// acs-e86g: a remote's install is never a copy this process wrote — such a
+/// copy is "busy" while any test thread's fork holds its write descriptor,
+/// and the remote's exec of it fails ETXTBSY. Every remote's acs is a link
+/// to one inode: the build's own binary, or the one staged copy of it where
+/// the build lives on another filesystem.
+#[test]
+fn every_remote_install_links_one_shared_binary() {
+    use std::os::unix::fs::MetadataExt;
+    let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+    let (a, b) = (Remote::installed(), Remote::installed());
+    let ia = ino(&a.installed_binary(acs::VERSION));
+    assert_eq!(ia, ino(&b.installed_binary(acs::VERSION)));
+    let shared = ino(&exe());
+    if ia != shared {
+        assert_eq!(ia, ino(staged_exe()), "a per-remote copy, not a link");
+    }
+}
+
 #[test]
 fn output_is_byte_exact_including_escape_sequences() {
     let remote = Remote::installed();
