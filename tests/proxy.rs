@@ -527,3 +527,46 @@ fn an_eager_pick_wants_the_hello_first() {
     }
     assert!(p.conn.closed(T));
 }
+
+/// Regression (acs-1cco): a frame other than HELLO was named in the ERROR
+/// by its `Debug` form, so an INPUT of a whole frame's worth of bytes made
+/// an ERROR of several MiB — too large for the client to decode, which
+/// reported a bad frame instead of the reason. The ERROR names the frame
+/// type, on every path that wants a HELLO first.
+#[test]
+fn a_full_size_frame_before_the_hello_is_refused_by_name() {
+    let big = Msg::Input {
+        seq: 0,
+        bytes: vec![0; acs::proto::MAX_FRAME - 8],
+    };
+    for (args, why) in [
+        (
+            &["--session", "a", "--mode", "attach-or-create"][..],
+            "expected HELLO, got INPUT",
+        ),
+        (&["--pick"][..], "expected HELLO or END_SESSION, got INPUT"),
+        (
+            &["--pick", "--eager"][..],
+            "expected the HELLO first, got INPUT",
+        ),
+    ] {
+        let t = TempDir::new();
+        let mut p = proxy(t.path(), args);
+        p.conn.send(&big);
+        // The menu's list goes out first; what follows it is the answer.
+        let answer = loop {
+            match p.conn.recv_control(T) {
+                Some(Msg::StatusReply(_) | Msg::ListEnd) => continue,
+                other => break other,
+            }
+        };
+        match answer {
+            Some(Msg::Error { code, message }) => {
+                assert_eq!(code, err::BAD_REQUEST, "{args:?}: {message}");
+                assert_eq!(message, why, "{args:?}");
+            }
+            other => panic!("{args:?}: {:?}", other.map(|m| m.kind())),
+        }
+        assert!(p.conn.closed(T), "{args:?}");
+    }
+}
