@@ -247,16 +247,26 @@ pub fn global_path() -> PathBuf {
 
 /// The local file: `$XDG_CONFIG_HOME/acs/config.yaml`, or
 /// `~/.config/acs/config.yaml` when that is unset or relative (as the XDG
-/// Base Directory spec says).
+/// Base Directory spec says). `None` when neither gives an absolute
+/// directory (no `XDG_CONFIG_HOME` and `HOME` unset, empty or relative):
+/// a path joined onto nothing would name a different file in every working
+/// directory (acs-36l0).
+pub fn local_file() -> Option<PathBuf> {
+    let absolute = |var| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    absolute("XDG_CONFIG_HOME")
+        .or_else(|| absolute("HOME").map(|h| h.join(".config")))
+        .map(|base| base.join("acs/config.yaml"))
+}
+
+/// The local file as a message names it: [`local_file`], or
+/// `~/.config/acs/config.yaml` when there is no home to put it in. For
+/// messages only — never read or written.
 pub fn local_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".config")
-        });
-    base.join("acs/config.yaml")
+    local_file().unwrap_or_else(|| PathBuf::from("~/.config/acs/config.yaml"))
 }
 
 /// Read a file into a document; `Ok(None)` if it does not exist.
@@ -274,7 +284,9 @@ pub fn read_doc(path: &Path) -> Result<Option<yaml::Document>, String> {
 impl Config {
     /// The global then the local file.
     pub fn load() -> Result<Config, String> {
-        Config::load_files(&[global_path(), local_path()])
+        // With no home there is no local file to read: just the global one.
+        let files: Vec<PathBuf> = std::iter::once(global_path()).chain(local_file()).collect();
+        Config::load_files(&files)
     }
 
     /// Read `files` in order; later ones override earlier ones.
@@ -1659,6 +1671,9 @@ aliases:
         // here, since tests run in parallel.
         let p = local_path();
         assert!(p.ends_with("acs/config.yaml"), "{}", p.display());
+        if let Some(p) = local_file() {
+            assert!(p.is_absolute(), "{}", p.display());
+        }
         assert!(global_path().ends_with("config.yaml"));
     }
 }
