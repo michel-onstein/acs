@@ -159,6 +159,49 @@ fn set_get_unset_keep_the_rest_of_the_file() {
     );
 }
 
+/// acs-tacx: a forward to the remote's IPv6 loopback is valid `-L`, but
+/// written plain into the one-line list it broke the re-parse ("unexpected
+/// text after the value"). Globally and on an alias it is now set and read
+/// back intact.
+#[test]
+fn an_ipv6_local_forward_is_set_and_read_back() {
+    let h = Home::new();
+    h.ok(&["config", "set", "local_forwards", "8080:[::1]:80"]);
+    assert_eq!(
+        h.ok(&["config", "get", "local_forwards"]),
+        "8080:[::1]:80\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "local_forwards: [\"8080:[::1]:80\"]\n"
+    );
+    h.ok(&[
+        "config",
+        "set",
+        "local_forwards",
+        "8080:[::1]:80,9090:localhost:90",
+    ]);
+    assert_eq!(
+        h.ok(&["config", "get", "local_forwards"]),
+        "8080:[::1]:80,9090:localhost:90\n"
+    );
+
+    h.ok(&["config", "host", "add", "d", "devbox.lan"]);
+    h.ok(&[
+        "config",
+        "host",
+        "set",
+        "d",
+        "local_forwards",
+        "5432:[::1]:5432",
+    ]);
+    let file = std::fs::read_to_string(h.local()).unwrap();
+    assert!(
+        file.contains("local_forwards: [\"5432:[::1]:5432\"]"),
+        "{file}"
+    );
+}
+
 /// acs-9yv: `local_networks` on a host entry, through the real binary —
 /// added, shown, and refused where the setting used to live.
 #[test]
