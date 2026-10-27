@@ -55,8 +55,9 @@ impl Timing {
     /// and that write is non-blocking, so a pipe that would not take all
     /// of it leaves the rest in `Link::pending` for `serve` to write —
     /// `HELLO partly sent` there, and `HELLO sent` again where the last of
-    /// it finally goes. The menu's connection owes the whole greeting the
-    /// same way, and is told once, late.
+    /// it finally goes. The menu's connection sends one ahead too
+    /// (acs-xvg); when a session is detached that one is moot, and the
+    /// greeting of the session picked is told again, late, as it goes.
     ///
     /// So `HELLO sent` always means the whole greeting is out, wherever in
     /// the order it lands: before `ACS-READY seen` when it went with the
