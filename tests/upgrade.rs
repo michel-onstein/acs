@@ -57,6 +57,17 @@ fn upgrade_under(
     if let Some(mask) = mask {
         with_umask(&mut cmd, mask);
     }
+    upgrade_with(cmd, home, server, args)
+}
+
+/// [`upgrade`] through `cmd`, a `Command` for the acs to run, set up as the
+/// test needs.
+fn upgrade_with(
+    mut cmd: Command,
+    home: &Path,
+    server: &ReleaseServer,
+    args: &[&str],
+) -> (i32, String, String) {
     let out = output_of(
         cmd.arg("upgrade")
             // The test server speaks http, which acs-95w refuses without
@@ -437,6 +448,40 @@ fn a_versioned_upgrade_under_a_group_writable_umask_makes_its_directory_0755() {
     assert!(version_of(&new).starts_with(&format!("acs {NEW} ")));
     assert_eq!(mode_of(new.parent().unwrap()), 0o755);
     assert_eq!(mode_of(&new), 0o755);
+}
+
+/// acs-3sae: the scratch directory the release is downloaded, verified and
+/// unpacked in was made 0777 & ~umask — 0775 under umask 002, so anyone in
+/// the group could swap the archive between its check and `tar`. The new
+/// binary's "it runs" check happens while the directory still exists, so
+/// the fake release records the directory's mode from there.
+#[test]
+fn the_scratch_directory_is_private_under_a_group_writable_umask() {
+    let d = TempDir::new();
+    let tmp = d.path().join("tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    let log = d.path().join("scratch-modes");
+    let server = ReleaseServer::start();
+    let fake = format!(
+        "#!/bin/sh\necho 'acs {NEW} (protocol 9, {t})'\nls -ld '{tmp}'/acs-upgrade.* >> '{log}'\n",
+        t = acs::payload::OWN_TARGET,
+        tmp = tmp.display(),
+        log = log.display()
+    );
+    server.release(NEW, fake.as_bytes(), true, false);
+    let acs = plain_copy(d.path());
+    let mut cmd = Command::new(&acs);
+    with_umask(&mut cmd, 0o002).env("TMPDIR", &tmp);
+    let (code, _, err) = upgrade_with(cmd, d.path(), &server, &[]);
+    assert_eq!(code, 0, "{err}");
+    let modes = std::fs::read_to_string(&log).unwrap();
+    let first = modes.lines().next().expect("the check ran the binary");
+    assert!(
+        first.starts_with("drwx------"),
+        "scratch directory: {first}"
+    );
+    // And it is gone afterwards.
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
 }
 
 /// acs-91q2: the one-line installer under umask 002 left
