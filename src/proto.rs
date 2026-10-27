@@ -115,6 +115,8 @@ pub mod err {
     pub const INTERNAL: u16 = 3;
     pub const BAD_REQUEST: u16 = 4;
     pub const EXISTS: u16 = 5;
+    /// Another identity is attached, and the request did not force it.
+    pub const BUSY: u16 = 6;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
