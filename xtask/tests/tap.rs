@@ -17,8 +17,10 @@ impl Drop for Scratch {
 }
 
 impl Scratch {
-    fn new() -> Scratch {
-        let root = std::env::temp_dir().join(format!("acs-tap-test-{}", std::process::id()));
+    /// A fresh tap under a directory of its own: `name` keeps the tests,
+    /// which run in parallel in one process, out of each other's.
+    fn new(name: &str) -> Scratch {
+        let root = std::env::temp_dir().join(format!("acs-tap-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // Git sees only what the test sets: no signing, no identity needed.
@@ -81,14 +83,19 @@ impl Scratch {
         formula
     }
 
-    /// `scripts/update-tap.sh <formula> <args>`.
+    /// `scripts/update-tap.sh <formula> <args>`, which must succeed.
     fn update(&self, formula: &Path, args: &[&str]) -> Output {
+        let out = self.try_update(formula, args);
+        assert!(out.status.success(), "{out:?}");
+        out
+    }
+
+    /// `scripts/update-tap.sh <formula> <args>`, however it ends.
+    fn try_update(&self, formula: &Path, args: &[&str]) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/update-tap.sh");
         let mut c = Command::new("sh");
         self.env(&mut c);
-        let out = c.arg(script).arg(formula).args(args).output().unwrap();
-        assert!(out.status.success(), "{out:?}");
-        out
+        c.arg(script).arg(formula).args(args).output().unwrap()
     }
 
     fn log(&self) -> Vec<String> {
@@ -109,7 +116,7 @@ fn stdout(o: &Output) -> String {
 
 #[test]
 fn a_release_updates_the_tap_once() {
-    let s = Scratch::new();
+    let s = Scratch::new("once");
     let f = s.render("1.9.0");
 
     // A dry run shows the change and pushes nothing.
@@ -146,4 +153,50 @@ fn a_release_updates_the_tap_once() {
         "{out:?}"
     );
     assert_eq!(s.log(), ["acs 1.10.0", "acs 1.9.0", "tap"]);
+}
+
+/// acs-u3qn: a fork whose releases are not GitHub-shaped — no
+/// `/releases/download/` in its URLs — renders a valid formula, and the tap
+/// script takes its version from the line the generator writes for it
+/// rather than rejecting it as naming no release.
+#[test]
+fn a_formula_whose_urls_are_not_github_shaped_still_lands() {
+    let s = Scratch::new("fork");
+    let f = s.render("2.0.0");
+    let text = std::fs::read_to_string(&f).unwrap();
+    let upstream = "https://github.com/michel-onstein/acs/releases/download/";
+    assert!(text.contains(upstream), "{text}");
+    let fork = text.replace(upstream, "https://dl.example.com/acs/2/");
+    assert!(!fork.contains("/releases/download/"), "{fork}");
+    let fork_file = s.root.join("fork.rb");
+    std::fs::write(&fork_file, &fork).unwrap();
+
+    let out = s.update(&fork_file, &[]);
+    assert!(stdout(&out).contains("tap: acs 2.0.0 pushed"), "{out:?}");
+    assert_eq!(s.log(), ["acs 2.0.0", "tap"]);
+
+    // And the version on the tap is read the same way: an older one is
+    // still left alone.
+    let out = s.update(&s.render("1.9.0"), &[]);
+    assert!(
+        stdout(&out).contains("already at acs 2.0.0, newer than 1.9.0"),
+        "{out:?}"
+    );
+
+    // A formula that does not say which release it is is refused, URLs or
+    // no URLs: nothing reads them for that any more.
+    let unmarked: String = text
+        .lines()
+        .filter(|l| !l.starts_with("# acs-version: "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let unmarked_file = s.root.join("unmarked.rb");
+    std::fs::write(&unmarked_file, unmarked).unwrap();
+    let out = s.try_update(&unmarked_file, &[]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("names no release"),
+        "{out:?}"
+    );
+    assert_eq!(s.log(), ["acs 2.0.0", "tap"]);
 }
