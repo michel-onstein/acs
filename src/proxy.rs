@@ -100,7 +100,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     crate::prune::on_proxy_start(|| live_versions(&dir));
     match what {
-        What::List => list(&dir),
+        What::List => list(&dir, STDOUT),
         What::Session { name, mode } => match session(&dir, name, mode) {
             Ok(code) => code,
             Err(e) => fail(e),
@@ -404,14 +404,28 @@ fn drain(fd: RawFd, buf: &[u8]) -> io::Result<()> {
     sys::write_all(fd, buf)
 }
 
-/// `--list`: one STATUS_REPLY frame per live session.
-fn list(dir: &SocketDir) -> ExitCode {
-    if sys::write_all(STDOUT, proto::ready_line().as_bytes()).is_err() {
+/// `--list`: one STATUS_REPLY frame per live session, to `out`. When the
+/// sessions cannot be read an ERROR ends the list, so the client reports
+/// the failure instead of an empty host (acs-mum0): stderr alone reaches
+/// nobody, ssh hands it to a terminal the listing does not show.
+fn list(dir: &SocketDir, out: RawFd) -> ExitCode {
+    if sys::write_all(out, proto::ready_line().as_bytes()).is_err() {
         return ExitCode::from(1);
     }
-    match write_statuses(dir) {
+    match write_statuses(dir, out) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => fail(e),
+        Err(e) => {
+            let message = format!("cannot list sessions: {e}");
+            let _ = sys::write_all(
+                out,
+                &Msg::Error {
+                    code: err::INTERNAL,
+                    message: message.clone(),
+                }
+                .to_bytes(),
+            );
+            fail(message)
+        }
     }
 }
 
@@ -427,12 +441,12 @@ fn send_list(dir: &SocketDir, kill: Option<(&str, &str, bool)>) -> Result<(), St
         Msg::Error { code, message }.encode(&mut out);
     }
     sys::write_all(STDOUT, &out).map_err(|e| e.to_string())?;
-    write_statuses(dir)?;
+    write_statuses(dir, STDOUT)?;
     sys::write_all(STDOUT, &Msg::ListEnd.to_bytes()).map_err(|e| e.to_string())
 }
 
 /// One STATUS_REPLY frame per live session; stale sockets are removed.
-fn write_statuses(dir: &SocketDir) -> Result<(), String> {
+fn write_statuses(dir: &SocketDir, out: RawFd) -> Result<(), String> {
     let names = dir
         .sessions()
         .map_err(|e| format!("{}: {e}", dir.path().display()))?;
@@ -441,7 +455,7 @@ fn write_statuses(dir: &SocketDir) -> Result<(), String> {
             continue;
         };
         match status_of(&path) {
-            Ok(info) => sys::write_all(STDOUT, &Msg::StatusReply(info).to_bytes())
+            Ok(info) => sys::write_all(out, &Msg::StatusReply(info).to_bytes())
                 .map_err(|e| e.to_string())?,
             Err(e) if refused(&e) => {
                 // Nobody listening: a master that died without cleaning up.
@@ -635,5 +649,37 @@ mod tests {
         let mut got = Vec::new();
         std::fs::File::from(out_r).read_to_end(&mut got).unwrap();
         assert_eq!(got, exit);
+    }
+
+    /// Regression (acs-mum0): a host whose sessions cannot be read used to
+    /// end `--list` with nothing but a line on stderr, and the client took
+    /// the silence for an empty host. It must say so in an ERROR frame.
+    #[test]
+    fn list_reports_an_unreadable_socket_dir_in_an_error_frame() {
+        use std::io::Read;
+        let tmp = crate::testutil::TempDir::new();
+        let dir = SocketDir::open_at(tmp.path().join("s")).unwrap();
+        std::fs::remove_dir(dir.path()).unwrap();
+        let out_path = tmp.path().join("out");
+        let out = std::fs::File::create(&out_path).unwrap();
+        assert_eq!(list(&dir, out.as_raw_fd()), ExitCode::from(1));
+        drop(out);
+        let mut got = Vec::new();
+        std::fs::File::open(&out_path)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        let ready = proto::ready_line();
+        assert!(got.starts_with(ready.as_bytes()), "{got:?}");
+        let mut dec = Decoder::new();
+        dec.push(&got[ready.len()..]);
+        match dec.next_msg() {
+            Ok(Some(Msg::Error { code, message })) => {
+                assert_eq!(code, err::INTERNAL);
+                assert!(message.starts_with("cannot list sessions: "), "{message}");
+            }
+            other => panic!("expected an ERROR, got {other:?}"),
+        }
+        assert!(matches!(dec.next_msg(), Ok(None)));
     }
 }

@@ -91,11 +91,7 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     // §7.1) before the master is decided, so a forward that arrives from
     // the configuration hits the same carve-out a `-L` does: a session that
     // forwards anything gets no shared master (acs-9n3).
-    apply_local_forwards(&mut args);
-    let decided = crate::mux::configure(&mut args.transport);
-    if args.verbose > 0 {
-        note(&decided);
-    }
+    prepare_session(&mut args);
     let name = args.transport.destination.clone();
     let mut timing = Timing::start(args.verbose > 0, "first connection");
     if let Err(e) = resolve_alias(&mut args, &name) {
@@ -125,6 +121,21 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
             }
             Err(c) => return ExitCode::from(c),
         }
+    }
+}
+
+/// Ready a session's transport before anything dials: the configured
+/// forwards join the command line's (acs-odd), then the shared-master
+/// decision is taken (acs-9n3) — in that order, so a configured forward
+/// vetoes the master as a `-L` does. `args.transport.destination` must
+/// still be the name typed (the alias, not the host it resolves to).
+/// Shared by `acs <host>` and the session picked from the every-host menu
+/// (acs-x5wd), which must not differ.
+pub(crate) fn prepare_session(args: &mut ClientArgs) {
+    apply_local_forwards(args);
+    let decided = crate::mux::configure(&mut args.transport);
+    if args.verbose > 0 {
+        note(&decided);
     }
 }
 

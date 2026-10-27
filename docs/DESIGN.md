@@ -279,6 +279,8 @@ they are, so the master's decoder never sees a frame without its head. `acs _pro
 attached/detached, the client identity attached (or last attached), created-at,
 idle time, child command, and size. Sockets that
 refuse connections are reported stale and removed — no `ps` parsing.
+If the directory cannot be read, an `ERROR` ends the list, and `acs list`
+reports that host as failed rather than as having no sessions.
 `acs _proxy --pick` serves the session menu (§4.4) on the session's own
 connection. After `ACS-READY` it sends the list as `--list` does, one
 `STATUS_REPLY` per session, closed by `LIST_END`, since the connection

@@ -34,7 +34,8 @@ pub(crate) fn push_session(sessions: &mut Vec<StatusInfo>, s: StatusInfo) -> Res
 pub(crate) enum Failure {
     /// No connection, or no answer in time.
     Unreachable(String),
-    /// The proxy answered with something that is not a STATUS reply.
+    /// The proxy answered with something that is not a STATUS reply, or
+    /// with an ERROR saying why it could not list.
     BadReply(String),
 }
 
@@ -190,6 +191,12 @@ pub(crate) fn query(
                     return Err(f);
                 }
                 continue;
+            }
+            // The host could not list its sessions: that is a failure to
+            // report, not an empty host (acs-mum0).
+            Ok(Some(Msg::Error { message, .. })) => {
+                link.close();
+                return Err(Failure::BadReply(message));
             }
             Ok(Some(_)) => continue,
             Ok(None) => {}
