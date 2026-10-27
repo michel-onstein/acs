@@ -484,6 +484,28 @@ fn identity_files_for_a_host_and_for_an_alias() {
     assert!(!h.ok(&["config", "host", "list"]).contains("id_devbox"));
 }
 
+/// acs-m8ts: an identity file ending in U+00A0 is written quoted and read
+/// back whole — it used to be saved bare and read back without it.
+#[test]
+fn an_identity_file_ending_in_a_no_break_space_reads_back_whole() {
+    let h = Home::new();
+    h.ok(&[
+        "config",
+        "host",
+        "add",
+        "a",
+        "b",
+        "--identity-file",
+        "k\u{a0}",
+    ]);
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "aliases:\n  a:\n    - host: b\n      identity_file: \"k\u{a0}\"\n"
+    );
+    let list = h.ok(&["config", "host", "list"]);
+    assert!(list.contains(" k\u{a0}"), "{list:?}");
+}
+
 #[test]
 fn redraw_on_reconnect_globally_and_for_an_alias() {
     // acs-ome: off for everything, back on for one alias.
