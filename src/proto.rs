@@ -455,6 +455,33 @@ impl Msg {
         out[start + 1..start + HEADER].copy_from_slice(&len.to_be_bytes());
     }
 
+    /// The frame type's name as DESIGN §4 spells it — what a message about
+    /// an unexpected frame names, rather than its `Debug` form, which for a
+    /// DATA or INPUT of up to `MAX_FRAME` bytes is several MiB: an ERROR
+    /// carrying that is itself too large to decode (acs-1cco).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Msg::Hello(_) => "HELLO",
+            Msg::Welcome(_) => "WELCOME",
+            Msg::Busy { .. } => "BUSY",
+            Msg::Data { .. } => "DATA",
+            Msg::Input { .. } => "INPUT",
+            Msg::Ack { .. } => "ACK",
+            Msg::Resize(_) => "RESIZE",
+            Msg::Ping(_) => "PING",
+            Msg::Pong(_) => "PONG",
+            Msg::Detach => "DETACH",
+            Msg::Kill { .. } => "KILL",
+            Msg::Exit { .. } => "EXIT",
+            Msg::Takeover => "TAKEOVER",
+            Msg::Status => "STATUS",
+            Msg::StatusReply(_) => "STATUS_REPLY",
+            Msg::Error { .. } => "ERROR",
+            Msg::EndSession { .. } => "END_SESSION",
+            Msg::ListEnd => "LIST_END",
+        }
+    }
+
     /// Encode into a fresh buffer.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::new();
