@@ -72,7 +72,18 @@ pub struct ModeObserver {
     utf8_left: u8,
     /// The bytes of that character seen so far.
     utf8: Vec<u8>,
+    /// The body of the OSC string now being read, while it is one and no
+    /// longer than [`TITLE_MAX`] (acs-r3m).
+    osc: Option<Vec<u8>>,
+    /// The window title the program last set (`OSC 0` or `OSC 2`), so it
+    /// can be written again after a reconnect on a terminal without the
+    /// xterm title stack (DESIGN §5.4).
+    title: Option<Vec<u8>>,
 }
+
+/// The longest OSC body kept for [`ModeObserver::title`]; a longer one is
+/// not a title anyone reads, and is not remembered.
+const TITLE_MAX: usize = 1024;
 
 impl ModeObserver {
     pub fn new() -> Self {
@@ -80,7 +91,7 @@ impl ModeObserver {
     }
 
     /// Forget everything, e.g. after a fresh attach where the local terminal
-    /// was cleared.
+    /// was cleared. The title goes too: it was another program's.
     pub fn clear(&mut self) {
         *self = Self::default();
     }
@@ -94,6 +105,13 @@ impl ModeObserver {
         self.seq_full = false;
         self.utf8_left = 0;
         self.utf8.clear();
+        self.osc = None;
+    }
+
+    /// The window title the program last set with `OSC 0` or `OSC 2`, if
+    /// any — control characters left out, so it can be written back as is.
+    pub fn title(&self) -> Option<&[u8]> {
+        self.title.as_deref()
     }
 
     /// True when the terminal is believed to be in its default state.
@@ -219,7 +237,14 @@ impl ModeObserver {
             }
             Lex::Esc => match b {
                 b'[' => Lex::Csi,
-                b']' | b'P' | b'_' | b'^' | b'X' => Lex::Str { esc: false },
+                b']' => {
+                    self.osc = Some(Vec::new());
+                    Lex::Str { esc: false }
+                }
+                b'P' | b'_' | b'^' | b'X' => {
+                    self.osc = None;
+                    Lex::Str { esc: false }
+                }
                 b'=' => {
                     self.keypad_app = true;
                     Lex::Ground
@@ -258,11 +283,43 @@ impl ModeObserver {
                 }
             }
             Lex::Str { esc } => match (esc, b) {
-                (_, 0x07) | (true, b'\\') => Lex::Ground,
+                (_, 0x07) | (true, b'\\') => {
+                    self.end_osc();
+                    Lex::Ground
+                }
                 (_, 0x1b) => Lex::Str { esc: true },
-                _ => Lex::Str { esc: false },
+                _ => {
+                    if let Some(body) = self.osc.as_mut() {
+                        if esc {
+                            body.push(0x1b);
+                        }
+                        body.push(b);
+                        if body.len() > TITLE_MAX {
+                            self.osc = None;
+                        }
+                    }
+                    Lex::Str { esc: false }
+                }
             },
         });
+    }
+
+    /// An OSC string ended: if it set the window title, remember it.
+    fn end_osc(&mut self) {
+        let Some(body) = self.osc.take() else {
+            return;
+        };
+        if let Some(t) = body
+            .strip_prefix(b"0;")
+            .or_else(|| body.strip_prefix(b"2;"))
+        {
+            let t: Vec<u8> = t
+                .iter()
+                .copied()
+                .filter(|&c| c >= 0x20 && c != 0x7f)
+                .collect();
+            self.title = Some(t);
+        }
     }
 
     fn csi(&mut self, body: &[u8], fin: u8) {
@@ -569,5 +626,51 @@ mod tests {
         let mut o = ModeObserver::new();
         o.observe(b"\x1b[?7l\x1b[?12h\x1b[4h\x1b[?99999h");
         assert!(o.is_clean());
+    }
+
+    /// acs-r3m: the last title the program set, by OSC 0 or 2 and with
+    /// either terminator, is what a reconnect writes back.
+    #[test]
+    fn the_last_title_set_is_remembered() {
+        let mut o = ModeObserver::new();
+        assert_eq!(o.title(), None);
+        o.observe(b"\x1b]2;vim main.rs\x07text");
+        assert_eq!(o.title(), Some(&b"vim main.rs"[..]));
+        // Split across reads, ended with ST, and set by OSC 0.
+        let osc0 = b"\x1b]0;top - load\x1b\\";
+        for split in 0..=osc0.len() {
+            let mut o = ModeObserver::new();
+            o.observe(&osc0[..split]);
+            o.observe(&osc0[split..]);
+            assert_eq!(o.title(), Some(&b"top - load"[..]), "split at {split}");
+        }
+        o.observe(osc0);
+        assert_eq!(o.title(), Some(&b"top - load"[..]));
+        // Other OSC strings and other string kinds are not titles.
+        o.observe(b"\x1b]1;icon\x07\x1b]8;;http://x\x1b\\\x1bP2;q\x1b\\\x1b]7;file://h/\x07");
+        assert_eq!(o.title(), Some(&b"top - load"[..]));
+        // Control characters are not kept; an empty title is a title.
+        o.observe(b"\x1b]2;a\x01b\x1b\\");
+        assert_eq!(o.title(), Some(&b"ab"[..]));
+        o.observe(b"\x1b]2;\x07");
+        assert_eq!(o.title(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn a_title_survives_resync_but_not_a_clear_or_an_overlong_string() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b]2;shell\x07");
+        // Half a title when the stream skipped is not a title.
+        o.observe(b"\x1b]2;half");
+        o.resync();
+        o.observe(b"\x07");
+        assert_eq!(o.title(), Some(&b"shell"[..]));
+        let mut long = b"\x1b]2;".to_vec();
+        long.extend(std::iter::repeat(b'x').take(TITLE_MAX + 1));
+        long.push(0x07);
+        o.observe(&long);
+        assert_eq!(o.title(), Some(&b"shell"[..]));
+        o.clear();
+        assert_eq!(o.title(), None);
     }
 }
