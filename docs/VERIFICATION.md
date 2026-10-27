@@ -1,9 +1,9 @@
 # acs — verification
 
-**Status:** Automated end-to-end checks pass (2026-09-24), except
-`scripts/test_install.sh`, which has been stale since release signing landed
-and cannot pass as it stands (see its rows below); the checks that need a
-person at a real terminal are listed at the end, not yet done.
+**Status:** Automated end-to-end checks pass (2026-09-24; the installer
+suite, `scripts/test_install.sh`, back from stale on 2026-10-27, acs-t8t);
+the checks that need a person at a real terminal are listed at the end, not
+yet done.
 
 What the unit and integration tests cannot show is checked here: acs over a
 real ssh connection, against a real host, with real terminal programs and
@@ -51,7 +51,7 @@ the network watcher against the real kernel.
 | Multi-user isolation | squatted and symlinked socket directories, foreign peer uid, per-user `main`, and (acs-9n3) a control-socket directory alice created before bob | Pass — bob refuses alice's directory by name and dials with no control path at all; his own comes up `0700` and his, and alice cannot list it (`rust:alpine` as root, `cargo test --test multiuser`, 2026-09-23) |
 | Static Linux binaries run | `dist/*-linux-musl/acs --version` in Alpine (aarch64 native, x86_64 emulated) | Pass |
 | macOS binaries signed | `codesign -v` on both complete macOS builds | Pass |
-| One-line installer | `scripts/test_install.sh` against the real v0.1.0 and v0.2.0 releases: macOS arm64 (curl), Alpine x86_64 (busybox wget) and Ubuntu aarch64 (curl), each as root and as a user | Pass — default layout, pinned version and in-place upgrade, `ACS_INSTALL_DIR`, checksum mismatch, missing version, unsupported platform. **Stale since signing (acs-o9v): the suite cannot pass today.** Its default `ACS_TEST_OLD=0.1.0` predates `SHA256SUMS.sig`, so the pinned-version case dies on a 404, and the checksum-mismatch mirror it builds has no `.sig` either, so the installer refuses before the checksum is reached. Both reproduce unchanged on `origin/main` |
+| One-line installer | `scripts/test_install.sh` (2026-10-27, acs-t8t) against the real v0.12.0 (the first signed release) and v0.17.0 releases, with the installer from `main` after acs-x57 and #228: macOS arm64 (curl), then `alpine:3` aarch64 (busybox wget, ash) and `ubuntu:24.04` aarch64 (curl), each as root and as a user | Pass, all seven cases in all five runs — default layout, pinned v0.12.0 then upgraded in place to v0.17.0, `ACS_INSTALL_DIR`, a `SHA256SUMS` signed by another key refused, checksum mismatch refused, missing version, unsupported platform. The checksum case now really reaches the checksum check: its local mirror's `SHA256SUMS` is signed by a throwaway key, and that case runs a copy of the installer with the throwaway key substituted for `release_key`, as `cargo xtask package` substitutes a fork's; the same mirror against the unmodified installer is the foreign-signature case. Back from stale since signing (acs-o9v): the old default `ACS_TEST_OLD=0.1.0` predated `SHA256SUMS.sig`, the mirror had no signature, and neither container image had `ssh-keygen` (now `openssh-keygen` on Alpine, `openssh-client` on Ubuntu), so the containers had never been reached since |
 | One-line installer, after acs-x57 | the substituted script by hand (2026-09-25): `shellcheck` and `sh -n`; `scripts/test_install.sh` as far as the stale cases allow (latest into the default layout, pinned v0.15.0 then upgraded in place, `ACS_INSTALL_DIR`); the repository script and the **packaged** one run for real in `alpine:3` (busybox wget, ash) and `ubuntu:24.04`, as root and as a user; a fork-packaged copy run locally | Pass — all three reachable cases green, every container install landed the 0.16.0 release and ran it, and the fork's copy asks `https://github.com/someone/acs-fork/...` and nothing upstream |
 | `acs upgrade` from GitHub, macOS | this code built as 0.1.0 (plain file), `acs upgrade --check`, then `acs upgrade` (2026-09-18) | Pass — replaced by the real 0.2.0 release; `codesign -v`: valid on disk, satisfies its Designated Requirement; no quarantine attribute |
 | `acs upgrade` from GitHub, Linux | the same as a static aarch64 build in Alpine, which has no curl | Pass — downloaded with the wget fallback and replaced by 0.2.0 |
