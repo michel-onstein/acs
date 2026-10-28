@@ -27,6 +27,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
+// What `ACS_DEFAULT_RELEASES_URL` and `ACS_DEFAULT_RELEASE_KEY` mean, the
+// same file `build.rs` includes, so `dist` reads them as the build does.
+#[path = "../../src/build_channel.rs"]
+mod build_channel;
 mod bump;
 mod channel;
 mod formula;
@@ -218,7 +222,11 @@ fn dist(args: &[String]) {
     let env = channel::Channel::from_env(
         std::env::var("ACS_DEFAULT_RELEASES_URL").ok().as_deref(),
         std::env::var("ACS_DEFAULT_RELEASE_KEY").ok().as_deref(),
-    );
+    )
+    .unwrap_or_else(|why| {
+        eprintln!("xtask dist: {why}");
+        exit(1)
+    });
     if channel != env {
         eprintln!(
             "xtask dist: this xtask was built for releases {} (key {}), but the environment \

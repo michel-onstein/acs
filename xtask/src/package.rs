@@ -126,10 +126,9 @@ pub fn install_script(script: &str, releases: &str, key: &str) -> Result<String,
             // single quotes `sh` expands nothing at all, so this is total:
             // whatever the build was given becomes exactly that string. That
             // is the whole of the injection answer here, and why neither
-            // value needs validating *for safety*. Whether a build-time
-            // releases URL is a sensible URL is a separate bead (acs-d7x);
-            // the key already has to be one ssh public key line
-            // (`src/release_key.rs`).
+            // value needs validating *for safety*. That both are sensible —
+            // an https URL with a host, one ssh public key line — the build
+            // has already checked (`src/build_channel.rs`, acs-d7x).
             [i] => lines[i] = format!("{name}={}", acs::ssh::sh_single_quote(value)),
             [] => {
                 return Err(format!(

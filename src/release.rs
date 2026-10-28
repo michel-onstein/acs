@@ -458,6 +458,16 @@ mod tests {
         assert!(!DEFAULT_RELEASES_URL.is_empty());
     }
 
+    /// The URL this build actually carries is one `build.rs` would accept,
+    /// so the check and the value it guards cannot drift apart (acs-d7x).
+    #[test]
+    fn the_built_in_releases_url_passes_the_build_time_check() {
+        use crate::build_channel::check_releases_url;
+        for url in [UPSTREAM_RELEASES_URL, DEFAULT_RELEASES_URL] {
+            assert_eq!(check_releases_url(Some(url)), Ok(Some(url)));
+        }
+    }
+
     /// acs-95w: what `ACS_RELEASES_URL` names is downloaded, checked only
     /// against sums fetched from the same place, and then run. A scheme
     /// that cannot be authenticated therefore needs an explicit say-so.

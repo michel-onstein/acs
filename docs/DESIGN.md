@@ -2221,10 +2221,17 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
     releases (VERSIONING.md, "Forking"); whichever it is, it is the key the
     packaged `install.sh` carries. Unset it is acs's own key — the one the
     checked-in `install.sh` carries — an empty value counts as unset, and a value
-    that is not an ssh public key line fails the build. What the variable
-    means lives in `src/release_key.rs`, which `build.rs` includes as
-    source: a build script is not a test target, so the rule sits where the
-    tests can reach it and only the wiring is left in `build.rs`. Like the
+    that is not an ssh public key line fails the build. That check decodes
+    the body (acs-d7x): base64 whose blob's embedded type string is the one
+    the line declares and, for a plain key, nothing but whole
+    length-prefixed fields — so a truncated or mismatched paste fails the
+    build rather than every user's upgrade. It stops there: a well-formed
+    key that is the wrong one cannot be told from the right one at build
+    time, and fails closed. What the variable means lives in
+    `src/build_channel.rs`, beside the releases URL's rule, which `build.rs`
+    includes as source and xtask compiles for the channel `dist` stamps: a
+    build script is not a test target, so the rule sits where the tests can
+    reach it and only the wiring is left in `build.rs`. Like the
     URL, that is the builder's decision rather than the environment's, so
     it carries none of the limits the runtime overrides below do.
   - **What it does not cover**: the first fetch of `install.sh` itself is
@@ -2253,7 +2260,10 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   "Forking") — and the release tasks follow it, into the packaged
   `install.sh`, the Homebrew formula and the notes (acs-x57). That one is
   the builder's decision rather than the environment's, so it carries none
-  of these limits.
+  of these limits — but a value that is not one https URL with a host (no
+  scheme, `http://`, an empty or malformed host or port, whitespace, a query
+  or fragment, credentials) fails the build, as a malformed key does, rather
+  than shipping a silently unreachable update channel (acs-d7x).
 - **Downloads use `curl`** (or `wget` when there is no curl, as on Alpine):
   an HTTP and TLS client of our own would cost more than the whole binary
   (§9). Either tries once (`--retry 0`, `-t 1`), so its timeout is the whole
@@ -2601,6 +2611,16 @@ short (acs-u3qn).
   install digest; a hand-written parser for the YAML subset of the
   configuration file (§7.2). **No async runtime**: the single-threaded poll
   loops do not need tokio.
+- **Build-time checks cost the binary nothing**: what `ACS_DEFAULT_RELEASES_URL`
+  and `ACS_DEFAULT_RELEASE_KEY` may be (§7.5) is `src/build_channel.rs`, run
+  by `build.rs` and xtask and compiled into the crate only for its tests. Its
+  URL check is not a URL parser — scheme, host, port, nothing a URL cannot
+  hold — and its key check decodes as far as the blob's fields and embedded
+  type and no further (acs-d7x): proving a key is a valid curve point or
+  modulus would need the crypto acs leaves to `ssh-keygen`, and a key that is
+  well-formed but wrong fails closed anyway. The base64 decoder is
+  hand-written rather than a crate, the build script sharing no
+  dependencies.
 - **Profile**: `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
   `panic = "abort"`, `strip = true`.
 - **Targets**: `aarch64-apple-darwin` (local, installed), `x86_64-apple-darwin`,
@@ -2644,6 +2664,8 @@ src/
   payload.rs    payload set format, ELF trailer, Mach-O embed
   prune.rs      pruning of unused remote versions
   sha256.rs     SHA-256, of a buffer or streamed from a file
+  build_channel.rs  what a build's releases URL and release key may be
+                (build.rs and xtask; tests only in the crate)
   signature.rs  the release key, and ssh-keygen -Y over a release's SHA256SUMS
   sys.rs        libc wrappers
 xtask/          cargo xtask dist
