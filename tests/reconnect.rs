@@ -838,6 +838,84 @@ fn bytes_in_flight_when_the_network_moved_do_not_answer_the_netcheck() {
     assert_consecutive(&c.text());
 }
 
+/// acs-spd: a terminal that stalls **after** a network change was asked
+/// about does not cost a redial. The `PONG` that answers the question sits
+/// in the pipe behind output the client cannot write, and the time spent
+/// blocked on the terminal is not counted against `ACS_NETCHECK_MS` — the
+/// link was not slow, the terminal was. The mirror of acs-7k7 for the
+/// netcheck's deadline, and the case acs-br2's "only the `PONG` answers"
+/// left exposed.
+///
+/// The order is made, not waited for. The link is frozen first (the proxy
+/// `SIGSTOP`ped), so the `PING` the change sends cannot be answered yet;
+/// `-v`'s `network changed` line says the question is out; only then does
+/// the terminal stop reading and the link thaw, so the answer comes back
+/// behind a backlog of output into a client that is about to block. The
+/// 7 s pause is the stimulus: more than twice `ACS_NETCHECK_MS`, which is
+/// 3 s here rather than the 2 s default so the frozen spell before the
+/// stall — time the host *is* answerable for — has room on a loaded
+/// machine. `RESUMED` is printed only once the flag file exists, written
+/// after the terminal drains again, so seeing it is the client reading the
+/// host after the stall and having kept the link.
+#[test]
+fn a_terminal_stall_during_a_netcheck_is_not_a_dead_link() {
+    let remote = Remote::installed();
+    // The master keeps a client that is not reading (acs-ode); this is
+    // about the client's judgement of the host.
+    remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
+    let go = remote.root.path().join("go");
+    let ticks = remote.root.path().join("ticks");
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![
+        ("ACS_BACKOFF_MS".to_string(), "100".to_string()),
+        ("ACS_PING_MS".to_string(), "20000".to_string()),
+        ("ACS_DEAD_MS".to_string(), "60000".to_string()),
+        ("ACS_NETCHECK_MS".to_string(), "3000".to_string()),
+    ];
+    env.extend(watch.env());
+    let cmd = format!(
+        "echo up; while true; do head -c 20000 /dev/zero | tr '\\0' y; \
+         [ -f '{go}' ] && printf RESUMED; echo; printf . >> '{ticks}'; sleep 0.02; done",
+        go = go.display(),
+        ticks = ticks.display(),
+    );
+    let mut c = Client::start_env(
+        &remote,
+        &["-v", "devbox", "spd", "--", "/bin/sh", "-c", &cmd],
+        &refs(&env),
+    );
+    c.wait_for("up", T);
+    let dialled = remote.connections();
+    let pid = *remote.transport_pids().last().unwrap();
+    // The link holds still, so the question cannot be answered yet.
+    acs::sys::kill(pid, libc::SIGSTOP).unwrap();
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    // The question is out. The program goes on printing into the frozen
+    // link until the master's queue for this client is full and the
+    // buffers between are too — 200 KB against the 64 KiB a read takes —
+    // so the answer, queued after all of it, cannot be read in the same
+    // pass as the output the client is about to block on.
+    let base = frames(&ticks);
+    wait_frames(&ticks, base, 10);
+    // Now the terminal stalls, and the answer comes back behind output the
+    // client cannot write.
+    c.set_paused(true);
+    acs::sys::kill(pid, libc::SIGCONT).unwrap();
+    std::thread::sleep(Duration::from_secs(7));
+    c.set_paused(false);
+    std::fs::write(&go, "").unwrap();
+    c.wait_for("RESUMED", T);
+    assert_eq!(
+        remote.connections(),
+        dialled,
+        "a terminal stall cost a redial: {}",
+        c.text()
+    );
+    assert!(!c.text().contains("reconnecting"), "{}", c.text());
+}
+
 /// acs-ft1, the other half: a network change under a link that is *still
 /// working* costs nothing — no redial, and so not a byte of what was typed
 /// (keys typed into a redial are discarded, DESIGN §5.2). Dropping a live

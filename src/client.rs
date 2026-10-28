@@ -1561,7 +1561,12 @@ fn serve(
                     // Skip anything we already wrote (never expected).
                     if skip < bytes.len() {
                         timing.first_output();
-                        if write_output(state, &bytes[skip..]).is_err() {
+                        // Time blocked on a terminal that is not reading is
+                        // not the host's to answer for (acs-spd).
+                        let began = sys::now_ms();
+                        let wrote = write_output(state, &bytes[skip..]);
+                        liveness.wrote_for(sys::now_ms().saturating_sub(began));
+                        if wrote.is_err() {
                             link.close();
                             return Outcome::Exit(code::ERROR);
                         }
