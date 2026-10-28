@@ -700,7 +700,9 @@ sequenceDiagram
   turned a stalled terminal into a lost link, with `PONG`s waiting in the pipe.
   The one exception is the deadline a network change brings forward, which
   only its own `PONG` clears (acs-br2, below): there the bytes in the pipe may
-  be older than the question.
+  be older than the question. A stalled terminal is kept from turning into a
+  lost link there another way — the time spent blocked writing to it is not
+  counted against that deadline (acs-spd, below).
 - The master does the same for its attached client, which answers `PING`
   with `PONG`: a client silent for 10 s is dropped, freeing the pty from
   its backpressure (§4.2). Without it a client that vanished without closing
@@ -836,6 +838,22 @@ sequenceDiagram
     earlier `PING` is refused on the same ground: it came back over the
     path that has gone. The nonce is the `PING`'s own timestamp, so the
     match is a comparison and costs nothing.
+  - **Time blocked on the terminal is not the host's** (acs-spd). The rule
+    above took away what used to cover a terminal that stalls *while the
+    question is outstanding*: the `PONG` sits unread in the pipe behind
+    output the client cannot write, and stale bytes no longer answer for
+    it. So the deadline moves out by every millisecond the client spends
+    in a write to the terminal once the `PING` has gone — the link was not
+    slow, the terminal was — and a stall like that costs no redial, as
+    acs-7k7 settled for `ACS_DEAD_MS`. It is the honest measure rather than
+    decoding ahead of the tick: what the deadline asks is how long the
+    host took, and only the time the client could have been reading
+    counts. Two things it leaves alone. A terminal already stalled when
+    the network moves is acs-br2's case — the client is blocked and sees
+    the change only afterwards, so the question is asked after the stall
+    and the bytes then read still answer nothing. And the dead interval
+    stays the outer bound: a write that never returns is acs-7k7's, not
+    this.
   - **Why not redial on the change itself.** Keys typed into a redial are
     discarded (§5.2), so a redial the link did not need is directly
     user-visible: the session blinks, the screen repaints and what was
@@ -886,9 +904,15 @@ or the link is lost before the first `WELCOME` — each exits 255. With
 up on; it is waited for with pings (`alias.rs`, the ping of §7.3) instead
 of ssh dials:
 
-- **The ping gate**: while the host is lost it is pinged every
-  `reachability_interval` (default 5 s, §7.2), and dialled only once it
-  answers — at once, too, after a network change (netwatch). An alias is
+- **The ping gate**: while the host is lost it is pinged every second for
+  the first 30 s, then every `reachability_interval` (default 5 s, §7.2),
+  and dialled only once it answers — at once, too, after a network change
+  (netwatch), which also starts the fast pings over (acs-vxg). Most hosts
+  that go away come back within seconds — a reboot, a VPN reconnecting — so
+  the fast pings put the dial within a second of the host's return rather
+  than up to a whole interval after it; a ping is one packet, and an outage
+  that outlasts the 30 s costs no more of them than before. An interval
+  below a second is used throughout. An alias is
   resolved again each time, so the first of its hosts to answer is the one
   dialled (§7.3); a plain host is pinged itself. A host that answers but
   whose ssh is not up yet gets a dial that fails and the gate again.
@@ -921,9 +945,10 @@ set stays visible; the cost of adding one is a row here.
 | --- | --- | --- | --- |
 | `ACS_PING_MS` | 3000 | silence before a `PING`, client and master alike | must stay well under `ACS_DEAD_MS`, or a quiet link is dead before it is asked |
 | `ACS_DEAD_MS` | 10000 | silence before the link is dead (client redials; master drops its client) | ceiling for `ACS_NETCHECK_MS`, which only brings it forward |
-| `ACS_NETCHECK_MS` | 2000 | time the host has to answer the `PING` a network change sends while up | only its own `PONG` clears it (acs-br2) |
+| `ACS_NETCHECK_MS` | 2000 | time the host has to answer the `PING` a network change sends while up | only its own `PONG` clears it (acs-br2); time blocked writing to the terminal is not counted (acs-spd) |
 | `ACS_BACKOFF_MS` | 1000 | the first wait of the redial backoff, after the free attempt | doubles to 30 s, or to itself if larger |
 | `ACS_BACKOFF_RESET_MS` | 30000 | how long a link must serve, `WELCOME` to loss, for the backoff to start over | equal to the redial's `ACS_DIAL_TIMEOUT_MS` by default; a redial spending that timeout never resets it (acs-omt2) |
+| `ACS_PERSIST_FAST_MS` | 1000 | the ping gate's first pings after a loss, 30 of them, before it backs off to `reachability_interval` (acs-vxg) | never above `reachability_interval`; a network change starts the 30 over |
 | `ACS_EARLY_MS` | 2000 | at most one network-change redial per interval in the offline wait | separate from `ACS_NETCHECK_MS`: this one guards a redial, that one a ping |
 | `ACS_DIAL_TIMEOUT_MS` (README) | 120000 first, 30000 redial and `acs list` | time to the marker, then to the `WELCOME` | one value sets both deadlines, which default 4:1 (acs-p46) |
 | `ACS_NOTE_HOLD_MS` | 500 | how long a diagnostic line waits for the output it would interrupt to reach a boundary, before it is written anyway | — |
@@ -946,7 +971,10 @@ Anything the client prints corrupts the screen the remote program drew, and a
 lossless resume will not repaint it. So:
 
 1. While the link is merely quiet (< 10 s, or < 2 s when this machine's
-   network has just changed under it, §5.3), print nothing.
+   network has just changed under it, §5.3), print nothing. A terminal that
+   is not reading is not a quiet link in either case: bytes read count
+   against the 10 s, and time blocked writing to the terminal does not
+   count towards the 2 s (§5.3, acs-7k7, acs-spd).
 2. Once declared dead, write one status line on the bottom row using
    save-cursor / restore-cursor, and set the window title with the xterm title
    stack (push `CSI 22;0 t`, pop `CSI 23;0 t`) so the remote's title comes

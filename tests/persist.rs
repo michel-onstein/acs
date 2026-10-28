@@ -104,6 +104,39 @@ fn a_dropped_plain_host_is_pinged_until_it_answers_then_resumed() {
     assert_eq!(remote.connections(), dials + 1);
 }
 
+/// acs-vxg: a lost host is pinged every second (here `ACS_PERSIST_FAST_MS`,
+/// 100 ms) for the first 30 of them, and only then every
+/// `reachability_interval` — before, it waited the whole 10 s for the first.
+#[test]
+fn a_lost_host_is_pinged_fast_at_first_then_every_interval() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox"]);
+    let env = net.env("persist: true\nreachability_interval: 10s\n");
+    let mut env = refs(&env);
+    env.extend([("ACS_PING_MS", "200"), ("ACS_PERSIST_FAST_MS", "100")]);
+    let mut c = Client::start_env(&remote, &session("devbox", &[]), &env);
+    c.wait_for("up", T);
+    net.set_up(&[]);
+    let pinged = net.pinged().len();
+    remote.cut_link();
+    c.wait_for(
+        "devbox is not answering — pinging it every 100ms at first, then 10s",
+        T,
+    );
+    let lost = Instant::now();
+    // Fast at first: five pings well inside the first 10 s interval.
+    let fast = Duration::from_secs(2);
+    while net.pinged().len() < pinged + 5 {
+        assert!(lost.elapsed() < fast, "not pinged fast after the loss");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Then backed off: after the 3 s of fast pings, none for a while.
+    std::thread::sleep(Duration::from_millis(3500).saturating_sub(lost.elapsed()));
+    let settled = net.pinged().len();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(net.pinged().len(), settled, "still pinging fast after 3 s");
+}
+
 #[test]
 fn an_unchecked_host_keeps_the_dial_backoff() {
     let remote = Remote::installed();
