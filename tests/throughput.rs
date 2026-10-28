@@ -8,11 +8,24 @@
 //! It streams `ACS_BENCH_MB` (default 512) MiB of program output through
 //! one session and prints the wall-clock rate and the master's CPU time
 //! per GiB, the number the master's copying shows up in.
+//!
+//! `client_output_throughput` does the same through the client, from the
+//! master to the client's terminal, and prints the client's CPU time per
+//! GiB, where its decoding shows up (acs-atxu).
+
+mod common;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+fn bench_mib() -> u64 {
+    std::env::var("ACS_BENCH_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512)
+}
 
 use acs::proto::{Decoder, Mode, Msg};
 use acs::testutil::{hello, TempDir};
@@ -20,10 +33,7 @@ use acs::testutil::{hello, TempDir};
 #[test]
 #[ignore = "a measurement: run with --ignored --nocapture"]
 fn output_throughput() {
-    let mb: u64 = std::env::var("ACS_BENCH_MB")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(512);
+    let mb = bench_mib();
     let total = mb << 20;
     let t = TempDir::new();
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_acs"));
@@ -83,4 +93,38 @@ fn output_throughput() {
     );
     drop(s);
     acs::testutil::end_sessions_under(t.path());
+}
+
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn client_output_throughput() {
+    let mb = bench_mib();
+    let total = (mb << 20) as usize;
+    let remote = common::Remote::installed();
+    // The same wait for a key as above, so the count starts with the
+    // output; `GO` says the client is attached and the stream is next.
+    let cmd = format!(
+        "stty raw -echo; printf GO; head -c 1 >/dev/null; head -c {total} /dev/zero; sleep 30"
+    );
+    let mut c = common::Client::start(&remote, &["devbox", "tp", "--", "/bin/sh", "-c", &cmd]);
+    c.wait_for("GO", Duration::from_secs(20));
+    let base = c.output_len();
+    let pid = c.pid() as u32;
+    let cpu0 = acs::testutil::cpu_time(pid).unwrap();
+    let t0 = Instant::now();
+    c.send(b"x");
+    c.wait_until(
+        "the stream is through",
+        |c| c.output_len() >= base + total,
+        Duration::from_secs(600),
+    );
+    let wall = t0.elapsed();
+    let cpu = acs::testutil::cpu_time(pid).unwrap().saturating_sub(cpu0);
+    let gib = total as f64 / (1u64 << 30) as f64;
+    println!(
+        "{mb} MiB in {wall:.2?}: {:.0} MiB/s; client CPU {cpu:.2?} ({:.2?}/GiB)",
+        mb as f64 / wall.as_secs_f64(),
+        Duration::from_secs_f64(cpu.as_secs_f64() / gib),
+    );
+    let _ = c.child.kill();
 }

@@ -345,6 +345,20 @@ pub fn encode_data(offset: u64, parts: &[&[u8]], out: &mut Vec<u8>) {
     }
 }
 
+/// Append `bytes` as INPUT frames from sequence `seq` on, [`MAX_CHUNK`] at
+/// a time: byte for byte what one `Msg::Input` per chunk encodes to, without
+/// copying each chunk into one first.
+pub fn encode_input(mut seq: u64, bytes: &[u8], out: &mut Vec<u8>) {
+    for chunk in bytes.chunks(MAX_CHUNK) {
+        out.reserve(HEADER + 8 + chunk.len());
+        out.push(ty::INPUT);
+        out.extend_from_slice(&((8 + chunk.len()) as u32).to_be_bytes());
+        out.extend_from_slice(&seq.to_be_bytes());
+        out.extend_from_slice(chunk);
+        seq += chunk.len() as u64;
+    }
+}
+
 impl Msg {
     /// Append this message as one frame to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
@@ -399,15 +413,15 @@ impl Msg {
                     w.u64(*since);
                     ty::BUSY
                 }
-                Msg::Data { offset, bytes } => {
-                    w.u64(*offset);
+                // The same layout: a u64, then the bytes to the end.
+                Msg::Data { offset: n, bytes } | Msg::Input { seq: n, bytes } => {
+                    w.u64(*n);
                     w.0.extend_from_slice(bytes);
-                    ty::DATA
-                }
-                Msg::Input { seq, bytes } => {
-                    w.u64(*seq);
-                    w.0.extend_from_slice(bytes);
-                    ty::INPUT
+                    if matches!(self, Msg::Data { .. }) {
+                        ty::DATA
+                    } else {
+                        ty::INPUT
+                    }
                 }
                 Msg::Ack { seq } => {
                     w.u64(*seq);
@@ -571,17 +585,16 @@ impl Msg {
                 identity: r.str("identity")?,
                 since: r.u64("since")?,
             },
-            ty::DATA => {
-                let offset = r.u64("offset")?;
+            // The same layout: a u64, then the bytes to the end.
+            ty::DATA | ty::INPUT => {
+                let n = r.u64(if t == ty::DATA { "offset" } else { "seq" })?;
                 let bytes = p[r.pos..].to_vec();
                 r.pos = p.len();
-                Msg::Data { offset, bytes }
-            }
-            ty::INPUT => {
-                let seq = r.u64("seq")?;
-                let bytes = p[r.pos..].to_vec();
-                r.pos = p.len();
-                Msg::Input { seq, bytes }
+                if t == ty::DATA {
+                    Msg::Data { offset: n, bytes }
+                } else {
+                    Msg::Input { seq: n, bytes }
+                }
             }
             ty::ACK => Msg::Ack { seq: r.u64("seq")? },
             ty::RESIZE => Msg::Resize(r.size()?),
@@ -649,23 +662,44 @@ impl Decoder {
         self.buf.extend_from_slice(bytes);
     }
 
-    /// Next complete message, `Ok(None)` if more bytes are needed.
-    pub fn next_msg(&mut self) -> Result<Option<Msg>, ProtoError> {
+    /// The next frame's type and payload, `Ok(None)` if it is not all
+    /// here yet.
+    fn frame(&self) -> Result<Option<(u8, &[u8])>, ProtoError> {
         let avail = &self.buf[self.start..];
         if avail.len() < HEADER {
             return Ok(None);
         }
-        let t = avail[0];
         let len = u32::from_be_bytes(avail[1..HEADER].try_into().unwrap()) as usize;
         if len > MAX_FRAME {
             return Err(ProtoError::TooLarge(len));
         }
-        if avail.len() < HEADER + len {
+        Ok(avail.get(HEADER..HEADER + len).map(|p| (avail[0], p)))
+    }
+
+    /// Next complete message, `Ok(None)` if more bytes are needed.
+    pub fn next_msg(&mut self) -> Result<Option<Msg>, ProtoError> {
+        let Some((t, p)) = self.frame()? else {
             return Ok(None);
-        }
-        let msg = Msg::decode(t, &avail[HEADER..HEADER + len])?;
+        };
+        let (msg, len) = (Msg::decode(t, p)?, p.len());
         self.start += HEADER + len;
         Ok(Some(msg))
+    }
+
+    /// The next frame if it is a complete, well-formed DATA frame: its
+    /// offset and its payload, borrowed from the decoder's buffer rather
+    /// than copied into a [`Msg::Data`] (acs-atxu). Anything else — another
+    /// type, a frame not all here yet, one too short to hold its offset or
+    /// over [`MAX_FRAME`] — is `None` and left where it is, for
+    /// [`next_msg`](Self::next_msg) to decode or refuse exactly as before.
+    pub fn next_data(&mut self) -> Option<(u64, &[u8])> {
+        let Ok(Some((ty::DATA, p))) = self.frame() else {
+            return None;
+        };
+        let offset = u64::from_be_bytes(*p.first_chunk::<8>()?);
+        let from = self.start + HEADER + 8;
+        self.start += HEADER + p.len();
+        Some((offset, &self.buf[from..self.start]))
     }
 
     /// Bytes buffered but not yet decoded.
@@ -840,6 +874,8 @@ mod tests {
             assert_eq!(got, want, "cut at {cut}");
         }
         let mut empty = Vec::new();
+        encode_input(7, &[], &mut empty);
+        assert_eq!(empty, b"", "no input is no frame");
         encode_data(7, &[], &mut empty);
         assert_eq!(
             empty,
@@ -1014,6 +1050,109 @@ mod tests {
             }
         }
         assert_eq!(got, samples());
+    }
+
+    /// `encode_input` is one `Msg::Input` per `MAX_CHUNK` of the bytes,
+    /// each at the sequence of its first byte, as the client used to build
+    /// them one copied chunk at a time (acs-atxu).
+    #[test]
+    fn encode_input_matches_one_msg_input_per_chunk() {
+        let payload: Vec<u8> = (0..=255u8).cycle().take(MAX_CHUNK * 2 + 5).collect();
+        for len in [1, MAX_CHUNK - 1, MAX_CHUNK, MAX_CHUNK + 1, payload.len()] {
+            let bytes = &payload[..len];
+            let mut want = b"queued".to_vec();
+            for (i, chunk) in bytes.chunks(MAX_CHUNK).enumerate() {
+                Msg::Input {
+                    seq: 100 + (i * MAX_CHUNK) as u64,
+                    bytes: chunk.to_vec(),
+                }
+                .encode(&mut want);
+            }
+            let mut got = b"queued".to_vec();
+            encode_input(100, bytes, &mut got);
+            assert_eq!(got, want, "{len} bytes");
+        }
+    }
+
+    /// Decode `stream` pushed in two parts the way the client does: the
+    /// DATA fast path first, the generic path for whatever it leaves.
+    fn decode_with_next_data(parts: [&[u8]; 2]) -> Vec<Msg> {
+        let mut d = Decoder::new();
+        let mut got = Vec::new();
+        for part in parts {
+            d.push(part);
+            loop {
+                if let Some((offset, bytes)) = d.next_data() {
+                    got.push(Msg::Data {
+                        offset,
+                        bytes: bytes.to_vec(),
+                    });
+                } else if let Some(m) = d.next_msg().unwrap() {
+                    got.push(m);
+                } else {
+                    break;
+                }
+            }
+        }
+        got
+    }
+
+    /// acs-atxu: the borrowed DATA path decodes exactly what the generic
+    /// one does, in any chunking, and leaves every other frame to it.
+    #[test]
+    fn next_data_agrees_with_next_msg_at_every_split_point() {
+        let mut want = samples();
+        want.push(Msg::Data {
+            offset: u64::MAX - 1,
+            bytes: Vec::new(),
+        });
+        want.push(Msg::Data {
+            offset: 7,
+            bytes: vec![0x5a; 300],
+        });
+        let mut stream = Vec::new();
+        for m in &want {
+            m.encode(&mut stream);
+        }
+        for split in 0..=stream.len() {
+            let got = decode_with_next_data([&stream[..split], &stream[split..]]);
+            assert_eq!(got, want, "split at {split}");
+        }
+    }
+
+    /// acs-atxu: the payload is the decoder's own buffer, not a copy of it.
+    #[test]
+    fn next_data_borrows_the_payload_in_place() {
+        let mut d = Decoder::new();
+        Msg::Ping(1).encode(&mut d.buf);
+        encode_data(42, &[b"hello"], &mut d.buf);
+        assert_eq!(d.next_data(), None, "a PING is not DATA");
+        assert_eq!(d.next_msg().unwrap(), Some(Msg::Ping(1)));
+        let range = d.buf.as_ptr_range();
+        let (offset, bytes) = d.next_data().unwrap();
+        assert_eq!((offset, bytes), (42, &b"hello"[..]));
+        assert!(range.contains(&bytes.as_ptr()), "copied out of the buffer");
+        assert_eq!(d.pending(), 0);
+        assert_eq!(d.next_data(), None);
+    }
+
+    /// acs-atxu: a DATA frame the generic path refuses is not taken by the
+    /// fast one, so it is still refused with the same error.
+    #[test]
+    fn next_data_leaves_bad_data_frames_to_next_msg() {
+        // Too short to hold its offset.
+        let mut d = Decoder::new();
+        d.push(&[ty::DATA, 0, 0, 0, 4, 1, 2, 3, 4, 0, 0, 0, 0]);
+        assert_eq!(d.next_data(), None);
+        assert!(matches!(d.next_msg(), Err(ProtoError::Truncated(_))));
+        // Over the limit, refused from the header alone.
+        let mut d = Decoder::new();
+        let mut frame = vec![ty::DATA];
+        frame.extend_from_slice(&(MAX_FRAME as u32 + 1).to_be_bytes());
+        frame.extend_from_slice(&[0; 16]);
+        d.push(&frame);
+        assert_eq!(d.next_data(), None);
+        assert!(matches!(d.next_msg(), Err(ProtoError::TooLarge(_))));
     }
 
     #[test]
