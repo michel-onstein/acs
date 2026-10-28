@@ -106,10 +106,8 @@ impl Net {
                 up = n.up_file().display()
             )
         };
-        use std::os::unix::fs::PermissionsExt;
         for (path, ipv4_only) in [(n.ping(), true), (n.ping6(), false)] {
-            std::fs::write(&path, body(ipv4_only)).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(&path, body(ipv4_only));
         }
         n.set_up(up);
         n.set_slow(&[]);
@@ -397,8 +395,8 @@ impl Ssh {
                 remote.transport()
             ));
         }
-        std::fs::write(
-            s.path(),
+        write_executable(
+            &s.path(),
             format!(
                 "#!/bin/sh\n{log}\
                  while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
@@ -407,10 +405,7 @@ impl Ssh {
                  echo \"ssh: connect to host $dest port 22: Connection refused\" >&2\nexit 255\n",
                 log = log_call_sh(&s.log()),
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(s.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         s
     }
 
@@ -493,6 +488,45 @@ pub fn copy_out_of_process(src: &Path, dest: &Path) {
     );
 }
 
+/// Write an executable `path` holding `body`, mode 0755, without this
+/// process ever holding it open for writing — see [`copy_out_of_process`].
+/// The body goes to a scratch file beside it first; that one may be "busy"
+/// for a moment, but nothing runs it.
+pub fn write_executable(path: &Path, body: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    let src = PathBuf::from(src);
+    std::fs::write(&src, body).unwrap();
+    copy_out_of_process(&src, path);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_file(&src);
+}
+
+/// Remove `path` (a file, or a directory and everything in it) when this
+/// test binary exits, once no test is running. Only in the process that
+/// asked: a forked child that calls `exit` inherits the handler, not the
+/// job.
+pub fn remove_at_exit(path: PathBuf) {
+    static PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static OWNER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    extern "C" fn remove_all() {
+        if OWNER.get() != Some(&std::process::id()) {
+            return;
+        }
+        let paths = PATHS.lock().map(|p| p.clone()).unwrap_or_default();
+        for p in paths {
+            let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
+        }
+    }
+    OWNER.get_or_init(|| {
+        // SAFETY: registers a plain function with no captured state.
+        unsafe { libc::atexit(remove_all) };
+        std::process::id()
+    });
+    PATHS.lock().unwrap().push(path);
+}
+
 /// `exe()` copied once per test binary onto `/tmp`, the filesystem every
 /// [`TempDir`] lives on, so a remote's install can hard-link it even where
 /// the build directory is on another filesystem (the Linux container's
@@ -500,17 +534,10 @@ pub fn copy_out_of_process(src: &Path, dest: &Path) {
 /// test binary exits.
 pub fn staged_exe() -> &'static Path {
     static STAGED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    fn path() -> PathBuf {
-        PathBuf::from(format!("/tmp/acst-exe-{}", std::process::id()))
-    }
-    extern "C" fn remove() {
-        let _ = std::fs::remove_file(path());
-    }
     STAGED.get_or_init(|| {
-        let p = path();
+        let p = PathBuf::from(format!("/tmp/acst-exe-{}", std::process::id()));
         copy_out_of_process(&exe(), &p);
-        // SAFETY: registers a plain function with no captured state.
-        unsafe { libc::atexit(remove) };
+        remove_at_exit(p.clone());
         p
     })
 }
@@ -658,9 +685,7 @@ impl Remote {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tmp = self.root.path().join(format!("transport.sh.{n}"));
-            std::fs::write(&tmp, &body).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(&tmp, &body);
             std::fs::rename(&tmp, &script).unwrap();
         }
         script.display().to_string()
@@ -842,15 +867,12 @@ impl Remote {
     pub fn fake_uname(&self, os: &str, arch: &str) {
         std::fs::create_dir_all(self.fake_bin()).unwrap();
         let script = self.fake_bin().join("uname");
-        std::fs::write(
+        write_executable(
             &script,
             format!(
                 "#!/bin/sh\ncase \"$1\" in -s) echo {os};; -m) echo {arch};; *) echo {os};; esac\n"
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
     }
 
     /// The installed binary for `version`, if any.

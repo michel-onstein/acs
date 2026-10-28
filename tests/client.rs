@@ -38,6 +38,14 @@ fn every_remote_install_links_one_shared_binary() {
     if ia != shared {
         assert_eq!(ia, ino(staged_exe()), "a per-remote copy, not a link");
     }
+    // Kept until the binary exits rather than dropped now: on macOS,
+    // unlinking a link of the binary while another test thread spawns it
+    // can kill that spawn, and this test ends while the others are still
+    // starting their clients.
+    for r in [a, b] {
+        remove_at_exit(r.root.path().to_path_buf());
+        std::mem::forget(r);
+    }
 }
 
 #[test]
