@@ -85,8 +85,9 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     }
     // The master acs keeps for this host, if it may have one: decided once,
     // before anything dials, so every call this client makes agrees about
-    // it (acs-9n3). Never for `acs list` over every alias, which asks a
-    // dozen hosts at once and would leave a master on each.
+    // it (acs-9n3). Not decided here for `acs list` over every alias, which
+    // asks a dozen hosts at once: it joins a master that answers, in
+    // list.rs, and never starts one, which would leave a master on each.
     // The configured forwards join the command line's (acs-odd, DESIGN
     // §7.1) before the master is decided, so a forward that arrives from
     // the configuration hits the same carve-out a `-L` does: a session that
@@ -706,17 +707,24 @@ impl Link {
     }
 }
 
-/// How long a connection may take to answer: to print its marker, and then
-/// to WELCOME us (DESIGN §5.3). A first connection may wait on a password
-/// or a key touch, so it gets longer than a redial, which must return to
-/// the backoff wait (where the command keys work) if the host accepted the
-/// connection and then went quiet. `ACS_DIAL_TIMEOUT_MS` sets both.
-pub fn answer_timeout(redial: bool) -> Duration {
-    let ms = std::env::var("ACS_DIAL_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if redial { 30_000 } else { 120_000 });
-    Duration::from_millis(ms)
+/// How long a fresh connection may take to answer: to print its marker,
+/// and then to WELCOME us (DESIGN §5.3). One the user is in front of may
+/// wait on a password or a key touch, so it gets two minutes; a `batch` one
+/// (`acs list`, the menu's hosts) cannot prompt, and gets the redial's 30 s.
+/// `ACS_DIAL_TIMEOUT_MS` sets both — but not [`redial_timeout`], which is
+/// a knob of its own so that shortening it leaves the first connection's
+/// two minutes alone (acs-p46).
+pub fn answer_timeout(batch: bool) -> Duration {
+    let default = if batch { 30_000 } else { 120_000 };
+    Duration::from_millis(crate::reconnect::env_ms("ACS_DIAL_TIMEOUT_MS", default))
+}
+
+/// How long a redial after a lost link may take to answer, marker and
+/// WELCOME (`ACS_REDIAL_TIMEOUT_MS`, DESIGN §5.3): shorter than a first
+/// connection's, because a host that accepted the connection and then went
+/// quiet must hand back to the backoff wait, where the command keys work.
+pub fn redial_timeout() -> Duration {
+    Duration::from_millis(crate::reconnect::env_ms("ACS_REDIAL_TIMEOUT_MS", 30_000))
 }
 
 /// The command keys through a redial (acs-8ax, DESIGN §5.2).
@@ -1462,7 +1470,10 @@ fn connect_once(
     timing: &mut Timing,
     netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> Outcome {
-    let timeout = answer_timeout(resuming);
+    let timeout = match resuming {
+        true => redial_timeout(),
+        false => answer_timeout(false),
+    };
     // Built before the dial so it can go out with it (acs-trw); the size
     // it carries is the terminal's as of now, and `serve` follows a
     // SIGWINCH that lands while the handshake is in flight.
