@@ -311,6 +311,60 @@ fn an_edit_writes_through_a_symlink() {
     assert_eq!(h.ok(&["config", "get", "install_on_remote"]), "false\n");
 }
 
+/// Regression (acs-5mmu): a dotfiles link made before the file it points at
+/// exists. `canonicalize` fails on a dangling link, and the rename used to
+/// land on the link path, replacing the link with a regular file.
+#[test]
+fn the_first_edit_writes_through_a_dangling_symlink() {
+    let h = Home::new();
+    let target = h.dir.path().join("dotfiles/acs.yaml");
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, h.local()).unwrap();
+
+    h.ok(&["config", "set", "install_on_remote", "false"]);
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "install_on_remote: false\n",
+        "the file the link points at was not created"
+    );
+    assert!(
+        std::fs::symlink_metadata(h.local())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link was replaced by a regular file"
+    );
+}
+
+/// Regression (acs-5mmu): an edit keeps a leading `---` and a closing `...`.
+#[test]
+fn an_edit_keeps_the_document_markers() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    std::fs::write(h.local(), "---\ninstall_on_remote: true\n...\n").unwrap();
+    h.ok(&["config", "set", "install_on_remote", "false"]);
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "---\ninstall_on_remote: false\n...\n"
+    );
+}
+
+/// Regression (acs-5mmu): a refused edit named a line of the text it did
+/// not save — line 6 of a five-line file — rather than the file on disk.
+#[test]
+fn a_refused_edit_does_not_cite_a_line_of_the_unsaved_text() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    let before = "# hosts\naliases:\n  web:\n    hosts:\n      - host: web.example\n";
+    std::fs::write(h.local(), before).unwrap();
+    h.fails(
+        &["config", "host", "add", "nas", "me@h"],
+        2,
+        "config.yaml: aliases.nas: host: bad host name 'me@h'",
+    );
+    assert_eq!(std::fs::read_to_string(h.local()).unwrap(), before);
+}
+
 #[test]
 fn errors_are_clear() {
     let h = Home::new();
