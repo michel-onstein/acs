@@ -212,7 +212,7 @@ pub fn check_main() -> ExitCode {
     let Ok(tmp) = crate::upgrade::scratch_dir("acs-update-check") else {
         return ExitCode::from(1);
     };
-    let target = release::archive_target(crate::payload::OWN_TARGET);
+    let target = release::own_archive_target();
     // This check only reads SHA256SUMS to compare version numbers: it
     // downloads nothing and runs nothing, so the scheme is not load-bearing
     // here and a plain mirror is allowed (acs-95w). `acs upgrade`, which

@@ -126,6 +126,34 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
     h.finish()
 }
 
+/// Digest of the file at `path`, read a buffer at a time rather than held
+/// whole: an archive or a complete acs is megabytes, and on a remote the
+/// copy would be the one thing the install allocates (acs-zgof).
+#[inline(always)] // out of line, a wrapper costs the slim build an unwind entry
+pub fn file(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
+    copy_file(path, &mut std::io::sink())
+}
+
+/// Copy the file at `from` into `to` a buffer at a time, returning the
+/// SHA-256 of exactly what was copied — so nothing can change between what
+/// is hashed and what is written.
+pub fn copy_file(from: &std::path::Path, to: &mut dyn std::io::Write) -> std::io::Result<[u8; 32]> {
+    use std::io::{ErrorKind, Read};
+    let mut file = std::fs::File::open(from)?;
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => return Ok(hash.finish()),
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hash.update(&buf[..n]);
+        to.write_all(&buf[..n])?;
+    }
+}
+
 pub fn hex(d: &[u8]) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -332,5 +360,23 @@ mod tests {
             h.update(&data[split..]);
             assert_eq!(h.finish(), digest(&data), "split {split}");
         }
+    }
+
+    /// acs-zgof: the file digest streams the file through the hash, and is
+    /// the digest of exactly the bytes it copied.
+    #[test]
+    fn copy_file_hashes_what_it_copies() {
+        let d = crate::testutil::TempDir::new();
+        let f = d.path().join("acs");
+        // Not a multiple of the buffer, so the last read is a short one.
+        let data: Vec<u8> = (0..200_003u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&f, &data).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(copy_file(&f, &mut out).unwrap(), digest(&data));
+        assert_eq!(out, data);
+        assert_eq!(file(&f).unwrap(), digest(&data));
+        std::fs::write(&f, b"").unwrap();
+        assert_eq!(file(&f).unwrap(), digest(b""));
+        assert!(file(&d.path().join("missing")).is_err());
     }
 }
