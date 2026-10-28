@@ -560,9 +560,7 @@ pub fn poll_retry(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     loop {
         let left = match deadline {
-            Some(d) => d
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis() as i32,
+            Some(d) => poll_timeout(d.saturating_duration_since(std::time::Instant::now())),
             None => -1,
         };
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, left) };
@@ -572,6 +570,36 @@ pub fn poll_retry(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize
         let e = io::Error::last_os_error();
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e);
+        }
+    }
+}
+
+/// `d` as a `poll(2)` timeout in milliseconds, clamped to `i32::MAX`: a
+/// bare `as i32` wraps a wait of 2^31 ms or more to a negative, which
+/// `poll` reads as no timeout at all (acs-wjj9).
+pub fn poll_timeout(d: std::time::Duration) -> i32 {
+    d.as_millis().min(i32::MAX as u128) as i32
+}
+
+/// The `poll(2)` timeout until the soonest of `deadline`, in [`now_ms`]
+/// milliseconds seen at `now`: `-1` (no timeout) for none, `0` for one
+/// already past, clamped to `i32::MAX`.
+pub fn poll_timeout_ms(deadline: Option<u64>, now: u64) -> i32 {
+    deadline.map_or(-1, |d| d.saturating_sub(now).min(i32::MAX as u64) as i32)
+}
+
+/// Wait until `fd` is readable (`true`) or `deadline` passes (`false`). A
+/// signal that cuts the wait short is sat out: the wait resumes for the time
+/// left, so `false` really means the deadline.
+pub fn wait_readable(fd: RawFd, deadline: std::time::Instant) -> io::Result<bool> {
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        let mut p = [pollfd(fd, libc::POLLIN)];
+        if poll(&mut p, poll_timeout(left))? > 0 {
+            return Ok(true);
         }
     }
 }
@@ -866,6 +894,74 @@ mod tests {
         let mut fds = [pollfd(r.as_raw_fd(), libc::POLLIN)];
         assert_eq!(poll_retry(&mut fds, -1).unwrap(), 1);
         assert_ne!(fds[0].revents & libc::POLLIN, 0);
+        drop(writer.join().unwrap());
+    }
+
+    /// acs-wjj9: a wait past `i32::MAX` ms clamps instead of wrapping to a
+    /// negative timeout, which `poll` would treat as "block forever".
+    #[test]
+    fn a_wait_past_i32_max_ms_clamps_the_poll_timeout() {
+        use std::time::Duration;
+        assert_eq!(poll_timeout(Duration::from_millis(1500)), 1500);
+        assert_eq!(
+            poll_timeout(Duration::from_millis(i32::MAX as u64)),
+            i32::MAX
+        );
+        assert_eq!(poll_timeout(Duration::from_millis(1 << 31)), i32::MAX);
+        assert_eq!(poll_timeout(Duration::from_millis(u64::MAX)), i32::MAX);
+    }
+
+    /// A millisecond deadline: none waits for ever, a past one not at all,
+    /// and one 2^31 ms or more away clamps rather than wrapping negative.
+    #[test]
+    fn a_millisecond_deadline_becomes_a_clamped_poll_timeout() {
+        assert_eq!(poll_timeout_ms(None, 1000), -1);
+        assert_eq!(poll_timeout_ms(Some(1500), 1000), 500);
+        assert_eq!(poll_timeout_ms(Some(900), 1000), 0);
+        assert_eq!(poll_timeout_ms(Some(1000 + (1 << 31)), 1000), i32::MAX);
+        assert_eq!(poll_timeout_ms(Some(u64::MAX), 0), i32::MAX);
+    }
+
+    /// A signal arriving mid-wait is sat out: `wait_readable` neither
+    /// reports the deadline early nor readiness that is not there, and still
+    /// sees data that comes after the signals.
+    #[test]
+    fn wait_readable_sits_out_signals_until_data_or_the_deadline() {
+        use std::time::{Duration, Instant};
+        extern "C" fn nothing(_: libc::c_int) {}
+        // SIGURG is ignored by default and used nowhere else; a handler
+        // without SA_RESTART makes it interrupt `poll` with EINTR.
+        signals::handle(libc::SIGURG, nothing as *const () as usize, 0).unwrap();
+        let me = unsafe { libc::pthread_self() } as usize;
+        let prod = |n: u32| {
+            std::thread::spawn(move || {
+                for _ in 0..n {
+                    std::thread::sleep(Duration::from_millis(10));
+                    unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGURG) };
+                }
+            })
+        };
+
+        let (r, w) = pipe().unwrap();
+        let t = Instant::now();
+        let p = prod(5);
+        assert!(!wait_readable(r.as_raw_fd(), t + Duration::from_millis(150)).unwrap());
+        assert!(
+            t.elapsed() >= Duration::from_millis(149),
+            "{:?}",
+            t.elapsed()
+        );
+        p.join().unwrap();
+
+        let p = prod(3);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+            assert_eq!(n, 1);
+            w
+        });
+        assert!(wait_readable(r.as_raw_fd(), Instant::now() + Duration::from_secs(10)).unwrap());
+        p.join().unwrap();
         drop(writer.join().unwrap());
     }
 

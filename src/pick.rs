@@ -321,7 +321,7 @@ impl Pick {
                 sys::pollfd(from, libc::POLLIN),
                 sys::pollfd(to, libc::POLLOUT),
             ];
-            match sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32) {
+            match sys::poll(&mut p, sys::poll_timeout(left)) {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
@@ -333,24 +333,7 @@ impl Pick {
                 self.write_owed()?;
             }
         }
-        wait_readable(from, deadline)
-    }
-}
-
-/// Wait until `fd` is readable or `deadline` passes (`false`).
-fn wait_readable(fd: RawFd, deadline: Instant) -> io::Result<bool> {
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Ok(false);
-        }
-        let mut p = [sys::pollfd(fd, libc::POLLIN)];
-        match sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32) {
-            Ok(0) => continue, // the deadline, or a signal cut the wait short
-            Ok(_) => return Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
+        sys::wait_readable(from, deadline)
     }
 }
 
@@ -392,10 +375,7 @@ fn run_menu(
     let mut buf = [0u8; 1024];
     loop {
         draw(menu, host)?;
-        let timeout = match menu.deadline() {
-            Some(d) => d.saturating_sub(sys::now_ms()).min(i32::MAX as u64) as i32,
-            None => -1,
-        };
+        let timeout = sys::poll_timeout_ms(menu.deadline(), sys::now_ms());
         let mut fds = [
             sys::pollfd(STDIN, libc::POLLIN),
             sys::pollfd(signals.as_raw_fd(), libc::POLLIN),
