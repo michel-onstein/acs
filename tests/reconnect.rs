@@ -269,58 +269,98 @@ fn a_link_lost_before_the_welcome_claims_no_session() {
 /// meanwhile, and judged liveness by what it had decoded before the block
 /// rather than by the bytes waiting in the pipe.
 ///
-/// The pause is the stimulus and stays a sleep: it must *exceed*
-/// `ACS_DEAD_MS` (800 ms), and a starved host can only make it longer. It
-/// was 8 s; 2.4 s is three dead intervals, and on macOS, whose pty holds
-/// 1 KiB in raw mode, the trickle below fills it in well under one, which
-/// leaves the client blocked in a write for about twice the dead interval.
-/// (A Linux pty holds about 20 KiB, which the trickle does not fill within
-/// 8 s either, so there the stall never blocked the client.) What
-/// followed it was a 500 ms settle before a negative assertion, which a
-/// stalled host silently turns into no test at all (acs-7wu). The settle is
-/// now an event: the session prints `RESUMED` only once the flag file is
-/// there, and the flag is written after the terminal starts draining again,
-/// so those bytes cannot be among the ones buffered during the pause — they
-/// were produced afterwards and carried across the same link. Seeing them is
-/// the client saying it read the host after the write unblocked and lived,
-/// which is exactly the moment the bug fired: the first `tick` after the
-/// unblocking write, with the newly read bytes not yet decoded. Waiting for
-/// output alone would not do — on unpause the flood of buffered `y`s arrives
-/// whether the link was kept or dropped and redialled.
+/// **The stall is proven, not assumed** (acs-io8c). How much a terminal
+/// holds before a write blocks is the pty's business — about 1 KiB on a
+/// macOS raw pty, about 20 KiB on Linux — and the 2.4 s pause this test used
+/// to sleep blocked the client on the first and never on the second. So the
+/// pause is not a duration: it lasts until the client is seen to have been
+/// stuck for three dead intervals (`STUCK`). The probe is a resize. The
+/// client handles `SIGWINCH` in its poll loop and passes it on as a RESIZE,
+/// which the program reports with `stty size`; a client blocked in
+/// `write_output` does neither, since the write is retried across the
+/// signal. So while the terminal is paused the test resizes and watches: a
+/// size the program reports means the client is still keeping up — the
+/// trickle has not filled the terminal yet — and the next probe asks for a
+/// new one; a size still unreported `STUCK` after it was asked for is a
+/// client that sat in a write that long, whatever the pty holds. A starved
+/// host only makes the pause longer.
 ///
-/// The stimulus itself is untouched: the flag test is a shell builtin beside
-/// two forks already in the loop, and until the flag appears the frame is the
-/// same 101 bytes, so the trickle that fills the terminal's buffer mid-pause
-/// is the one acs-7k7 was reproduced with.
+/// The trickle is one write of 1000 bytes per loop and no newline, so a
+/// frame reaches the client as one DATA in one read, and the write that
+/// blocks leaves nothing behind it to decode — the shape acs-7k7 fired on:
+/// the first `tick` after the unblocking write, with the bytes read during
+/// the stall not yet decoded. At some 20 KiB/s it fills a Linux pty in about
+/// a second.
+///
+/// The settle is an event, not a sleep (acs-7wu): the session prints
+/// `RESUMED` only once the flag file is there, and the flag is written after
+/// the terminal drains again, so those bytes were produced after the stall
+/// and carried across the same link. Seeing them is the client saying it
+/// read the host after the write unblocked and lived. Waiting for output
+/// alone would not do — on unpause the buffered `y`s arrive whether the link
+/// was kept or dropped and redialled.
 #[test]
 fn a_stalled_terminal_is_not_a_dead_link() {
+    /// Three times `FAST`'s `ACS_DEAD_MS`.
+    const STUCK: Duration = Duration::from_millis(2400);
     let remote = Remote::installed();
     // The master keeps its client for a minute (it has its own liveness,
     // acs-ode); this is about the client's judgement of the master.
     remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
     let go = remote.root.path().join("go");
+    let size = remote.root.path().join("size");
     let mut c = start(
         &remote,
         "stall",
-        // A trickle: one small frame per read, and the terminal's buffer
-        // fills partway through the pause, blocking the client in a write
-        // with nothing left to decode.
+        // Renamed into place, so a read never sees half a size.
         &format!(
-            "echo up; while true; do head -c 100 /dev/zero | tr '\\0' y; \
-             [ -f '{}' ] && printf RESUMED; echo; sleep 0.05; done",
-            go.display()
+            "echo up; while true; do head -c 1000 /dev/zero | tr '\\0' y; \
+             stty size > '{size}.new' && mv '{size}.new' '{size}'; \
+             [ -f '{go}' ] && printf RESUMED; sleep 0.02; done",
+            size = size.display(),
+            go = go.display()
         ),
         FAST,
     );
     c.wait_for("up", T);
+    let reported = || std::fs::read_to_string(&size).unwrap_or_default();
+    c.wait_until(
+        "the program reports its size",
+        |_| reported() == "24 80\n",
+        T,
+    );
     // Counted from here, not from one: a remote that has to install acs
     // first spends a connection or two before the session (acs-cu8), and
     // what this test is about is whether the stall costs one *more*.
     let dialled = remote.connections();
-    // Nothing is read for three times ACS_DEAD_MS (800 ms).
     c.set_paused(true);
-    std::thread::sleep(Duration::from_millis(2400));
+    let deadline = Instant::now() + T;
+    let mut cols = 80;
+    let want = loop {
+        cols += 1;
+        let want = format!("24 {cols}\n");
+        c.resize(cols, 24);
+        let asked = Instant::now();
+        while reported() != want && asked.elapsed() < STUCK {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if reported() != want {
+            break want;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the client never blocked on the paused terminal: {} resizes got through",
+            cols - 80
+        );
+    };
     c.set_paused(false);
+    // The resize the blocked client sat on goes through once its write
+    // does: it was stuck, not lost.
+    c.wait_until(
+        "the last resize reaches the program",
+        |_| reported() == want,
+        T,
+    );
     // Only now, so every RESUMED is output made after the stall.
     std::fs::write(&go, "").unwrap();
     c.wait_for("RESUMED", T);
