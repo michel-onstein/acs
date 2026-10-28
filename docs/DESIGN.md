@@ -138,7 +138,7 @@ lives in the master and the client.
 - `-e none`: ssh's `~.` escape is off (it is already off without a tty; this
   makes it explicit).
 - **The control options depend on which call it is** (`Call` in `ssh.rs`).
-  The first connection and a side call (`acs list <host>`, install) reuse an
+  The first connection and a side call (`acs list <host>`) reuse an
   ssh master **acs owns** — `ControlMaster=auto` on acs's own
   `ControlPath`, with `ControlPersist` — so a detach-and-reattach, or an
   `acs list <host>` followed by an attach, costs one round trip instead of a
@@ -2090,7 +2090,8 @@ one of the alias's entries instead of `<name>`:
   unreachable code (255) without calling ssh — or, persisting (§5.3),
   pings them every second for the first 30 pings, then every
   `reachability_interval`, until one answers (§5.3).
-- It applies to every ssh call — the session, `acs list`, install — since they
+- It applies to every ssh call — the session (and the install it carries),
+  `acs list` — since they
   share one destination and key. `-v` says which entry was chosen and why.
 - **Redial**: a reconnect (§5.3) resolves the alias again, so after a network
   change the client reaches the host through whichever address answers now.
@@ -2418,12 +2419,16 @@ for b in "$HOME/.local/share/acs/$v/acs" "/usr/local/lib/acs/$v/acs"; do
   [ -f "$b" ] && [ -x "$b" ] && exec "$b" _proxy main --create
 done
 printf '\nACS-NEED %s %s\n' "$(uname -s)" "$(uname -m)"
+# the session's prelude, where install_on_remote is on: wait for the install
+while IFS= read -r l; do case $l in *"ACS-INSTALL <sync>")
+  IFS= read -r l; (eval "$l"); s=$?; [ $s = 0 ] || exit $s
+  <the loop above again>; exit 6;; esac
+done
 ```
 
-The marker — `ACS-NEED` here, `ACS-READY` from the proxy, and the
-finisher's `ok` — is printed after a newline of its own, so a startup file
-that printed without one (`printf foo`) cannot put it mid-line, where it
-would not be recognised.
+The marker — `ACS-NEED` here, `ACS-READY` from the proxy — is printed after
+a newline of its own, so a startup file that printed without one
+(`printf foo`) cannot put it mid-line, where it would not be recognised.
 
 - `/usr/local/lib/acs/<version>/` is an optional system-wide location an
   administrator can populate once for all users; `acs` never writes there.
@@ -2438,8 +2443,8 @@ would not be recognised.
   or link the user put there is left alone, and an older client never moves
   the link back from a newer version. Nothing in the protocol depends on
   that link, so failing to make it (`HOME` unset in the ssh environment,
-  `~/.local/bin` a regular file or unwritable) is a warning printed after
-  the finisher's `ok`, not a failed install: the binary under
+  `~/.local/bin` a regular file or unwritable) is a warning from the
+  finisher, not a failed install: the binary under
   `~/.local/share/acs/<version>/` is complete and every connection works.
 - `acs _proxy` touches its version directory on start; versions untouched for
   30 days whose sessions have all ended are removed by the next proxy start —
@@ -2464,8 +2469,10 @@ would not be recognised.
   there would reach every user on every connection about a directory none
   of them can change.
 
-When the client reads `ACS-NEED`, it maps the `uname` pair to a target,
-installs a binary for it (below), and redials. Protocol versions are checked in
+When the client reads `ACS-NEED`, it maps the `uname` pair to a target and
+installs a binary for it **on the same connection** (below, acs-6k2): the
+prelude installs it, runs the candidates again, and execs the proxy, so first
+contact is one ssh handshake. Protocol versions are checked in
 `HELLO`; a new proxy that finds an older master tells the user to finish or
 kill the session rather than guess across versions.
 
@@ -2506,22 +2513,75 @@ Installing on a remote whose target is `r`:
    install by hand. macOS as a remote is rare, and carrying Mach-O payloads
    would add ~0.4 MB to every binary.
 
-On the wire, with no decompressor needed inside `acs` (gzip is on every
-Linux, busybox included), in two ssh calls that may use the user's
-multiplexed connection:
+On the wire there is no decompressor inside `acs` (gzip is on every Linux,
+busybox included), and **no second connection** (acs-6k2). The session's
+prelude ([§8](#8-installing-the-remote-binary)) says `ACS-NEED` and then
+reads its stdin a line at a time — the `read` builtin takes a pipe one byte
+at a time, so it consumes nothing past the line — passing over everything
+until `ACS-INSTALL <sync>`. That skips the HELLO the client sent ahead with
+the dial (§5.3, acs-trw), meant for a proxy that turned out not to be there;
+`<sync>` is random per dial, so no HELLO holds it by chance. The next line is
+a one-line script, which the prelude `eval`s in a subshell. It is no more
+trusted than the command line — both are the client's, over the one
+authenticated channel — and it travels on stdin only because its lengths and
+digests depend on the target `ACS-NEED` named. The client writes:
+
+```text
+\nACS-INSTALL <sync>\n<script>\n<bytes the script takes><HELLO>
+```
+
+and the script, for case 2 (case 1 takes the file straight into
+`acs.new.<token>` and has no `P` step):
 
 ```sh
-# 1: unpack the slim binary; stdin is gz(slim_r) from P. The shell checks
-#    the SHA-256 the client computed BEFORE the file is made executable.
+acs_take() { …exactly $1 bytes of stdin into $2… }; trap <rm the temp files> EXIT; set -e
 umask 022; d=~/.local/share/acs/0.3.1; mkdir -p $d; chmod 755 ~/.local/share/acs $d
-gzip -dc > $d/acs.new.<token>
+acs_take <n> $d/acs.gz.<token>; gzip -dc < $d/acs.gz.<token> > $d/acs.new.<token>
 got=$({ sha256sum $d/acs.new.<token> || shasum -a 256 … || openssl dgst … ; } | …)
-[ "$got" = <digest> ] || { rm -f $d/acs.new.<token>; exit 5; }
+[ "$got" = <digest> ] || { rm -f $d/acs.new.<token>; exit 5; }   # BEFORE chmod
 chmod 755 $d/acs.new.<token>
-# 2: stdin is P; check P against its own digest, append it as a trailer,
-#    then rename over $d/acs and repoint ~/.local/bin/acs
-$d/acs.new.<token> _install --finish --slim-sha256 <digest> --blob-sha256 <digest>
+acs_take <m> $d/acs.blob.<token>; <the same check of P against its digest>
+# check P again, append it as a trailer, rename over $d/acs, repoint ~/.local/bin/acs
+$d/acs.new.<token> _install --finish --slim-sha256 <digest> --blob-sha256 <digest> \
+  --payloads < $d/acs.blob.<token> >/dev/null
 ```
+
+The prelude then runs its candidate loop again — every check it makes on any
+connection, so an install it would not trust is refused (exit 6, and the
+client says the install went through but cannot be run) — and execs the
+proxy on what is left of stdin, which starts with the client's next HELLO.
+The client reads `ACS-READY` on the same pipe and the session starts. A
+failed step ends the connection with its status (3 no gzip, 4 nothing to
+hash with, 5 a mismatch), which the client reports beside the remote's own
+message; temporary files are removed on the way out.
+
+**`acs_take` takes exactly the bytes it is told to**, because what follows
+belongs to the next step and finally to the session. `head -c` is not POSIX,
+and the BSD one reads through stdio, a buffer past the count. A `read(2)`
+never returns more than it is asked for, and `dd bs=<still owed> count=1` is
+one read — it does not fill a block on a short read unless told to — so the
+loop takes what the pipe holds, up to what is owed, and `wc -c` says how far
+it got. A pass that gets nothing is the end of input, and fails the install.
+A pipe holds a few dozen kilobytes, so on its own that is a `dd` and a `wc`
+per few dozen kilobytes — measured at 0.5–1 s for the 1.9 MB complete build
+in the container, slower than the handshakes it replaced. Where `dd` knows
+`iflag=fullblock` (GNU, busybox, current macOS) a probe that reads nothing
+finds out, and `dd` then fills the block with reads of what is still owed,
+so the first pass takes the lot; elsewhere the probe fails without reading
+and the loop does the same work a read at a time.
+
+**First contact is one handshake.** It used to be the dial that got
+`ACS-NEED`, one install call for case 1 or two for case 2, and a redial:
+four ssh invocations for a payload install, each a full handshake without a
+master — measured over ssh to a local container (`tests/e2e_ssh.rs`'s host)
+with the macOS complete build installing Linux aarch64, 0.22 s before and
+0.13 s after with `ACS_CONTROL_PERSIST=0`. With acs's own master (§3, the
+default) the three later calls were already channels on one connection, so
+the saving there is three channel round trips and three ssh processes —
+nothing measurable against a local container (0.13 s either way), a round
+trip each on a real link. A new release ships after
+every merge (docs/VERSIONING.md), so every host pays first contact once per
+release. The upload itself still dominates on a slow link.
 
 **The directories acs makes carry a mode of their own** (acs-iws), not
 whatever the remote's umask leaves. The prelude refuses to exec a binary
@@ -2603,10 +2663,11 @@ or `openssl` refuses the install rather than running something unchecked.
 The payload trailer is checked against its own digest too: parsing it only
 says it is well formed, not that it is ours.
 
-Step 2 is skipped in case 1 (the file sent is already complete, and step 1
-then uses `cat` rather than `gzip -dc`). `<token>` is random per install, so
-two clients installing the same version at once write separate files and the
-final atomic rename puts identical content in place either way. A version's
+Case 1 has no `P` step: the file sent is already complete, and the script
+takes it straight into `acs.new.<token>`. `<token>` is random per install,
+so two clients installing the same version at once — each on its own
+connection — write separate files, and the final atomic rename puts
+identical content in place either way. A version's
 binary is never replaced by different content, so running masters are never
 affected by someone else's install.
 
@@ -2737,8 +2798,8 @@ scripts/        verify.sh, test_linux.sh, e2e_ssh.sh, source_stamp.sh
   encodings, split reads, key release events and bracketed paste; the mode
   observer on sequences split at every byte boundary; the ssh argv builder
   (session calls put the transport options first; the user's
-  `-i`/`-p`/`-J`/`-F`/`-o` follow in order and are identical for session,
-  `acs list` and install calls).
+  `-i`/`-p`/`-J`/`-F`/`-o` follow in order and are identical for session
+  and `acs list` calls).
 - **Integration** (no ssh): `--transport-cmd` makes the client exec
   `acs _proxy …` locally instead of `ssh host acs _proxy …`. Tests start a
   session running a deterministic producer, kill the transport mid-stream,

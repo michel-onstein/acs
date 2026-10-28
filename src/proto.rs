@@ -25,6 +25,9 @@ const HEADER: usize = 5;
 pub const READY_MARKER: &str = "ACS-READY";
 /// Written by the remote prelude when no usable binary is installed.
 pub const NEED_MARKER: &str = "ACS-NEED";
+/// Written by the client after `ACS-NEED`, followed by the dial's sync
+/// token, to start the install on the same connection (acs-6k2).
+pub const INSTALL_MARKER: &str = "ACS-INSTALL";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WinSize {

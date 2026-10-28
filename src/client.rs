@@ -1543,7 +1543,17 @@ fn connect_once(
     };
     let pargs = proxy_args(args, state, resuming);
     let pargs: Vec<&str> = pargs.iter().map(String::as_str).collect();
-    let remote = ssh::remote_acs(crate::VERSION, &pargs);
+    // Where acs may be installed, the prelude waits after ACS-NEED for the
+    // install on this same connection (acs-6k2), keyed by a token of this
+    // dial's so that nothing else on its stdin can start one.
+    let sync = args.config.install_on_remote.value.then(sys::random_token);
+    let remote = match &sync {
+        Some(s) => ssh::remote_acs_installing(crate::VERSION, &pargs, s),
+        None => ssh::remote_acs(crate::VERSION, &pargs),
+    };
+    // The proxy an install execs needs a HELLO of its own: the one that
+    // went ahead with the dial was read past by the prelude.
+    let again = sync.as_ref().map(|_| greeting.clone()).unwrap_or_default();
     // A redial honours the command keys while ssh has not asked for the
     // terminal (DialKeys) — where acs has a terminal to give it: raw mode,
     // and the foreground of the terminal it reads.
@@ -1588,7 +1598,7 @@ fn connect_once(
             )
         }
     };
-    let (link, marker) = match dialed {
+    let (mut link, marker) = match dialed {
         Ok(x) => x,
         Err(e) => {
             // The dial itself did not come up: nothing reached the host,
@@ -1605,42 +1615,78 @@ fn connect_once(
             };
         }
     };
-    let rest = match marker {
-        Marker::Ready { proto: p, rest } => {
-            if p != proto::PROTO_VERSION {
-                note(&format!(
-                    "remote acs speaks protocol {p}, this client {}",
-                    proto::PROTO_VERSION
-                ));
-                link.close();
-                return Outcome::Exit(code::ERROR);
-            }
-            rest
-        }
+    let (p, rest) = match marker {
+        Marker::Ready { proto: p, rest } => (p, rest),
         Marker::Need { os, arch } => {
-            link.close();
-            if !args.config.install_on_remote.value {
+            // No token: install_on_remote is off, and the prelude has gone.
+            let Some(sync) = sync else {
+                link.close();
                 note(&crate::install::not_installing(args, &os, &arch));
                 return Outcome::Exit(code::INSTALL_FAILED);
+            };
+            // The install, and then the session, on this same connection
+            // (acs-6k2, DESIGN §8.1).
+            let to = link.to.as_raw_fd();
+            if let Err(e) = crate::install::install(args, &os, &arch, &sync, to, &again) {
+                link.close();
+                note(&e);
+                return Outcome::Exit(code::INSTALL_FAILED);
             }
-            return match crate::install::install(args, &os, &arch) {
-                Ok(()) => {
+            match await_installed(&mut link) {
+                Ok(x) => {
                     timing.mark("acs installed");
-                    connect_and_serve(
-                        args, state, raw, signals, resuming, ended, None, timing, netwatch,
-                    )
+                    note(&format!(
+                        "installed acs {} on {}",
+                        crate::VERSION,
+                        args.transport.destination
+                    ));
+                    x
                 }
                 Err(e) => {
-                    note(&e);
-                    Outcome::Exit(code::INSTALL_FAILED)
+                    link.close();
+                    note(&crate::install::failed(&args.transport.destination, e));
+                    return Outcome::Exit(code::INSTALL_FAILED);
                 }
-            };
+            }
         }
     };
+    if p != proto::PROTO_VERSION {
+        note(&format!(
+            "remote acs speaks protocol {p}, this client {}",
+            proto::PROTO_VERSION
+        ));
+        link.close();
+        return Outcome::Exit(code::ERROR);
+    }
     state.master = link.muxed.then(|| args.transport.clone());
     serve(
         args, state, raw, signals, link, rest, timeout, timing, size, netwatch,
     )
+}
+
+/// After an install was sent over `link`: wait for the proxy the prelude
+/// execs to say `ACS-READY`, and return its protocol and what came after.
+/// `Err` is the remote's exit status when the connection ended first —
+/// a failed step or a refusal, which the remote has already explained on
+/// stderr.
+///
+/// No deadline, as the install's own calls never had one: the upload is
+/// as slow as the link, and the connection's end is what says it failed.
+fn await_installed(link: &mut Link) -> Result<(u16, Vec<u8>), Option<i32>> {
+    let mut scanner = MarkerScanner::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = sys::read(link.from.as_raw_fd(), &mut buf).unwrap_or(0);
+        if n == 0 {
+            return Err(link.child.wait().ok().and_then(|s| s.code()));
+        }
+        match scanner.push(&buf[..n]) {
+            Some(Marker::Ready { proto, rest }) => return Ok((proto, rest)),
+            // The prelude says ACS-NEED once; a second is not an answer.
+            Some(Marker::Need { .. }) => return Err(None),
+            None => {}
+        }
+    }
 }
 
 /// Leave detached: the terminal put back, and the way to reattach told.
