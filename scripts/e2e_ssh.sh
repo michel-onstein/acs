@@ -112,4 +112,5 @@ export ACS_E2E_CLIENT="$root/$client"
 export ACS_E2E_KEY="$work/key"
 export ACS_E2E_PORT="$port"
 export ACS_E2E_CONTAINER="$name"
-cargo test -p acs --test e2e_ssh -- --test-threads=1 --nocapture
+# Every e2e test is #[ignore] so a plain cargo test counts it (acs-hdj4).
+cargo test -p acs --test e2e_ssh -- --include-ignored --test-threads=1 --nocapture
