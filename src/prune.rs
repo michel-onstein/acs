@@ -9,28 +9,18 @@ use std::time::{Duration, SystemTime};
 
 /// How long an unused version is kept (`ACS_PRUNE_AFTER_SECS` for tests).
 fn max_age() -> Duration {
-    Duration::from_secs(
-        std::env::var("ACS_PRUNE_AFTER_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30 * 86_400),
-    )
+    Duration::from_secs(crate::sys::env_or("ACS_PRUNE_AFTER_SECS", 30 * 86_400))
 }
 
 /// Minimum time between prune runs (`ACS_PRUNE_EVERY_SECS` for tests).
 fn every() -> Duration {
-    Duration::from_secs(
-        std::env::var("ACS_PRUNE_EVERY_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(86_400),
-    )
+    Duration::from_secs(crate::sys::env_or("ACS_PRUNE_EVERY_SECS", 86_400))
 }
 
 /// `~/.local/share/acs`, if this binary runs from a version directory in it.
 pub fn versions_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    let home = crate::sys::env_nonempty("HOME")?;
     root_for(&exe, crate::VERSION, Path::new(&home))
 }
 

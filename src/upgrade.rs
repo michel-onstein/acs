@@ -190,7 +190,7 @@ fn link_candidates() -> Vec<PathBuf> {
             v.push(std::path::absolute(&a0).unwrap_or(a0));
         }
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+    if let Some(home) = crate::sys::env_nonempty("HOME") {
         v.push(crate::layout::user_bin(Path::new(&home)).join("acs"));
     }
     v.push(crate::layout::system_link());

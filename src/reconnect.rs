@@ -13,27 +13,20 @@ use crate::sys;
 use crate::timing::{Phase, Timing};
 use crate::tty::RawMode;
 
-pub(crate) fn env_ms(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
 /// Send a PING after this much silence (`ACS_PING_MS`).
 fn ping_after() -> u64 {
-    env_ms("ACS_PING_MS", 3000)
+    sys::env_or("ACS_PING_MS", 3000)
 }
 
 /// How long a link must have served, WELCOME to loss, for the backoff to
 /// start over at its free attempt (`ACS_BACKOFF_RESET_MS`, acs-omt2).
 fn backoff_reset_after() -> Duration {
-    Duration::from_millis(env_ms("ACS_BACKOFF_RESET_MS", 30_000))
+    sys::env_ms("ACS_BACKOFF_RESET_MS", 30_000)
 }
 
 /// Declare the link dead after this much silence (`ACS_DEAD_MS`).
 fn dead_after() -> u64 {
-    env_ms("ACS_DEAD_MS", 10_000)
+    sys::env_or("ACS_DEAD_MS", 10_000)
 }
 
 /// How long the host has to answer the PING a network change sends while
@@ -41,7 +34,7 @@ fn dead_after() -> u64 {
 /// is only "is this link still the one" and the answer is one round trip;
 /// the full `ACS_DEAD_MS` stands for every other kind of silence.
 fn netcheck_after() -> u64 {
-    env_ms("ACS_NETCHECK_MS", 2000)
+    sys::env_or("ACS_NETCHECK_MS", 2000)
 }
 
 /// Waits between redials (acs-iyq): **the first attempt after a drop goes
@@ -118,7 +111,7 @@ pub fn run(
     mut timing: Timing,
     netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> u8 {
-    let mut backoff = Backoff::new(env_ms("ACS_BACKOFF_MS", 1000));
+    let mut backoff = Backoff::new(sys::env_or("ACS_BACKOFF_MS", 1000));
     let mut last_early: Option<Instant> = None;
     let mut resuming = false;
     // A dial after a wait; `gated`: the host has just answered the ping
@@ -368,7 +361,7 @@ enum Offline {
 /// settling quietly: any later hint carries it, instead of the backoff
 /// (30 s at worst) having to cover for it.
 fn early_every() -> Duration {
-    Duration::from_millis(env_ms("ACS_EARLY_MS", 2000))
+    sys::env_ms("ACS_EARLY_MS", 2000)
 }
 
 /// Wait `wait` before the next redial with the link down: show `msg` as the

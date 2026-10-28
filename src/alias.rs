@@ -618,9 +618,7 @@ const NO_HOST: i32 = 68;
 /// Ping `host` once, waiting at most `deadline` for the answer (`ACS_PING`
 /// names the program, `ACS_PING6` the IPv6 one).
 pub fn ping(host: &str, deadline: Duration) -> bool {
-    let prog = std::env::var_os("ACS_PING")
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "ping".into());
+    let prog = crate::sys::env_nonempty("ACS_PING").unwrap_or_else(|| "ping".into());
     match ping_with(&prog, host, deadline) {
         Some(0) => true,
         // macOS ping is IPv4-only: an IPv6 literal, or a name with only
@@ -628,9 +626,7 @@ pub fn ping(host: &str, deadline: Duration) -> bool {
         // takes no timeout flag — our own deadline kills it (acs-4pv).
         // Linux ping is dual-stack and never exits this way.
         Some(NO_HOST) => {
-            let prog6 = std::env::var_os("ACS_PING6")
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| "ping6".into());
+            let prog6 = crate::sys::env_nonempty("ACS_PING6").unwrap_or_else(|| "ping6".into());
             run_ping(&prog6, &["-c", "1", "--", host], deadline) == Some(0)
         }
         _ => false,
