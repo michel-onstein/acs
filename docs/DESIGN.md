@@ -94,7 +94,7 @@ flowchart LR
    protocols, and terminal queries/replies all work as if you had run `ssh -t`.
 2. **One binary** for both sides and for both client platforms (macOS and
    Linux), statically linked on Linux, that can install itself on a remote
-   (§8). Slim build < 1.1 MB; with the embedded Linux payloads < 2.1 MB.
+   (§8). Slim build < 1.15 MB; with the embedded Linux payloads < 2.3 MB.
 3. **Survive network interruption** with no lost output, and detect a dead link
    in seconds rather than a minute.
 4. **Command mode** on a double-tap of Ctrl-] (§6): `d` detach, `x` exit.
@@ -2747,14 +2747,20 @@ affected by someone else's install.
 
 | Target | Slim | Complete |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 1024 KB | 2.05 MB |
-| `aarch64-unknown-linux-musl` | 911 KB | 1.94 MB |
-| `aarch64-apple-darwin` | 774 KB | 1.79 MB |
-| `x86_64-apple-darwin` | 836 KB | 1.88 MB |
+| `x86_64-unknown-linux-musl` | 1046 KB | 2.10 MB |
+| `aarch64-unknown-linux-musl` | 932 KB | 1.98 MB |
+| `aarch64-apple-darwin` | 774 KB | 1.84 MB |
+| `x86_64-apple-darwin` | 853 KB | 1.92 MB |
 
-The payload set (both Linux builds, gzip'd) is 1030 KB. Measured 2026-10-27;
-the budget `cargo xtask dist` enforces is slim ≤ 1.1 MB and complete ≤ 2.1 MB
-(goal 2), raised from 1 MB / 2 MB when x86_64 Linux passed them.
+The payload set (both Linux builds, gzip'd) is 1051 KB. Measured 2026-10-28
+at 792c178, where release builds still leave the copy (`src/cp`) out. The
+budget `cargo xtask dist` enforces is slim ≤ 1.15 MB and complete ≤ 2.3 MB
+(goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them, and
+from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9): built into a
+release at that same commit, the copy's phase 1 took x86_64 Linux to 1110 KB
+slim and 2.22 MB complete — 64 KB and 125 KB more, since the complete build
+carries it again in both Linux payloads — past both old limits with only
+the local copy written.
 
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by

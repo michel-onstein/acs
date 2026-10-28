@@ -9,7 +9,7 @@
 //! 3. complete Linux builds: slim + appended blob;
 //! 4. complete macOS builds: rebuilt with `--features embed-payloads`, then
 //!    ad-hoc signed;
-//! 5. a size report, failing over budget (slim 1.1 MB, complete 2.1 MB);
+//! 5. a size report, failing over budget (slim 1.15 MB, complete 2.3 MB);
 //! 6. `source.stamp`, the fingerprint of the sources it built from
 //!    (`scripts/source_stamp.sh`), which `scripts/e2e_ssh.sh --no-build`
 //!    checks before it reuses the binaries (acs-gb4), and `channel.stamp`,
@@ -39,8 +39,12 @@ mod upstream;
 
 const LINUX: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
 const MAC: &[&str] = &["aarch64-apple-darwin", "x86_64-apple-darwin"];
-const SLIM_BUDGET: u64 = 1_100_000;
-const COMPLETE_BUDGET: u64 = 2_100_000;
+// Raised from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9,
+// ACSCP_DESIGN §10.4): measured, it adds about 64 KB to the slim x86_64
+// Linux build and, carried again in both Linux payloads, about 125 KB to the
+// complete one. DESIGN goal 2 and §8.1 state the same figures.
+const SLIM_BUDGET: u64 = 1_150_000;
+const COMPLETE_BUDGET: u64 = 2_300_000;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -333,6 +337,33 @@ fn dist(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A budget in the decimal megabytes the docs write it in: 1.15 MB.
+    fn mb(bytes: u64) -> String {
+        let s = format!("{:.3}", bytes as f64 / 1e6);
+        format!("{} MB", s.trim_end_matches('0').trim_end_matches('.'))
+    }
+
+    /// acs-hofu.9: the budget is stated in three places besides the
+    /// constants — this file's doc line, DESIGN goal 2 and DESIGN §8.1 — and
+    /// a raise that moves the constants alone leaves the docs promising a
+    /// limit `dist` no longer enforces.
+    #[test]
+    fn the_docs_state_the_budget_dist_enforces() {
+        let (slim, complete) = (mb(SLIM_BUDGET), mb(COMPLETE_BUDGET));
+        assert_eq!(
+            (mb(1_150_000), mb(2_100_000)),
+            ("1.15 MB".into(), "2.1 MB".into())
+        );
+        let this = include_str!("main.rs");
+        let doc_line = format!("failing over budget (slim {slim}, complete {complete})");
+        assert!(this.contains(&doc_line), "xtask doc: {doc_line}");
+        let design = include_str!("../../docs/DESIGN.md");
+        let goal = format!("Slim build < {slim}; with the embedded Linux payloads < {complete}.");
+        assert!(design.contains(&goal), "DESIGN goal 2: {goal}");
+        let table = format!("slim ≤ {slim} and complete ≤ {complete}");
+        assert!(design.contains(&table), "DESIGN §8.1: {table}");
+    }
 
     #[test]
     fn targets_acs_releases_are_taken_in_order() {
