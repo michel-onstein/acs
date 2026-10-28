@@ -19,6 +19,7 @@ pub mod modes;
 pub mod mux;
 pub mod netmatch;
 pub mod netwatch;
+mod outq;
 pub mod payload;
 pub mod pick;
 pub mod proto;
