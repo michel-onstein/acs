@@ -70,18 +70,15 @@ pub enum Target {
     Pick(String),
 }
 
+/// What reaching a host takes, apart from anything a session adds: the ssh
+/// transport, how verbose to be, the configuration, and the alias the
+/// destination was resolved from. [`ClientArgs`] embeds one beside what
+/// only a session has, so that the dial, the alias resolution and the
+/// remote install serve anything else that reaches a host the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientArgs {
+pub struct Connection {
     pub transport: Transport,
-    pub target: Target,
-    pub list: bool,
-    pub reconnect: bool,
-    /// `--persist`: keep waiting for a lost host (DESIGN §5.3), whatever the
-    /// configuration says.
-    pub persist: bool,
-    pub force: bool,
     pub verbose: u8,
-    pub command: Vec<String>,
     /// The configuration file's settings (DESIGN §7.2); defaults until the
     /// client loads them.
     pub config: Config,
@@ -90,15 +87,55 @@ pub struct ClientArgs {
     pub alias: Option<String>,
     /// The index of the alias's entry in use, once one was chosen.
     pub entry: Option<usize>,
+}
+
+impl Connection {
+    /// A connection over `transport`, with the default configuration and
+    /// no alias resolved yet.
+    pub fn new(transport: Transport, verbose: u8) -> Self {
+        Connection {
+            transport,
+            verbose,
+            config: Config::default(),
+            alias: None,
+            entry: None,
+        }
+    }
+
+    /// The host as the user named it: the alias, or the destination.
+    pub fn host_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.transport.destination)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientArgs {
+    /// How the host is reached.
+    pub conn: Connection,
+    pub target: Target,
+    pub list: bool,
+    pub reconnect: bool,
+    /// `--persist`: keep waiting for a lost host (DESIGN §5.3), whatever the
+    /// configuration says.
+    pub persist: bool,
+    pub force: bool,
+    pub command: Vec<String>,
     /// `-L none`: the configuration's `local_forwards` (§7.2) do not apply
     /// to this session, only the `-L` specs given here (acs-odd).
     pub no_configured_forwards: bool,
 }
 
-impl ClientArgs {
-    /// The host as the user named it: the alias, or the destination.
-    pub fn host_name(&self) -> &str {
-        self.alias.as_deref().unwrap_or(&self.transport.destination)
+/// The ssh option that the command-line option `-<c>` passes through to
+/// every ssh call (DESIGN §7.1), or `None` when `-<c>` is not one of them.
+/// `port` is the letter the port is given with — `p` for acs, as ssh
+/// spells it; `P` for a copy, as scp does — and whichever it is, ssh's
+/// `-p` is what is passed on. This is the one list of passed-through
+/// options.
+pub fn ssh_passthrough(c: char, port: char) -> Option<char> {
+    match c {
+        'i' | 'J' | 'F' | 'o' => Some(c),
+        _ if c == port => Some('p'),
+        _ => None,
     }
 }
 
@@ -170,11 +207,6 @@ where
         let arg = p.next().map_err(|e| e.to_string())?;
         let Some(arg) = arg else { break };
         match arg {
-            Short(c @ ('i' | 'p' | 'J' | 'F' | 'o')) => {
-                let v = p.value().map_err(|e| e.to_string())?;
-                user_opts.push(format!("-{c}").into());
-                user_opts.push(v);
-            }
             // Not a user_opt: a forward goes to the session's ssh alone
             // (DESIGN §7.1), and its spec is checked here rather than by
             // ssh, per dial, on the session's terminal.
@@ -214,7 +246,14 @@ where
             Short('h') | Long("help") => return Ok(Parsed::Help),
             Short('V') | Long("version") => return Ok(Parsed::Version),
             Value(v) => positionals.push(text(v, "argument")?),
-            Short(c) => return Err(format!("unknown option -{c}")),
+            Short(c) => match ssh_passthrough(c, 'p') {
+                Some(o) => {
+                    let v = p.value().map_err(|e| e.to_string())?;
+                    user_opts.push(format!("-{o}").into());
+                    user_opts.push(v);
+                }
+                None => return Err(format!("unknown option -{c}")),
+            },
             Long(l) => return Err(format!("unknown option --{l}")),
         }
     }
@@ -263,17 +302,13 @@ where
     transport.transport_cmd = transport_cmd;
 
     let args = Box::new(ClientArgs {
-        transport,
+        conn: Connection::new(transport, verbose),
         target,
         list,
         reconnect,
         persist,
         force,
-        verbose,
         command,
-        config: Config::default(),
-        alias: None,
-        entry: None,
         no_configured_forwards,
     });
     Ok(match host {
@@ -294,7 +329,8 @@ mod tests {
     }
 
     fn opts(a: &ClientArgs) -> Vec<String> {
-        a.transport
+        a.conn
+            .transport
             .user_opts
             .iter()
             .map(|s| s.to_str().unwrap().to_string())
@@ -304,7 +340,7 @@ mod tests {
     #[test]
     fn dsh_forms() {
         let a = run(&["devbox"]).unwrap();
-        assert_eq!(a.transport.destination, "devbox");
+        assert_eq!(a.conn.transport.destination, "devbox");
         assert_eq!(a.target, Target::Pick("main".into()));
         assert!(a.reconnect && !a.list);
 
@@ -334,10 +370,10 @@ mod tests {
             match list(args).unwrap() {
                 Parsed::ListAll(a) => {
                     assert!(a.list);
-                    assert_eq!(a.transport.destination, "");
+                    assert_eq!(a.conn.transport.destination, "");
                     if !args.is_empty() {
                         assert_eq!(opts(&a), ["-p", "2222"]);
-                        assert_eq!(a.verbose, 1);
+                        assert_eq!(a.conn.verbose, 1);
                     }
                 }
                 other => panic!("{args:?}: {other:?}"),
@@ -347,21 +383,21 @@ mod tests {
             match list(args).unwrap() {
                 Parsed::Run(a) => {
                     assert!(a.list);
-                    assert_eq!(a.transport.destination, "devbox");
+                    assert_eq!(a.conn.transport.destination, "devbox");
                 }
                 other => panic!("{args:?}: {other:?}"),
             }
         }
         // A host called `list`, listed: `acs list list`, or `acs list me@list`.
         match list(&["list"]).unwrap() {
-            Parsed::Run(a) => assert_eq!(a.transport.destination, "list"),
+            Parsed::Run(a) => assert_eq!(a.conn.transport.destination, "list"),
             other => panic!("{other:?}"),
         }
         // Reached as a session host, behind an option or as user@list.
         for args in [&["-v", "list"][..], &["me@list", "work"]] {
             let a = run(args).unwrap();
             assert!(!a.list);
-            assert!(a.transport.destination.ends_with("list"), "{args:?}");
+            assert!(a.conn.transport.destination.ends_with("list"), "{args:?}");
         }
     }
 
@@ -411,7 +447,32 @@ mod tests {
                 "cfg"
             ]
         );
-        assert_eq!(a.transport.destination, "me@box");
+        assert_eq!(a.conn.transport.destination, "me@box");
+    }
+
+    /// One list of passed-through ssh options, whichever letter the port
+    /// is spelled with: `-p` for acs, `-P` for acscp (where `-p` is scp's
+    /// preserve), and ssh's `-p` passed on either way.
+    #[test]
+    fn the_passthrough_follows_the_port_letter() {
+        for port in ['p', 'P'] {
+            for c in ['i', 'J', 'F', 'o'] {
+                assert_eq!(ssh_passthrough(c, port), Some(c), "-{c} with -{port}");
+            }
+            assert_eq!(ssh_passthrough(port, port), Some('p'), "-{port}");
+            for c in ['L', 'l', 'v', 'r', 'h', 'V', 'q', 'x'] {
+                assert_eq!(ssh_passthrough(c, port), None, "-{c} with -{port}");
+            }
+        }
+        assert_eq!(ssh_passthrough('P', 'p'), None, "acs has no -P");
+        assert_eq!(
+            ssh_passthrough('p', 'P'),
+            None,
+            "acscp's -p is not the port"
+        );
+        // acs's command line spells the port -p.
+        let e = run(&["-P", "2222", "box"]).unwrap_err();
+        assert!(e.contains("unknown option -P"), "{e}");
     }
 
     /// acs-6f5: `-L` is kept apart from the pass-through options, because
@@ -429,17 +490,24 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            a.transport.local_forwards,
+            a.conn.transport.local_forwards,
             ["8080:localhost:80", "5432:db.internal:5432"]
         );
         // They are not ssh pass-through options.
         assert_eq!(opts(&a), ["-p", "2222"]);
-        assert!(run(&["box"]).unwrap().transport.local_forwards.is_empty());
+        assert!(run(&["box"])
+            .unwrap()
+            .conn
+            .transport
+            .local_forwards
+            .is_empty());
 
         // `acs list` may attach the session it picks from the menu (§7.3),
         // so a forward is taken there too.
         match list(&["-L", "8080:localhost:80"]).unwrap() {
-            Parsed::ListAll(a) => assert_eq!(a.transport.local_forwards, ["8080:localhost:80"]),
+            Parsed::ListAll(a) => {
+                assert_eq!(a.conn.transport.local_forwards, ["8080:localhost:80"])
+            }
             other => panic!("{other:?}"),
         }
 
@@ -464,11 +532,11 @@ mod tests {
         for spelling in ["none", "NONE", "None"] {
             let a = run(&["-L", spelling, "box"]).unwrap();
             assert!(a.no_configured_forwards, "{spelling}");
-            assert!(a.transport.local_forwards.is_empty(), "{spelling}");
+            assert!(a.conn.transport.local_forwards.is_empty(), "{spelling}");
         }
         let a = run(&["-L", "none", "-L", "9000:localhost:9000", "box"]).unwrap();
         assert!(a.no_configured_forwards);
-        assert_eq!(a.transport.local_forwards, ["9000:localhost:9000"]);
+        assert_eq!(a.conn.transport.local_forwards, ["9000:localhost:9000"]);
         // `acs list` may attach the session it picks, so it takes it too.
         match list(&["-L", "none"]).unwrap() {
             Parsed::ListAll(a) => assert!(a.no_configured_forwards),
@@ -490,7 +558,7 @@ mod tests {
         let a = run(&["h", "--new", "--force", "-vv", "--no-reconnect"]).unwrap();
         assert_eq!(a.target, Target::New);
         assert!(a.force);
-        assert_eq!(a.verbose, 2);
+        assert_eq!(a.conn.verbose, 2);
         assert!(!a.reconnect);
     }
 
@@ -556,7 +624,7 @@ mod tests {
     #[test]
     fn ssh_program_and_transport_hook() {
         let a = run(&["--ssh", "/opt/ssh", "--transport-cmd", "sh -c", "h"]).unwrap();
-        assert_eq!(a.transport.ssh, OsString::from("/opt/ssh"));
-        assert_eq!(a.transport.transport_cmd.as_deref(), Some("sh -c"));
+        assert_eq!(a.conn.transport.ssh, OsString::from("/opt/ssh"));
+        assert_eq!(a.conn.transport.transport_cmd.as_deref(), Some("sh -c"));
     }
 }

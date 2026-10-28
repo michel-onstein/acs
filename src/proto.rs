@@ -19,7 +19,8 @@ pub const MAX_FRAME: usize = 1 << 20;
 /// Largest DATA/INPUT chunk a sender puts in one frame.
 pub const MAX_CHUNK: usize = 32 * 1024;
 
-const HEADER: usize = 5;
+/// A frame header: the type byte and the payload length, `u32` BE.
+pub(crate) const HEADER: usize = 5;
 
 /// Written by the remote side immediately before its first frame.
 pub const READY_MARKER: &str = "ACS-READY";
@@ -225,32 +226,34 @@ mod ty {
     pub const LIST_END: u8 = 18;
 }
 
-struct W<'a>(&'a mut Vec<u8>);
+/// The field encoder, shared by every message set over these frames: the
+/// integers big-endian, bytes and strings prefixed by a `u32` length.
+pub(crate) struct W<'a>(pub(crate) &'a mut Vec<u8>);
 
 impl W<'_> {
-    fn u8(&mut self, v: u8) {
+    pub(crate) fn u8(&mut self, v: u8) {
         self.0.push(v);
     }
-    fn u16(&mut self, v: u16) {
+    pub(crate) fn u16(&mut self, v: u16) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
-    fn u32(&mut self, v: u32) {
+    pub(crate) fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
-    fn u64(&mut self, v: u64) {
+    pub(crate) fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
-    fn i32(&mut self, v: i32) {
+    pub(crate) fn i32(&mut self, v: i32) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
-    fn bytes(&mut self, b: &[u8]) {
+    pub(crate) fn bytes(&mut self, b: &[u8]) {
         self.u32(b.len() as u32);
         self.0.extend_from_slice(b);
     }
-    fn str(&mut self, s: &str) {
+    pub(crate) fn str(&mut self, s: &str) {
         self.bytes(s.as_bytes());
     }
-    fn size(&mut self, s: &WinSize) {
+    pub(crate) fn size(&mut self, s: &WinSize) {
         self.u16(s.cols);
         self.u16(s.rows);
         self.u16(s.xpixel);
@@ -258,13 +261,19 @@ impl W<'_> {
     }
 }
 
-struct R<'a> {
+/// The field decoder that reads what [`W`] writes, every field named for
+/// the error that says it was cut short.
+pub(crate) struct R<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> R<'a> {
-    fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], ProtoError> {
+    /// A decoder over one frame's payload.
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        R { buf, pos: 0 }
+    }
+    pub(crate) fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], ProtoError> {
         if self.buf.len() - self.pos < n {
             return Err(ProtoError::Truncated(what));
         }
@@ -272,26 +281,26 @@ impl<'a> R<'a> {
         self.pos += n;
         Ok(s)
     }
-    fn u8(&mut self, what: &'static str) -> Result<u8, ProtoError> {
+    pub(crate) fn u8(&mut self, what: &'static str) -> Result<u8, ProtoError> {
         Ok(self.take(1, what)?[0])
     }
-    fn u16(&mut self, what: &'static str) -> Result<u16, ProtoError> {
+    pub(crate) fn u16(&mut self, what: &'static str) -> Result<u16, ProtoError> {
         Ok(u16::from_be_bytes(self.take(2, what)?.try_into().unwrap()))
     }
-    fn u32(&mut self, what: &'static str) -> Result<u32, ProtoError> {
+    pub(crate) fn u32(&mut self, what: &'static str) -> Result<u32, ProtoError> {
         Ok(u32::from_be_bytes(self.take(4, what)?.try_into().unwrap()))
     }
-    fn u64(&mut self, what: &'static str) -> Result<u64, ProtoError> {
+    pub(crate) fn u64(&mut self, what: &'static str) -> Result<u64, ProtoError> {
         Ok(u64::from_be_bytes(self.take(8, what)?.try_into().unwrap()))
     }
-    fn i32(&mut self, what: &'static str) -> Result<i32, ProtoError> {
+    pub(crate) fn i32(&mut self, what: &'static str) -> Result<i32, ProtoError> {
         Ok(i32::from_be_bytes(self.take(4, what)?.try_into().unwrap()))
     }
-    fn bytes(&mut self, what: &'static str) -> Result<Vec<u8>, ProtoError> {
+    pub(crate) fn bytes(&mut self, what: &'static str) -> Result<Vec<u8>, ProtoError> {
         let n = self.u32(what)? as usize;
         Ok(self.take(n, what)?.to_vec())
     }
-    fn str(&mut self, what: &'static str) -> Result<String, ProtoError> {
+    pub(crate) fn str(&mut self, what: &'static str) -> Result<String, ProtoError> {
         String::from_utf8(self.bytes(what)?).map_err(|_| ProtoError::BadUtf8)
     }
     /// A session name, held to the grammar of DESIGN §4.1 on the way in as
@@ -299,21 +308,21 @@ impl<'a> R<'a> {
     /// an honest peer never sends anything else; a name that breaks the
     /// grammar is a malformed frame, exactly as bad UTF-8 is, and the
     /// client refuses it rather than printing it or handing it back.
-    fn name(&mut self, what: &'static str) -> Result<String, ProtoError> {
+    pub(crate) fn name(&mut self, what: &'static str) -> Result<String, ProtoError> {
         let s = self.str(what)?;
         match crate::session::validate_name(&s) {
             Ok(()) => Ok(s),
             Err(_) => Err(ProtoError::BadValue(what)),
         }
     }
-    fn bool(&mut self, what: &'static str) -> Result<bool, ProtoError> {
+    pub(crate) fn bool(&mut self, what: &'static str) -> Result<bool, ProtoError> {
         match self.u8(what)? {
             0 => Ok(false),
             1 => Ok(true),
             _ => Err(ProtoError::BadValue(what)),
         }
     }
-    fn size(&mut self) -> Result<WinSize, ProtoError> {
+    pub(crate) fn size(&mut self) -> Result<WinSize, ProtoError> {
         Ok(WinSize {
             cols: self.u16("cols")?,
             rows: self.u16("rows")?,
@@ -321,7 +330,7 @@ impl<'a> R<'a> {
             ypixel: self.u16("ypixel")?,
         })
     }
-    fn done(&self, t: u8) -> Result<(), ProtoError> {
+    pub(crate) fn done(&self, t: u8) -> Result<(), ProtoError> {
         if self.pos == self.buf.len() {
             Ok(())
         } else {
@@ -522,7 +531,7 @@ impl Msg {
     }
 
     fn decode(t: u8, p: &[u8]) -> Result<Msg, ProtoError> {
-        let mut r = R { buf: p, pos: 0 };
+        let mut r = R::new(p);
         let m = match t {
             ty::HELLO => {
                 let proto = r.u16("proto")?;
@@ -676,7 +685,24 @@ impl Decoder {
         Ok(avail.get(HEADER..HEADER + len).map(|p| (avail[0], p)))
     }
 
-    /// Next complete message, `Ok(None)` if more bytes are needed.
+    /// The next whole frame, consumed: its type and its payload, borrowed
+    /// from the decoder's buffer. `Ok(None)` if it is not all here yet;
+    /// over [`MAX_FRAME`] is refused from the header alone. This is the
+    /// frame splitter any message set over these frames decodes from;
+    /// what the type means is the caller's.
+    pub fn next_frame(&mut self) -> Result<Option<(u8, &[u8])>, ProtoError> {
+        let Some((t, p)) = self.frame()? else {
+            return Ok(None);
+        };
+        let from = self.start + HEADER;
+        self.start = from + p.len();
+        Ok(Some((t, &self.buf[from..self.start])))
+    }
+
+    /// Next complete message, `Ok(None)` if more bytes are needed. Unlike
+    /// [`next_frame`](Self::next_frame), a frame that does not decode is
+    /// left where it is, so [`take_rest`](Self::take_rest) still hands it
+    /// on whole.
     pub fn next_msg(&mut self) -> Result<Option<Msg>, ProtoError> {
         let Some((t, p)) = self.frame()? else {
             return Ok(None);
@@ -1050,6 +1076,83 @@ mod tests {
             }
         }
         assert_eq!(got, samples());
+    }
+
+    /// `next_frame` is the splitter another message set decodes from: the
+    /// frames it lends decode to what `next_msg` gives, at every split
+    /// point, and it leaves nothing behind.
+    #[test]
+    fn next_frame_splits_what_next_msg_decodes_at_every_split_point() {
+        let mut stream = Vec::new();
+        for m in samples() {
+            m.encode(&mut stream);
+        }
+        for split in 0..=stream.len() {
+            let mut d = Decoder::new();
+            let mut got = Vec::new();
+            for part in [&stream[..split], &stream[split..]] {
+                d.push(part);
+                while let Some((t, p)) = d.next_frame().unwrap() {
+                    got.push(Msg::decode(t, p).unwrap());
+                }
+            }
+            assert_eq!(got, samples(), "split at {split}");
+            assert_eq!(d.pending(), 0, "split at {split}");
+        }
+    }
+
+    /// `next_frame` lends a frame of any type, one `Msg` does not know
+    /// included, consumes it whole, and refuses an oversize one from its
+    /// header — while `next_msg` leaves a frame it cannot decode in place.
+    #[test]
+    fn next_frame_takes_any_type_and_keeps_the_frame_limit() {
+        let frame = [200, 0, 0, 0, 2, 7, 8];
+        let mut d = Decoder::new();
+        d.push(&frame);
+        assert!(matches!(d.next_msg(), Err(ProtoError::UnknownType(200))));
+        assert_eq!(d.pending(), frame.len(), "next_msg keeps what it refuses");
+        assert_eq!(d.next_frame().unwrap(), Some((200, &[7u8, 8][..])));
+        assert_eq!(d.pending(), 0);
+        assert_eq!(d.next_frame().unwrap(), None);
+
+        let mut d = Decoder::new();
+        d.push(&[200, 0, 0]);
+        assert_eq!(d.next_frame().unwrap(), None, "half a header");
+        d.push(&[0, 1]);
+        assert_eq!(d.next_frame().unwrap(), None, "header, no payload");
+        d.push(&[9]);
+        assert_eq!(d.next_frame().unwrap(), Some((200, &[9u8][..])));
+
+        let mut d = Decoder::new();
+        let mut hdr = vec![ty::HELLO];
+        hdr.extend_from_slice(&((MAX_FRAME as u32) + 1).to_be_bytes());
+        d.push(&hdr);
+        assert_eq!(d.next_frame(), Err(ProtoError::TooLarge(MAX_FRAME + 1)));
+    }
+
+    /// The field codec another message set encodes with: what `W` writes,
+    /// `R` reads back, and a short payload names the field it was cut in.
+    #[test]
+    fn the_field_codec_round_trips() {
+        let mut out = Vec::new();
+        let mut w = W(&mut out);
+        w.u8(1);
+        w.u16(2);
+        w.u32(3);
+        w.u64(4);
+        w.i32(-5);
+        w.bytes(b"six");
+        w.str("seven");
+        let mut r = R::new(&out);
+        assert_eq!(r.u8("a"), Ok(1));
+        assert_eq!(r.u16("b"), Ok(2));
+        assert_eq!(r.u32("c"), Ok(3));
+        assert_eq!(r.u64("d"), Ok(4));
+        assert_eq!(r.i32("e"), Ok(-5));
+        assert_eq!(r.bytes("f").as_deref(), Ok(&b"six"[..]));
+        assert_eq!(r.str("g").as_deref(), Ok("seven"));
+        assert_eq!(r.done(0), Ok(()));
+        assert_eq!(r.u8("h"), Err(ProtoError::Truncated("h")));
     }
 
     /// `encode_input` is one `Msg::Input` per `MAX_CHUNK` of the bytes,

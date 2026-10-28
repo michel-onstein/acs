@@ -73,9 +73,30 @@ pub enum Role {
     List,
     /// Background check for a newer release, started by the client.
     UpdateCheck,
+    /// `acscp …` or `acs cp …`: copy files to and from a host. The name is
+    /// taken; the copy itself is not built yet.
+    Copy,
 }
 
 impl Role {
+    /// The role of a process started with `args`, the program name first:
+    /// an underscore-prefixed first argument keeps its hidden role whatever
+    /// the binary is called; then a binary called [`layout::COPY_NAME`]
+    /// copies; anything else is [`from_first_arg`](Self::from_first_arg).
+    pub fn from_argv(args: &[OsString]) -> Role {
+        let first = args.get(1);
+        if first.is_some_and(|a| a.as_encoded_bytes().starts_with(b"_")) {
+            return Role::from_first_arg(first);
+        }
+        let name = args
+            .first()
+            .and_then(|a| std::path::Path::new(a).file_name());
+        if name.is_some_and(|n| n == layout::COPY_NAME) {
+            return Role::Copy;
+        }
+        Role::from_first_arg(first)
+    }
+
     /// Hidden roles are selected by an underscore-prefixed first argument, so
     /// they can never collide with a host name.
     pub fn from_first_arg(arg: Option<&OsString>) -> Role {
@@ -86,11 +107,12 @@ impl Role {
             Some("_update-check") => Role::UpdateCheck,
             Some("_version") | Some("--version") | Some("-V") => Role::Version,
             // Reserved words, only as the very first argument: a host
-            // called `config`, `upgrade` or `list` is still reachable as
-            // `user@config`, or with any option before it.
+            // called `config`, `upgrade`, `list` or `cp` is still reachable
+            // as `user@config`, or with any option before it.
             Some("config") => Role::Config,
             Some("upgrade") => Role::Upgrade,
             Some("list") => Role::List,
+            Some("cp") => Role::Copy,
             _ => Role::Client,
         }
     }
@@ -126,7 +148,7 @@ pub fn print_version() {
 
 /// Entry point shared by `main` and the integration tests.
 pub fn run(args: Vec<OsString>) -> ExitCode {
-    let role = Role::from_first_arg(args.get(1));
+    let role = Role::from_argv(&args);
     match role {
         Role::Version => {
             print_version();
@@ -140,6 +162,10 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         Role::Config => config_cmd::main(&args[2..]),
         Role::Upgrade => upgrade::main(&args[2..]),
         Role::UpdateCheck => update_check::check_main(),
+        Role::Copy => {
+            eprintln!("acs: copying files is not built yet");
+            ExitCode::from(client::code::USAGE)
+        }
     }
 }
 
@@ -174,9 +200,59 @@ mod tests {
         assert_eq!(role("config"), Role::Config);
         assert_eq!(role("upgrade"), Role::Upgrade);
         assert_eq!(role("list"), Role::List);
+        assert_eq!(role("cp"), Role::Copy);
         assert_eq!(Role::from_first_arg(None), Role::Client);
         // A host of that name: as user@list, or behind an option.
         assert_eq!(role("me@list"), Role::Client);
+        assert_eq!(role("me@cp"), Role::Client);
         assert_eq!(role("-v"), Role::Client);
+    }
+
+    fn argv(args: &[&str]) -> Role {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        Role::from_argv(&args)
+    }
+
+    /// Run as `acscp`, by any path, the binary copies — whatever the first
+    /// argument, a reserved word or a host included.
+    #[test]
+    fn the_acscp_name_is_the_copy() {
+        for name in ["acscp", "/usr/local/bin/acscp", "../bin/acscp"] {
+            assert_eq!(argv(&[name]), Role::Copy, "{name}");
+            for first in ["box:f", "-r", "list", "config", "--version", "devbox"] {
+                assert_eq!(argv(&[name, first, "."]), Role::Copy, "{name} {first}");
+            }
+        }
+        // `acs cp` is the same role without the second name.
+        assert_eq!(argv(&["acs", "cp", "box:f", "."]), Role::Copy);
+        assert_eq!(argv(&["/opt/acs/acs", "cp"]), Role::Copy);
+    }
+
+    /// The hidden roles are the process's whatever it is called: the
+    /// remote may run the binary through an `acscp` link too.
+    #[test]
+    fn hidden_roles_win_over_the_acscp_name() {
+        assert_eq!(argv(&["acscp", "_proxy"]), Role::Proxy);
+        assert_eq!(argv(&["/x/acscp", "_master", "s"]), Role::Master);
+        assert_eq!(argv(&["acscp", "_version"]), Role::Version);
+    }
+
+    /// Under the name `acs`, or any name but `acscp`, the roles are what
+    /// the first argument has always chosen.
+    #[test]
+    fn other_names_keep_the_first_argument_roles() {
+        for name in ["acs", "/usr/local/bin/acs", "acs-dev", "acscp2", "xacscp"] {
+            assert_eq!(argv(&[name]), Role::Client, "{name}");
+            assert_eq!(argv(&[name, "devbox"]), Role::Client, "{name}");
+            assert_eq!(argv(&[name, "list"]), Role::List, "{name}");
+            assert_eq!(argv(&[name, "config"]), Role::Config, "{name}");
+            assert_eq!(argv(&[name, "upgrade"]), Role::Upgrade, "{name}");
+            assert_eq!(argv(&[name, "-V"]), Role::Version, "{name}");
+            assert_eq!(argv(&[name, "_proxy"]), Role::Proxy, "{name}");
+            assert_eq!(argv(&[name, "me@cp"]), Role::Client, "{name}");
+        }
+        // An acscp directory is not an acscp binary.
+        assert_eq!(argv(&["/opt/acscp/acs", "devbox"]), Role::Client);
+        assert_eq!(argv(&[]), Role::Client);
     }
 }

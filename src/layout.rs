@@ -38,6 +38,9 @@ pub const USER_BIN: &str = ".local/bin";
 pub const SYSTEM_ROOT: &str = system_root_str!();
 /// The system-wide link directory.
 pub const SYSTEM_BIN: &str = "/usr/local/bin";
+/// The second name of the acs binary: run as `acscp`, it copies files
+/// (the copy role, `acs cp`).
+pub const COPY_NAME: &str = "acscp";
 
 // The three below are inlined: out of line, each costs the slim build an
 // unwind entry for a single `join`.

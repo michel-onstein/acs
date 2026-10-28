@@ -2257,10 +2257,12 @@ their YAML shape:
   alias that has no host yet says to add one first.
 - Removing something that lives in the other file fails with a pointer to it
   (`it is set in /etc/acs/config.yaml:1 (use --global)`).
-- `config` is a reserved **first** argument (as are `upgrade`, §7.5, and
-  `list`, §7). A host literally called `config` (or `upgrade`, or `list`) is
-  reached as `user@config`, or with any option before it
-  (`acs -p 22 config`); `acs list list` lists a host called `list`.
+- `config` is a reserved **first** argument (as are `upgrade`, §7.5,
+  `list`, §7, and `cp`, kept for copying files, which is not built yet). A
+  host literally called `config` (or `upgrade`, `list` or `cp`) is reached
+  as `user@config`, or with any option before it (`acs -p 22 config`);
+  `acs list list` lists a host called `list`. The binary run under the name
+  `acscp` is reserved the same way, for the copy.
 
 ### 7.5 `acs upgrade`
 
