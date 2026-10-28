@@ -457,10 +457,12 @@ pub fn start_master(
 ///
 /// **It stays 30 s, on purpose (acs-hsw, DESIGN §9.1 and decision 11).**
 /// It is not a free lever: the suite proves "only X can have happened" by
-/// waiting at most `T` against timers sized to outlast it — a minute of
-/// master liveness, `reachability_timeout` and silenced host, two minutes
-/// of backoff and redial, at least twice `T` each. Raising `T` alone turns
-/// those into races, so it moves only together with all of them. And the
+/// waiting at most `T` against timers sized to outlast it — master
+/// liveness, `reachability_timeout` and a silenced host at
+/// [`OUTLAST_ONE_WAIT`], backoff and redial at [`OUTLAST_TWO_WAITS`].
+/// Those are derived from `T` (acs-3sk9), so moving it is this one edit;
+/// the tests that read a timer back (`reconnecting in 120s`) format it
+/// from the same constant. And the
 /// evidence (acs-2dc) says it would buy little: the suite is green at a
 /// load average of 20 with no I/O pressure; what reds it is a dial starved
 /// of I/O — two shells and a cold debug binary — which no deadline short
@@ -469,6 +471,31 @@ pub fn start_master(
 /// it) is re-run alone before it is read, and one that is red idle is a
 /// bug — as acs-br2's "only under load" turned out to be.
 pub const T: Duration = Duration::from_secs(30);
+
+/// A timer a test proves did **not** fire by waiting at most [`T`] once:
+/// master liveness (`ACS_DEAD_MS`), the test network's
+/// `reachability_timeout`, a silenced host's hang, a command-key window
+/// that must outlast a held dial. Twice `T`, so the wait always ends first
+/// with a whole `T` to spare.
+pub const OUTLAST_ONE_WAIT: Duration = Duration::from_secs(T.as_secs() * 2);
+
+/// A timer a test proves did not fire across **two** waits to [`T`] in a
+/// row — typically one for `reconnecting in …` and one for what is meant
+/// to cut it short: the backoff (`ACS_BACKOFF_MS`, `ACS_EARLY_MS`) and the
+/// dial and redial timeouts. Twice [`OUTLAST_ONE_WAIT`], four times `T`.
+pub const OUTLAST_TWO_WAITS: Duration = Duration::from_secs(OUTLAST_ONE_WAIT.as_secs() * 2);
+
+/// `d` in milliseconds, the way the `ACS_*_MS` variables take it.
+pub fn ms(d: Duration) -> String {
+    d.as_millis().to_string()
+}
+
+/// `d` in whole seconds with an `s`, the way the client prints a timer
+/// (`reconnecting in 120s`) and the configuration takes one
+/// (`reachability_timeout: 60s`).
+pub fn secs(d: Duration) -> String {
+    format!("{}s", d.as_secs())
+}
 
 /// How long [`poll`] sleeps between looks.
 pub const POLL_EVERY: Duration = Duration::from_millis(20);
@@ -556,18 +583,26 @@ mod tests {
         assert!(!alive(pid), "child {pid} still running");
     }
 
-    /// acs-hsw: [`super::T`] is at most half the minute the suite's
-    /// outlasting timers give (master liveness, `reachability_timeout`, a
-    /// silenced host), so a wait to `T` still ends before any of them can.
-    /// Raising it means raising those with it — read the comment at `T`.
+    /// acs-hsw, acs-3sk9: [`super::T`] is at most half of every timer the
+    /// suite proves did not fire, so a wait to `T` — or two in a row, for
+    /// the longer ones — still ends before any of them can. The timers are
+    /// derived from `T`; this holds the relation if one is ever written
+    /// out by hand again.
     #[test]
-    fn the_deadline_stays_under_half_the_suites_minute_timers() {
-        let minute = std::time::Duration::from_secs(60);
+    fn the_deadline_stays_under_half_the_suites_outlasting_timers() {
+        use super::{ms, secs, OUTLAST_ONE_WAIT, OUTLAST_TWO_WAITS, T};
+        assert!(T * 2 <= OUTLAST_ONE_WAIT, "{T:?} vs {OUTLAST_ONE_WAIT:?}");
         assert!(
-            super::T * 2 <= minute,
-            "T = {:?}: move the 60 s and 120 s timers in tests/ with it",
-            super::T
+            OUTLAST_ONE_WAIT * 2 <= OUTLAST_TWO_WAITS,
+            "{OUTLAST_ONE_WAIT:?} vs {OUTLAST_TWO_WAITS:?}"
         );
+        // Whole seconds, so `secs` names the very timer `ms` set: the
+        // client's `reconnecting in 120s` rounds nothing away.
+        for d in [T, OUTLAST_ONE_WAIT, OUTLAST_TWO_WAITS] {
+            assert_eq!(d.subsec_nanos(), 0, "{d:?}");
+            assert_eq!(ms(d), format!("{}000", d.as_secs()));
+            assert_eq!(secs(d), format!("{}s", d.as_secs()));
+        }
     }
 
     /// `poll` hands back what `f` found, on the try that found it.

@@ -276,12 +276,15 @@ fn double_tap(c: &Client) {
 /// The window to choose the command key after a double tap, as wide as the
 /// rest of the suite's waits: `ACS_ESCAPE_TIMEOUT_MS` sets it (acs-mq0),
 /// so the `d` these tests send after a pause is not racing the default 2 s.
-const WIDE: (&str, &str) = ("ACS_ESCAPE_TIMEOUT_MS", "30000");
+fn wide() -> (&'static str, &'static str) {
+    static WIDE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| ms(T));
+    ("ACS_ESCAPE_TIMEOUT_MS", WIDE.as_str())
+}
 
 #[test]
 fn arming_command_mode_rings_the_bell() {
     let remote = Remote::installed();
-    let mut c = start_env(&remote, "bell", "echo started; sleep 30", &[WIDE]);
+    let mut c = start_env(&remote, "bell", "echo started; sleep 30", &[wide()]);
     c.wait_for("started", T);
     assert!(!c.output().contains(&0x07));
     double_tap(&c);
@@ -303,7 +306,7 @@ fn the_bell_setting_and_its_environment_override() {
         ([&off[..], &[("ACS_COMMAND_BELL", "1")]].concat(), true),
     ];
     for (env, bell) in cases {
-        let env = [&env[..], &[WIDE]].concat();
+        let env = [&env[..], &[wide()]].concat();
         let remote = Remote::installed();
         let mut c = start_env(&remote, "nb", "echo started; sleep 30", &env);
         c.wait_for("started", T);
@@ -342,7 +345,7 @@ fn the_bell_waits_for_the_programs_osc_to_end() {
         "printf 'A\\033]2;ti'; read x < {}; printf 'tle\\033\\\\B'; sleep 30",
         gate.display()
     );
-    let mut c = start_env(&remote, "osc", &cmd, &[WIDE]);
+    let mut c = start_env(&remote, "osc", &cmd, &[wide()]);
     c.wait_for("A\x1b]2;ti", T);
     double_tap(&c);
     std::thread::sleep(Duration::from_millis(1000));

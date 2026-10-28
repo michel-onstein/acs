@@ -76,7 +76,7 @@ const RING_FRAMES: u64 = 5;
 /// acs-iyq: the first redial after a drop waits for nothing, so a momentary
 /// drop costs the dial and no more.
 ///
-/// The backoff is two minutes — longer than every deadline in the suite, as
+/// The backoff is four times `T` — longer than every deadline in the suite, as
 /// acs-7wu left it — so a client that waited even its *first* step could not
 /// be back inside `T` however fast the machine is. Nothing here is timed:
 /// resuming at all is the assertion, and the clock it is read against is the
@@ -84,7 +84,12 @@ const RING_FRAMES: u64 = 5;
 #[test]
 fn the_first_redial_after_a_drop_does_not_wait() {
     let remote = Remote::installed();
-    let mut c = start(&remote, "now", TICKER, &[("ACS_BACKOFF_MS", "120000")]);
+    let mut c = start(
+        &remote,
+        "now",
+        TICKER,
+        &[("ACS_BACKOFF_MS", ms(OUTLAST_TWO_WAITS).as_str())],
+    );
     c.wait_for("#20#", T);
     remote.cut_link();
     c.wait_resumed();
@@ -158,9 +163,9 @@ fn a_client_busy_with_output_answers_the_masters_ping() {
 #[test]
 fn frozen_link_is_declared_dead_and_replaced() {
     let remote = Remote::installed();
-    // The master keeps its own liveness (acs-ode); a minute of it, so the
+    // The master keeps its own liveness (acs-ode); twice `T` of it, so the
     // one judgement on trial here is the client's.
-    remote.remote_env(&[("ACS_DEAD_MS", "60000")]);
+    remote.remote_env(&[("ACS_DEAD_MS", ms(OUTLAST_ONE_WAIT).as_str())]);
     let mut env: Vec<(String, String)> = FAST
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -296,9 +301,12 @@ fn a_stalled_terminal_is_not_a_dead_link() {
     /// Three times `FAST`'s `ACS_DEAD_MS`.
     const STUCK: Duration = Duration::from_millis(2400);
     let remote = Remote::installed();
-    // The master keeps its client for a minute (it has its own liveness,
+    // The master keeps its client for twice `T` (it has its own liveness,
     // acs-ode); this is about the client's judgement of the master.
-    remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
+    remote.remote_env(&[
+        ("ACS_DEAD_MS", ms(OUTLAST_ONE_WAIT).as_str()),
+        ("ACS_PING_MS", ms(OUTLAST_ONE_WAIT / 3).as_str()),
+    ]);
     let go = remote.root.path().join("go");
     let size = remote.root.path().join("size");
     let mut c = start(
@@ -365,7 +373,7 @@ fn a_stalled_terminal_is_not_a_dead_link() {
 /// when the wait expires — which is what the elapsed bound distinguishes, so
 /// it stays a bound on elapsed time (acs-7wu).
 ///
-/// What changed is the room it has: two minutes of backoff against the
+/// What changed is the room it has: four times `T` of backoff against the
 /// suite's own `T`, where it was 20 s against 5 s. The same statement — an
 /// exit a quarter of the way into the wait cannot be the wait ending — with
 /// six times the slack. `T` rather than a number of its own is the point:
@@ -380,14 +388,14 @@ fn detach_works_while_the_link_is_down() {
         &remote,
         "dd",
         "echo up; sleep 30",
-        &[("ACS_BACKOFF_MS", "120000")],
+        &[("ACS_BACKOFF_MS", ms(OUTLAST_TWO_WAITS).as_str())],
     );
     c.wait_for("up", T);
     // The network is down, not merely the link: the free first redial
     // (acs-iyq) is refused, and the client is in its wait once it says so.
     remote.refuse_one_dial();
     remote.cut_link();
-    c.wait_for("reconnecting in 120s", T);
+    c.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
     let t0 = Instant::now();
     c.send(&command(b'd'));
     assert_eq!(c.wait(T), 0);
@@ -461,15 +469,16 @@ fn ctrl_c_during_a_redial_clears_the_status_line() {
 /// the wait between dials. The redial is held for good — only the keys can
 /// end it — and `x` says it needs the link before `d` detaches.
 ///
-/// The redial timeout is two minutes, longer than every deadline in the
+/// The redial timeout is four times `T`, longer than every deadline in the
 /// suite: a client that only read the keys once the dial gave up — which
 /// is what it did, the cooked terminal handing them over late — cannot
 /// pass inside `T`.
 #[test]
 fn detach_works_during_a_redial() {
     let remote = Remote::installed();
+    let redial = ms(OUTLAST_TWO_WAITS);
     let mut env = FAST.to_vec();
-    env.push(("ACS_REDIAL_TIMEOUT_MS", "120000"));
+    env.push(("ACS_REDIAL_TIMEOUT_MS", &redial));
     let mut c = start(&remote, "dr", "echo up; sleep 30", &env);
     c.wait_for("up", T);
     remote.hold_dial();
@@ -663,7 +672,7 @@ fn modes_on_before_a_gap_are_reset_on_detach() {
 /// Regression (acs-xk4): when the session is another program by the time the
 /// client is back, the old program's modes are reset before it is forgotten.
 ///
-/// The first client's wait is two minutes, and what ends it is the test
+/// The first client's wait is four times `T`, and what ends it is the test
 /// saying so — a network change (acs-6p8) once the replacement session is
 /// in place — rather than the wait running out (acs-ryz). It was three
 /// seconds, and everything between the cut and the redial had to happen
@@ -679,7 +688,7 @@ fn modes_of_a_restarted_session_are_reset() {
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    env.push(("ACS_BACKOFF_MS".to_string(), "120000".to_string()));
+    env.push(("ACS_BACKOFF_MS".to_string(), ms(OUTLAST_TWO_WAITS)));
     env.extend(watch.env());
     let mut a = start(
         &remote,
@@ -693,7 +702,7 @@ fn modes_of_a_restarted_session_are_reset() {
     // left in a wait that outlasts every deadline in the suite.
     remote.refuse_one_dial();
     remote.cut_link();
-    a.wait_for("reconnecting in 120s", T);
+    a.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
     // The first program ends while the link is down; another takes its name.
     wait_until(
         T,
@@ -721,7 +730,7 @@ fn modes_of_a_restarted_session_are_reset() {
 }
 
 /// A network change redials out of the offline wait instead of sitting it
-/// out — again a statement about elapsed time, and again with two minutes of
+/// out — again a statement about elapsed time, and again with four times `T` of
 /// backoff against `T` rather than 20 s against 5 s (acs-7wu).
 ///
 /// The change is a real one: the machine is on different networks than it
@@ -731,16 +740,16 @@ fn modes_of_a_restarted_session_are_reset() {
 fn a_network_change_redials_at_once() {
     let remote = Remote::installed();
     let watch = NetWatch::new("192.168.1.5/24\n");
-    let mut env = vec![("ACS_BACKOFF_MS".to_string(), "120000".to_string())];
+    let mut env = vec![("ACS_BACKOFF_MS".to_string(), ms(OUTLAST_TWO_WAITS))];
     env.extend(watch.env());
     let mut c = start(&remote, "net", TICKER, &refs(&env));
     c.wait_for("#10#", T);
     // The network is down: the free first redial (acs-iyq) is refused, and
-    // the two minutes of backoff behind it are what the watcher then has to
+    // the four times `T` of backoff behind it are what the watcher then has to
     // cut short for this to mean anything.
     remote.refuse_one_dial();
     remote.cut_link();
-    c.wait_for("reconnecting in 120s", T);
+    c.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
     let dialled = remote.connections();
     let t0 = Instant::now();
     // Wi-Fi came back on another network: the watcher fires, and this
@@ -765,7 +774,7 @@ fn a_network_change_redials_at_once() {
 /// — so a client sitting out an outage redialled over and over, and every
 /// key typed at one of those moments was discarded on the `WELCOME` that
 /// followed (DESIGN §5.2). That is what made three tests in this file fail
-/// together on a cold full-parallel run with two minutes of backoff
+/// together on a cold full-parallel run with four times `T` of backoff
 /// configured, and on a real laptop it is the promise of §5.2 broken:
 /// `d` typed during an outage does nothing at all.
 ///
@@ -779,7 +788,7 @@ fn a_network_change_redials_at_once() {
 fn a_hint_that_changed_no_network_does_not_cut_the_wait_short() {
     let remote = Remote::installed();
     let watch = NetWatch::new("192.168.1.5/24\n");
-    let mut env = vec![("ACS_BACKOFF_MS".to_string(), "120000".to_string())];
+    let mut env = vec![("ACS_BACKOFF_MS".to_string(), ms(OUTLAST_TWO_WAITS))];
     env.extend(watch.env());
     // The program outlasts `T`, so exiting 0 can only be the detach and
     // not the session ending under a client that redialled and resumed.
@@ -787,7 +796,7 @@ fn a_hint_that_changed_no_network_does_not_cut_the_wait_short() {
     c.wait_for("up", T);
     remote.refuse_one_dial();
     remote.cut_link();
-    c.wait_for("reconnecting in 120s", T);
+    c.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
     let dialled = remote.connections();
     // The kernel says something about the network, and this machine is on
     // exactly the networks it was on: nothing to redial for.
@@ -810,7 +819,7 @@ fn a_hint_that_changed_no_network_does_not_cut_the_wait_short() {
 /// acs-ft1: the watcher is polled while the link is *up* too, and what a
 /// change buys there is a question, not a redial.
 ///
-/// The dead-link timeout is a minute here, so nothing but the network
+/// The dead-link timeout is twice `T` here, so nothing but the network
 /// change can end this link inside `T` — and the client's own clock cannot
 /// reach it either, which is exactly the laptop-wake case the watcher is
 /// for (`sys::now_ms` is monotonic and stops with the machine, so the sleep
@@ -824,8 +833,8 @@ fn a_network_change_ends_a_frozen_link_without_the_dead_timeout() {
     let watch = NetWatch::new("192.168.1.5/24\n");
     let mut env = vec![
         ("ACS_BACKOFF_MS".to_string(), "100".to_string()),
-        ("ACS_PING_MS".to_string(), "20000".to_string()),
-        ("ACS_DEAD_MS".to_string(), "60000".to_string()),
+        ("ACS_PING_MS".to_string(), ms(OUTLAST_ONE_WAIT / 3)),
+        ("ACS_DEAD_MS".to_string(), ms(OUTLAST_ONE_WAIT)),
     ];
     env.extend(watch.env());
     let mut c = start(&remote, "wake", TICKER, &refs(&env));
@@ -864,7 +873,7 @@ fn a_network_change_ends_a_frozen_link_without_the_dead_timeout() {
 /// Nothing here is timed. `SIGSTOP` on the client *is* the starved
 /// machine, applied on purpose rather than waited for, and the host is
 /// frozen before the hint so it can answer nothing after it: inside `T`,
-/// against a minute of `ACS_DEAD_MS`, only the change can end this link.
+/// against twice `T` of `ACS_DEAD_MS`, only the change can end this link.
 ///
 /// Two things make the order the scheduler's business rather than luck.
 /// The host is held at a gate of its own until the client has been
@@ -883,15 +892,18 @@ fn bytes_in_flight_when_the_network_moved_do_not_answer_the_netcheck() {
     let remote = Remote::installed();
     // The master keeps a client that is not reading (it has its own
     // liveness, acs-ode); this is about the client's judgement of the host.
-    remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
+    remote.remote_env(&[
+        ("ACS_DEAD_MS", ms(OUTLAST_ONE_WAIT).as_str()),
+        ("ACS_PING_MS", ms(OUTLAST_ONE_WAIT / 3).as_str()),
+    ]);
     let ticks = remote.root.path().join("ticks");
     let gate = remote.root.path().join("gate");
     make_fifo(&gate);
     let watch = NetWatch::new("192.168.1.5/24\n");
     let mut env = vec![
         ("ACS_BACKOFF_MS".to_string(), "100".to_string()),
-        ("ACS_PING_MS".to_string(), "20000".to_string()),
-        ("ACS_DEAD_MS".to_string(), "60000".to_string()),
+        ("ACS_PING_MS".to_string(), ms(OUTLAST_ONE_WAIT / 3)),
+        ("ACS_DEAD_MS".to_string(), ms(OUTLAST_ONE_WAIT)),
     ];
     env.extend(watch.env());
     // The ticker of the test above, tapping the remote's own filesystem for
@@ -955,14 +967,17 @@ fn a_terminal_stall_during_a_netcheck_is_not_a_dead_link() {
     let remote = Remote::installed();
     // The master keeps a client that is not reading (acs-ode); this is
     // about the client's judgement of the host.
-    remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
+    remote.remote_env(&[
+        ("ACS_DEAD_MS", ms(OUTLAST_ONE_WAIT).as_str()),
+        ("ACS_PING_MS", ms(OUTLAST_ONE_WAIT / 3).as_str()),
+    ]);
     let go = remote.root.path().join("go");
     let ticks = remote.root.path().join("ticks");
     let watch = NetWatch::new("192.168.1.5/24\n");
     let mut env = vec![
         ("ACS_BACKOFF_MS".to_string(), "100".to_string()),
-        ("ACS_PING_MS".to_string(), "20000".to_string()),
-        ("ACS_DEAD_MS".to_string(), "60000".to_string()),
+        ("ACS_PING_MS".to_string(), ms(OUTLAST_ONE_WAIT / 3)),
+        ("ACS_DEAD_MS".to_string(), ms(OUTLAST_ONE_WAIT)),
         ("ACS_NETCHECK_MS".to_string(), "3000".to_string()),
     ];
     env.extend(watch.env());
@@ -1060,15 +1075,15 @@ fn a_network_change_on_a_live_link_costs_nothing() {
 ///
 /// The line is a reader of the decision and not part of it, which is what
 /// the rest of this test says: the hint that produced it changed no
-/// network, so the wait it landed in still runs to its deadline. Two
-/// minutes of backoff against `T`, as acs-7wu left it, and nothing is timed
+/// network, so the wait it landed in still runs to its deadline. Four
+/// times `T` of backoff against `T`, as acs-7wu left it, and nothing is timed
 /// — the detach at the end is the proof, since a wait cut short puts the
 /// client in a redial where what is typed is flushed rather than read.
 #[test]
 fn under_v_a_hint_that_changed_nothing_says_so_and_still_ends_nothing() {
     let remote = Remote::installed();
     let watch = NetWatch::new("192.168.1.5/24\n");
-    let mut env = vec![("ACS_BACKOFF_MS".to_string(), "120000".to_string())];
+    let mut env = vec![("ACS_BACKOFF_MS".to_string(), ms(OUTLAST_TWO_WAITS))];
     env.extend(watch.env());
     let mut c = Client::start_env(
         &remote,
@@ -1090,7 +1105,7 @@ fn under_v_a_hint_that_changed_nothing_says_so_and_still_ends_nothing() {
     c.wait_for("up", T);
     remote.refuse_one_dial();
     remote.cut_link();
-    c.wait_for("reconnecting in 120s", T);
+    c.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
     let dialled = remote.connections();
     // The kernel says something while this machine is on the networks it
     // was on. Without `-v` that is silence; with it, a line.
@@ -1121,7 +1136,7 @@ fn under_v_a_hint_that_changed_nothing_says_so_and_still_ends_nothing() {
 fn under_v_a_real_change_names_the_networks_and_still_redials() {
     let remote = Remote::installed();
     let watch = NetWatch::new("192.168.1.5/24\n");
-    let mut env = vec![("ACS_BACKOFF_MS".to_string(), "120000".to_string())];
+    let mut env = vec![("ACS_BACKOFF_MS".to_string(), ms(OUTLAST_TWO_WAITS))];
     env.extend(watch.env());
     let mut c = Client::start_env(
         &remote,
@@ -1131,12 +1146,12 @@ fn under_v_a_real_change_names_the_networks_and_still_redials() {
     c.wait_for("#10#", T);
     remote.refuse_one_dial();
     remote.cut_link();
-    c.wait_for("reconnecting in 120s", T);
+    c.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
     let dialled = remote.connections();
     watch.set_networks("10.0.0.5/24\n");
     watch.hint();
     c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
-    // Inside `T`, against two minutes of backoff: only the change can have
+    // Inside `T`, against four times `T` of backoff: only the change can have
     // brought this on.
     remote.wait_more_connections(dialled, 1, T);
 }
@@ -1146,8 +1161,8 @@ fn under_v_a_real_change_names_the_networks_and_still_redials() {
 /// change again, instead of being answered "not a change" against a set of
 /// networks that has already moved.
 ///
-/// The drop path is driven rather than waited for. `ACS_EARLY_MS` is two
-/// minutes here, so the rate limit is open for exactly one early redial and
+/// The drop path is driven rather than waited for. `ACS_EARLY_MS` is four
+/// times `T` here, so the rate limit is open for exactly one early redial and
 /// shut for everything after it — no wall clock decides which side of it a
 /// change lands on. The first change takes that redial (refused, so the
 /// client is back in the wait with the limit now closed); the second is
@@ -1157,7 +1172,7 @@ fn under_v_a_real_change_names_the_networks_and_still_redials() {
 /// - as it was, the second change was committed as it was read, so this
 ///   hint compared 172.16.0.5/24 against 172.16.0.5/24 and said *not a
 ///   change* — the change was not deferred, it was gone, and only the
-///   backoff (two minutes here, 30 s at worst in life) recovered it;
+///   backoff (four times `T` here, 30 s at worst in life) recovered it;
 /// - now the networks held still say 10.0.0.5/24, so the same change is
 ///   named again.
 ///
@@ -1170,8 +1185,8 @@ fn a_change_the_rate_limit_suppressed_is_offered_again() {
     let remote = Remote::installed();
     let watch = NetWatch::new("192.168.1.5/24\n");
     let mut env = vec![
-        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
-        ("ACS_EARLY_MS".to_string(), "120000".to_string()),
+        ("ACS_BACKOFF_MS".to_string(), ms(OUTLAST_TWO_WAITS)),
+        ("ACS_EARLY_MS".to_string(), ms(OUTLAST_TWO_WAITS)),
     ];
     env.extend(watch.env());
     let mut c = Client::start_env(
@@ -1183,7 +1198,7 @@ fn a_change_the_rate_limit_suppressed_is_offered_again() {
     c.wait_for("#10#", T);
     remote.refuse_one_dial();
     remote.cut_link();
-    c.wait_for("reconnecting in 120s", T);
+    c.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
     let dialled = remote.connections();
 
     // The first change takes the one early redial the limit allows. It is
@@ -1193,9 +1208,9 @@ fn a_change_the_rate_limit_suppressed_is_offered_again() {
     watch.set_networks("10.0.0.5/24\n");
     watch.hint();
     c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
-    c.wait_for("reconnecting in 120s", T);
+    c.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
 
-    // A second genuine change, inside the two minutes: read, and dropped.
+    // A second genuine change, inside the four times `T`: read, and dropped.
     watch.set_networks("172.16.0.5/24\n");
     watch.hint();
     c.wait_for("acs: network changed: 10.0.0.5/24 → 172.16.0.5/24", T);
@@ -1239,14 +1254,14 @@ fn echoing(name: &str) -> Vec<&str> {
 
 /// The environment of a handshake test: `watch`'s stand-ins, no offline
 /// wait to read a hint in its place (the free first redial goes at once,
-/// acs-iyq, and the one after it waits two minutes), and dial and redial
-/// timeouts of two minutes — four times `T`, so a client that waited one
+/// acs-iyq, and the one after it waits four times `T`), and dial and redial
+/// timeouts of four times `T` too, so a client that waited one
 /// out cannot pass anything here.
 fn handshake_env(watch: &NetWatch) -> Vec<(String, String)> {
     let mut env = vec![
-        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
-        ("ACS_DIAL_TIMEOUT_MS".to_string(), "120000".to_string()),
-        ("ACS_REDIAL_TIMEOUT_MS".to_string(), "120000".to_string()),
+        ("ACS_BACKOFF_MS".to_string(), ms(OUTLAST_TWO_WAITS)),
+        ("ACS_DIAL_TIMEOUT_MS".to_string(), ms(OUTLAST_TWO_WAITS)),
+        ("ACS_REDIAL_TIMEOUT_MS".to_string(), ms(OUTLAST_TWO_WAITS)),
     ];
     env.extend(watch.env());
     env
@@ -1310,7 +1325,7 @@ fn a_network_that_only_appeared_leaves_the_handshake_alone() {
 /// the address.
 ///
 /// The connection goes quiet after its marker, and the dial timeout is
-/// two minutes: only abandoning it brings the session back inside `T`.
+/// four times `T`: only abandoning it brings the session back inside `T`.
 #[test]
 fn a_network_that_went_during_the_handshake_is_dialled_again_at_once() {
     let remote = Remote::installed();
@@ -1338,7 +1353,7 @@ fn a_network_that_went_during_the_handshake_is_dialled_again_at_once() {
 /// acs-xo1, before the marker: a redial still in ssh's handshake when the
 /// network it was made from goes is killed and made again at once. The
 /// dial is held short of the remote command for good, so without the
-/// change it would sit there for the whole two minutes.
+/// change it would sit there for the whole four times `T`.
 #[test]
 fn a_network_that_went_during_a_redial_is_dialled_again_at_once() {
     let remote = Remote::installed();
@@ -1366,7 +1381,7 @@ fn a_network_that_went_during_a_redial_is_dialled_again_at_once() {
 
 /// acs-xo1: the first connection too — a named session's, and plain
 /// `acs <host>`'s, whose first dial is the session menu's (DESIGN §4.4).
-/// That is the two-minute case.
+/// That is the four-times-`T` case.
 #[test]
 fn a_network_that_went_during_the_first_dial_is_dialled_again_at_once() {
     for args in [&["-v", "devbox", "fd"][..], &["-v", "devbox"][..]] {
@@ -1448,7 +1463,7 @@ fn a_network_change_leaves_a_first_dial_asking_for_a_password_alone() {
 /// against the watcher; this one says it of the client, which is where the
 /// redial actually happens.
 ///
-/// `ACS_EARLY_MS` is two minutes so the whole flap lands inside one
+/// `ACS_EARLY_MS` is four times `T` so the whole flap lands inside one
 /// interval, with no wall clock deciding it. The first change spends the
 /// one early redial and is refused — so the refusal is spent too, and any
 /// second redial would connect and show in the count.
@@ -1457,8 +1472,8 @@ fn a_flapping_interface_is_one_redial() {
     let remote = Remote::installed();
     let watch = NetWatch::new("192.168.1.5/24\n");
     let mut env = vec![
-        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
-        ("ACS_EARLY_MS".to_string(), "120000".to_string()),
+        ("ACS_BACKOFF_MS".to_string(), ms(OUTLAST_TWO_WAITS)),
+        ("ACS_EARLY_MS".to_string(), ms(OUTLAST_TWO_WAITS)),
     ];
     env.extend(watch.env());
     let mut c = Client::start_env(
@@ -1470,7 +1485,7 @@ fn a_flapping_interface_is_one_redial() {
     c.wait_for("#10#", T);
     remote.refuse_one_dial();
     remote.cut_link();
-    c.wait_for("reconnecting in 120s", T);
+    c.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
     let dialled = remote.connections();
 
     // The interface comes and goes: every step of it moves an address, so
@@ -1480,7 +1495,7 @@ fn a_flapping_interface_is_one_redial() {
     watch.hint();
     c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
     // The one redial the limit allows, refused: back in the wait.
-    c.wait_for("reconnecting in 120s", T);
+    c.wait_for(&format!("reconnecting in {}", secs(OUTLAST_TWO_WAITS)), T);
 
     // Three more changes with nobody able to act on any of them. Each is
     // named against 10.0.0.5/24 — the set the *redial* left held — which
@@ -1513,7 +1528,7 @@ fn a_flapping_interface_is_one_redial() {
 /// up on in time rather than waited for forever.
 ///
 /// The clock is the host's, so the test does not read it (acs-o8h). A
-/// silenced connection holds the link open for a minute, well past the `T`
+/// silenced connection holds the link open for twice `T`, well past the `T`
 /// the helpers wait to, so "waited for forever" is a client that never
 /// exits — and both give-up messages are formatted from the very `Duration`
 /// that was used as the deadline, so the line naming 0.5 s *is* the
@@ -1547,14 +1562,15 @@ fn a_silent_host_is_given_up_on() {
 /// them — `no answer from devbox within 4 s` before the session had even
 /// started — so acs-ryz widened it to ten and the test took twenty. The
 /// redial has a knob of its own now (acs-p46), and the first connection
-/// keeps its two minutes, set here explicitly: a client that applied that
+/// keeps its four times `T`, set here explicitly: a client that applied that
 /// to the redial would make no second attempt inside `T`. So this is also
 /// the test that the two deadlines are separate.
 #[test]
 fn a_redial_into_a_silent_host_returns_to_the_backoff() {
     let remote = Remote::installed();
+    let dial = ms(OUTLAST_TWO_WAITS);
     let mut env = FAST.to_vec();
-    env.push(("ACS_DIAL_TIMEOUT_MS", "120000"));
+    env.push(("ACS_DIAL_TIMEOUT_MS", &dial));
     env.push(("ACS_REDIAL_TIMEOUT_MS", "1000"));
     let mut c = start(&remote, "rs", "echo up; cat", &env);
     c.wait_for("up", T);
@@ -1666,7 +1682,7 @@ fn a_session_ending_during_an_outage_leaves_no_status_behind() {
 
 /// Arming command mode rings the bell whether the link is up or not.
 ///
-/// The backoff is two minutes, as everywhere else in this file that wants
+/// The backoff is four times `T`, as everywhere else in this file that wants
 /// both halves of a double tap inside one offline wait: it was twenty
 /// seconds, which is plenty until it is not, and nothing wants it back
 /// (acs-7wu, acs-ryz).
@@ -1677,7 +1693,7 @@ fn a_session_ending_during_an_outage_leaves_no_status_behind() {
 /// after the BEL, under the window to choose a command key. That used to be
 /// a bare two-second constant with no knob, the last wall-clock window in
 /// this file (acs-ryz); since acs-mq0 `ACS_ESCAPE_TIMEOUT_MS` sets that
-/// window too, so thirty seconds here buys the second write the same room
+/// window too, so `T` here buys the second write the same room
 /// every other wait in the suite has.
 #[test]
 fn the_bell_rings_while_the_link_is_down_too() {
@@ -1687,21 +1703,27 @@ fn the_bell_rings_while_the_link_is_down_too() {
         "ob",
         "echo up; sleep 30",
         &[
-            ("ACS_BACKOFF_MS", "120000"),
-            ("ACS_ESCAPE_TIMEOUT_MS", "30000"),
+            ("ACS_BACKOFF_MS", ms(OUTLAST_TWO_WAITS).as_str()),
+            ("ACS_ESCAPE_TIMEOUT_MS", ms(T).as_str()),
         ],
     );
     c.wait_for("up", T);
     remote.refuse_one_dial();
     remote.cut_link();
     // The end of the wait's status line (its title has a BEL of its own).
-    // `in 120s` and not the free attempt's line (acs-iyq): the double tap
+    // `in …` and not the free attempt's line (acs-iyq): the double tap
     // below is only read while the client is waiting, not while it dials.
-    c.wait_for("in 120s (Ctrl-] Ctrl-] d to detach)\x1b[0m\x1b8", T);
+    c.wait_for(
+        &format!(
+            "in {} (Ctrl-] Ctrl-] d to detach)\x1b[0m\x1b8",
+            secs(OUTLAST_TWO_WAITS)
+        ),
+        T,
+    );
     // One write, so the double tap cannot be split across the escape
     // window by a host that deschedules the client between the two presses
     // (acs-o8h): 50 ms of sleep inside the default 400 ms was the tightest
-    // wall-clock gap in this file. The window is thirty seconds here now,
+    // wall-clock gap in this file. The window is `T` here now,
     // so one write is belt and braces rather than the thing holding it up.
     c.send(&[0x1d, 0x1d]);
     c.wait_for("\x07", T);
@@ -1736,17 +1758,23 @@ fn the_escape_window_is_the_same_offline() {
         "ew",
         "echo up; sleep 30",
         &[
-            ("ACS_BACKOFF_MS", "120000"),
-            ("ACS_ESCAPE_TIMEOUT_MS", "30000"),
+            ("ACS_BACKOFF_MS", ms(OUTLAST_TWO_WAITS).as_str()),
+            ("ACS_ESCAPE_TIMEOUT_MS", ms(T).as_str()),
         ],
     );
     c.wait_for("up", T);
     remote.refuse_one_dial();
     remote.cut_link();
     // Past the end of the wait's status line, whose title carries a BEL of
-    // its own — `in 120s`, so both presses land in the offline wait rather
+    // its own — `in …` of the backoff, so both presses land in the offline wait rather
     // than the first one in the free redial (acs-iyq).
-    c.wait_for("in 120s (Ctrl-] Ctrl-] d to detach)\x1b[0m\x1b8", T);
+    c.wait_for(
+        &format!(
+            "in {} (Ctrl-] Ctrl-] d to detach)\x1b[0m\x1b8",
+            secs(OUTLAST_TWO_WAITS)
+        ),
+        T,
+    );
     c.send(&[0x1d]);
     // Well past the default 400 ms window, inside the configured one.
     std::thread::sleep(Duration::from_millis(1000));
@@ -1764,7 +1792,7 @@ fn the_escape_window_is_the_same_offline() {
 /// come and gone. `offline()` used to build a fresh one on every entry, and
 /// `serve()` one per link, so the press was dropped without a trace.
 ///
-/// The backoff here is `FAST`'s 100 ms against a minute of escape window —
+/// The backoff here is `FAST`'s 100 ms against twice `T` of escape window —
 /// the inverse of the constant `the_escape_window_is_the_same_offline`
 /// needed before the fix, and the combination the bug is reachable with:
 /// someone who widened `ACS_ESCAPE_TIMEOUT_MS` because 400 ms is too quick
@@ -1777,7 +1805,7 @@ fn the_escape_window_is_the_same_offline() {
 /// further connection is the client saying the offline wait came back
 /// under the held press; and the second press goes in only once the
 /// session is back, where there is no deadline to race. The one floor is
-/// that the whole round trip fits inside the escape window, and a minute
+/// that the whole round trip fits inside the escape window, and twice `T`
 /// is many times what the nominal few seconds need.
 ///
 /// It used to fail that attempt with a four-second `ACS_DIAL_TIMEOUT_MS`
@@ -1790,8 +1818,9 @@ fn the_escape_window_is_the_same_offline() {
 #[test]
 fn a_held_command_key_survives_a_redial_attempt() {
     let remote = Remote::installed();
+    let window = ms(OUTLAST_ONE_WAIT);
     let mut env = FAST.to_vec();
-    env.push(("ACS_ESCAPE_TIMEOUT_MS", "60000"));
+    env.push(("ACS_ESCAPE_TIMEOUT_MS", &window));
     let mut c = start(&remote, "hk", "echo up; cat", &env);
     c.wait_for("up", T);
     // Half of Ctrl-] Ctrl-] d, and then the link goes.
