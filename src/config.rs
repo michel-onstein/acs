@@ -107,6 +107,9 @@ pub struct Alias {
     /// How long to wait for the hosts' pings; `None` leaves it to the
     /// global setting.
     pub reachability_timeout: Option<Setting<Duration>>,
+    /// Check the hosts by connecting to their ssh port rather than pinging
+    /// them (acs-fbes); `None` leaves it to the global setting.
+    pub reachability_tcp: Option<Setting<bool>>,
     /// Keep waiting for a lost host; `None` leaves it to the global
     /// setting.
     pub persist: Option<Setting<bool>>,
@@ -138,6 +141,9 @@ pub struct Config {
     /// How long an alias's hosts have to answer a ping (default 0.5 s;
     /// DESIGN §7.3).
     pub reachability_timeout: Setting<Duration>,
+    /// Check an alias's hosts by connecting to their ssh port rather than
+    /// pinging them (default false; acs-fbes, DESIGN §7.3).
+    pub reachability_tcp: Setting<bool>,
     /// Keep waiting for a lost host, dialling once it answers a ping
     /// (default false; DESIGN §5.3).
     pub persist: Setting<bool>,
@@ -163,6 +169,7 @@ impl Default for Config {
             command_bell: Setting::default(true),
             redraw_on_reconnect: Setting::default(true),
             reachability_timeout: Setting::default(DEFAULT_REACHABILITY_TIMEOUT),
+            reachability_tcp: Setting::default(false),
             persist: Setting::default(false),
             prefer_local_network: Setting::default(false),
             reachability_interval: Setting::default(DEFAULT_REACHABILITY_INTERVAL),
@@ -325,6 +332,12 @@ pub const SETTINGS: &[Def] = &[
         },
         global: field!(reachability_timeout),
         alias: field!(reachability_timeout),
+    },
+    Def {
+        key: "reachability_tcp",
+        kind: Kind::Bool,
+        global: field!(reachability_tcp),
+        alias: field!(reachability_tcp),
     },
     Def {
         key: "persist",
@@ -621,6 +634,15 @@ impl Config {
             .and_then(|e| e.persist.as_ref())
             .or_else(|| alias.and_then(|a| a.persist.as_ref()))
             .unwrap_or(&self.persist)
+    }
+
+    /// `reachability_tcp` for `alias`: its own setting, else the global
+    /// one.
+    pub fn reachability_tcp_for<'a>(&'a self, alias: &'a Alias) -> &'a Setting<bool> {
+        alias
+            .reachability_tcp
+            .as_ref()
+            .unwrap_or(&self.reachability_tcp)
     }
 
     /// `prefer_local_network` for `alias`: its own setting, else the global
@@ -1127,7 +1149,7 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards, aliases)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, aliases)",
             ),
             ("aliases: [a]\n", ":1: aliases: expected a mapping"),
             // acs-9yv: a bad network on a host entry, and the setting's
@@ -1335,7 +1357,7 @@ aliases:
             ),
             (
                 "aliases:\n  d:\n    user: me\n",
-                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards, hosts; a single host entry needs 'host: <name>')",
+                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, hosts; a single host entry needs 'host: <name>')",
             ),
             (
                 "aliases:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
