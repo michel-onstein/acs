@@ -1123,6 +1123,12 @@ impl Client {
         );
     }
 
+    /// How many bytes the client wrote to its terminal so far, without
+    /// copying them: for output too large to search (tests/throughput.rs).
+    pub fn output_len(&self) -> usize {
+        self.output.lock().unwrap().len()
+    }
+
     /// Everything the client wrote to its terminal so far.
     pub fn output(&self) -> Vec<u8> {
         self.output.lock().unwrap().clone()

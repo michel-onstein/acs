@@ -1875,14 +1875,8 @@ fn write_frame(state: &mut State, bytes: &[u8]) -> io::Result<()> {
 /// Ctrl-L after a reconnect.
 fn queue_input(state: &mut State, out: &mut Vec<u8>, bytes: &[u8]) {
     state.paste.feed(bytes);
-    for chunk in bytes.chunks(proto::MAX_CHUNK) {
-        let seq = state.unacked.push(chunk);
-        Msg::Input {
-            seq,
-            bytes: chunk.to_vec(),
-        }
-        .encode(out);
-    }
+    let seq = state.unacked.push(bytes);
+    proto::encode_input(seq, bytes, out);
 }
 
 /// Serve one link: finish the handshake, then relay until something ends
@@ -1948,6 +1942,37 @@ fn serve(
     loop {
         // Decode everything available first.
         loop {
+            // Session output, the hottest path there is: written to the
+            // terminal from the decoder's buffer, not copied out of it
+            // into a `Msg` first (acs-atxu). Before the WELCOME a DATA
+            // frame is no output of ours; the generic path ignores it.
+            if welcomed {
+                if let Some((offset, bytes)) = dec.next_data() {
+                    liveness.heard();
+                    // A frame whose end does not fit in a u64 is not one
+                    // the master could have sent: undecodable, like any
+                    // other (acs-shj7).
+                    let Some((skip, end)) = data_span(state.offset, offset, bytes.len()) else {
+                        note("protocol error: DATA frame past the end of the stream");
+                        return lost(link, LinkEnd::Channel);
+                    };
+                    // Skip anything we already wrote (never expected).
+                    if skip < bytes.len() {
+                        timing.first_output();
+                        // Time blocked on a terminal that is not reading is
+                        // not the host's to answer for (acs-spd).
+                        let began = sys::now_ms();
+                        let wrote = write_output(state, &bytes[skip..]);
+                        liveness.wrote_for(sys::now_ms().saturating_sub(began));
+                        if wrote.is_err() {
+                            link.close();
+                            return Outcome::Exit(code::ERROR);
+                        }
+                        state.offset = end;
+                    }
+                    continue;
+                }
+            }
             let msg = match dec.next_msg() {
                 Ok(Some(m)) => m,
                 Ok(None) => break,
@@ -2037,13 +2062,7 @@ fn serve(
                     // Resend what the master may not have (DESIGN §5.2).
                     if !state.unacked.is_empty() {
                         let (seq, bytes) = state.unacked.pending();
-                        for (i, chunk) in bytes.chunks(proto::MAX_CHUNK).enumerate() {
-                            Msg::Input {
-                                seq: seq + (i * proto::MAX_CHUNK) as u64,
-                                bytes: chunk.to_vec(),
-                            }
-                            .encode(out.tail());
-                        }
+                        proto::encode_input(seq, &bytes, out.tail());
                     }
                     // Then Ctrl-L, so the program repaints (DESIGN §5.2):
                     // after what was typed before the drop, before anything
@@ -2097,29 +2116,6 @@ fn serve(
                         _ => code::ERROR,
                     };
                     return Outcome::Exit(exit);
-                }
-                Msg::Data { offset, bytes } if welcomed => {
-                    // A frame whose end does not fit in a u64 is not one
-                    // the master could have sent: undecodable, like any
-                    // other (acs-shj7).
-                    let Some((skip, end)) = data_span(state.offset, offset, bytes.len()) else {
-                        note("protocol error: DATA frame past the end of the stream");
-                        return lost(link, LinkEnd::Channel);
-                    };
-                    // Skip anything we already wrote (never expected).
-                    if skip < bytes.len() {
-                        timing.first_output();
-                        // Time blocked on a terminal that is not reading is
-                        // not the host's to answer for (acs-spd).
-                        let began = sys::now_ms();
-                        let wrote = write_output(state, &bytes[skip..]);
-                        liveness.wrote_for(sys::now_ms().saturating_sub(began));
-                        if wrote.is_err() {
-                            link.close();
-                            return Outcome::Exit(code::ERROR);
-                        }
-                        state.offset = end;
-                    }
                 }
                 Msg::Ack { seq } => state.unacked.ack(seq),
                 // The answer to a question a network change asked, and the
