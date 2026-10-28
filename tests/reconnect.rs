@@ -269,8 +269,13 @@ fn a_link_lost_before_the_welcome_claims_no_session() {
 /// meanwhile, and judged liveness by what it had decoded before the block
 /// rather than by the bytes waiting in the pipe.
 ///
-/// The 8 s pause is the stimulus and stays a sleep: it must *exceed*
-/// `ACS_DEAD_MS` (800 ms), and a starved host can only make it longer. What
+/// The pause is the stimulus and stays a sleep: it must *exceed*
+/// `ACS_DEAD_MS` (800 ms), and a starved host can only make it longer. It
+/// was 8 s; 2.4 s is three dead intervals, and on macOS, whose pty holds
+/// 1 KiB in raw mode, the trickle below fills it in well under one, which
+/// leaves the client blocked in a write for about twice the dead interval.
+/// (A Linux pty holds about 20 KiB, which the trickle does not fill within
+/// 8 s either, so there the stall never blocked the client.) What
 /// followed it was a 500 ms settle before a negative assertion, which a
 /// stalled host silently turns into no test at all (acs-7wu). The settle is
 /// now an event: the session prints `RESUMED` only once the flag file is
@@ -312,9 +317,9 @@ fn a_stalled_terminal_is_not_a_dead_link() {
     // first spends a connection or two before the session (acs-cu8), and
     // what this test is about is whether the stall costs one *more*.
     let dialled = remote.connections();
-    // Nothing is read for well past ACS_DEAD_MS (800 ms).
+    // Nothing is read for three times ACS_DEAD_MS (800 ms).
     c.set_paused(true);
-    std::thread::sleep(Duration::from_secs(8));
+    std::thread::sleep(Duration::from_millis(2400));
     c.set_paused(false);
     // Only now, so every RESUMED is output made after the stall.
     std::fs::write(&go, "").unwrap();
@@ -423,7 +428,7 @@ fn ctrl_c_during_a_redial_clears_the_status_line() {
 /// the wait between dials. The redial is held for good — only the keys can
 /// end it — and `x` says it needs the link before `d` detaches.
 ///
-/// The dial timeout is two minutes, longer than every deadline in the
+/// The redial timeout is two minutes, longer than every deadline in the
 /// suite: a client that only read the keys once the dial gave up — which
 /// is what it did, the cooked terminal handing them over late — cannot
 /// pass inside `T`.
@@ -431,7 +436,7 @@ fn ctrl_c_during_a_redial_clears_the_status_line() {
 fn detach_works_during_a_redial() {
     let remote = Remote::installed();
     let mut env = FAST.to_vec();
-    env.push(("ACS_DIAL_TIMEOUT_MS", "120000"));
+    env.push(("ACS_REDIAL_TIMEOUT_MS", "120000"));
     let mut c = start(&remote, "dr", "echo up; sleep 30", &env);
     c.wait_for("up", T);
     remote.hold_dial();
@@ -1201,13 +1206,14 @@ fn echoing(name: &str) -> Vec<&str> {
 
 /// The environment of a handshake test: `watch`'s stand-ins, no offline
 /// wait to read a hint in its place (the free first redial goes at once,
-/// acs-iyq, and the one after it waits two minutes), and a dial timeout
-/// of two minutes — four times `T`, so a client that waited one out
-/// cannot pass anything here.
+/// acs-iyq, and the one after it waits two minutes), and dial and redial
+/// timeouts of two minutes — four times `T`, so a client that waited one
+/// out cannot pass anything here.
 fn handshake_env(watch: &NetWatch) -> Vec<(String, String)> {
     let mut env = vec![
         ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
         ("ACS_DIAL_TIMEOUT_MS".to_string(), "120000".to_string()),
+        ("ACS_REDIAL_TIMEOUT_MS".to_string(), "120000".to_string()),
     ];
     env.extend(watch.env());
     env
@@ -1501,19 +1507,22 @@ fn a_silent_host_is_given_up_on() {
 /// Regression (acs-znr): a redial into a host that has gone quiet times out
 /// and returns to the backoff wait — and reconnects once the host answers.
 ///
-/// The dial timeout **is** the subject here, so it stays a stretch of wall
-/// clock — but ten seconds of it rather than four (acs-ryz). It covers the
-/// first connection too, and four seconds was not enough for one: under
-/// parallel copies of the suite with `dd` and fork loops beside them,
-/// `no answer from devbox within 4 s` before the session had even started
-/// was the commonest failure this file had. Ten is the same statement with
-/// the slack acs-cu8 gave the frozen-link bound, and still leaves twenty
-/// seconds of `T` for the second attempt to be made.
+/// The redial timeout **is** the subject here, so it stays a stretch of
+/// wall clock: one second of it. It used to be `ACS_DIAL_TIMEOUT_MS`, which
+/// set the first connection's deadline too, and four seconds was not
+/// enough for that one under parallel copies of the suite with `dd` beside
+/// them — `no answer from devbox within 4 s` before the session had even
+/// started — so acs-ryz widened it to ten and the test took twenty. The
+/// redial has a knob of its own now (acs-p46), and the first connection
+/// keeps its two minutes, set here explicitly: a client that applied that
+/// to the redial would make no second attempt inside `T`. So this is also
+/// the test that the two deadlines are separate.
 #[test]
 fn a_redial_into_a_silent_host_returns_to_the_backoff() {
     let remote = Remote::installed();
     let mut env = FAST.to_vec();
-    env.push(("ACS_DIAL_TIMEOUT_MS", "10000"));
+    env.push(("ACS_DIAL_TIMEOUT_MS", "120000"));
+    env.push(("ACS_REDIAL_TIMEOUT_MS", "1000"));
     let mut c = start(&remote, "rs", "echo up; cat", &env);
     c.wait_for("up", T);
     let dialled = remote.connections();
@@ -1528,6 +1537,27 @@ fn a_redial_into_a_silent_host_returns_to_the_backoff() {
     c.wait_for("hello", T);
 }
 
+/// acs-p46: a short redial deadline does not shorten the first
+/// connection's. The first dial is held — as one waiting on a passphrase
+/// or a key touch is — for three times the redial timeout, and then let
+/// through: the session starts, and nothing gave up on it. Held rather
+/// than slowed, so a stalled host only makes the test slower (acs-o8h);
+/// the sleep is the stimulus, and a starved host can only lengthen it.
+#[test]
+fn a_short_redial_deadline_leaves_the_first_connection_its_own() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_REDIAL_TIMEOUT_MS", "300"));
+    let dialled = remote.connections();
+    remote.hold_dial();
+    let mut c = start(&remote, "fd", "echo up; cat", &env);
+    remote.wait_more_connections(dialled, 1, T);
+    std::thread::sleep(Duration::from_millis(900));
+    remote.release_dial();
+    c.wait_for("up", T);
+    assert!(!c.text().contains("no answer"), "{}", c.text());
+}
+
 /// Regression (acs-omt2): a redial that runs out its whole timeout against
 /// a silent host does not reset the backoff, however long it took. The
 /// reset is for a connection that *served* the threshold, WELCOME to loss;
@@ -1535,17 +1565,18 @@ fn a_redial_into_a_silent_host_returns_to_the_backoff() {
 /// handed out a free immediate attempt after every silent dial and the
 /// backoff never climbed.
 ///
-/// Here the dial timeout equals the reset threshold, as the defaults do,
-/// and the waits still go 0 → 1 s → 2 s. Ten seconds of dial timeout for
-/// the reason the test above gives.
+/// Here the redial timeout equals the reset threshold, as the defaults do,
+/// and the waits still go 0 → 1 s → 2 s. Two seconds of each: the first
+/// connection is no longer held to the redial's deadline (acs-p46), so
+/// the ten that used to protect it are not needed.
 #[test]
 fn a_silent_redial_as_long_as_the_reset_threshold_keeps_the_backoff_climbing() {
     let remote = Remote::installed();
     let mut env = FAST.to_vec();
     env.retain(|(k, _)| *k != "ACS_BACKOFF_MS");
     env.push(("ACS_BACKOFF_MS", "1000"));
-    env.push(("ACS_DIAL_TIMEOUT_MS", "10000"));
-    env.push(("ACS_BACKOFF_RESET_MS", "10000"));
+    env.push(("ACS_REDIAL_TIMEOUT_MS", "2000"));
+    env.push(("ACS_BACKOFF_RESET_MS", "2000"));
     let mut c = start(&remote, "rb", "echo up; cat", &env);
     c.wait_for("up", T);
     remote.silence(Some(""));

@@ -623,7 +623,8 @@ reached as `user@config`.
 | `ACS_CONTROL_PERSIST` | seconds an acs-owned ssh master outlives its last use (default 300); `0` turns the shared master off |
 | `ACS_CONTROL_FALLBACK_MS` | how long a connection that joins an existing master may take to answer before the master is ended and the connection made on its own (default 2000) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
-| `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial and for each host of `acs list`) |
+| `ACS_DIAL_TIMEOUT_MS` | how long a new connection may take to answer (default 120 s, time for a password or a key touch; 30 s for each host of `acs list`) |
+| `ACS_REDIAL_TIMEOUT_MS` | how long a reconnect may take to answer before acs goes back to waiting and tries again (default 30 s); it does not change `ACS_DIAL_TIMEOUT_MS` |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |

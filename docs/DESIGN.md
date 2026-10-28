@@ -890,8 +890,9 @@ sequenceDiagram
   redials (acs-6p8, above); **connected**, it asks the host and shortens
   the dead-link timeout (acs-ft1, above); and **handshaking** — from the
   dial until the `WELCOME` — it ends a dial that is very probably doomed,
-  instead of leaving it to run out `ACS_DIAL_TIMEOUT_MS`, 30 s on a redial
-  and 120 s on the first connection. The laptop opened on another network
+  instead of leaving it to run out its timeout, 30 s on a redial
+  (`ACS_REDIAL_TIMEOUT_MS`) and 120 s on the first connection
+  (`ACS_DIAL_TIMEOUT_MS`). The laptop opened on another network
   while acs was mid-connect is the case: the connection ssh was making
   went with the old address the moment the lid opened.
   - **Both halves of the handshake, every dial that has a session behind
@@ -1017,11 +1018,16 @@ sequenceDiagram
 - **Before the first WELCOME there is a deadline too**: liveness only starts
   with WELCOME, and `ConnectTimeout` only covers the TCP connect, so a host
   that accepts and then says nothing would otherwise hold the client forever.
-  A connection has 30 s on a redial — then it is dropped and the client goes
-  back to its backoff wait, where the command keys work even when ssh had
-  the terminal — and 120 s on the
-  first connection (time for a password), then the client exits 255, for the
-  marker and again for the handshake (`ACS_DIAL_TIMEOUT_MS` sets both). A
+  A connection has 30 s on a redial (`ACS_REDIAL_TIMEOUT_MS`) — then it is
+  dropped and the client goes back to its backoff wait, where the command
+  keys work even when ssh had the terminal — and 120 s on the first
+  connection (`ACS_DIAL_TIMEOUT_MS`: time for a password or a key touch),
+  then the client exits 255, each for the marker and again for the
+  handshake. They are two knobs (acs-p46) because they are two things: one
+  knob set both, so shortening the redial's to stop a hung redial holding
+  the backoff up also shortened the window a first connection has for a
+  human to answer it, and a 4:1 ratio kept between them would still have
+  done so, only less. A
   takeover question restarts the handshake's clock, and a network change
   that took an address away ends the handshake at once and starts a fresh
   one with a whole timeout (acs-xo1, above).
@@ -1076,10 +1082,11 @@ set stays visible; the cost of adding one is a row here.
 | `ACS_DEAD_MS` | 10000 | silence before the link is dead (client redials; master drops its client) | ceiling for `ACS_NETCHECK_MS`, which only brings it forward |
 | `ACS_NETCHECK_MS` | 2000 | time the host has to answer the `PING` a network change sends while up | only its own `PONG` clears it (acs-br2); time blocked writing to the terminal is not counted (acs-spd) |
 | `ACS_BACKOFF_MS` | 1000 | the first wait of the redial backoff, after the free attempt | doubles to 30 s, or to itself if larger |
-| `ACS_BACKOFF_RESET_MS` | 30000 | how long a link must serve, `WELCOME` to loss, for the backoff to start over | equal to the redial's `ACS_DIAL_TIMEOUT_MS` by default; a redial spending that timeout never resets it (acs-omt2) |
+| `ACS_BACKOFF_RESET_MS` | 30000 | how long a link must serve, `WELCOME` to loss, for the backoff to start over | equal to `ACS_REDIAL_TIMEOUT_MS` by default; a redial spending that timeout never resets it (acs-omt2) |
 | `ACS_PERSIST_FAST_MS` | 1000 | the ping gate's first pings after a loss, 30 of them, before it backs off to `reachability_interval` (acs-vxg) | never above `reachability_interval`; a network change starts the 30 over |
 | `ACS_EARLY_MS` | 2000 | at most one network-change redial per interval in the offline wait | separate from `ACS_NETCHECK_MS`: this one guards a redial, that one a ping |
-| `ACS_DIAL_TIMEOUT_MS` (README) | 120000 first, 30000 redial and `acs list` | time to the marker, then to the `WELCOME` | one value sets both deadlines, which default 4:1 (acs-p46); a network change that removed an address ends either at once and dials again with a fresh one, unless ssh is asking the user something (acs-xo1) |
+| `ACS_DIAL_TIMEOUT_MS` (README) | 120000 first connection, 30000 each host of `acs list` and the menu | a fresh connection's time to the marker, then to the `WELCOME` | not the redial's, which is its own knob (acs-p46); a network change that removed an address ends the dial at once and dials again with a fresh one, unless ssh is asking the user something (acs-xo1) |
+| `ACS_REDIAL_TIMEOUT_MS` (README) | 30000 | a redial's time to the marker, then to the `WELCOME`, before it goes back to the backoff wait | shortening it leaves the first connection's `ACS_DIAL_TIMEOUT_MS` alone (acs-p46); the same network-change rule (acs-xo1) |
 | `ACS_NOTE_HOLD_MS` | 500 | how long a diagnostic line waits for the output it would interrupt to reach a boundary, before it is written anyway | — |
 | `ACS_MASTER_REBIND_MS` | 5000 | how often the master checks its socket path is still there (§4.2) | the backstop: a new master for the name prods the old one at once (acs-lbba) |
 | `ACS_MASTER_HELLO_MS` | 10000 | time a new connection to the master has for its first whole message (acs-3anc) | the client's `HELLO` goes with the dial, so this is never a round trip short |
