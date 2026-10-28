@@ -198,3 +198,33 @@ fn a_first_connect_that_fails_is_waited_out_before_any_session() {
     c.wait_for("new session 's' on devbox", T);
     c.wait_for("up", T);
 }
+
+/// acs-ysx: every ping step shows its status, and while the host stays
+/// down the text is the same each time. A line already up is not drawn
+/// again for nothing: a long outage, when the link is at its worst, does
+/// not send the whole span on every step.
+#[test]
+fn an_unchanged_status_line_is_drawn_once_across_ping_steps() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox"]);
+    let env = net.env("persist: true\nreachability_interval: 100ms\n");
+    let mut env = refs(&env);
+    env.push(("ACS_PING_MS", "100"));
+    let mut c = Client::start_env(&remote, &session("devbox", &[]), &env);
+    c.wait_for("up", T);
+    net.set_up(&[]);
+    let pinged = net.pinged().len();
+    remote.cut_link();
+    let line = "\x1b[7macs: devbox is not answering — pinging it every 100ms";
+    c.wait_for(line, T);
+    wait_until(
+        T,
+        || net.pinged().len() >= pinged + 4,
+        || "never: four pings after the drop",
+    );
+    let drawn = c.text().matches(line).count();
+    assert_eq!(drawn, 1, "the same status line was drawn {drawn} times");
+    // And it still comes down when the host is back.
+    net.set_up(&["devbox"]);
+    c.wait_for("\x1b[23;0t", T);
+}

@@ -492,11 +492,24 @@ pub fn note_max(msg: &str, max: usize) {
 /// - **A quiet session cannot swallow one.** A program that stops
 ///   mid-sequence, or a link that dies there, would otherwise hold a note
 ///   for ever. The wait is bounded by `ACS_NOTE_HOLD_MS` (500 ms), after
-///   which the note is written where it stands, and leaving [`serve`]
-///   flushes what is left whatever the stream was doing.
+///   which the note is written anyway, and leaving [`serve`] flushes
+///   what is left whatever the stream was doing — each of them *over* the
+///   open sequence, as below.
+/// - **Outside the frame loop nothing lands inside a sequence either**
+///   (acs-ysx). Every note goes through [`raise`], and the terminal's
+///   stream is known here for as long as the client runs, not only while
+///   [`serve`] relays: [`stream`] is told after every frame and whenever
+///   the observer is cleared or resynced. A note written with the stream
+///   open — mid-outage, after the status line has put the terminal back
+///   inside the program's CSI — ends the sequence first and re-opens it
+///   after, the way the status line does ([`write_over_stream`]). A note
+///   added mid-outage therefore needs no knowledge of terminal state, and
+///   [`write_over_stream`] and [`leave`] assert that what is known here is
+///   what the observer says.
 mod notes {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
+    use crate::modes::ModeObserver;
     use crate::sys;
 
     /// How long a note waits for the stream to reach a boundary before it
@@ -511,6 +524,14 @@ mod notes {
         /// Open while the frame loop is relaying; `None` everywhere else,
         /// where every note goes straight out.
         static GATE: RefCell<Option<Gate>> = const { RefCell::new(None) };
+        /// Where the program's stream left the terminal: `None` at a
+        /// boundary, otherwise the bytes that re-open what it left
+        /// unfinished (empty where that cannot be done). Kept across the
+        /// gate, since the terminal stays where the last frame left it.
+        static OPEN: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+        /// How many notes have been written, so the status line knows one
+        /// may have scrolled it off its row.
+        static WRITTEN: Cell<u64> = const { Cell::new(0) };
         /// Where notes go in this crate's own tests, in place of fd 2.
         #[cfg(test)]
         static SINK: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
@@ -518,9 +539,6 @@ mod notes {
 
     #[derive(Default)]
     struct Gate {
-        /// The last frame written left the terminal inside a sequence or a
-        /// character: a note written now would land in the middle of it.
-        mid_sequence: bool,
         /// Notes waiting for the boundary, oldest first.
         held: Vec<String>,
         /// When the oldest of them started waiting.
@@ -550,7 +568,7 @@ mod notes {
         let straight_out = GATE.with(|g| {
             let mut g = g.borrow_mut();
             match g.as_mut() {
-                Some(gate) if gate.mid_sequence => {
+                Some(gate) if open() => {
                     if gate.held.is_empty() {
                         gate.since = sys::now_ms();
                     }
@@ -575,22 +593,39 @@ mod notes {
         })
     }
 
-    /// Where the program's stream stands after a frame was written to the
-    /// terminal. A boundary releases what was held for it.
-    pub fn at_boundary(at: bool) {
-        let release = GATE.with(|g| {
-            let mut g = g.borrow_mut();
-            match g.as_mut() {
-                Some(gate) => {
-                    gate.mid_sequence = !at;
-                    at && !gate.held.is_empty()
-                }
-                None => false,
-            }
-        });
+    /// The last frame written left the terminal inside a sequence or a
+    /// character: a note written now would land in the middle of it.
+    fn open() -> bool {
+        OPEN.with(|s| s.borrow().is_some())
+    }
+
+    /// What [`OPEN`] should hold for `o`.
+    fn open_in(o: &ModeObserver) -> Option<Vec<u8>> {
+        (!o.at_boundary()).then(|| o.reopen_sequence().unwrap_or_default())
+    }
+
+    /// Where the program's stream stands, after a frame was written to the
+    /// terminal or the observer was cleared or resynced. A boundary
+    /// releases what was held for it.
+    pub fn stream(o: &ModeObserver) {
+        let at = o.at_boundary();
+        OPEN.with(|s| *s.borrow_mut() = open_in(o));
+        let release = at && waiting();
         if release {
             flush();
         }
+    }
+
+    /// Whether what is known here is where `o` says the stream is: false
+    /// means the observer moved without [`stream`] being told, and a note
+    /// would be written blind.
+    pub fn agrees(o: &ModeObserver) -> bool {
+        OPEN.with(|s| *s.borrow() == open_in(o))
+    }
+
+    /// How many notes have been written so far.
+    pub fn count() -> u64 {
+        WRITTEN.with(Cell::get)
     }
 
     /// When the oldest held note is written whatever the stream is doing.
@@ -624,12 +659,22 @@ mod notes {
         }
     }
 
+    /// Write one note: over the program's open sequence when there is one
+    /// (`ST` before it on the stream's fd, the sequence again after), so
+    /// neither swallows the other.
     fn write(line: &str) {
+        WRITTEN.with(|n| n.set(n.get() + 1));
+        let open = OPEN.with(|s| s.borrow().clone());
         #[cfg(test)]
         {
             let captured = SINK.with(|s| match s.borrow_mut().as_mut() {
                 Some(lines) => {
-                    lines.push(line.to_string());
+                    lines.push(match &open {
+                        Some(reopen) => {
+                            format!("\x1b\\{line}{}", String::from_utf8_lossy(reopen))
+                        }
+                        None => line.to_string(),
+                    });
                     true
                 }
                 None => false,
@@ -638,7 +683,13 @@ mod notes {
                 return;
             }
         }
+        let Some(reopen) = open else {
+            let _ = sys::write_all(2, line.as_bytes());
+            return;
+        };
+        let _ = sys::write_all(1, b"\x1b\\");
         let _ = sys::write_all(2, line.as_bytes());
+        let _ = sys::write_all(1, &reopen);
     }
 
     /// Collect this thread's notes instead of printing them.
@@ -1160,6 +1211,10 @@ pub struct State {
     pub attached_once: bool,
     /// A reconnect status line / title is on the terminal (DESIGN §5.4).
     pub status_shown: bool,
+    /// What the status line last wrote over the stream, and how many notes
+    /// had been written by then: drawing the same again is skipped
+    /// (acs-ysx).
+    pub status_drawn: (Vec<u8>, u64),
     /// Ring the bell when command mode arms (DESIGN §6.1).
     pub command_bell: bool,
     /// A bell waits for the output to reach a boundary.
@@ -1389,6 +1444,7 @@ pub fn run(
         identity: identity(),
         attached_once: false,
         status_shown: false,
+        status_drawn: (Vec::new(), 0),
         command_bell: command_bell(&args.config),
         bell_pending: false,
         redraw_on_reconnect: redraw_on_reconnect(&args),
@@ -1423,12 +1479,14 @@ pub fn run(
 /// eat the first bytes of whatever runs next — the shell's own prompt.
 pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
     crate::reconnect::clear_status(state);
+    debug_assert!(notes::agrees(&state.observer), "notes lost the stream");
     let mut out = state.observer.interrupt_sequence().to_vec();
     out.extend_from_slice(&state.observer.reset_sequence());
     if !out.is_empty() {
         let _ = sys::write_all(STDOUT, &out);
     }
     state.observer.clear();
+    notes::stream(&state.observer);
     *raw = None;
 }
 
@@ -1444,10 +1502,24 @@ pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
 /// ([`ModeObserver::reopen_sequence`]), ending it is still better than
 /// writing into it.
 pub fn write_over_stream(state: &State, bytes: &[u8]) {
+    let _ = sys::write_all(STDOUT, &over_stream(state, bytes));
+}
+
+/// What [`write_over_stream`] writes.
+pub(crate) fn over_stream(state: &State, bytes: &[u8]) -> Vec<u8> {
+    // The notes ride on the same knowledge of the stream (acs-ysx): a
+    // mismatch here is an observer that moved without telling them.
+    debug_assert!(notes::agrees(&state.observer), "notes lost the stream");
     let mut out = state.observer.interrupt_sequence().to_vec();
     out.extend_from_slice(bytes);
     out.extend_from_slice(&state.observer.reopen_sequence().unwrap_or_default());
-    let _ = sys::write_all(STDOUT, &out);
+    out
+}
+
+/// How many `acs:` notes have been written: one may have scrolled the
+/// status line off its row (acs-ysx).
+pub(crate) fn notes_written() -> u64 {
+    notes::count()
 }
 
 /// Connect once: dial, handshake, and serve until the link ends.
@@ -1769,7 +1841,7 @@ fn write_output(state: &mut State, bytes: &[u8]) -> io::Result<()> {
     let r = write_frame(state, bytes);
     // Where the frame left the stream is where the next note may go, until
     // a frame moves it on.
-    notes::at_boundary(state.observer.at_boundary());
+    notes::stream(&state.observer);
     r
 }
 
@@ -1800,7 +1872,7 @@ fn write_frame(state: &mut State, bytes: &[u8]) -> io::Result<()> {
     // terminal sees them in the order they are written. The rest of the
     // frame follows and may open a sequence of its own; that is the next
     // note's problem, not this one's.
-    notes::at_boundary(true);
+    notes::stream(&state.observer);
     sys::write_all(STDOUT, &bytes[n..])?;
     state.observer.observe(&bytes[n..]);
     Ok(())
@@ -1952,6 +2024,7 @@ fn serve(
                                 let _ = sys::write_all(STDOUT, &out);
                             }
                             state.observer.clear();
+                            notes::stream(&state.observer);
                         }
                         AttachKind::Gap => {
                             // The same program, still in its modes: keep
@@ -1960,6 +2033,7 @@ fn serve(
                             out.extend_from_slice(b"\x1b[H\x1b[J");
                             let _ = sys::write_all(STDOUT, &out);
                             state.observer.resync();
+                            notes::stream(&state.observer);
                         }
                     }
                     state.offset = w.offset;
@@ -2451,12 +2525,15 @@ mod tests {
         assert_eq!(notes::written(), ["acs: between frames\r\n"]);
 
         // A frame that ended halfway through an escape sequence.
-        notes::at_boundary(false);
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[1;3");
+        notes::stream(&o);
         note("first");
         note("second");
         assert!(notes::written().is_empty(), "written into the sequence");
         // The frame that finishes it releases both, oldest first.
-        notes::at_boundary(true);
+        o.observe(b"1m");
+        notes::stream(&o);
         assert_eq!(notes::written(), ["acs: first\r\n", "acs: second\r\n"]);
 
         // And nothing is held behind them afterwards.
@@ -2474,7 +2551,9 @@ mod tests {
     fn a_held_note_survives_a_program_that_stops_mid_sequence() {
         notes::capture();
         let relaying = notes::Relaying::open();
-        notes::at_boundary(false);
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[1;3");
+        notes::stream(&o);
         note("held");
         // Nothing is due while the bytes that would finish the sequence
         // may still be on their way.
@@ -2483,19 +2562,81 @@ mod tests {
         assert!(notes::written().is_empty());
         assert!(notes::deadline().is_some_and(|d| d > raised));
         // The sequence never finishes: `ACS_NOTE_HOLD_MS` later the note
-        // is written where it stands rather than lost.
+        // is written rather than lost — over the sequence, not into it
+        // (acs-ysx).
         notes::flush_due(raised + 60_000);
-        assert_eq!(notes::written(), ["acs: held\r\n"]);
+        assert_eq!(notes::written(), ["\x1b\\acs: held\r\n\x1b[1;3"]);
         assert_eq!(notes::deadline(), None);
 
         // The way out of the frame loop writes what is still held, so the
         // notes that end a link — a protocol error, an ERROR frame, the
         // takeover — arrive even when the last frame left a sequence open.
-        notes::at_boundary(false);
         note("on the way out");
         assert!(notes::written().is_empty());
         drop(relaying);
-        assert_eq!(notes::written(), ["acs: on the way out\r\n"]);
+        assert_eq!(notes::written(), ["\x1b\\acs: on the way out\r\n\x1b[1;3"]);
+        notes::stream(&ModeObserver::new());
+    }
+
+    /// acs-ysx: a note raised outside the frame loop — the dial, the
+    /// offline wait, alias resolution, an exit note — knows nothing of the
+    /// terminal, and the terminal may be inside the program's CSI: the
+    /// last frame left it there, and the status line put it back. Such a
+    /// note is written over the sequence, as the status line is, and not
+    /// into it.
+    #[test]
+    fn a_note_outside_the_frame_loop_steps_over_an_open_sequence() {
+        notes::capture();
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[1;31");
+        notes::stream(&o);
+        note("mid-outage");
+        assert_eq!(notes::written(), ["\x1b\\acs: mid-outage\r\n\x1b[1;31"]);
+        // A string cannot be handed back: it is ended and stays ended.
+        o.observe(b"\x1b]2;half a tit");
+        notes::stream(&o);
+        note("in a title");
+        assert_eq!(notes::written(), ["\x1b\\acs: in a title\r\n"]);
+        // At a boundary the note goes out as it is.
+        notes::stream(&ModeObserver::new());
+        note("plain");
+        assert_eq!(notes::written(), ["acs: plain\r\n"]);
+    }
+
+    /// acs-ysx: the knowledge above is only as good as the calls that keep
+    /// it, so the writes that step over the stream check it against the
+    /// observer. An observer that moved without telling the notes is
+    /// caught there, before a note is written blind.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "notes lost the stream")]
+    fn an_observer_that_moves_behind_the_notes_back_is_caught() {
+        let mut state = test_state();
+        state.observer.observe(b"\x1b[1;31");
+        let _ = over_stream(&state, b"status");
+    }
+
+    fn test_state() -> State {
+        State {
+            host: "devbox".into(),
+            session: None,
+            instance: None,
+            offset: 0,
+            unacked: Unacked::new(0),
+            observer: ModeObserver::new(),
+            identity: String::new(),
+            attached_once: false,
+            status_shown: false,
+            status_drawn: (Vec::new(), 0),
+            command_bell: false,
+            bell_pending: false,
+            redraw_on_reconnect: false,
+            paste: keys::PasteTracker::default(),
+            detector: Detector::new(escape_config()),
+            force_next: false,
+            master: None,
+            welcomed_at: None,
+        }
     }
 
     #[test]
