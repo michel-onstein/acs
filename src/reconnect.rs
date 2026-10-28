@@ -285,8 +285,9 @@ fn pingable(args: &ClientArgs) -> bool {
         .map_or(true, |a| a.entries.iter().any(|e| e.reachability_check))
 }
 
-/// Persisting (DESIGN §5.3): ping the lost host every
-/// `reachability_interval` — at once on a network change — until it
+/// Persisting (DESIGN §5.3): ping the lost host as
+/// [`client::PingSteps`] says — every second at first, then every
+/// `reachability_interval`, and at once on a network change — until it
 /// answers (`true`: dial it now), showing the status line and honouring
 /// the command keys meanwhile (`false`: the user detached, or gave up).
 /// An alias is resolved again each time, so its first host to answer is
@@ -299,16 +300,20 @@ fn wait_for_answer(
     netwatch: Option<&crate::netwatch::NetWatch>,
     last_early: &mut Option<Instant>,
 ) -> bool {
-    let every = client::reachability_interval(args);
+    let mut steps = client::PingSteps::new(client::reachability_interval(args));
     let msg = format!(
-        "{} is not answering — pinging it every {} ({})",
+        "{} is not answering — pinging it {} ({})",
         state.host,
-        crate::config::format_timeout(every),
+        steps.describe(),
         give_up_keys(state)
     );
     loop {
-        match offline(state, raw, signals, every, netwatch, last_early, &msg) {
-            Offline::Retry | Offline::NetworkChanged => {
+        let wait = steps.next();
+        match offline(state, raw, signals, wait, netwatch, last_early, &msg) {
+            o @ (Offline::Retry | Offline::NetworkChanged) => {
+                if matches!(o, Offline::NetworkChanged) {
+                    steps.restart();
+                }
                 let answers = match args.alias.clone() {
                     Some(_) => redial_alias(args, state),
                     None => {

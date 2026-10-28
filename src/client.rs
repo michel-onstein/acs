@@ -209,20 +209,64 @@ fn args_alias(args: &ClientArgs) -> Option<&crate::config::Alias> {
     args.config.alias(crate::alias::split_user(name).1)
 }
 
-/// Before any session: wait, pinging every `reachability_interval`, until
-/// the host `name` stands for answers — an alias's hosts as resolving pings
-/// them (and then points `args` at the one that answered), a plain host
-/// itself. Ctrl-C gives up. A host that cannot be pinged (an alias whose
-/// hosts all have `reachability_check: false`) is just waited for once.
+/// The waits between the ping gate's pings (DESIGN §5.3, acs-vxg): every
+/// second (`ACS_PERSIST_FAST_MS`) for the first 30 of them after a loss,
+/// then every `reachability_interval` — a host back in seconds is dialled
+/// within one, and a long outage costs no more pings than it did. Never
+/// slower than `reachability_interval` itself.
+pub(crate) struct PingSteps {
+    fast: Duration,
+    every: Duration,
+    since: Instant,
+}
+
+impl PingSteps {
+    pub(crate) fn new(every: Duration) -> Self {
+        let fast = Duration::from_millis(crate::reconnect::env_ms("ACS_PERSIST_FAST_MS", 1000));
+        PingSteps {
+            fast: fast.min(every),
+            every,
+            since: Instant::now(),
+        }
+    }
+
+    /// The wait before the next ping.
+    pub(crate) fn next(&self) -> Duration {
+        match self.since.elapsed() < self.fast * 30 {
+            true => self.fast,
+            false => self.every,
+        }
+    }
+
+    /// Start the fast pings over: a new network is a fresh loss.
+    pub(crate) fn restart(&mut self) {
+        self.since = Instant::now();
+    }
+
+    /// "every 1s at first, then 5s", for the status line.
+    pub(crate) fn describe(&self) -> String {
+        let f = crate::config::format_timeout;
+        match self.fast == self.every {
+            true => format!("every {}", f(self.every)),
+            false => format!("every {} at first, then {}", f(self.fast), f(self.every)),
+        }
+    }
+}
+
+/// Before any session: wait, pinging as [`PingSteps`] says, until the host
+/// `name` stands for answers — an alias's hosts as resolving pings them (and
+/// then points `args` at the one that answered), a plain host itself. Ctrl-C
+/// gives up. A host that cannot be pinged (an alias whose hosts all have
+/// `reachability_check: false`) is just waited for once.
 pub(crate) fn wait_for_host(args: &mut ClientArgs, name: &str) {
-    let every = reachability_interval(args);
+    let steps = PingSteps::new(reachability_interval(args));
     note(&format!(
-        "waiting for {} to answer a ping, every {} (Ctrl-C gives up)",
+        "waiting for {} to answer a ping, {} (Ctrl-C gives up)",
         args.host_name(),
-        crate::config::format_timeout(every)
+        steps.describe()
     ));
     loop {
-        std::thread::sleep(every);
+        std::thread::sleep(steps.next());
         if host_answers(args, name).unwrap_or(true) {
             return;
         }
