@@ -716,6 +716,93 @@ pub fn answer_timeout(redial: bool) -> Duration {
     Duration::from_millis(ms)
 }
 
+/// The command keys through a redial (acs-8ax, DESIGN §5.2).
+///
+/// ssh runs in a process group of its own, in the background of the
+/// terminal, so stdin is acs's to read until ssh reaches for the terminal
+/// to ask for something. The kernel stops a background process that sets
+/// the terminal's modes or reads from it — `SIGTTOU`, `SIGTTIN`, sent to
+/// its whole group, so a ProxyCommand's own ssh stops the transport too —
+/// and that stop is the hand-off: the terminal goes back to its cooked
+/// settings, ssh's group is made the foreground and continued, and stdin
+/// is ssh's for the rest of the dial. Nothing ssh asks for can be read by
+/// acs, because ssh cannot write its prompt before the stop.
+pub(crate) struct DialKeys<'a> {
+    state: &'a mut State,
+    raw: &'a mut RawMode,
+    /// ssh has the terminal.
+    handed: bool,
+    /// The user left during the dial, and how.
+    left: Option<Left>,
+}
+
+#[derive(Clone, Copy)]
+enum Left {
+    /// `Ctrl-] Ctrl-] d`, or the terminal went away.
+    Detach,
+    /// The interrupt key: as it would in the cooked terminal, it ends acs.
+    Interrupt,
+}
+
+impl DialKeys<'_> {
+    /// One look at the dial, after a poll in which stdin was `readable`:
+    /// hand the terminal over if ssh stopped for it, otherwise read the
+    /// keys. `true` when the user left.
+    fn step(&mut self, pid: i32, readable: bool) -> bool {
+        if sys::stopped(pid) {
+            if !self.handed {
+                let _ = self.raw.suspend();
+                let _ = sys::tcsetpgrp(STDIN, pid);
+                self.handed = true;
+            }
+            // Again after the hand-off only for a Ctrl-Z at ssh's prompt,
+            // which would otherwise leave the dial stopped until it timed
+            // out.
+            let _ = sys::kill(-pid, libc::SIGCONT);
+            return false;
+        }
+        if self.handed {
+            return false;
+        }
+        let now = sys::now_ms();
+        let was = self.state.detector.armed();
+        let mut buf = [0u8; 256];
+        let o = match readable {
+            true => match sys::read(STDIN, &mut buf) {
+                Ok(n) if n > 0 => self.state.detector.feed(&buf[..n], now),
+                _ => {
+                    self.left = Some(Left::Detach);
+                    return true;
+                }
+            },
+            false => self.state.detector.tick(now),
+        };
+        follow_detector(self.state, was);
+        // Everything else typed into the dial is dropped (DESIGN §5.2).
+        if o.forward.contains(&self.raw.intr()) {
+            self.left = Some(Left::Interrupt);
+        }
+        match o.action {
+            Some(Action::Detach) => self.left = Some(Left::Detach),
+            Some(Action::Exit) => crate::reconnect::show_status(
+                self.state,
+                "ending the session needs the connection — Ctrl-] Ctrl-] d detaches instead",
+            ),
+            None => {}
+        }
+        self.left.is_some()
+    }
+
+    /// The terminal back as a dial without the keys leaves it: acs's again,
+    /// and cooked until the `WELCOME`.
+    fn finish(&mut self) {
+        if self.handed {
+            let _ = sys::tcsetpgrp(STDIN, sys::getpgrp());
+        }
+        let _ = self.raw.suspend();
+    }
+}
+
 /// Start the transport running `remote` and wait, at most `timeout`, for
 /// the marker line; `timing` is told when ssh is spawned and the marker
 /// seen.
@@ -744,7 +831,7 @@ pub fn dial(
     if crate::mux::joinable(&args.transport, call) {
         timing.mark("shared ssh master checked");
         let window = timeout.min(crate::mux::fallback_window());
-        match dial_once(args, call, remote, window, timing, first.clone()) {
+        match dial_once(args, call, remote, window, timing, first.clone(), None) {
             Ok(x) => return Ok(x),
             // A master that is up but cannot carry a channel is worse than
             // none: take it down, so the dial below and the next client
@@ -765,9 +852,10 @@ pub fn dial(
             Err(e) => return Err(e),
         }
     }
-    dial_once(args, call, remote, timeout, timing, first)
+    dial_once(args, call, remote, timeout, timing, first, None)
 }
 
+/// One dial; with `keys`, one whose command keys are live ([`DialKeys`]).
 fn dial_once(
     args: &ClientArgs,
     call: Call,
@@ -775,9 +863,15 @@ fn dial_once(
     timeout: Duration,
     timing: &mut Timing,
     first: Vec<u8>,
+    mut keys: Option<&mut DialKeys>,
 ) -> io::Result<(Link, Marker)> {
     let deadline = Instant::now() + timeout;
     let mut cmd = args.transport.command(call, remote);
+    if let Some(k) = keys.as_deref_mut() {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        let _ = k.raw.dialing();
+    }
     if args.verbose > 0 {
         note_max(
             &format!(
@@ -819,8 +913,37 @@ fn dial_once(
     }
     let mut scanner = MarkerScanner::new();
     let mut buf = [0u8; 4096];
+    let pid = child.id() as i32;
     let marker = loop {
-        if !sys::wait_readable(from.as_raw_fd(), deadline)? {
+        let ready = match keys.as_deref_mut() {
+            None => sys::wait_readable(from.as_raw_fd(), deadline)?,
+            Some(k) => {
+                // ssh stopping for the terminal is noticed by looking, so
+                // the poll never sleeps long.
+                let mut wait = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50));
+                if let Some(d) = k.state.detector.deadline() {
+                    wait = wait.min(Duration::from_millis(d.saturating_sub(sys::now_ms())));
+                }
+                let mut fds = [
+                    sys::pollfd(from.as_raw_fd(), libc::POLLIN),
+                    sys::pollfd(if k.handed { -1 } else { STDIN }, libc::POLLIN),
+                ];
+                sys::poll(&mut fds, sys::poll_timeout(wait))?;
+                if k.step(pid, fds[1].revents != 0) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                match fds[0].revents != 0 {
+                    true => true,
+                    false if Instant::now() < deadline => continue,
+                    false => false,
+                }
+            }
+        };
+        if !ready {
             let _ = child.kill();
             let _ = child.wait();
             return Err(io::Error::new(
@@ -837,7 +960,16 @@ fn dial_once(
             if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
                 note(&format!("remote said: {noise}"));
             }
-            let _ = child.wait();
+            let status = child.wait();
+            // A Ctrl-C at ssh's prompt reached ssh alone, which had the
+            // terminal: it ends acs as it did when they shared a group.
+            if let Some(k) = keys.as_deref_mut().filter(|k| k.handed) {
+                use std::os::unix::process::ExitStatusExt;
+                if status.is_ok_and(|s| s.signal() == Some(libc::SIGINT)) {
+                    k.left = Some(Left::Interrupt);
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+            }
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "the connection closed before acs started on the remote",
@@ -1235,11 +1367,48 @@ pub fn connect_and_serve(
     let pargs = proxy_args(args, state, resuming);
     let pargs: Vec<&str> = pargs.iter().map(String::as_str).collect();
     let remote = ssh::remote_acs(crate::VERSION, &pargs);
-    // Cooked mode while ssh may prompt (password, key touch).
-    if let Some(r) = raw.as_mut() {
-        let _ = r.suspend();
-    }
-    let (link, marker) = match dial(args, call, &remote, timeout, timing, greeting) {
+    // A redial honours the command keys while ssh has not asked for the
+    // terminal (DialKeys) — where acs has a terminal to give it: raw mode,
+    // and the foreground of the terminal it reads.
+    let foreground = sys::tcgetpgrp(STDIN).is_ok_and(|p| p == sys::getpgrp());
+    let dialed = match raw.as_mut().filter(|_| resuming && foreground) {
+        Some(r) => {
+            let mut keys = DialKeys {
+                state,
+                raw: r,
+                handed: false,
+                left: None,
+            };
+            let dialed = dial_once(
+                args,
+                call,
+                &remote,
+                timeout,
+                timing,
+                greeting,
+                Some(&mut keys),
+            );
+            keys.finish();
+            match keys.left {
+                Some(Left::Detach) => return detached(state, raw),
+                Some(Left::Interrupt) => {
+                    // The fatal-signal path puts the terminal back and takes
+                    // the status line down (tty::install_emergency_restore).
+                    let _ = sys::kill(std::process::id() as i32, libc::SIGINT);
+                    return Outcome::Exit(130);
+                }
+                None => dialed,
+            }
+        }
+        None => {
+            // Cooked mode while ssh may prompt (password, key touch).
+            if let Some(r) = raw.as_mut() {
+                let _ = r.suspend();
+            }
+            dial(args, call, &remote, timeout, timing, greeting)
+        }
+    };
+    let (link, marker) = match dialed {
         Ok(x) => x,
         Err(e) => {
             // The dial itself did not come up: nothing reached the host,
@@ -1292,6 +1461,17 @@ pub fn connect_and_serve(
     serve(
         args, state, raw, signals, link, rest, timeout, timing, size, netwatch,
     )
+}
+
+/// Leave detached: the terminal put back, and the way to reattach told.
+fn detached(state: &mut State, raw: &mut Option<RawMode>) -> Outcome {
+    leave(state, raw);
+    let name = state.session.clone().unwrap_or_default();
+    note(&format!(
+        "detached from {}/{name} — reattach with: acs {} {name}",
+        state.host, state.host
+    ));
+    Outcome::Exit(code::DETACHED)
 }
 
 fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -1780,13 +1960,7 @@ fn serve(
                     let _ = sys::poll(&mut p, 50);
                 }
                 link.close();
-                leave(state, raw);
-                let name = state.session.clone().unwrap_or_default();
-                note(&format!(
-                    "detached from {}/{name} — reattach with: acs {} {name}",
-                    state.host, state.host
-                ));
-                return Outcome::Exit(code::DETACHED);
+                return detached(state, raw);
             }
             Some(Action::Exit) => {
                 // This connection is the attached one, so the master lets

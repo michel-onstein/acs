@@ -646,11 +646,17 @@ sequenceDiagram
   seconds later is how accidents happen. (Command-mode keys still work — §6
   — which is why what ends the wait early matters: only a change to this
   machine's own network does, §5.3.)
-  That includes the redial itself, where the terminal is back in cooked mode
-  for ssh's prompts: what was typed then is discarded when raw mode resumes
-  on `WELCOME` (`TCSAFLUSH`), and the takeover question discards it before
-  asking. A Ctrl-C there ends the client with the status line blanked and
-  the title popped, as any fatal signal does.
+  That includes the redial itself. Until ssh asks for the terminal, acs
+  reads the keys of a redial itself — command keys honoured, the rest
+  dropped, §5.3 has how — and once ssh has asked, the terminal is back in
+  cooked mode for ssh's prompt and stdin is ssh's (acs-8ax). Either way,
+  what reached the terminal and was not read is discarded when raw mode
+  resumes on `WELCOME` (`TCSAFLUSH`), and the takeover question discards it
+  before asking; a passphrase typed at ssh's prompt is read by ssh alone,
+  never by acs, and never echoed. A Ctrl-C there ends the client with the
+  status line blanked and the title popped, as any fatal signal does — read
+  by acs as the cooked terminal's interrupt key before ssh has asked, and
+  delivered to ssh, whose death by it ends acs, once ssh has the terminal.
 - **Fresh attach** (new client, e.g. after an explicit detach or from another
   machine) does **not** replay the ring: the local terminal's state is unknown,
   and replaying mode-changing sequences into it is unsafe. It behaves like
@@ -724,10 +730,11 @@ sequenceDiagram
   cost 10 s of silence before it is a drop at all (§5.3), and most of them
   are momentary, so a wait before looking once put a second on every resume
   to buy nothing; a host that is really gone refuses the attempt (or times
-  out, below) and the backoff starts from there. What it costs: the offline
-  wait is where typed command keys are honoured (§5.4), so the second
-  between a drop and the first dial is no longer one in which `d` detaches
-  — it is a dial like any other, and keys typed into a dial are dropped.
+  out, below) and the backoff starts from there. It cost something for a
+  while: the offline wait was the only place the command keys were
+  honoured (§5.4), so the second between a drop and the first dial stopped
+  being one in which `d` detaches. A redial honours them too now (acs-8ax,
+  below), so it costs nothing.
 - **What counts as a network change** (acs-6p8). The watcher
   (`netwatch.rs`) has two halves, and the socket is only the first: a
   `PF_ROUTE` (macOS) or `NETLINK_ROUTE` (Linux) message says the kernel
@@ -877,8 +884,50 @@ sequenceDiagram
     and it is what this uses.
 - Authentication prompts on reconnect (password, hardware key touch) are
   passed through, because ssh gets the controlling tty for prompts even with
-  `-T`; the client restores cooked mode while ssh is authenticating. With
-  keys in an agent, reconnect is silent.
+  `-T`. With keys in an agent, reconnect is silent.
+- **The command keys during a redial** (acs-8ax). A dial against a dead
+  network can take its whole `ConnectTimeout`, and `Ctrl-] Ctrl-] d` used
+  to do nothing until it gave up: the terminal was cooked for ssh, so the
+  keys sat in its line buffer. They conflict with ssh's prompts — stdin is
+  one terminal, and whoever reads first gets the bytes — so the redial is
+  arbitrated by **job control** rather than by guessing whether ssh will
+  ask for anything:
+  - ssh is spawned in a **process group of its own**, in the background of
+    the terminal, and the terminal is put in a mode that is cooked but for
+    line buffering and signals (`ICANON`, `ISIG` and `IEXTEN` off), so acs
+    reads each key as it arrives and feeds the command detector: `d`
+    detaches at once, `x` says it needs the link as in the offline wait,
+    the interrupt key ends the client as Ctrl-C did, and everything else
+    is dropped. Keys echo, as they did in the cooked dial.
+  - A background process that sets the terminal's modes or reads it is
+    **stopped by the kernel** (`SIGTTOU`, `SIGTTIN`), and the signal goes
+    to its whole process group — so a ProxyCommand's or ProxyJump's own
+    ssh stops the transport too, which leaves those signals at their
+    default. ssh's `readpassphrase` sets the modes
+    (echo off, `TCSAFLUSH`) before it writes the prompt, for a password, a
+    key passphrase, a PIN and the host-key question alike, and it is made
+    to start over after the stop. acs looks for the stop every 50 ms
+    (`waitid(WSTOPPED)`) and then **hands the terminal over**: the cooked
+    settings back, ssh's group made the foreground (`tcsetpgrp`), the group
+    continued. From then on stdin is ssh's and acs does not read it — the
+    keys are not live for the rest of that dial, as no dial's were before.
+    The prompt cannot have been seen before the hand-off, so nothing the
+    user types at it can reach acs.
+  - When the dial ends, however it ends, the terminal is taken back for
+    acs's group and left cooked until the `WELCOME`, as a cooked dial
+    leaves it (§5.2).
+  - **Which dials:** a redial (the first connection has no session to
+    detach from, and keeps the cooked dial with ssh in acs's group) while
+    acs has the terminal — in raw mode and the foreground of the terminal
+    on its stdin. A client run in the background of its shell, or on a
+    terminal that is not its controlling one, has no terminal to hand over
+    and dials cooked, as before. A non-interactive key — agent, hardware
+    touch, `SSH_ASKPASS` — never touches the terminal, so its redial is
+    live from end to end; that is the common case the change is for.
+  - What it does not need: no change to ssh's options. Interactive
+    authentication on a redial still works exactly as it did, which is why
+    this is not `BatchMode` on redials — that would have made a password
+    host unable to reconnect at all.
 - **The greeting goes out with the dial** (acs-trw): the `HELLO` is written
   into ssh's stdin as it is spawned, before the marker is awaited (§3), so a
   redial costs the ssh handshake and one trip for the `WELCOME` rather than
@@ -892,7 +941,8 @@ sequenceDiagram
   with WELCOME, and `ConnectTimeout` only covers the TCP connect, so a host
   that accepts and then says nothing would otherwise hold the client forever.
   A connection has 30 s on a redial — then it is dropped and the client goes
-  back to its backoff wait, where the command keys work — and 120 s on the
+  back to its backoff wait, where the command keys work even when ssh had
+  the terminal — and 120 s on the
   first connection (time for a password), then the client exits 255, for the
   marker and again for the handshake (`ACS_DIAL_TIMEOUT_MS` sets both). A
   takeover question restarts the handshake's clock.
@@ -1017,7 +1067,7 @@ lossless resume will not repaint it. So:
 | Ctrl-] | Held for up to **400 ms**. If nothing else arrives, it is sent to the remote. |
 | Ctrl-] then any other key within 400 ms | Both keys sent to the remote, in order, immediately. |
 | Ctrl-] Ctrl-] within 400 ms | Enter command mode: the next key is a command. The terminal bell rings. |
-| … then `d` | **Detach.** `DETACH` to the master, restore the local terminal, exit 0. The session keeps running. Works even while the link is down (it is purely local then). |
+| … then `d` | **Detach.** `DETACH` to the master, restore the local terminal, exit 0. The session keeps running. Works even while the link is down (it is purely local then), in a redial too unless ssh is prompting (below). |
 | … then `x` | **Exit.** `KILL` to the master, wait for `EXIT`, restore the terminal, exit with the child's status. Needs the link; if it is down the client says so and stays in the session. |
 | … then any other key, or nothing for **2 s** (longer if the escape window is, below) | All the held keys are sent to the remote as typed. |
 
@@ -1089,6 +1139,15 @@ dropped like any key typed into one (§5.2) — it is not sent as `INPUT`
 ahead of the `WELCOME` (acs-wnhd). Which side of the `WELCOME` the window
 ends on is a matter of milliseconds, so either outcome is acceptable; what
 is not is a byte reaching the program from a link that was not yet up.
+
+**When the keys are live.** Always while a link is up, always in the wait
+between redials (§5.4), and during a redial until ssh asks for the
+terminal (acs-8ax, §5.3): once it has, the keys are ssh's — a password
+must reach ssh and nothing else — until that dial ends, and the next wait
+honours them again. The first connection's dial, which has no session to
+detach from, and a client that is not in the foreground of its terminal
+dial with the keys off. The detector carries through all of these, a
+redial included: a press held when the dial starts is still held in it.
 
 Command mode prints nothing on the screen — it only rings the bell (below):
 the local terminal shows only what the remote sent. The table is intended to
