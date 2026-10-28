@@ -1122,31 +1122,17 @@ fn write(path: &Path, doc: &Document) -> Result<(), Error> {
         Error::Io(format!("cannot write {}: {e}{hint}", what.display()))
     };
     std::fs::create_dir_all(dir).map_err(|e| io(e, dir))?;
-    let tmp = dir.join(format!(".config.yaml.{}", crate::sys::random_token()));
-    // Created 0600, then widened to match an existing file (acs-q4f).
-    // `fs::write` used the process umask, typically 0644, and the mode was
-    // copied only afterwards — so a brand new configuration stayed
-    // world-readable for good. It holds no secret, but it is an inventory
-    // of the user's hosts, login names and key paths, which is not
-    // everybody's business on a shared machine.
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|e| io(e, path))?;
-        f.write_all(text.as_bytes()).map_err(|e| io(e, path))?;
-    }
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
-    }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        io(e, path)
-    })
+    // 0600 when new, else the existing file's mode (acs-q4f). `fs::write`
+    // used the process umask, typically 0644, and the mode was copied only
+    // afterwards — so a brand new configuration stayed world-readable for
+    // good. It holds no secret, but it is an inventory of the user's hosts,
+    // login names and key paths, which is not everybody's business on a
+    // shared machine.
+    let mode = std::fs::metadata(path).map_or(0o600, |m| {
+        use std::os::unix::fs::PermissionsExt as _;
+        m.permissions().mode() & 0o7777
+    });
+    crate::sys::write_atomic(path, mode, text.as_bytes()).map_err(|e| io(e, path))
 }
 
 #[cfg(test)]

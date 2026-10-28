@@ -250,6 +250,73 @@ pub fn create_new(path: &std::path::Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+/// [`create_new`], with exactly `mode` whatever the umask (acs-g4uc).
+///
+/// The mode `open` is given is masked by the umask — 077 leaves an
+/// executable 0700 (acs-28b) — so it is set again through the handle,
+/// which cannot be redirected to another file. A failure there removes
+/// the file again: it is ours, made a moment ago.
+pub fn create_new_mode(path: &std::path::Path, mode: u32) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)?;
+    fchmod(f.as_raw_fd(), mode).inspect_err(|_| {
+        let _ = std::fs::remove_file(path);
+    })?;
+    Ok(f)
+}
+
+/// An unpredictable name beside `path`: `.<name><tag>.<token>`, for a file
+/// that is renamed over it (acs-721).
+fn temp_beside(path: &std::path::Path, tag: &str) -> io::Result<std::path::PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut tmp = std::ffi::OsString::from(".");
+    tmp.push(name);
+    tmp.push(tag);
+    tmp.push(".");
+    tmp.push(random_token());
+    Ok(path.with_file_name(tmp))
+}
+
+/// Replace `path` with `bytes` at exactly `mode`, so that it is the old
+/// file or the new one and never half of either (acs-g4uc).
+///
+/// Written under a fresh name beside it by [`create_new_mode`], so a name
+/// planted ahead of us is refused rather than written through, and renamed
+/// over it. The rename replaces `path` itself: a symlink there is replaced
+/// by a regular file, so a caller that edits what a link leads to resolves
+/// it first. On any failure after the temporary file is made, it is
+/// removed.
+pub fn write_atomic(path: &std::path::Path, mode: u32, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let tmp = temp_beside(path, "")?;
+    let mut f = create_new_mode(&tmp, mode)?;
+    let written = f.write_all(bytes);
+    drop(f);
+    written
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+}
+
+/// Point the symlink `link` at `target`, atomically: a fresh link beside it
+/// renamed over it, so `link` is never missing (acs-g4uc). `symlink` fails
+/// on a name already taken rather than following it, and the temporary
+/// link is removed when the rename fails.
+pub fn symlink_atomic(target: &std::path::Path, link: &std::path::Path) -> io::Result<()> {
+    let tmp = temp_beside(link, ".link")?;
+    std::os::unix::fs::symlink(target, &tmp)?;
+    std::fs::rename(&tmp, link).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 /// Open `path` as a directory without following a symlink at its last
 /// component, for checking and changing it through the handle rather than
 /// by name (acs-hjk).
@@ -851,6 +918,168 @@ mod tests {
         let fresh = t.path().join(format!(".acs.upgrade.{}", random_token()));
         create_new(&fresh).expect("a free name");
         assert!(fresh.exists());
+    }
+
+    fn mode_of(p: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// The names in `dir`, sorted: what a failed write must leave as it was.
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// acs-g4uc: the three helpers under a umask that would widen a
+    /// default mode (002, Ubuntu's with user-private groups) and one that
+    /// would narrow it (077). The umask is the whole process's, so each is
+    /// run in a child test process of its own rather than racing every
+    /// other test here.
+    #[test]
+    fn the_atomic_helpers_ignore_the_umask() {
+        const VAR: &str = "ACS_TEST_SYS_UMASK";
+        if let Some(mask) = std::env::var_os(VAR) {
+            let mask = u32::from_str_radix(mask.to_str().unwrap(), 8).unwrap();
+            let _mask = Umask::set(mask);
+            atomic_helpers_under_the_current_umask(mask);
+            return;
+        }
+        let me = std::env::current_exe().unwrap();
+        for mask in ["002", "077"] {
+            let out = std::process::Command::new(&me)
+                .args([
+                    "sys::tests::the_atomic_helpers_ignore_the_umask",
+                    "--exact",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(VAR, mask)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && text.contains("1 passed"),
+                "under umask {mask}:\n{text}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    fn atomic_helpers_under_the_current_umask(mask: u32) {
+        let t = crate::testutil::TempDir::new();
+        // A plain create shows the umask really is in force.
+        let plain = t.path().join("plain");
+        drop(create_new(&plain).unwrap());
+        assert_eq!(mode_of(&plain), 0o666 & !mask);
+
+        let exe = t.path().join("exe");
+        drop(create_new_mode(&exe, 0o755).unwrap());
+        assert_eq!(mode_of(&exe), 0o755, "umask {mask:o}");
+
+        let state = t.path().join("state");
+        write_atomic(&state, 0o600, b"one").unwrap();
+        assert_eq!(mode_of(&state), 0o600, "umask {mask:o}");
+        write_atomic(&state, 0o644, b"two").unwrap();
+        assert_eq!(mode_of(&state), 0o644, "umask {mask:o}");
+        assert_eq!(std::fs::read(&state).unwrap(), b"two");
+
+        let link = t.path().join("link");
+        symlink_atomic(&exe, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+        assert_eq!(
+            names(t.path()),
+            ["exe", "link", "plain", "state"],
+            "a temporary name was left behind"
+        );
+    }
+
+    /// acs-g4uc: `create_new_mode` refuses a name already there, a planted
+    /// symlink above all, exactly as [`create_new`] does (acs-721).
+    #[test]
+    fn create_new_mode_refuses_a_name_that_is_already_there() {
+        let t = crate::testutil::TempDir::new();
+        let secret = t.path().join("precious");
+        std::fs::write(&secret, b"do not touch").unwrap();
+        let secret_mode = mode_of(&secret);
+        let planted = t.path().join("planted");
+        std::os::unix::fs::symlink(&secret, &planted).unwrap();
+        let e = create_new_mode(&planted, 0o777).expect_err("wrote through a planted symlink");
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&secret).unwrap(), b"do not touch");
+        assert_eq!(mode_of(&secret), secret_mode, "chmodded through the link");
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// acs-g4uc: `write_atomic` replaces the path itself, and a failure —
+    /// before the temporary file exists or after — leaves the directory as
+    /// it was, with no temporary file behind.
+    #[test]
+    fn write_atomic_replaces_whole_or_leaves_nothing_behind() {
+        let t = crate::testutil::TempDir::new();
+        let f = t.path().join("f");
+        std::fs::write(&f, b"old").unwrap();
+        write_atomic(&f, 0o600, b"new").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"new");
+        assert_eq!(mode_of(&f), 0o600);
+
+        // A symlink at the path is replaced by a file, not written through:
+        // a caller that means the link's target resolves it first.
+        let target = t.path().join("target");
+        std::fs::write(&target, b"kept").unwrap();
+        let link = t.path().join("l");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_atomic(&link, 0o600, b"file").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_file());
+        assert_eq!(std::fs::read(&target).unwrap(), b"kept");
+
+        // The rename fails: a non-empty directory is in the way.
+        let dir = t.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("inside"), b"").unwrap();
+        let before = names(t.path());
+        write_atomic(&dir, 0o600, b"x").expect_err("renamed over a directory");
+        assert_eq!(names(t.path()), before, "a temporary file was left behind");
+
+        // The create fails: no directory to write in.
+        write_atomic(&t.path().join("missing/f"), 0o600, b"x").expect_err("no directory");
+        assert_eq!(names(t.path()), before);
+
+        // A path with no file name has no temporary name either.
+        assert_eq!(
+            write_atomic(std::path::Path::new("/"), 0o600, b"x")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// acs-g4uc: `symlink_atomic` repoints an existing link, and when the
+    /// rename fails the temporary link is gone again.
+    #[test]
+    fn symlink_atomic_repoints_or_leaves_nothing_behind() {
+        let t = crate::testutil::TempDir::new();
+        let link = t.path().join("acs");
+        symlink_atomic(std::path::Path::new("one"), &link).unwrap();
+        symlink_atomic(std::path::Path::new("two"), &link).unwrap();
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::Path::new("two")
+        );
+
+        let dir = t.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("inside"), b"").unwrap();
+        let before = names(t.path());
+        symlink_atomic(std::path::Path::new("x"), &dir).expect_err("renamed over a directory");
+        assert_eq!(names(t.path()), before, "a temporary link was left behind");
     }
 
     /// acs-721: the names are not guessable, and not the process id.
