@@ -6,9 +6,8 @@ use std::time::{Duration, Instant};
 use acs::proto::{AttachKind, Mode, Msg, Resume, Welcome};
 use acs::testutil::{hello, FrameConn, TempDir};
 
-/// As `common::T`, which this file cannot reach: generous, because the
-/// suite runs its targets in parallel (acs-kip).
-const T: Duration = Duration::from_secs(30);
+mod common;
+use common::T;
 
 fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_acs"))
@@ -315,21 +314,30 @@ fn master_rejects_a_mismatched_protocol() {
 
 // ---- session protocol (acs-5v9.10) ------------------------------------------
 
-/// Numbers of the `n<i>` lines in `out`, in order.
-fn numbers(out: &[u8]) -> Vec<u32> {
-    String::from_utf8_lossy(out)
-        .split(['\r', '\n'])
-        .filter_map(|l| l.strip_prefix('n').and_then(|n| n.parse().ok()))
-        .collect()
+/// Numbers of the `#<i>#` ticks in `out`, in order — the shared reader
+/// (`common::numbers`, acs-2dc), so a tick the snapshot cut in half is left
+/// out rather than read as a smaller number (acs-mkb). This file used to
+/// carry its own copy, which parsed a truncated `n17` of `n175` as 17.
+fn numbers(out: &[u8]) -> Vec<u64> {
+    common::numbers(&String::from_utf8_lossy(out))
 }
 
-const TICKER: &str = "i=0; while true; do i=$((i+1)); echo n$i; sleep 0.02; done";
+/// Prints `#1#`, `#2#`, … — the shape `common::numbers` reads.
+const TICKER: &str = "i=0; while true; do i=$((i+1)); echo \"#$i#\"; sleep 0.02; done";
+
+#[test]
+fn numbers_leaves_out_a_tick_the_snapshot_cut_in_half() {
+    assert_eq!(numbers(b"#1#\r\n#2#\r\n#3#\r\n"), [1, 2, 3]);
+    // `#175#` cut after `#17`: not a 17, and so not a gap.
+    assert_eq!(numbers(b"#173#\r\n#174#\r\n#17"), [173, 174]);
+    assert_eq!(numbers(b"#173#\r\n#174#\r\n#"), [173, 174]);
+}
 
 #[test]
 fn resume_replays_exactly_the_missed_bytes() {
     let t = TempDir::new();
     let (mut a, w) = start(t.path(), "r", &["/bin/sh", "-c", TICKER], "me");
-    a.wait_output("n3\r\n", T);
+    a.wait_output("#3#\r\n", T);
     let seen = a.next_offset.unwrap();
     let before = a.output.clone();
     drop(a); // the link drops: no DETACH
@@ -353,14 +361,14 @@ fn resume_replays_exactly_the_missed_bytes() {
         other => panic!("{other:?}"),
     }
     b.next_offset = Some(seen);
-    let target = format!("n{}\r\n", numbers(&before).last().unwrap() + 20);
+    let target = format!("#{}#\r\n", numbers(&before).last().unwrap() + 20);
     b.wait_output(&target, T);
     let mut all = before;
     all.extend_from_slice(&b.output);
     let n = numbers(&all);
     assert_eq!(
         n,
-        (1..=n.len() as u32).collect::<Vec<_>>(),
+        (1..=n.len() as u64).collect::<Vec<_>>(),
         "lines lost or repeated"
     );
 }
