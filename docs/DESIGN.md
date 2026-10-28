@@ -1473,14 +1473,30 @@ that cannot wait, which bytes end the open sequence and which write it again
     nothing back.
 - **Connect timings** under `-v` (acs-pgn, `timing.rs`): one line per phase
   of a connection, `acs: timing: <connection>: <phase> +<step> ms (<total>
-  ms total)`, for the first connection and for every redial. The phases, in
-  order: `alias resolved` (an alias's pings and lookups), `ssh spawned`,
-  `HELLO sent`, `ACS-READY seen`, `session list received` (the menu's
-  `_proxy --pick`, §4.4), `WELCOME received`, `first output byte`; a phase a
+  ms total)`, for the first connection and for every redial. A phase a
   connection does not go through is not told, and nothing is told after the
   first output byte. They exist to show what dominates connect latency on a
   real host — the ssh handshake, remote startup files or the reachability
-  deadline — before any of it is optimised.
+  deadline — before any of it is optimised. The phases, in order — this
+  list is `timing::Phase`, and `tests/timing.rs` fails when the two differ
+  (acs-fb7r):
+  - `alias resolved` — an alias's pings and lookups.
+  - `network moved — dialing again` — a dial or handshake abandoned for a
+    network change (§7), told before the dial made again.
+  - `shared ssh master checked` — acs's own master may be joined
+    (acs-9n3, §7.1); not told where it may not.
+  - `ssh spawned`.
+  - `HELLO partly sent` — the transport's pipe took only part of the
+    greeting (below).
+  - `HELLO sent` — the whole greeting has gone (below).
+  - `ACS-READY seen` — the remote runs this acs.
+  - `ACS-NEED seen` — instead of `ACS-READY seen`: the remote has no acs,
+    or not this one.
+  - `acs installed` — after `ACS-NEED seen`, the install on the same
+    connection done (acs-6k2, §8.1).
+  - `session list received` — the menu's `_proxy --pick` answered (§4.4).
+  - `WELCOME received`.
+  - `first output byte`.
 - **`HELLO sent` is where the *whole* greeting has gone** (acs-ftn), so the
   order of the lines is what says whether the greeting overlapped the
   marker's leg (§5.3, acs-trw) or waited behind it — which is the one thing
