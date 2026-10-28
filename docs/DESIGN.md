@@ -1055,6 +1055,13 @@ could not receive it; what this forwards is one escape press, no older than
 the escape window, released into a live link exactly as the online path
 would have released it.
 
+"Came back" means the `WELCOME`, not the dial. A press whose window runs out
+while a redial is still in its handshake was typed into that dial, and is
+dropped like any key typed into one (§5.2) — it is not sent as `INPUT`
+ahead of the `WELCOME` (acs-wnhd). Which side of the `WELCOME` the window
+ends on is a matter of milliseconds, so either outcome is acceptable; what
+is not is a byte reaching the program from a link that was not yet up.
+
 Command mode prints nothing on the screen — it only rings the bell (below):
 the local terminal shows only what the remote sent. The table is intended to
 grow — `r` (force redraw) and `?` (help, followed by a redraw) are obvious

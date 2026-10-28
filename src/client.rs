@@ -1711,7 +1711,13 @@ fn serve(
             let was = state.detector.armed();
             let o = state.detector.tick(sys::now_ms());
             follow_detector(state, was);
-            queue_input(state, &mut out, &o.forward);
+            // A press whose window ran out before the WELCOME was typed
+            // into the dial: dropped, as offline() drops it (acs-wnhd,
+            // DESIGN §6.1). Stdin is not read until then, so this is the
+            // only way a key reaches here early.
+            if welcomed {
+                queue_input(state, &mut out, &o.forward);
+            }
         }
         match action {
             Some(Action::Detach) => {
