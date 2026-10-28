@@ -113,6 +113,13 @@ fn typed(key: &str, value: &str) -> Result<Node, String> {
     } else if config::FORWARDS.contains(&key) {
         let specs = config::parse_forwards(value).map_err(|e| format!("{key}: {e}"))?;
         Ok(forwards_node(&specs))
+    } else if value.is_empty() {
+        // An empty `identity_file` names no key, and the file would not load
+        // with one; what drops an alias's key is `host unset` (acs-cdal).
+        Err(format!(
+            "{key} needs a key file, not an empty value \
+             (acs config host unset <alias> {key} removes it)"
+        ))
     } else {
         Ok(Node::string(value))
     }
@@ -271,7 +278,9 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
             alias: alias.to_string(),
             host: Some(host.to_string()),
         },
-        ["host", "set", alias, key, value] if !value.is_empty() => Cmd::HostSet {
+        // An empty value is for the setting to judge, as it is for `set`
+        // (acs-cdal): `typed` refuses it by name where it means nothing.
+        ["host", "set", alias, key, value] => Cmd::HostSet {
             alias: alias.to_string(),
             key: key.to_string(),
             value: value.to_string(),
@@ -1376,6 +1385,49 @@ aliases:
             let e = parse(&args(a)).unwrap_err();
             assert!(e.contains(want), "{a}: {e}");
         }
+    }
+
+    #[test]
+    fn an_empty_alias_value_is_parsed_as_the_global_one_is() {
+        // acs-cdal: the per-alias form refused '' as "bad arguments" while
+        // the global form took it; the setting's own check judges it now.
+        let words = |w: &[&str]| -> Vec<OsString> { w.iter().map(OsString::from).collect() };
+        assert_eq!(
+            parse(&words(&["host", "set", "a", "local_forwards", ""])).unwrap(),
+            (
+                Cmd::HostSet {
+                    alias: "a".into(),
+                    key: "local_forwards".into(),
+                    value: String::new(),
+                },
+                false
+            )
+        );
+        assert_eq!(
+            parse(&words(&["set", "local_forwards", ""])).unwrap(),
+            (Cmd::Set("local_forwards".into(), String::new()), false)
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_judged_by_its_setting() {
+        // acs-cdal: the same answer for a setting whether global or an
+        // alias's, and a refusal that names the setting.
+        for (key, want) in [
+            ("persist", "persist is true or false, not ''"),
+            (
+                "reachability_timeout",
+                "reachability_timeout: expected a duration",
+            ),
+            (
+                "identity_file",
+                "identity_file needs a key file, not an empty value",
+            ),
+        ] {
+            let e = typed(key, "").unwrap_err();
+            assert!(e.contains(want), "{key}: {e}");
+        }
+        assert_eq!(value_text(&typed("local_forwards", "").unwrap()), "none");
     }
 
     #[test]

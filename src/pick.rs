@@ -265,10 +265,16 @@ impl Pick {
                 }
                 Ok(None) => match self.wait(from, deadline) {
                     Ok(true) => match sys::read(from, &mut buf) {
+                        // An ERROR and then the end: the host could not
+                        // read its sessions, which is what to report
+                        // (acs-5jrq), not the connection closing.
                         Ok(0) => {
-                            return Err(Failure::Unreachable(
-                                "the connection closed before the session list".into(),
-                            ))
+                            return Err(match answer.error {
+                                Some(e) => Failure::BadReply(e),
+                                None => Failure::Unreachable(
+                                    "the connection closed before the session list".into(),
+                                ),
+                            })
                         }
                         Ok(n) => self.dec.push(&buf[..n]),
                         Err(e) => return Err(Failure::Unreachable(e.to_string())),

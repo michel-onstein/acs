@@ -1,6 +1,8 @@
 //! End-to-end over real ssh against a container host (acs-5v9.24). Run by
-//! `scripts/e2e_ssh.sh`, which starts the host and sets `ACS_E2E_*`;
-//! skipped otherwise.
+//! `scripts/e2e_ssh.sh`, which starts the host, sets `ACS_E2E_*` and passes
+//! `--include-ignored`. Every test is `#[ignore]`, so a plain `cargo test`
+//! counts them as ignored rather than passing them unrun (acs-hdj4), and one
+//! asked for without the host fails instead of returning early.
 //!
 //! The tests run one at a time in name order, and `e2e_01` must be first
 //! (it checks the first-contact install), so numbers are zero-padded:
@@ -20,14 +22,20 @@ struct Host {
     container: String,
 }
 
-fn host() -> Option<Host> {
-    let v = |k: &str| std::env::var(k).ok();
-    Some(Host {
-        client: v("ACS_E2E_CLIENT")?,
-        key: v("ACS_E2E_KEY")?,
-        port: v("ACS_E2E_PORT")?,
-        container: v("ACS_E2E_CONTAINER")?,
-    })
+/// The host `scripts/e2e_ssh.sh` started. A test only gets here when it was
+/// asked for by name or with `--include-ignored`, so a missing variable is a
+/// failure, not a reason to pass without running.
+fn host() -> Host {
+    let v = |k: &str| {
+        std::env::var(k)
+            .unwrap_or_else(|_| panic!("{k} is not set: this test runs under scripts/e2e_ssh.sh"))
+    };
+    Host {
+        client: v("ACS_E2E_CLIENT"),
+        key: v("ACS_E2E_KEY"),
+        port: v("ACS_E2E_PORT"),
+        container: v("ACS_E2E_CONTAINER"),
+    }
 }
 
 impl Host {
@@ -116,8 +124,9 @@ fn wait_greeting(port: u16, timeout: Duration) -> String {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_01_first_contact_installs_and_attaches() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client("first", "echo up-and-running; sleep 60", &[]);
     c.wait_for("installing acs", T);
     c.wait_for("(Linux aarch64)", T);
@@ -130,8 +139,9 @@ fn e2e_01_first_contact_installs_and_attaches() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_02_identity_file_is_required() {
-    let Some(h) = host() else { return };
+    let h = host();
     // Same options but no -i: this host only accepts the generated key.
     let args = [
         "-F",
@@ -155,8 +165,9 @@ fn e2e_02_identity_file_is_required() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_03_vim_uses_the_alternate_screen_and_exits_cleanly() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client("vim", "vim -u NONE -N", &[]);
     c.wait_for("\x1b[?1049h", T);
     std::thread::sleep(Duration::from_millis(500));
@@ -168,8 +179,9 @@ fn e2e_03_vim_uses_the_alternate_screen_and_exits_cleanly() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_04_osc52_and_hyperlinks_pass_through_verbatim() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client(
         "osc",
         "printf '\\033]52;c;aGVsbG8=\\007\\033]8;;https://x.test\\033\\\\link\\033]8;;\\033\\\\'; echo; echo done; sleep 30",
@@ -186,8 +198,9 @@ fn e2e_04_osc52_and_hyperlinks_pass_through_verbatim() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_05_kitty_keyboard_protocol_command_key() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client("kitty", "printf '\\033[>1u'; echo kitty-on; sleep 60", &[]);
     c.wait_for("kitty-on", T);
     c.send(b"\x1b[93;5u\x1b[93;5ud");
@@ -197,8 +210,9 @@ fn e2e_05_kitty_keyboard_protocol_command_key() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_06_mouse_reports_reach_the_program() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client(
         "mouse",
         "stty raw -echo; printf '\\033[?1000h'; echo mouse-on; od -An -tx1 -N 6",
@@ -221,8 +235,9 @@ fn e2e_06_mouse_reports_reach_the_program() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_07_killed_connection_resumes_without_loss() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client("drop", TICKER, &[("ACS_BACKOFF_MS", "300")]);
     c.wait_for("#30#", T);
     // Kill the sshd process serving the session (not the listener).
@@ -244,8 +259,9 @@ fn e2e_07_killed_connection_resumes_without_loss() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_08_frozen_host_is_detected_and_resumed() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client(
         "freeze",
         TICKER,
@@ -271,8 +287,9 @@ fn e2e_08_frozen_host_is_detected_and_resumed() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_09_list_shows_the_sessions() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut args = vec!["list".to_string()];
     args.extend(h.ssh_args());
     args.push("dev@127.0.0.1".into());
@@ -292,8 +309,9 @@ fn e2e_09_list_shows_the_sessions() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_09b_list_without_a_host_asks_every_alias() {
-    let Some(h) = host() else { return };
+    let h = host();
     // `box` is the container; `gone` is a documentation address no ping
     // reaches.
     let dir = acs::testutil::TempDir::new();
@@ -328,8 +346,9 @@ fn e2e_09b_list_without_a_host_asks_every_alias() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_10_user_at_alias_logs_in_as_that_user() {
-    let Some(h) = host() else { return };
+    let h = host();
     // The entry's own user has no key on the host: only the override works.
     let cfg = acs::testutil::TempDir::new();
     let env = config_env(
@@ -350,8 +369,9 @@ fn e2e_10_user_at_alias_logs_in_as_that_user() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_11_identity_file_from_the_configuration() {
-    let Some(h) = host() else { return };
+    let h = host();
     // The key only under a HOME of our own, reached as ~/.ssh/id_box: acs
     // expands the ~. `keyed` names it on its host entry, over a missing
     // alias key; `plain` names it for the whole alias. No -i is given.
@@ -413,8 +433,9 @@ fn e2e_11_identity_file_from_the_configuration() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_12_ctrl_l_after_a_reattach_and_a_resume() {
-    let Some(h) = host() else { return };
+    let h = host();
     // Every byte the program receives, as `in:xx`.
     let reporter = "stty raw -echo; echo ready; \
         while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1); printf 'in:%s\\n' $b; done";
@@ -444,8 +465,9 @@ fn e2e_12_ctrl_l_after_a_reattach_and_a_resume() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
-    let Some(h) = host() else { return };
+    let h = host();
     let echo = |name: &str| format!("echo ready-{name}; while read l; do echo got-{name}:$l; done");
     for name in ["menu-a", "menu-b"] {
         let mut c = h.client(name, &echo(name), &[]);
@@ -507,8 +529,9 @@ fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
 /// it. The container's sshd is set to `AllowTcpForwarding yes` for it
 /// (scripts/e2e/Dockerfile) — Alpine ships `no`.
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_14_a_local_forward_is_the_session_connections_alone() {
-    let Some(h) = host() else { return };
+    let h = host();
     let port = free_port();
     // Back to the container's own sshd, so what comes out of the forward is
     // the host's real banner rather than something the test planted.
@@ -608,9 +631,10 @@ fn total_ms(text: &str, what: &str, phase: &str) -> Option<u64> {
 /// link takes the master down with it, because the master's own connection
 /// is the one that failed.
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_15_a_shared_master_carries_the_second_connection_and_dies_with_the_link() {
     use std::os::unix::fs::PermissionsExt;
-    let Some(h) = host() else { return };
+    let h = host();
     let dir = acs::testutil::TempDir::new();
     let mux = dir.path().join("mux");
     let dir_s = mux.to_str().unwrap().to_string();

@@ -11,6 +11,15 @@ real interruptions. `scripts/e2e_ssh.sh` automates everything that can be
 automated; `scripts/test_linux.sh` covers Linux, multi-user isolation, and
 the network watcher against the real kernel.
 
+The tests behind those two scripts — `tests/e2e_ssh.rs`,
+`tests/multiuser.rs` and `tests/netns.rs` — are `#[ignore]`, and the scripts
+ask for them with `--include-ignored`. A plain `cargo test`, and so
+`scripts/verify.sh` on a Mac, counts them as ignored in each binary's
+summary instead of passing them unrun, and `scripts/verify.sh` ends its test
+step with the total it left out (acs-hdj4). One asked for outside its
+script fails rather than returning early, so a green run of a script means
+those tests ran.
+
 ## Environment
 
 - Client: `dist/aarch64-apple-darwin/acs` (complete build from

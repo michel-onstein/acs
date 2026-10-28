@@ -25,7 +25,16 @@ impl Drop for Proxy {
 }
 
 fn proxy(dir: &Path, args: &[&str]) -> Proxy {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_acs"))
+    proxy_in(dir, None, args)
+}
+
+/// [`proxy`] run from `cwd`, against which a relative `dir` resolves.
+fn proxy_in(dir: &Path, cwd: Option<&Path>, args: &[&str]) -> Proxy {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acs"));
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let mut child = cmd
         .arg("_proxy")
         .args(args)
         .env("ACS_SOCKET_DIR", dir)
@@ -133,6 +142,28 @@ fn creates_a_session_and_relays_both_ways() {
     // The master closed: the proxy follows.
     assert!(p.conn.closed(T));
     assert!(p.child.wait().unwrap().success());
+}
+
+/// Regression (acs-7nan): a relative `ACS_SOCKET_DIR` names one directory,
+/// taken from the proxy's working directory. The master runs from `/`, and
+/// used to be handed the relative path as it was, so it looked for `/rel`
+/// and the session could not start.
+#[test]
+fn a_relative_socket_dir_is_one_directory_for_proxy_and_master() {
+    let t = TempDir::new();
+    let mut p = proxy_in(
+        Path::new("rel"),
+        Some(t.path()),
+        &["--session", "r", "--mode", "attach-or-create"],
+    );
+    p.conn.send(&hello_cmd("r", "me", "echo up; exit 3"));
+    assert!(welcome(&mut p).created);
+    p.conn.wait_output("up", T);
+    match p.conn.recv_control(T) {
+        Some(Msg::Exit { status }) => assert_eq!(acs::sys::exit_code(status), 3),
+        other => panic!("{other:?}"),
+    }
+    assert!(t.path().join("rel").is_dir());
 }
 
 /// Regression (acs-4w8): a frame that had only half arrived when the HELLO

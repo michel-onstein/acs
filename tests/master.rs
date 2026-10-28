@@ -646,12 +646,22 @@ fn input_is_acked_only_as_fast_as_the_pty_takes_it() {
         seq: w.input_seq,
         bytes: vec![b'x'; n],
     });
+    let mut acked = None;
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
         if let Some(Msg::Ack { seq }) = c.recv(Duration::from_millis(200)) {
             assert!(seq < end, "acked {seq}: input the pty never took");
+            acked = Some(seq);
         }
     }
+    // An upper bound alone passes against a master that never acks at all
+    // (acs-n7w9): what the terminal did take must be acknowledged, and that
+    // is about its input buffer — some 1 KiB on macOS, 12–16 KiB on Linux.
+    let acked = acked.expect("no ACK for the input the pty took") - w.input_seq;
+    assert!(
+        (512..=1 << 17).contains(&acked),
+        "acked {acked} of {n}: not about a pty input buffer"
+    );
 }
 
 #[test]
