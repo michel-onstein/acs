@@ -68,6 +68,25 @@ fn welcome(p: &mut Proxy) -> acs::proto::Welcome {
     }
 }
 
+/// Wait, up to `T`, for `pid` to spend under a tenth of a half-second
+/// window on the CPU (acs-ci9u). It replaces a fixed 200 ms settle after
+/// the close, a deadline for the proxy's legitimate work that a starved
+/// host could miss, so that the work spilled into the window the test then
+/// measures. A proxy that spins never gets here at all.
+fn wait_idle(pid: u32) {
+    let deadline = std::time::Instant::now() + T;
+    loop {
+        let burnt = acs::testutil::cpu_over(pid, Duration::from_millis(500));
+        if burnt < Duration::from_millis(50) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "proxy never went idle: {burnt:?} of CPU in its last 500 ms"
+        );
+    }
+}
+
 /// Regression (acs-wza): after the client's side closes while its input is
 /// still backed up towards a master that is not reading, the proxy waits
 /// instead of spinning on the closed pipe.
@@ -94,7 +113,10 @@ fn a_closed_client_with_input_backed_up_does_not_spin_the_proxy() {
     }
     std::thread::sleep(Duration::from_millis(300));
     p.conn.close_write();
-    std::thread::sleep(Duration::from_millis(200));
+    wait_idle(p.child.id());
+    // Once idle, it stays idle. An upper bound on CPU time, unlike one on
+    // wall time, is one load cannot push up: a starved process only gets
+    // less of the CPU. Load can only hide a spin, never invent one.
     let burnt = acs::testutil::cpu_over(p.child.id(), Duration::from_secs(1));
     assert!(
         burnt < Duration::from_millis(300),
@@ -383,6 +405,12 @@ fn pick_lists_ends_on_request_and_attaches_what_the_hello_names() {
 /// to, without forcing it, answers at once with who holds it. The master
 /// answers BUSY and keeps the connection open for a forced retry, so the
 /// proxy used to wait out its 10 s KILL_WAIT and report a timeout.
+///
+/// "At once" is the answer's content, not a stopwatch (acs-ci9u): the BUSY
+/// with its holder's name comes only from the master's BUSY, and waiting
+/// out KILL_WAIT ends in a timeout error instead, so a 5 s bound — which a
+/// starved host can reach without the bug — said nothing the match below
+/// does not.
 #[test]
 fn ending_a_session_someone_else_holds_names_them_at_once() {
     let t = TempDir::new();
@@ -392,15 +420,12 @@ fn ending_a_session_someone_else_holds_names_them_at_once() {
 
     let mut p = proxy(t.path(), &["--pick"]);
     assert_eq!(names(&pick_list(&mut p)), ["a"]);
-    let asked = std::time::Instant::now();
     p.conn.send(&Msg::EndSession {
         name: "a".into(),
         identity: "bob@desk".into(),
         force: false,
     });
     let answer = pick_list(&mut p);
-    let took = asked.elapsed();
-    assert!(took < Duration::from_secs(5), "took {took:?}");
     assert!(
         matches!(&answer[..], [Msg::Error { code, message }, Msg::StatusReply(s)]
             if *code == err::BUSY
