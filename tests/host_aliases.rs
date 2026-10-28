@@ -108,7 +108,7 @@ fn no_reachable_host_is_an_error_with_exit_255() {
     assert!(remote.transport_pids().is_empty(), "no connection is made");
 }
 
-/// devbox.lan would answer, but only after 30 s: at the alias's own 5 s
+/// devbox.lan would answer, but only after `T`: at the alias's own 5 s
 /// deadline acs gives up on it and takes the next host.
 ///
 /// **The next host is not pinged at all**, and that is deliberate
@@ -120,7 +120,7 @@ fn no_reachable_host_is_an_error_with_exit_255() {
 /// because its shell had not been scheduled yet. `reachability_check:
 /// false` takes the deadline out of the fallback's way altogether. The
 /// pinged fallback is `falls_back_to_the_next_host_and_its_user`'s to
-/// cover, and its deadline is the minute [`Net::env`] gives a
+/// cover, and its deadline is the twice `T` [`Net::env`] gives a
 /// configuration that sets none.
 ///
 /// **What is left of the clock is one lower bound**, which load cannot
@@ -131,7 +131,7 @@ fn no_reachable_host_is_an_error_with_exit_255() {
 /// - *the alias's 5 s was used, not the file's 20 s* — the line names the
 ///   deadline it applied, so a global one would read `within 20s` and the
 ///   wait for this one would fail;
-/// - *the 30 s ping was not waited out* — had it been, devbox.lan answers
+/// - *the slow ping was not waited out* — had it been, devbox.lan answers
 ///   and is chosen, and the line below is never printed at all.
 #[test]
 fn a_host_slower_than_the_deadline_is_passed_over() {
@@ -503,8 +503,8 @@ fn the_host_used_last_on_these_networks_is_taken_without_waiting() {
         place.remembered(),
         "devbox\tdevbox.example.com\t192.168.1.0/24\n"
     );
-    // Now devbox.lan would take 30 s to say it is down, and the deadline
-    // is a minute: the remembered host is taken as soon as it answers, and
+    // Now devbox.lan would take `T` to say it is down, and the deadline
+    // is twice that: the remembered host is taken as soon as it answers, and
     // devbox.lan is not waited for.
     net.set_slow(&["devbox.lan"]);
     let text = connect_through(
@@ -578,7 +578,10 @@ fn reachability_tcp_checks_the_ssh_port_instead_of_pinging() {
     env.push(("ACS_SSH".into(), port_ssh(&dir, open, closed)));
     let mut c = Client::start_env(&remote, &session("devbox"), &refs(&env));
     c.wait_for(
-        &format!("devbox: devbox.lan does not answer on port {closed} within 60s"),
+        &format!(
+            "devbox: devbox.lan does not answer on port {closed} within {}",
+            secs(OUTLAST_ONE_WAIT)
+        ),
         T,
     );
     c.wait_for(

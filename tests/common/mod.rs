@@ -15,6 +15,11 @@ use acs::testutil::TempDir;
 
 /// The deadline test helpers wait to; see [`acs::testutil::T`].
 pub use acs::testutil::T;
+/// The timers a wait to `T` is proved against, derived from it (acs-3sk9),
+/// and their spellings as `ACS_*_MS` values and as the client prints them.
+/// Not every test binary reads every one.
+#[allow(unused_imports)]
+pub use acs::testutil::{ms, secs, OUTLAST_ONE_WAIT, OUTLAST_TWO_WAITS};
 /// Deadline waits as free functions, for any condition (acs-bndl).
 pub use acs::testutil::{poll, wait_until};
 
@@ -103,7 +108,8 @@ impl Net {
                 false => "",
             };
             format!(
-                "#!/bin/sh\nfor h; do :; done\nif grep -qx \"$h\" '{lag}'; then sleep 2; fi\necho \"$h\" >> '{log}'\n{refuse}if grep -qx \"$h\" '{slow}'; then sleep 30; fi\ngrep -qx \"$h\" '{up}'\n",
+                "#!/bin/sh\nfor h; do :; done\nif grep -qx \"$h\" '{lag}'; then sleep 2; fi\necho \"$h\" >> '{log}'\n{refuse}if grep -qx \"$h\" '{slow}'; then sleep {slow_secs}; fi\ngrep -qx \"$h\" '{up}'\n",
+                slow_secs = T.as_secs(),
                 lag = n.lag_file().display(),
                 log = n.pinged_file().display(),
                 slow = n.slow_file().display(),
@@ -136,7 +142,10 @@ impl Net {
         self.dir.path().join("slow")
     }
 
-    /// Hosts whose ping takes 30 s to say whether they answer.
+    /// Hosts whose ping takes [`T`] to say whether they answer: longer
+    /// than a test waits for anything, shorter than [`Net::env`]'s
+    /// `reachability_timeout`, so only a client that waits it out sees
+    /// them answer.
     pub fn set_slow(&self, slow: &[&str]) {
         let mut s = slow.join("\n");
         s.push('\n');
@@ -217,7 +226,7 @@ impl Net {
         let config = if config.contains("reachability_timeout") {
             config.to_string()
         } else {
-            format!("reachability_timeout: 60s\n{config}")
+            format!("reachability_timeout: {}\n{config}", secs(OUTLAST_ONE_WAIT))
         };
         let mut env = config_env(self.dir.path(), &config);
         env.push(("ACS_PING".into(), self.ping().display().to_string()));
@@ -679,7 +688,7 @@ impl Remote {
              [ -f '{delay}' ] && sleep \"$(cat '{delay}')\"\n\
              while [ -f '{gate}' ]; do sleep 0.05; done\n\
              if [ -f '{mute}' ]; then exec 3<&0; dd bs=1 count=1 of='{mute}'.$$ 2>/dev/null <&3; fi\n\
-             [ -f '{silent}' ] && {{ cat '{silent}'; exec sleep 60; }}\n\
+             [ -f '{silent}' ] && {{ cat '{silent}'; exec sleep {silent_secs}; }}\n\
              [ -f '{noise}' ] && cat '{noise}'\n\
              export HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n\
              [ -f '{renv}' ] && . '{renv}'\n\
@@ -692,6 +701,7 @@ impl Remote {
             refuse = self.refuse_file().display(),
             pids = self.pid_file().display(),
             silent = self.silent_file().display(),
+            silent_secs = OUTLAST_ONE_WAIT.as_secs(),
             delay = self.delay_file().display(),
             gate = self.gate_file().display(),
             mute = self.mute_file().display(),
