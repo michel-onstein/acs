@@ -782,3 +782,59 @@ fn no_home_means_no_local_file() {
     assert!(!err.contains("config.yaml:"), "{out}{err}");
     assert!(err.contains("no configuration"), "{out}{err}");
 }
+
+/// acs-gydj: every row of the settings table goes through the commands the
+/// same way — `set`, `get` and `unset` for a top-level one, `host set`,
+/// `show` and `host unset` for an alias's — so a new row needs no code of
+/// its own in `acs config`.
+#[test]
+fn every_setting_in_the_table_round_trips() {
+    use acs::config::{Kind, SETTINGS};
+    let h = Home::new();
+    h.ok(&["config", "host", "add", "d", "d.lan"]);
+    let pristine = std::fs::read_to_string(h.local()).unwrap();
+    for d in SETTINGS {
+        let value = |current: &str| match d.kind {
+            // Not the default, so `get` shows the edit took.
+            Kind::Bool if current.trim() == "true" => "false",
+            Kind::Bool => "true",
+            Kind::Duration { .. } => "1500ms",
+            Kind::Forwards => "8080:localhost:80",
+            Kind::Path => "~/.ssh/k",
+        };
+        if d.global.is_some() {
+            let before = h.ok(&["config", "get", d.key]);
+            let v = value(&before);
+            h.ok(&["config", "set", d.key, v]);
+            assert_eq!(h.ok(&["config", "get", d.key]).trim(), v, "{}", d.key);
+            h.ok(&["config", "unset", d.key]);
+            assert_eq!(h.ok(&["config", "get", d.key]), before, "{}", d.key);
+        } else {
+            h.fails(&["config", "set", d.key, "x"], 2, "unknown setting");
+        }
+        if d.alias.is_some() {
+            let v = value("");
+            h.ok(&["config", "host", "set", "d", d.key, v]);
+            let show = h.ok(&["config", "show"]);
+            let line = format!("{}: {v}", d.key);
+            let line = match d.kind {
+                Kind::Forwards => format!("{}: [{v}]", d.key),
+                _ => line,
+            };
+            assert!(show.contains(&line), "{} not in:\n{show}", d.key);
+            h.ok(&["config", "host", "unset", "d", d.key]);
+        } else {
+            h.fails(
+                &["config", "host", "set", "d", d.key, "true"],
+                2,
+                "unknown alias setting",
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(h.local()).unwrap(),
+            pristine,
+            "{}",
+            d.key
+        );
+    }
+}
