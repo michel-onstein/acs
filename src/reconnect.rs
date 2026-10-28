@@ -127,12 +127,12 @@ pub fn run(
         // Served time starts at this link's WELCOME, not at the dial.
         state.welcomed_at = None;
         if redial {
-            timing = Timing::start(args.verbose > 0, "redial");
+            timing = Timing::start(args.conn.verbose > 0, "redial");
         }
         // An alias is resolved again for every redial, so a fallback host is
         // picked up after a network change (DESIGN §7.3).
         let reachable = !redial || gated || redial_alias(&mut args, state);
-        if redial && reachable && !gated && args.alias.is_some() {
+        if redial && reachable && !gated && args.conn.alias.is_some() {
             timing.mark(Phase::AliasResolved);
         }
         gated = false;
@@ -252,10 +252,11 @@ fn give_up_keys(state: &State) -> &'static str {
 /// an alias if any of its hosts has `reachability_check` on (the others
 /// keep the dial backoff).
 fn pingable(args: &ClientArgs) -> bool {
-    let Some(name) = &args.alias else {
+    let Some(name) = &args.conn.alias else {
         return true;
     };
-    args.config
+    args.conn
+        .config
         .alias(crate::alias::split_user(name).1)
         .map_or(true, |a| a.entries.iter().any(|e| e.reachability_check))
 }
@@ -289,10 +290,10 @@ fn wait_for_answer(
                 if matches!(o, Offline::NetworkChanged) {
                     steps.restart();
                 }
-                let answers = match args.alias.clone() {
+                let answers = match args.conn.alias.clone() {
                     Some(_) => redial_alias(args, state),
                     None => {
-                        let name = args.transport.destination.clone();
+                        let name = args.conn.transport.destination.clone();
                         client::host_answers(args, &name) != Some(false)
                     }
                 };
@@ -309,23 +310,23 @@ fn wait_for_answer(
 /// change of host is always told: the session is only there if the new host
 /// is the same machine.
 fn redial_alias(args: &mut crate::cli::ClientArgs, state: &mut State) -> bool {
-    let Some(name) = args.alias.clone() else {
+    let Some(name) = args.conn.alias.clone() else {
         return true;
     };
-    let before = args.transport.destination.clone();
-    match client::resolve_alias(args, &name) {
+    let before = args.conn.transport.destination.clone();
+    match client::resolve_alias(&mut args.conn, &name) {
         Ok(()) => {
-            if args.transport.destination != before {
+            if args.conn.transport.destination != before {
                 clear_status(state);
                 note(&format!(
                     "{name}: now using {} (was {before})",
-                    args.transport.destination
+                    args.conn.transport.destination
                 ));
             }
             true
         }
         Err(e) => {
-            if args.verbose > 0 {
+            if args.conn.verbose > 0 {
                 note(&e);
             }
             false

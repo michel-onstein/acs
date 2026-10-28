@@ -58,7 +58,7 @@ pub fn choose(
         args.target = Target::Named(default);
         return Ok(None);
     }
-    let host = args.host_name().to_string();
+    let host = args.conn.host_name().to_string();
     let fail = |f: Failure| {
         eprintln!("acs: {}", f.message(&host));
         f.code()
@@ -140,9 +140,10 @@ fn open_pick(
     };
     let remote = ssh::remote_acs(crate::VERSION, proxy_args);
     let first = ahead.map(|h| Msg::Hello(h).to_bytes()).unwrap_or_default();
-    let (mut link, marker) =
-        client::dial_watching(args, call, &remote, timeout, timing, first, netwatch, None)
-            .map_err(|e| Failure::Unreachable(e.to_string()))?;
+    let (mut link, marker) = client::dial_watching(
+        &args.conn, call, &remote, timeout, timing, first, netwatch, None,
+    )
+    .map_err(|e| Failure::Unreachable(e.to_string()))?;
     let owed = link.take_pending();
     let rest = match marker {
         Marker::Ready { proto: p, rest } if p == proto::PROTO_VERSION => rest,
@@ -425,9 +426,15 @@ fn ended(menu: &mut Menu, h: usize, name: &str, a: Listing) -> String {
 /// `acs list` in a terminal: the session menu over every host alias (DESIGN
 /// §7.3). Returns the exit status: the attached session's, or the menu's.
 pub fn every_host(args: &ClientArgs) -> u8 {
-    let names: Vec<String> = args.config.hosts.iter().map(|a| a.name.clone()).collect();
+    let names: Vec<String> = args
+        .conn
+        .config
+        .hosts
+        .iter()
+        .map(|a| a.name.clone())
+        .collect();
     if names.is_empty() {
-        eprintln!("acs: {}", list::no_aliases(&args.config));
+        eprintln!("acs: {}", list::no_aliases(&args.conn.config));
         return code::USAGE;
     }
     let (wake_r, wake_w) = match sys::pipe() {
@@ -469,13 +476,13 @@ pub fn every_host(args: &ClientArgs) -> u8 {
     // decision, the alias resolved again, its key and user, and the
     // ordinary session call, which may prompt.
     let mut picked = picked_session(args, &names[h], target, force);
-    let mut timing = Timing::start(args.verbose > 0, "first connection");
-    if let Err(e) = client::resolve_alias(&mut picked, &names[h]) {
+    let mut timing = Timing::start(args.conn.verbose > 0, "first connection");
+    if let Err(e) = client::resolve_alias(&mut picked.conn, &names[h]) {
         eprintln!("acs: {e}");
         return code::UNREACHABLE;
     }
     timing.mark(Phase::AliasResolved);
-    let netwatch = crate::netwatch::NetWatch::new(picked.verbose > 0);
+    let netwatch = crate::netwatch::NetWatch::new(picked.conn.verbose > 0);
     client::run(picked, None, timing, netwatch)
 }
 
@@ -490,7 +497,7 @@ fn picked_session(args: &ClientArgs, name: &str, target: Target, force: bool) ->
     picked.list = false;
     picked.target = target;
     picked.force |= force;
-    picked.transport.destination = name.to_string();
+    picked.conn.transport.destination = name.to_string();
     client::prepare_session(&mut picked);
     picked
 }
@@ -536,7 +543,7 @@ fn end_on(args: &ClientArgs, alias: &str, menu: &mut Menu, h: usize, session: &s
     menu.set_note(format!("ending session '{session}' on {alias}…"));
     let _ = draw(menu, "");
     let mut on = args.clone();
-    let note = match client::resolve_alias(&mut on, alias) {
+    let note = match client::resolve_alias(&mut on.conn, alias) {
         Err(e) => format!("{alias}: {e}"),
         Ok(()) => match open_pick(
             &on,
@@ -587,14 +594,14 @@ mod tests {
             let crate::cli::Parsed::ListAll(mut a) = parsed else {
                 panic!("not acs list")
             };
-            a.config = config.clone();
+            a.conn.config = config.clone();
             let p = picked_session(&a, alias, Target::Named("main".into()), false);
             assert!(!p.list);
             assert_eq!(p.target, Target::Named("main".into()));
-            assert_eq!(p.transport.destination, alias);
+            assert_eq!(p.conn.transport.destination, alias);
             // A forward of any kind: no shared master (acs-9n3).
-            assert!(p.transport.mux.is_none(), "{argv:?} on {alias}");
-            p.transport.local_forwards
+            assert!(p.conn.transport.mux.is_none(), "{argv:?} on {alias}");
+            p.conn.transport.local_forwards
         };
         assert_eq!(picked(&[], "db"), ["5432:db.internal:5432"]);
         assert_eq!(picked(&[], "web"), ["8080:localhost:80"]);

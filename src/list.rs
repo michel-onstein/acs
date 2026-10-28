@@ -59,7 +59,7 @@ impl Failure {
 }
 
 pub fn run(args: &ClientArgs) -> ExitCode {
-    let host = args.host_name();
+    let host = args.conn.host_name();
     match query(args, Call::Side, client::answer_timeout(false)) {
         Ok(Some(sessions)) => print!("{}", render(host, &sessions, sys::unix_now())),
         Ok(None) => println!("{}", not_installed(host)),
@@ -75,9 +75,15 @@ pub fn run(args: &ClientArgs) -> ExitCode {
 /// (DESIGN §7.3) and asked in parallel, so a slow or dead host holds up
 /// only its own line. Exits 0 if every host answered, 255 if any did not.
 pub fn run_all(args: &ClientArgs) -> ExitCode {
-    let aliases: Vec<&str> = args.config.hosts.iter().map(|a| a.name.as_str()).collect();
+    let aliases: Vec<&str> = args
+        .conn
+        .config
+        .hosts
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect();
     if aliases.is_empty() {
-        eprintln!("acs: {}", no_aliases(&args.config));
+        eprintln!("acs: {}", no_aliases(&args.conn.config));
         return ExitCode::from(code::USAGE);
     }
     // Nobody can type a password into several ssh at once (Call::Batch), so
@@ -142,10 +148,10 @@ pub(crate) fn ask(
     timeout: Duration,
 ) -> Result<Option<Vec<StatusInfo>>, Failure> {
     let mut args = base.clone();
-    client::resolve_alias(&mut args, alias).map_err(Failure::Unreachable)?;
+    client::resolve_alias(&mut args.conn, alias).map_err(Failure::Unreachable)?;
     // After the alias is resolved: the socket is named for the host it
     // stands for now, as the session's was.
-    crate::mux::join(&mut args.transport);
+    crate::mux::join(&mut args.conn.transport);
     query(&args, Call::Batch, timeout)
 }
 
@@ -169,7 +175,7 @@ pub(crate) fn query(
     // Nothing to send ahead: `_proxy --list` speaks first and this call
     // never sends a HELLO.
     let (link, marker) = client::dial(
-        args,
+        &args.conn,
         call,
         &remote,
         timeout,
@@ -188,7 +194,7 @@ pub(crate) fn query(
     dec.push(&rest);
     let late = format!(
         "no answer from {} within {} s",
-        args.transport.destination,
+        args.conn.transport.destination,
         timeout.as_secs_f32()
     );
     let listed = read_listing(

@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::process::{Child, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::cli::{self, ClientArgs, Parsed, Target};
+use crate::cli::{self, ClientArgs, Connection, Parsed, Target};
 use crate::keys::{self, Action, Detector};
 use crate::modes::ModeObserver;
 use crate::outq::OutQueue;
@@ -66,7 +66,7 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
         Parsed::Run(a) => (*a, false),
         Parsed::ListAll(a) => (*a, true),
     };
-    args.config = match crate::config::Config::load() {
+    args.conn.config = match crate::config::Config::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("acs: {e}");
@@ -74,7 +74,7 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
         }
     };
     // Before connecting: a newer release found by an earlier check.
-    crate::update_check::on_client_start(&args.config);
+    crate::update_check::on_client_start(&args.conn.config);
     // `acs list` in a terminal is the session menu; into a pipe, the table
     // (DESIGN §7.3).
     let menu = sys::isatty(STDIN) && sys::isatty(STDOUT);
@@ -94,9 +94,9 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     // the configuration hits the same carve-out a `-L` does: a session that
     // forwards anything gets no shared master (acs-9n3).
     prepare_session(&mut args);
-    let name = args.transport.destination.clone();
-    let mut timing = Timing::start(args.verbose > 0, "first connection");
-    if let Err(e) = resolve_alias(&mut args, &name) {
+    let name = args.conn.transport.destination.clone();
+    let mut timing = Timing::start(args.conn.verbose > 0, "first connection");
+    if let Err(e) = resolve_alias(&mut args.conn, &name) {
         eprintln!("acs: {e}");
         // Persisting (DESIGN §5.3): wait until one of its hosts answers.
         if args.list || !persist(&args) {
@@ -104,7 +104,7 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
         }
         wait_for_host(&mut args, &name);
     }
-    if args.alias.is_some() {
+    if args.conn.alias.is_some() {
         timing.mark(Phase::AliasResolved);
     }
     if args.list && !menu {
@@ -115,7 +115,7 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     let always = args.list;
     // Made before the first dial, so a change while it waits is seen
     // (acs-xo1), and the one watcher the whole client keeps.
-    let netwatch = crate::netwatch::NetWatch::new(args.verbose > 0);
+    let netwatch = crate::netwatch::NetWatch::new(args.conn.verbose > 0);
     loop {
         match crate::pick::choose(&mut args, always, &mut timing, netwatch.as_ref()) {
             Ok(picked) => return ExitCode::from(run(args, picked, timing, netwatch)),
@@ -132,14 +132,14 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
 /// Ready a session's transport before anything dials: the configured
 /// forwards join the command line's (acs-odd), then the shared-master
 /// decision is taken (acs-9n3) — in that order, so a configured forward
-/// vetoes the master as a `-L` does. `args.transport.destination` must
+/// vetoes the master as a `-L` does. `args.conn.transport.destination` must
 /// still be the name typed (the alias, not the host it resolves to).
 /// Shared by `acs <host>` and the session picked from the every-host menu
 /// (acs-x5wd), which must not differ.
 pub(crate) fn prepare_session(args: &mut ClientArgs) {
     apply_local_forwards(args);
-    let decided = crate::mux::configure(&mut args.transport);
-    if args.verbose > 0 {
+    let decided = crate::mux::configure(&mut args.conn.transport);
+    if args.conn.verbose > 0 {
         note(&decided);
     }
 }
@@ -162,8 +162,8 @@ fn apply_local_forwards(args: &mut ClientArgs) {
     if args.no_configured_forwards {
         return;
     }
-    let name = args.transport.destination.clone();
-    let setting = args.config.local_forwards_for(Some(&name));
+    let name = args.conn.transport.destination.clone();
+    let setting = args.conn.config.local_forwards_for(Some(&name));
     let at = setting
         .origin
         .as_ref()
@@ -172,16 +172,16 @@ fn apply_local_forwards(args: &mut ClientArgs) {
     let add: Vec<String> = setting
         .value
         .iter()
-        .filter(|s| !args.transport.local_forwards.contains(s))
+        .filter(|s| !args.conn.transport.local_forwards.contains(s))
         .cloned()
         .collect();
     if add.is_empty() {
         return;
     }
-    if args.verbose > 0 {
+    if args.conn.verbose > 0 {
         note(&format!("{name}: local_forwards {} ({at})", add.join(", ")));
     }
-    args.transport.local_forwards.extend(add);
+    args.conn.transport.local_forwards.extend(add);
 }
 
 /// Whether a lost host is waited for (DESIGN §5.3): `--persist`, then
@@ -191,27 +191,30 @@ pub(crate) fn persist(args: &ClientArgs) -> bool {
     if args.persist {
         return true;
     }
-    let alias = args_alias(args);
-    let entry = alias.zip(args.entry).and_then(|(a, i)| a.entries.get(i));
+    let alias = alias_of(&args.conn);
+    let entry = alias
+        .zip(args.conn.entry)
+        .and_then(|(a, i)| a.entries.get(i));
     env_switch(
         std::env::var("ACS_PERSIST").ok().as_deref(),
-        args.config.persist_for(alias, entry).value,
+        args.conn.config.persist_for(alias, entry).value,
     )
 }
 
 /// How often a lost host is pinged while it is waited for: the alias's
 /// `reachability_interval`, else the global one.
 pub(crate) fn reachability_interval(args: &ClientArgs) -> Duration {
-    args.config
-        .reachability_interval_for(args_alias(args))
+    args.conn
+        .config
+        .reachability_interval_for(alias_of(&args.conn))
         .value
 }
 
-/// The alias `args` go through, resolved or not yet: `[user@]<alias>` as
+/// The alias `conn` goes through, resolved or not yet: `[user@]<alias>` as
 /// given.
-fn args_alias(args: &ClientArgs) -> Option<&crate::config::Alias> {
-    let name = args.alias.as_deref().unwrap_or(&args.transport.destination);
-    args.config.alias(crate::alias::split_user(name).1)
+fn alias_of(conn: &Connection) -> Option<&crate::config::Alias> {
+    let name = conn.alias.as_deref().unwrap_or(&conn.transport.destination);
+    conn.config.alias(crate::alias::split_user(name).1)
 }
 
 /// The waits between the ping gate's pings (DESIGN §5.3, acs-vxg): every
@@ -267,7 +270,7 @@ pub(crate) fn wait_for_host(args: &mut ClientArgs, name: &str) {
     let steps = PingSteps::new(reachability_interval(args));
     note(&format!(
         "waiting for {} to answer a ping, {} (Ctrl-C gives up)",
-        args.host_name(),
+        args.conn.host_name(),
         steps.describe()
     ));
     loop {
@@ -284,12 +287,12 @@ pub(crate) fn wait_for_host(args: &mut ClientArgs, name: &str) {
 /// alias whose hosts all have `reachability_check: false`.
 pub(crate) fn host_answers(args: &mut ClientArgs, name: &str) -> Option<bool> {
     let alias_name = crate::alias::split_user(name).1;
-    match args.config.alias(alias_name) {
+    match args.conn.config.alias(alias_name) {
         Some(a) if a.entries.iter().all(|e| !e.reachability_check) => None,
-        Some(_) => Some(resolve_alias(args, name).is_ok()),
+        Some(_) => Some(resolve_alias(&mut args.conn, name).is_ok()),
         None => {
-            let host = crate::alias::split_user(&args.transport.destination).1;
-            let timeout = args.config.reachability_timeout.value;
+            let host = crate::alias::split_user(&args.conn.transport.destination).1;
+            let timeout = args.conn.config.reachability_timeout.value;
             Some(crate::alias::ping(host, timeout))
         }
     }
@@ -310,21 +313,21 @@ pub struct Picked {
 /// it stands for now, with that entry's key (DESIGN §7.3); with `-v`, say
 /// which entry was chosen and why. `name` is kept as given, so a redial
 /// resolves it the same way.
-pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
-    let verbose = args.verbose > 0;
+pub fn resolve_alias(conn: &mut Connection, name: &str) -> Result<(), String> {
+    let verbose = conn.verbose > 0;
     // The entry used last on these networks goes first (acs-zpj); asked
     // only for an alias, since it reads this machine's interfaces.
-    let memory = args
+    let memory = conn
         .config
         .alias(crate::alias::split_user(name).1)
         .and_then(|_| crate::alias_memory::Memory::system());
     // `reachability_tcp`'s `ssh -G` sees what the dial will: `--ssh` and
     // the command line's -p/-F/-J/-o/-i (acs-nhrq).
-    let mut ssh = vec![args.transport.ssh.clone()];
-    ssh.extend(args.transport.user_opts.iter().cloned());
+    let mut ssh = vec![conn.transport.ssh.clone()];
+    ssh.extend(conn.transport.user_opts.iter().cloned());
     let entry = crate::alias::resolve_remembering(
         name,
-        &args.config,
+        &conn.config,
         std::sync::Arc::new(crate::alias::ping),
         &crate::netmatch::system,
         memory.as_ref(),
@@ -336,14 +339,14 @@ pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
         },
     )?;
     if let Some(e) = entry {
-        args.alias = Some(name.to_string());
-        args.entry = args_alias(args).and_then(|a| {
+        conn.alias = Some(name.to_string());
+        conn.entry = alias_of(conn).and_then(|a| {
             a.entries
                 .iter()
                 .position(|x| x.origin == e.origin && x.host == e.host)
         });
-        args.transport.destination = e.destination();
-        args.transport.identity_file = e
+        conn.transport.destination = e.destination();
+        conn.transport.identity_file = e
             .identity_file
             .as_ref()
             .map(|s| crate::config::expand_home(&s.value));
@@ -353,7 +356,7 @@ pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
                 .as_ref()
                 .map(|o| o.to_string())
                 .unwrap_or_default();
-            if args.transport.user_identity() {
+            if conn.transport.user_identity() {
                 note(&format!(
                     "{name}: the key given on the command line replaces identity_file {} ({at})",
                     key.value
@@ -411,8 +414,9 @@ pub(crate) fn command_bell(config: &crate::config::Config) -> bool {
 pub(crate) fn redraw_on_reconnect(args: &ClientArgs) -> bool {
     env_switch(
         std::env::var("ACS_REDRAW_ON_RECONNECT").ok().as_deref(),
-        args.config
-            .redraw_on_reconnect_for(args.alias.as_deref())
+        args.conn
+            .config
+            .redraw_on_reconnect_for(args.conn.alias.as_deref())
             .value,
     )
 }
@@ -911,14 +915,14 @@ impl DialKeys<'_> {
 /// connection of its own, with the whole `timeout` — where a password or
 /// a key touch may legitimately take a minute.
 pub fn dial(
-    args: &ClientArgs,
+    conn: &Connection,
     call: Call,
     remote: &str,
     timeout: Duration,
     timing: &mut Timing,
     first: Vec<u8>,
 ) -> io::Result<(Link, Marker)> {
-    dial_watching(args, call, remote, timeout, timing, first, None, None)
+    dial_watching(conn, call, remote, timeout, timing, first, None, None)
 }
 
 /// [`dial`], watching this machine's network while it waits (acs-xo1,
@@ -929,7 +933,7 @@ pub fn dial(
 /// unless ssh is asking the user something ([`ssh_is_asking`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dial_watching(
-    args: &ClientArgs,
+    conn: &Connection,
     call: Call,
     remote: &str,
     timeout: Duration,
@@ -943,10 +947,10 @@ pub(crate) fn dial_watching(
             netwatch,
             keys: keys.as_deref_mut(),
         };
-        match dial_sharing(args, call, remote, timeout, timing, first.clone(), w) {
+        match dial_sharing(conn, call, remote, timeout, timing, first.clone(), w) {
             Err(e) if moved(&e) => {
                 timing.mark(Phase::NetworkMoved);
-                if args.verbose > 0 {
+                if conn.verbose > 0 {
                     note("the network moved under the dial — dialing again");
                 }
             }
@@ -977,7 +981,7 @@ fn ssh_is_asking() -> bool {
 
 /// One dial, through acs's shared ssh master where it may (acs-9n3).
 fn dial_sharing(
-    args: &ClientArgs,
+    conn: &Connection,
     call: Call,
     remote: &str,
     timeout: Duration,
@@ -985,18 +989,18 @@ fn dial_sharing(
     first: Vec<u8>,
     mut w: Watch,
 ) -> io::Result<(Link, Marker)> {
-    if crate::mux::joinable(&args.transport, call) {
+    if crate::mux::joinable(&conn.transport, call) {
         timing.mark(Phase::MasterChecked);
         let window = timeout.min(crate::mux::fallback_window());
         let joined = Watch {
             netwatch: w.netwatch,
             keys: w.keys.as_deref_mut(),
         };
-        match dial_once(args, call, remote, window, timing, first.clone(), joined) {
+        match dial_once(conn, call, remote, window, timing, first.clone(), joined) {
             Ok(x) => return Ok(x),
             // The master's connection was made from the network that went.
             Err(e) if moved(&e) => {
-                crate::mux::stop(&args.transport);
+                crate::mux::stop(&conn.transport);
                 return Err(e);
             }
             // A master that is up but cannot carry a channel is worse than
@@ -1010,20 +1014,20 @@ fn dial_sharing(
             {
                 note(&format!(
                     "the shared ssh master for {} did not answer within {} s — dialing its own connection",
-                    args.transport.destination,
+                    conn.transport.destination,
                     window.as_secs_f32()
                 ));
-                crate::mux::stop(&args.transport);
+                crate::mux::stop(&conn.transport);
             }
             Err(e) => return Err(e),
         }
     }
-    dial_once(args, call, remote, timeout, timing, first, w)
+    dial_once(conn, call, remote, timeout, timing, first, w)
 }
 
 /// One dial; with `w.keys`, one whose command keys are live ([`DialKeys`]).
 fn dial_once(
-    args: &ClientArgs,
+    conn: &Connection,
     call: Call,
     remote: &str,
     timeout: Duration,
@@ -1033,17 +1037,17 @@ fn dial_once(
 ) -> io::Result<(Link, Marker)> {
     let Watch { netwatch, mut keys } = w;
     let deadline = Instant::now() + timeout;
-    let mut cmd = args.transport.command(call, remote);
+    let mut cmd = conn.transport.command(call, remote);
     if let Some(k) = keys.as_deref_mut() {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
         let _ = k.raw.dialing();
     }
-    if args.verbose > 0 {
+    if conn.verbose > 0 {
         note_max(
             &format!(
                 "running {}",
-                ssh::display_argv(&args.transport.argv(call, remote))
+                ssh::display_argv(&conn.transport.argv(call, remote))
             ),
             16 * crate::safe::MAX_FIELD,
         );
@@ -1052,7 +1056,7 @@ fn dial_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     let mut child = sys::spawn(&mut cmd).map_err(|e| {
-        let argv = args.transport.argv(call, remote);
+        let argv = conn.transport.argv(call, remote);
         io::Error::new(
             e.kind(),
             format!("cannot run {}: {e}", argv[0].to_string_lossy()),
@@ -1142,14 +1146,14 @@ fn dial_once(
                 io::ErrorKind::TimedOut,
                 format!(
                     "no answer from {} within {} s",
-                    args.transport.destination,
+                    conn.transport.destination,
                     timeout.as_secs_f32()
                 ),
             ));
         }
         let n = sys::read(from.as_raw_fd(), &mut buf)?;
         if n == 0 {
-            if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
+            if let Some(noise) = scanner.noise_text().filter(|_| conn.verbose > 0) {
                 note(&format!("remote said: {noise}"));
             }
             let status = child.wait();
@@ -1175,7 +1179,7 @@ fn dial_once(
         Marker::Ready { .. } => Phase::ReadySeen,
         Marker::Need { .. } => Phase::NeedSeen,
     });
-    if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
+    if let Some(noise) = scanner.noise_text().filter(|_| conn.verbose > 0) {
         note(&format!("skipped remote login output: {noise:?}"));
     }
     Ok((
@@ -1184,7 +1188,7 @@ fn dial_once(
             to,
             from,
             pending: pending.into(),
-            muxed: args.transport.multiplexes(call),
+            muxed: conn.transport.multiplexes(call),
         },
         marker,
     ))
@@ -1428,7 +1432,7 @@ pub fn run(
     };
     let _ = sys::signals::ignore(libc::SIGPIPE);
     let mut state = State {
-        host: args.host_name().to_string(),
+        host: args.conn.host_name().to_string(),
         session: match &args.target {
             Target::Named(n) | Target::Pick(n) => Some(n.clone()),
             Target::New => None,
@@ -1441,7 +1445,7 @@ pub fn run(
         attached_once: false,
         status_shown: false,
         status_drawn: (Vec::new(), 0),
-        command_bell: command_bell(&args.config),
+        command_bell: command_bell(&args.conn.config),
         bell_pending: false,
         redraw_on_reconnect: redraw_on_reconnect(&args),
         paste: keys::PasteTracker::default(),
@@ -1450,7 +1454,7 @@ pub fn run(
         master: picked
             .as_ref()
             .filter(|p| p.link.muxed)
-            .map(|_| args.transport.clone()),
+            .map(|_| args.conn.transport.clone()),
         welcomed_at: None,
     };
     let mut raw: Option<RawMode> = None;
@@ -1552,7 +1556,7 @@ pub fn connect_and_serve(
                     crate::mux::stop(&old);
                 }
                 timing.mark(Phase::NetworkMoved);
-                if args.verbose > 0 {
+                if args.conn.verbose > 0 {
                     note("the network moved under the handshake — dialing again");
                 }
             }
@@ -1599,7 +1603,7 @@ fn connect_once(
                 size
             }
         };
-        state.master = link.muxed.then(|| args.transport.clone());
+        state.master = link.muxed.then(|| args.conn.transport.clone());
         return serve(
             args, state, raw, signals, link, p.rest, timeout, timing, size, netwatch,
         );
@@ -1613,21 +1617,21 @@ fn connect_once(
     // master there drops every *other* acs session on it, each losing what
     // its user had typed (DESIGN §5.2), for a connection that was fine.
     //
-    // The transport the link *ran on*, which is not `args.transport` any
+    // The transport the link *ran on*, which is not `args.conn.transport` any
     // more if the alias resolved to another host a moment ago: that host's
     // master is a live connection of somebody else's.
     if let Some(old) = state.master.take().filter(|_| resuming) {
         // No reason means no evidence, and this is the direction to be
         // wrong in: a sibling redials, a stranded user waits.
         if ended.map_or(true, LinkEnd::failed_the_connection) {
-            if args.verbose > 0 {
+            if args.conn.verbose > 0 {
                 note(&format!(
                     "ending the shared ssh master the lost link ran on ({})",
                     old.destination
                 ));
             }
             crate::mux::stop(&old);
-        } else if args.verbose > 0 {
+        } else if args.conn.verbose > 0 {
             note(&format!(
                 "keeping the shared ssh master ({}): the channel ended, not the connection",
                 old.destination
@@ -1645,7 +1649,12 @@ fn connect_once(
     // Where acs may be installed, the prelude waits after ACS-NEED for the
     // install on this same connection (acs-6k2), keyed by a token of this
     // dial's so that nothing else on its stdin can start one.
-    let sync = args.config.install_on_remote.value.then(sys::random_token);
+    let sync = args
+        .conn
+        .config
+        .install_on_remote
+        .value
+        .then(sys::random_token);
     let remote = match &sync {
         Some(s) => ssh::remote_acs_installing(crate::VERSION, &pargs, s),
         None => ssh::remote_acs(crate::VERSION, &pargs),
@@ -1666,7 +1675,7 @@ fn connect_once(
                 left: None,
             };
             let dialed = dial_watching(
-                args,
+                &args.conn,
                 call,
                 &remote,
                 timeout,
@@ -1693,7 +1702,7 @@ fn connect_once(
                 let _ = r.suspend();
             }
             dial_watching(
-                args, call, &remote, timeout, timing, greeting, netwatch, None,
+                &args.conn, call, &remote, timeout, timing, greeting, netwatch, None,
             )
         }
     };
@@ -1720,13 +1729,13 @@ fn connect_once(
             // No token: install_on_remote is off, and the prelude has gone.
             let Some(sync) = sync else {
                 link.close();
-                note(&crate::install::not_installing(args, &os, &arch));
+                note(&crate::install::not_installing(&args.conn, &os, &arch));
                 return Outcome::Exit(code::INSTALL_FAILED);
             };
             // The install, and then the session, on this same connection
             // (acs-6k2, DESIGN §8.1).
             let to = link.to.as_raw_fd();
-            if let Err(e) = crate::install::install(args, &os, &arch, &sync, to, &again) {
+            if let Err(e) = crate::install::install(&args.conn, &os, &arch, &sync, to, &again) {
                 link.close();
                 note(&e);
                 return Outcome::Exit(code::INSTALL_FAILED);
@@ -1737,13 +1746,13 @@ fn connect_once(
                     note(&format!(
                         "installed acs {} on {}",
                         crate::VERSION,
-                        args.transport.destination
+                        args.conn.transport.destination
                     ));
                     x
                 }
                 Err(e) => {
                     link.close();
-                    note(&crate::install::failed(&args.transport.destination, e));
+                    note(&crate::install::failed(&args.conn.transport.destination, e));
                     return Outcome::Exit(code::INSTALL_FAILED);
                 }
             }
@@ -1757,7 +1766,7 @@ fn connect_once(
         link.close();
         return Outcome::Exit(code::ERROR);
     }
-    state.master = link.muxed.then(|| args.transport.clone());
+    state.master = link.muxed.then(|| args.conn.transport.clone());
     serve(
         args, state, raw, signals, link, rest, timeout, timing, size, netwatch,
     )
@@ -2140,7 +2149,7 @@ fn serve(
                     return Outcome::Exit(code::TAKEN_OVER);
                 }
                 other => {
-                    if args.verbose > 0 {
+                    if args.conn.verbose > 0 {
                         note(&format!("ignoring {other:?}"));
                     }
                 }
@@ -2336,7 +2345,7 @@ fn serve(
             link.close();
             note(&format!(
                 "no answer from {} within {} s",
-                args.transport.destination,
+                args.conn.transport.destination,
                 handshake.as_secs_f32()
             ));
             return Outcome::Exit(code::UNREACHABLE);
@@ -2460,9 +2469,9 @@ mod tests {
             let Parsed::Run(mut a) = parsed else {
                 panic!("{argv:?}")
             };
-            a.config = config.clone();
+            a.conn.config = config.clone();
             apply_local_forwards(&mut a);
-            a.transport.local_forwards.clone()
+            a.conn.transport.local_forwards.clone()
         };
         // A plain host, and an alias with no list of its own, take the
         // global one.
@@ -2668,9 +2677,9 @@ aliases:
                 Parsed::Run(a) => *a,
                 other => panic!("{other:?}"),
             };
-            a.config = config.clone();
+            a.conn.config = config.clone();
             a.persist = flag;
-            a.entry = entry;
+            a.conn.entry = entry;
             a
         };
         // The entry in use, then the alias, then the global setting.
