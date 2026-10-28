@@ -25,6 +25,9 @@ const UP: &[&str] = &["--", "/bin/sh", "-c", "echo MUX-UP; exec sleep 300"];
 /// is how one channel out of several on a master is singled out.
 const POISONED: &str = "poisoned";
 
+/// The session whose remote command [`Fake::end_the_channel`] ends.
+const ENDED: &str = "ended";
+
 /// The master persists long enough that nothing here races it, and the
 /// fallback window is short enough that a test waiting it out is quick.
 fn env(fake: &Fake) -> Vec<(String, String)> {
@@ -125,16 +128,30 @@ impl Fake {
              exec 9<&0\n\
              \"$t\" \"$1\" <&9 &\n\
              c=$!\n\
+             case \" $* \" in *'{ended}'*) mine=1 ;; *) mine= ;; esac\n\
              while kill -0 $c 2>/dev/null; do\n\
              if [ -f \"$cp.gone\" ]; then kill -9 $c 2>/dev/null; break; fi\n\
+             # On demand, the remote command ends and the connection stays\n\
+             # (acs-b4f): ssh exits with the command's status — or, told\n\
+             # `hang`, closes the channel and does not exit at all.\n\
+             if [ -n \"$mine\" ] && [ -f '{end}' ]; then\n\
+             s=$(cat '{end}'); rm -f '{end}'; kill -9 $c 2>/dev/null; wait $c\n\
+             if [ \"$s\" = hang ]; then exec >&-; exec sleep 300; fi\n\
+             exit $s\n\
+             fi\n\
              sleep 0.05\n\
              done\n\
              wait $c\n\
-             exit $?\n",
+             # A remote command a signal ended, or a master that went, is\n\
+             # 255 from a real mux client: no exit status came back.\n\
+             s=$?; [ $s -gt 128 ] && exit 255\n\
+             exit $s\n",
             log = log_call_sh(&f.log()),
             wedge = f.wedge().display(),
             poison = f.poison().display(),
             marker = POISONED,
+            ended = ENDED,
+            end = f.end().display(),
         );
         std::fs::write(f.path(), body).unwrap();
         std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -160,6 +177,17 @@ impl Fake {
 
     fn poison(&self) -> PathBuf {
         self.root.path().join("poison")
+    }
+
+    fn end(&self) -> PathBuf {
+        self.root.path().join("end")
+    }
+
+    /// End the [`ENDED`] session's remote command, once, and have its ssh
+    /// exit `status` — or, for `hang`, close the channel and stay. The
+    /// master and every other channel on it are left alone.
+    fn end_the_channel(&self, status: &str) {
+        std::fs::write(self.end(), status).unwrap();
     }
 
     /// From now on, a dial that joins acs's master never answers — until
@@ -385,6 +413,84 @@ fn a_channel_that_breaks_leaves_the_master_and_the_sibling_alone() {
     );
     let text = sibling.text();
     assert!(!text.contains("connection lost"), "{text:?}");
+}
+
+/// acs-b4f: EOF on a channel, two sessions on one master, the second's ssh
+/// exiting `status`. Answers whether the redial ran `ssh -O exit`, and
+/// where it did not, checks the sibling kept its connection.
+fn end_a_channel(status: &str) -> bool {
+    let remote = Remote::installed();
+    let fake = Fake::new("devbox", &remote);
+    let mut env = env(&fake);
+    env.push(("ACS_BACKOFF_MS".into(), "100".into()));
+    let ssh = fake.path();
+
+    let mut args = vec!["--ssh", ssh.to_str().unwrap(), "devbox", "sibling"];
+    args.extend(UP);
+    let mut sibling = Client::spawn(&exe(), &args, &refs(&env));
+    sibling.wait_for("MUX-UP", T);
+    let sibling_pid = *remote.transport_pids().last().unwrap();
+    let path = Fake::control_path(&fake.dials()[0]).unwrap();
+
+    let mut args = vec!["-v", "--ssh", ssh.to_str().unwrap(), "devbox", ENDED];
+    args.extend(UP);
+    let mut ended = Client::spawn(&exe(), &args, &refs(&env));
+    ended.wait_session(ENDED);
+    ended.wait_for("MUX-UP", T);
+    fake.assert_all_on(&path);
+    fake.leave_a_socket(&path);
+    let base = remote.connections();
+
+    fake.end_the_channel(status);
+    ended.wait_resumed();
+    remote.wait_more_connections(base, 1, T);
+
+    // The decision is made before the redial dials, so neither of these
+    // races it.
+    let exited = fake.calls().iter().any(|c| c.contains(" -O exit "));
+    let said = ended.text();
+    if exited {
+        assert!(said.contains("ending the shared ssh master"), "{said:?}");
+    } else {
+        assert!(said.contains("keeping the shared ssh master"), "{said:?}");
+        assert_eq!(remote.connections(), base + 1, "{:?}", fake.dials());
+        assert!(
+            acs::sys::kill(sibling_pid, 0).is_ok(),
+            "the sibling's connection was taken down with the master"
+        );
+        let text = sibling.text();
+        assert!(!text.contains("connection lost"), "{text:?}");
+    }
+    exited
+}
+
+/// ssh exiting with the remote command's status is the channel ending on a
+/// connection that is still up: the master, and the sibling on it, stay.
+#[test]
+fn a_channel_whose_command_ended_leaves_the_master_and_the_sibling_alone() {
+    assert!(
+        !end_a_channel("1"),
+        "the master was ended over a channel's own exit"
+    );
+}
+
+/// 255 is ssh's own failure — the connection — so the master goes.
+#[test]
+fn a_channel_whose_ssh_failed_ends_the_master() {
+    assert!(
+        end_a_channel("255"),
+        "a failed connection's master was left up"
+    );
+}
+
+/// An ssh that has not exited when the reap gives up is no evidence, and
+/// no evidence ends the master, as it always has.
+#[test]
+fn a_channel_whose_ssh_does_not_exit_ends_the_master() {
+    assert!(
+        end_a_channel("hang"),
+        "an unreaped ssh's master was left up"
+    );
 }
 
 /// An alias is resolved again **before** every redial (DESIGN §7.3), so by
