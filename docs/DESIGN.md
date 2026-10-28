@@ -884,6 +884,46 @@ sequenceDiagram
     on wake the 10 s window starts from zero however long the sleep was.
     The address that moved is the only evidence available at that moment,
     and it is what this uses.
+- **The dead interval stays a fixed 10 s — not shorter, not scaled by the
+  round trip** (acs-vq1, decision 12). Decided 2026-10-28 with acs-pgn's
+  per-phase timings in hand. The case a shorter interval would speed up is
+  narrow: silence that netwatch did not explain (no address moved) and
+  that is not a closed connection (a `FIN` or `RST` ends the link at once,
+  with no timeout involved), on a path where a *new* connection would
+  succeed while the old one cannot.
+  - **Most such silence is a blip the old connection survives.** TCP
+    retransmits, so a path that is gone for a few seconds and comes back
+    resumes the link with nothing lost and nothing redialled; with 10 s and
+    a `PING` every 3 s, a blip up to about 7 s costs nothing. A shorter
+    interval turns those into redials, and a redial cannot succeed before
+    the path is back either — it fails, and the backoff starts climbing
+    while the old connection would simply have carried on.
+  - **A false alarm is not free.** It is a redial: keys typed into it are
+    discarded (§5.2), the screen repaints, and the dial is a full ssh
+    handshake, since a redial does not join acs's master (decision 10).
+    acs-pgn measured 51 ms to `ACS-READY` cold on loopback; on a real
+    host that is several round trips plus authentication, and a hardware
+    key wants a touch.
+  - **RTT-adaptive buys nothing the floor does not.** The round trip is
+    free to measure — a `PING`'s nonce is its own timestamp — but a few
+    times it is well under a second on every path acs is used over
+    (loopback, LAN, a continent, even a geostationary hop of ~600 ms), and
+    the interval must still exceed the 3 s ping interval plus a round trip
+    or a quiet link is dead before it is asked. So the floor would decide
+    everywhere, and choosing it is choosing a fixed interval. Worse, the
+    silence the interval has to ride out is not the round trip: a host
+    stalled on swap or CPU, a master's `PING` behind 64 KiB of output on a
+    slow uplink (the cap above), a bufferbloated link under upload — an idle-time
+    RTT underestimates exactly those, which is where an adaptive interval
+    would raise false alarms.
+  - **The drops worth catching fast are caught already**: a wake or a
+    Wi-Fi switch by netwatch in 2 s (acs-ft1, above), a host or `sshd` that
+    went away cleanly by the closed connection. `ACS_DEAD_MS` stays the
+    override for a reliable path where faster detection is wanted (the
+    frozen-host check in [VERIFICATION.md](VERIFICATION.md) runs at 3 s).
+  - **What would reopen it**: `-v` logs from real use showing drops that
+    netwatch missed, that ran the full 10 s, and whose redial then
+    succeeded at once — the one case this costs time in.
 - **A network change during the handshake abandons it and dials again at
   once** (acs-xo1). So a change means something in each of the three
   phases a client can be in: **offline**, it cuts the wait short and
@@ -1079,7 +1119,7 @@ set stays visible; the cost of adding one is a row here.
 | Knob | Default | What it bounds | Interactions |
 | --- | --- | --- | --- |
 | `ACS_PING_MS` | 3000 | silence before a `PING`, client and master alike | must stay well under `ACS_DEAD_MS`, or a quiet link is dead before it is asked |
-| `ACS_DEAD_MS` | 10000 | silence before the link is dead (client redials; master drops its client) | ceiling for `ACS_NETCHECK_MS`, which only brings it forward |
+| `ACS_DEAD_MS` | 10000 | silence before the link is dead (client redials; master drops its client) | ceiling for `ACS_NETCHECK_MS`, which only brings it forward; fixed, not scaled by the round trip (decision 12) |
 | `ACS_NETCHECK_MS` | 2000 | time the host has to answer the `PING` a network change sends while up | only its own `PONG` clears it (acs-br2); time blocked writing to the terminal is not counted (acs-spd) |
 | `ACS_BACKOFF_MS` | 1000 | the first wait of the redial backoff, after the free attempt | doubles to 30 s, or to itself if larger |
 | `ACS_BACKOFF_RESET_MS` | 30000 | how long a link must serve, `WELCOME` to loss, for the backoff to start over | equal to `ACS_REDIAL_TIMEOUT_MS` by default; a redial spending that timeout never resets it (acs-omt2) |
@@ -2929,3 +2969,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 9 | Listing: an option or a command | Revisited at the user's request (2026-09-19). Listing was `dsh`'s `-l`/`--list` option, and without a host it listed every alias — an option doing a whole-program action, as a command would. Now it is the command `acs list [<host>]`, beside `acs config` and `acs upgrade`: one host with a host, every alias without. The per-host form moved too rather than staying `acs <host> --list`, so that listing has one spelling. `list` is reserved as a first argument (a host of that name: `user@list`, an option first, or `acs list list`), and `-l`/`--list` are removed outright, with a usage error pointing to `acs list` — acs has no compatibility contract to keep yet (§7, §7.4) |
 | 10 | Reusing an ssh master (acs-9n3) | Revisited 2026-09-23, with the per-phase timings of acs-pgn in hand. §3 set `ControlMaster=no` outright because a reconnect can hang on a dead multiplexer — but that hazard is the redial's, and the price was a full handshake (and a second hardware-key touch) on every first connection, `acs list <host>` and reattach. acs now keeps **its own** master — its own `ControlPath` under `/tmp/acs-mux-<uid>`, its own `ControlPersist`, never the user's — for the first connection and side calls, and `acs list` over every alias joins one that is up but never starts one (acs-hmv: 33 ms against 50 ms per listing on loopback); a redial still opts out, and ends the master the lost link ran on when what ended that link says the connection failed rather than only the channel on it (acs-n1m, §7.1 — a protocol error is bytes arriving, so the connection is up and every sibling session on the master keeps it; so is an ssh that exits with the remote command's status rather than its own 255, acs-b4f); a dial that joins a master must produce its marker within 2 s or the master is ended and the dial made again on its own connection; a session with a `-L` has no master, because a forward asked of a client is opened by the master and would outlive the session. Measured over ssh to a container on loopback, where a handshake costs almost no round trips: 51 ms to `ACS-READY` cold against 13 ms on the master. Every reason acs cannot vouch for the socket's directory costs the speed-up and nothing else; `ACS_CONTROL_PERSIST=0` restores the old dial exactly (§3, §7.1) |
 | 11 | The suite-wide test deadline `T` (acs-hsw) | Decided 2026-10-28 on acs-2dc's measurements: `T` stays 30 s. Moving it from 30 s to 300 s took `tests/client.rs` from 86 failures in 850 to 6 under deliberate I/O starvation, but the same load without the I/O pressure was already 850 of 850 green, so what a longer `T` buys is a pass under starvation, at the price of every genuine hang reporting minutes later — and it is not one change but many, since the suite's minute and two-minute timers are sized to outlast `T` and would have to move with it (since acs-3sk9 they are derived from `T`, so that part is one edit). Instead the limit is written down: the suite is not expected to pass under sustained I/O starvation, a dial-wait red beside heavy I/O is re-run alone before it is read, and a red on an idle machine is a bug (§9.1) |
+| 12 | The dead-link timeout: fixed, shorter or RTT-adaptive (acs-vq1) | Decided 2026-10-28 with acs-pgn's per-phase timings in hand: it stays a fixed 10 s, with a `PING` after 3 s of silence and `ACS_DEAD_MS` as the override. Silence that netwatch does not explain is mostly a blip the existing TCP connection rides out, and a redial cannot succeed before the path is back anyway, so a shorter interval mainly turns survivable blips into redials — each one discarding typed keys, repainting the screen and costing a full handshake (51 ms cold on loopback, several round trips and possibly a key touch on a real host). An RTT-adaptive interval is decided by its floor on every real path, since a few round trips are under a second and the floor must exceed the ping interval; and the silence it must survive (a stalled host, output queued on a slow or bufferbloated uplink) is what an idle round trip underestimates. The fast cases are covered already: netwatch in 2 s, a closed connection at once. Reopen on `-v` evidence of drops netwatch missed whose redial then succeeded at once (§5.3) |
