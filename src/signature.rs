@@ -166,15 +166,10 @@ pub fn verify_with(key: &str, sums: &Path, sig: &Path, tmp: &Path) -> Result<(),
 /// that can name another key.
 fn write_allowed_signers(key: &str, tmp: &Path) -> Result<PathBuf, String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let path = tmp.join(format!("allowed_signers.{}", crate::sys::random_token()));
     // `create_new` is O_CREAT|O_EXCL, so a name planted ahead of us is an
     // error rather than a write through to its target (acs-721).
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
+    let mut f = crate::sys::create_new_mode(&path, 0o600)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     f.write_all(allowed_signers(key).as_bytes())
         .map_err(|e| format!("{}: {e}", path.display()))?;

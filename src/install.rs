@@ -361,13 +361,12 @@ fn finish(f: &Finish) -> Result<(), String> {
         // Our own file is the slim build; complete it with the blob. What
         // is hashed is what is copied, so nothing can change in between.
         let full = dir.join(format!("acs.full.{}", f.token));
-        let mut out = create_exe(&full)?;
+        // 0755 whatever the remote's umask (077 would leave 0700, acs-28b).
+        let mut out = crate::sys::create_new_mode(&full, 0o755)
+            .map_err(|e| format!("{}: {e}", full.display()))?;
         let done = complete(f, &me, &mut out);
         drop(out);
-        if let Err(e) = done
-            .and_then(|()| set_exe_mode(&full))
-            .and_then(|()| rename(&full, &final_path))
-        {
+        if let Err(e) = done.and_then(|()| rename(&full, &final_path)) {
             let _ = std::fs::remove_file(&full);
             return Err(e);
         }
@@ -382,7 +381,7 @@ fn finish(f: &Finish) -> Result<(), String> {
         }
         rename(&me, &final_path)?;
     }
-    if let Err(e) = link_bin(&final_path, &f.token) {
+    if let Err(e) = link_bin(&final_path) {
         // The link is a convenience: nothing in the protocol depends on it
         // (DESIGN §8), and the client finds the binary through the prelude.
         // So it is a warning after the ok, not a failed install (acs-iry).
@@ -422,31 +421,13 @@ fn complete(f: &Finish, me: &Path, out: &mut std::fs::File) -> Result<(), String
     out.sync_all().map_err(|e| e.to_string())
 }
 
-fn create_exe(path: &Path) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o755)
-        .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// The mode [`create_exe`] asks for is masked by the remote's umask (077
-/// leaves 0700), so set it for real, as the self-copy path does (acs-28b).
-fn set_exe_mode(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("{}: {e}", path.display()))
-}
-
 fn rename(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::rename(from, to).map_err(|e| format!("rename to {}: {e}", to.display()))
 }
 
 /// Point `~/.local/bin/acs` at the newest install: a temporary symlink
 /// renamed over the old one, so it is never missing.
-fn link_bin(target: &Path, token: &str) -> Result<(), String> {
+fn link_bin(target: &Path) -> Result<(), String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
     let bin = crate::layout::user_bin(&home);
     let link = bin.join("acs");
@@ -454,10 +435,7 @@ fn link_bin(target: &Path, token: &str) -> Result<(), String> {
         return Ok(());
     }
     std::fs::create_dir_all(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
-    let tmp = bin.join(format!(".acs.{token}"));
-    let _ = std::fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(target, &tmp).map_err(|e| e.to_string())?;
-    rename(&tmp, &link)
+    crate::sys::symlink_atomic(target, &link).map_err(|e| format!("{}: {e}", link.display()))
 }
 
 /// Whether `~/.local/bin/acs` (`link`) should point at `target`, the
