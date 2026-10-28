@@ -493,9 +493,20 @@ impl Config {
 
     /// Read `files` in order; later ones override earlier ones.
     pub fn load_files(files: &[PathBuf]) -> Result<Config, String> {
+        let docs: Vec<_> = files.iter().map(|f| read_doc(f)).collect();
+        Config::merge(files, &docs)
+    }
+
+    /// [`Config::load_files`] over files already read with [`read_doc`],
+    /// so an edit that needs the merge parses neither again (acs-siqo).
+    /// The first error in file order wins.
+    pub fn merge(
+        files: &[PathBuf],
+        docs: &[Result<Option<yaml::Document>, String>],
+    ) -> Result<Config, String> {
         let mut c = Config::default();
-        for f in files {
-            if let Some(doc) = read_doc(f)? {
+        for (f, d) in files.iter().zip(docs) {
+            if let Some(doc) = d.as_ref().map_err(Clone::clone)? {
                 c.apply(f, &doc.root)?;
                 c.files.push(f.clone());
             }

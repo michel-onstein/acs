@@ -843,12 +843,19 @@ fn one_line(n: &Node) -> bool {
         }
 }
 
+/// `indent` spaces, written in place rather than built per line.
+fn pad(out: &mut String, indent: usize) {
+    for _ in 0..indent {
+        out.push(' ');
+    }
+}
+
 fn push_before(out: &mut String, before: &[String], indent: usize) {
     for b in before {
         if b.is_empty() {
             out.push('\n');
         } else {
-            out.push_str(&" ".repeat(indent));
+            pad(out, indent);
             out.push_str(b);
             out.push('\n');
         }
@@ -871,21 +878,24 @@ fn line_end(out: &mut String, n: &Node) {
     out.push('\n');
 }
 
-fn emit_block(out: &mut String, v: &Value, indent: usize) {
-    let pad = " ".repeat(indent);
-    match v {
-        Value::Map(entries) => {
-            for (k, n) in entries {
-                push_before(out, &n.before, indent);
-                out.push_str(&pad);
-                out.push_str(&key_text(k, false));
-                out.push(':');
-                line_end(out, n);
-                if !one_line(n) {
-                    emit_block(out, &n.value, indent + 2);
-                }
-            }
+/// A mapping's entries, one `key:` line each. A slice, so a `- key:` item
+/// hands on the keys after its first without copying them (acs-siqo).
+fn emit_map(out: &mut String, entries: &[(String, Node)], indent: usize) {
+    for (k, n) in entries {
+        push_before(out, &n.before, indent);
+        pad(out, indent);
+        out.push_str(&key_text(k, false));
+        out.push(':');
+        line_end(out, n);
+        if !one_line(n) {
+            emit_block(out, &n.value, indent + 2);
         }
+    }
+}
+
+fn emit_block(out: &mut String, v: &Value, indent: usize) {
+    match v {
+        Value::Map(entries) => emit_map(out, entries, indent),
         Value::Seq(items) => {
             for n in items {
                 match &n.value {
@@ -894,7 +904,7 @@ fn emit_block(out: &mut String, v: &Value, indent: usize) {
                         let (k0, n0) = &entries[0];
                         push_before(out, &n.before, indent);
                         push_before(out, &n0.before, indent);
-                        out.push_str(&pad);
+                        pad(out, indent);
                         out.push_str("- ");
                         out.push_str(&key_text(k0, false));
                         out.push(':');
@@ -902,11 +912,11 @@ fn emit_block(out: &mut String, v: &Value, indent: usize) {
                         if !one_line(n0) {
                             emit_block(out, &n0.value, indent + 4);
                         }
-                        emit_block(out, &Value::Map(entries[1..].to_vec()), indent + 2);
+                        emit_map(out, &entries[1..], indent + 2);
                     }
                     _ => {
                         push_before(out, &n.before, indent);
-                        out.push_str(&pad);
+                        pad(out, indent);
                         out.push('-');
                         line_end(out, n);
                         if !one_line(n) {
@@ -917,7 +927,7 @@ fn emit_block(out: &mut String, v: &Value, indent: usize) {
             }
         }
         other => {
-            out.push_str(&pad);
+            pad(out, indent);
             out.push_str(&flow_text(other));
             out.push('\n');
         }

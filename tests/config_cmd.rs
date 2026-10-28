@@ -395,6 +395,53 @@ fn a_refused_edit_says_fix_by_hand_only_for_a_bad_file() {
     assert_eq!(std::fs::read_to_string(h.local()).unwrap(), bad);
 }
 
+/// acs-siqo: an edit reads each file once and hands it to every check, and
+/// gives the answers it gave when each check read the files itself. A host
+/// set needs both files whole and reports the first broken one in file
+/// order (global, then local); any other edit leaves a broken other file
+/// alone, as before; and the hint for a refused unset still finds the
+/// setting in the other file.
+#[test]
+fn an_edit_reads_each_file_once_and_answers_as_before() {
+    let h = Home::new();
+    h.ok(&["config", "host", "add", "devbox", "a.lan"]);
+    std::fs::create_dir_all(h.global().parent().unwrap()).unwrap();
+
+    // A broken global file: the host set names it, though the edit is local.
+    std::fs::write(h.global(), "aliases: [\n").unwrap();
+    h.fails(
+        &["config", "host", "set", "devbox", "persist", "false"],
+        2,
+        "etc/acs/config.yaml:1",
+    );
+    // Both broken: still the global one, read first.
+    let local = std::fs::read_to_string(h.local()).unwrap();
+    std::fs::write(h.local(), "aliases: [\n").unwrap();
+    h.fails(
+        &["config", "host", "set", "devbox", "persist", "false"],
+        2,
+        "etc/acs/config.yaml:1",
+    );
+    std::fs::write(h.local(), &local).unwrap();
+    // Any other edit of the local file does not need the global one.
+    h.ok(&["config", "set", "install_on_remote", "false"]);
+    assert_eq!(std::fs::read_to_string(h.global()).unwrap(), "aliases: [\n");
+
+    // A good global file: the host set goes through, and an unset of what
+    // only the global file sets points there.
+    std::fs::write(h.global(), "update_check: false\n").unwrap();
+    h.ok(&["config", "host", "set", "devbox", "persist", "false"]);
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "aliases:\n  devbox:\n    persist: false\n    hosts:\n      - host: a.lan\ninstall_on_remote: false\n"
+    );
+    h.fails(
+        &["config", "unset", "update_check"],
+        2,
+        "it is set in ~/etc/acs/config.yaml:1 (use --global)",
+    );
+}
+
 #[test]
 fn errors_are_clear() {
     let h = Home::new();
