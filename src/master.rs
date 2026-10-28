@@ -164,7 +164,11 @@ fn parse_args(args: &[OsString]) -> Result<Args, String> {
                 .ok_or_else(|| format!("{} needs a value", a.to_string_lossy()))
         };
         match a.to_str() {
-            Some("--dir") => dir = Some(PathBuf::from(val()?)),
+            // Absolute before the daemon's chdir to `/` (acs-7nan).
+            Some("--dir") => {
+                let d = PathBuf::from(val()?);
+                dir = Some(std::path::absolute(&d).unwrap_or(d));
+            }
             Some("--session") => session = Some(val()?),
             Some("--ready-fd") => ready_fd = Some(val()?.parse().map_err(|_| "bad --ready-fd")?),
             Some("--ring") => ring = val()?.parse().map_err(|_| "bad --ring")?,
