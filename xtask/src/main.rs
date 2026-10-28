@@ -60,9 +60,14 @@ fn main() {
                 exit(1);
             }
         }
+        // The release channel this xtask was built for, in the stamp's form:
+        // the key `scripts/update-tap.sh vX.Y.Z` checks a published
+        // SHA256SUMS.sig against, so a fork's tap trusts the fork's key with
+        // no edit to the script (acs-oxl4).
+        Some("channel") if args.len() == 1 => print!("{}", channel::Channel::built().stamp()),
         _ => {
             eprintln!(
-                "usage: cargo xtask dist [--targets t1,t2] [--out dir]\n       cargo xtask bump [--dry-run] [--major|--minor|--patch] (see docs/VERSIONING.md)\n       cargo xtask package --dist DIR --version X.Y.Z --out DIR\n       cargo xtask formula --version X.Y.Z --sums SHA256SUMS [--out FILE]"
+                "usage: cargo xtask dist [--targets t1,t2] [--out dir]\n       cargo xtask bump [--dry-run] [--major|--minor|--patch] (see docs/VERSIONING.md)\n       cargo xtask package --dist DIR --version X.Y.Z --out DIR\n       cargo xtask formula --version X.Y.Z --sums SHA256SUMS [--out FILE]\n       cargo xtask channel"
             );
             exit(2);
         }
