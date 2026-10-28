@@ -178,10 +178,18 @@ pub fn run(
         let persist = client::persist(&args);
         if !args.reconnect || (state.instance.is_none() && !persist) {
             client::leave(state, raw);
-            note(&format!(
-                "connection lost — the session keeps running; reattach with: acs {} {name}",
-                state.host
-            ));
+            // Lost before any WELCOME, there is no session known to keep
+            // running, and for `--new` no name to reattach to (acs-rsn5).
+            note(&match state.instance {
+                Some(_) => format!(
+                    "connection lost — the session keeps running; reattach with: acs {} {name}",
+                    state.host
+                ),
+                None => format!(
+                    "connection to {} lost before the session started",
+                    state.host
+                ),
+            });
             return code::UNREACHABLE;
         }
         redial = true;
