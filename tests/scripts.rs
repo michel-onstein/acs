@@ -161,6 +161,35 @@ fn test_linux_gives_each_checkout_its_own_target_volume() {
     );
 }
 
+/// acs-hdj4: the multi-user, netns and e2e tests are `#[ignore]`, so a plain
+/// `cargo test` counts them rather than passing them unrun. The scripts that
+/// can run them have to ask for them, or they go dark there too — counted as
+/// ignored in the one place they were meant to run.
+#[test]
+fn the_container_scripts_run_the_ignored_tests() {
+    let dir = TempDir::new();
+    let root = checkout(dir.path(), "a");
+    let linux = run(dir.path(), &root, "test_linux.sh", &[]).join("\n");
+    for step in [
+        "--test multiuser -- \\\n            --include-ignored --skip peer_helper",
+        "--test netns -- \\\n            --include-ignored",
+    ] {
+        assert!(
+            linux.contains(step),
+            "test_linux.sh lacks {step:?}:\n{linux}"
+        );
+    }
+    let e2e = run(dir.path(), &root, "e2e_ssh.sh", &["--no-build"]);
+    let test = e2e
+        .iter()
+        .find(|l| l.starts_with("cargo test"))
+        .expect("e2e_ssh.sh ran no cargo test");
+    assert!(
+        test.contains("--test e2e_ssh -- --include-ignored"),
+        "{test}"
+    );
+}
+
 #[test]
 fn e2e_gives_each_checkout_its_own_host_on_a_free_port() {
     let dir = TempDir::new();

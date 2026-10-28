@@ -39,6 +39,32 @@ impl Drop for TempDir {
     }
 }
 
+/// A child process killed and reaped when dropped, so a test that panics
+/// part way does not leave it running (acs-88a8). Derefs to the `Child`.
+pub struct KillOnDrop(pub std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // Both are no-ops on a child already waited for: std remembers the
+        // status and signals nothing, so a recycled pid is never hit.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// SIGTERM the master of every session socket at most two levels below
 /// `root`; a master ends its session on SIGTERM (SIGHUP, then SIGKILL).
 pub fn end_sessions_under(root: &Path) {
@@ -356,5 +382,46 @@ impl Drop for FrameConn {
         if let Some(s) = &self.socket {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KillOnDrop;
+
+    fn alive(pid: u32) -> bool {
+        crate::sys::kill(pid as i32, 0).is_ok()
+    }
+
+    /// acs-88a8: a test that panics while holding a child must not leave
+    /// it running.
+    #[test]
+    fn a_guarded_child_is_killed_when_the_test_panics() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("100")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let r = std::panic::catch_unwind(move || {
+            let _g = KillOnDrop(child);
+            assert!(alive(pid));
+            panic!("deliberate");
+        });
+        assert!(r.is_err());
+        // Reaped as well as killed, so not even a zombie is left.
+        assert!(!alive(pid), "child {pid} still running");
+    }
+
+    /// A child the test already waited for is left alone by the guard.
+    #[test]
+    fn a_waited_child_is_not_signalled_again() {
+        let mut g = KillOnDrop(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(g.wait().unwrap().success());
+        drop(g);
     }
 }

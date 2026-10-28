@@ -604,7 +604,7 @@ reached as `user@config`.
 | `ACS_REDRAW_ON_RECONNECT` | `0`: no Ctrl-L after reconnecting; `1`: a Ctrl-L even if the configuration (global or the alias's) turns it off |
 | `ACS_PERSIST` | `1`: never give up on a lost host (as `--persist`); `0`: give up as by default, whatever the configuration says |
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
-| `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
+| `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`); a relative path is taken from the remote login directory, normally home |
 | `ACS_CONTROL_DIR` | local directory for acs's own ssh control sockets (default `/tmp/acs-mux-<uid>`, made `0700`) |
 | `ACS_CONTROL_PERSIST` | seconds an acs-owned ssh master outlives its last use (default 300); `0` turns the shared master off |
 | `ACS_CONTROL_FALLBACK_MS` | how long a connection that joins an existing master may take to answer before the master is ended and the connection made on its own (default 2000) |

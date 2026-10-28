@@ -46,11 +46,15 @@ exec docker run --rm $platform \
         echo "== cargo test (root)"
         cargo test -p acs
         echo "== multi-user isolation"
-        ACS_MULTIUSER_TEST=1 cargo test -p acs --test multiuser -- --test-threads=1
+        # The isolation tests are #[ignore] outside this step (acs-hdj4);
+        # peer_helper is the child half of one of them, run by its parent.
+        ACS_MULTIUSER_TEST=1 cargo test -p acs --test multiuser -- \
+            --include-ignored --skip peer_helper --test-threads=1
         # A step of its own: it adds and removes interfaces, which moves
         # what getifaddrs reports process-wide, and netwatch and netmatch
         # have tests that read that while asserting it holds still.
         echo "== the kernel drives the network watcher"
-        ACS_NETNS_TEST=1 cargo test -p acs --test netns -- --test-threads=1 --nocapture
+        ACS_NETNS_TEST=1 cargo test -p acs --test netns -- \
+            --include-ignored --test-threads=1 --nocapture
         echo "== ok"
     '
