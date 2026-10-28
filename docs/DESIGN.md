@@ -1698,6 +1698,63 @@ one of the alias's entries instead of `<name>`:
   deadline passes kills and reaps it. Once a host is chosen the others'
   pings are not waited for; they end at the deadline. `ACS_PING` names
   another program, which is how the tests avoid ICMP.
+- **The entry used last here** (acs-zpj): a higher-ranked host that is
+  down where you are — `devbox.lan` away from home — costs the whole
+  deadline on every connection, the choice waiting for its ping. So acs
+  remembers which entry it chose, per alias and **set of local networks**,
+  and on those networks takes that entry **as soon as its own ping
+  answers**, not waiting for the ones ranked before it
+  (`alias_memory.rs`, `alias::resolve_remembering`).
+  - *The place* is this machine's usable networks (`getifaddrs`, as for
+    `prefer_local_network`, or `ACS_NETWATCH_NETS` as the watcher reads
+    them), each in network form, sorted: a new lease on the same subnet is
+    the same place; a network more or less — a VPN up, a second interface
+    — is another. On no usable network nothing is remembered or recalled.
+    `user@<alias>` shares the alias's memory.
+  - *What is remembered* is the chosen entry's `host`, and only when it was
+    **not first in the rank**; a choice of the first-ranked entry forgets
+    the memory instead, since there was no wait to save. A choice made
+    without answers (none reachable) leaves it as it was.
+  - *It is still pinged*, not dialled blind: ssh to a host that is down
+    takes its `ConnectTimeout`, far longer than the wait saved. An entry
+    with `reachability_check: false` is taken at once. Every other entry is
+    still pinged, as before, by the same deadline.
+  - *The entry used last is down*: its ping fails or the deadline passes,
+    and the walk goes on as without the memory, from the same pings — so
+    it costs nothing beyond the one deadline the walk has anyway. What was
+    chosen instead is remembered.
+  - *A higher-ranked host back up*: the connection stays on the remembered
+    entry (the entries are ways to reach one machine), and the usual
+    choice is still made from the same pings, by the same deadline, on a
+    thread the connection does not wait for, and remembered — here the
+    higher-ranked host, so the next connection waits for it again. A
+    process that ends before the deadline (a short `acs list`) leaves the
+    memory as it was; the next longer one corrects it.
+  - *The configuration changed*: a remembered host that is no longer an
+    entry of the alias, or is ranked behind an unchecked one so that it
+    could not be chosen, is ignored, and the choice made replaces it.
+    Several entries with the same `host` are taken by the first of them.
+    With `prefer_local_network`, the rank waits for the names to resolve;
+    the remembered entry does not.
+  - *The file* is `$XDG_STATE_HOME/acs/aliases` (default
+    `~/.local/state/acs/aliases`): a line per memory, `alias`, `host` and
+    the networks separated by tabs, newest first, at most 64. It is a
+    hint: a line that does not parse is dropped, an unreadable file is
+    empty, and a whole new file replaces it on each change (written beside
+    it and renamed). A file that cannot be written leaves the memory as it
+    was, and `-v` says why (`cannot remember the choice in …`). Since only
+    a configured entry can be taken through it, an edited file can choose
+    among the alias's hosts and nothing else. Threads of one process
+    (`acs list` over every alias) take turns; between processes the last
+    write wins, losing at most a hint.
+  - `-v` says it: `devbox.example.com was used last on these networks`,
+    then the "using" line, then for every other entry `<host> not waited
+    for: <host> was used last on these networks` (acs-qis's one line per
+    entry). On the walk without it, the lines are the usual ones.
+  - Probing the ssh port with a TCP connect instead of ICMP would be a
+    truer signal, and would serve hosts that drop pings; it is a bead of
+    its own, acs-fbes (it needs the port, from `ssh -G`, and an answer for
+    an entry behind a `ProxyJump`).
 - The chosen entry becomes the ssh destination: `user@host` if it has a
   `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
 - **`user@<alias>`** goes through the alias the same way — same order, same
