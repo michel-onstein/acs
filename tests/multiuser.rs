@@ -12,11 +12,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use acs::proto::{Marker, Mode, Msg};
-use acs::testutil::{hello, FrameConn, KillOnDrop};
+use acs::testutil::{hello, hello_running, FrameConn, KillOnDrop};
 
-/// As `common::T`, which this file cannot reach: generous, because the
-/// suite runs its targets in parallel (acs-kip).
-const T: Duration = Duration::from_secs(30);
+mod common;
+use common::{exe, T};
+
 const PEER_ENV: &str = "ACS_PEER_HELPER_SOCKET";
 
 /// Fail unless this is the container `scripts/test_linux.sh` set up: a test
@@ -40,12 +40,8 @@ fn user(name: &str) -> User {
     User { uid, gid, home }
 }
 
-fn exe() -> &'static str {
-    env!("CARGO_BIN_EXE_acs")
-}
-
 /// A command run as `u`, with a clean environment for that user.
-fn as_user(u: &User, program: &str) -> Command {
+fn as_user(u: &User, program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut c = Command::new(program);
     c.uid(u.uid)
         .gid(u.gid)
@@ -96,15 +92,8 @@ fn start_session(u: &User, session: &str, extra_env: &[(&str, &str)]) -> (FrameC
             .spawn()
             .unwrap(),
     );
-    let mut c = FrameConn::from_io(child.stdout.take().unwrap(), child.stdin.take().unwrap());
-    assert!(matches!(c.expect_marker(T), Some(Marker::Ready { .. })));
-    let mut h = hello(session, Mode::AttachOrCreate, "test");
-    h.command = vec!["/bin/sleep".into(), "100".into()];
-    c.send(&Msg::Hello(h));
-    assert!(
-        matches!(c.recv_control(T), Some(Msg::Welcome(_))),
-        "no WELCOME"
-    );
+    let mut c = FrameConn::ready_over(&mut child);
+    c.greet(hello_running(session, "test", &["/bin/sleep", "100"]));
     (c, child)
 }
 

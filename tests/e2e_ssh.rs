@@ -128,17 +128,11 @@ fn greeting(port: u16) -> Option<String> {
 
 /// [`greeting`], waiting for the forward to be bound and carrying bytes.
 fn wait_greeting(port: u16, timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(g) = greeting(port) {
-            return g;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "nothing answered on 127.0.0.1:{port} within {timeout:?}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    poll(
+        timeout,
+        || greeting(port),
+        || format!("nothing answered on 127.0.0.1:{port} within {timeout:?}"),
+    )
 }
 
 #[test]
@@ -454,10 +448,7 @@ fn e2e_11_identity_file_from_the_configuration() {
 #[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_12_ctrl_l_after_a_reattach_and_a_resume() {
     let h = host();
-    // Every byte the program receives, as `in:xx`.
-    let reporter = "stty raw -echo; echo ready; \
-        while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1); printf 'in:%s\\n' $b; done";
-    let mut c = h.client("redraw", reporter, &[]);
+    let mut c = h.client("redraw", REPORTER, &[]);
     c.wait_for("ready", T);
     c.send(b"z");
     c.wait_for("in:7a", T);
@@ -486,7 +477,6 @@ fn e2e_12_ctrl_l_after_a_reattach_and_a_resume() {
 #[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
     let h = host();
-    let echo = |name: &str| format!("echo ready-{name}; while read l; do echo got-{name}:$l; done");
     for name in ["menu-a", "menu-b"] {
         let mut c = h.client(name, &echo(name), &[]);
         c.wait_for(&format!("ready-{name}"), T);
@@ -501,26 +491,15 @@ fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
     c.wait_for("\x1b[?1049h", T);
     c.wait_for("acs: detached sessions on dev@127.0.0.1", T);
     c.wait_for("menu-b ", T);
-    // The number of a session's row, from the last screen drawn.
-    let row = |c: &Client, name: &str| -> usize {
-        let text = c.text();
-        let screen = &text[text.rfind("\x1b[Hacs: ").unwrap()..];
-        let line = screen
-            .split("\r\n")
-            .find(|l| l.contains(&format!(" {name} ")))
-            .unwrap_or_else(|| panic!("no {name} in {screen:?}"));
-        let line = line.trim_start_matches("\x1b[7m");
-        line[2..3].parse().unwrap()
-    };
     // End menu-b: the cursor down to it, x, y.
-    let b = row(&c, "menu-b");
+    let b = menu_row(&c, "menu-b");
     c.send(&vec![b'j'; b - 1]);
     c.send(b"x");
     c.wait_for("end session 'menu-b'?", T);
     c.send(b"y");
     c.wait_for("session 'menu-b' ended", T);
     // Attach menu-a by its number.
-    let a = row(&c, "menu-a");
+    let a = menu_row(&c, "menu-a");
     c.send(a.to_string().as_bytes());
     c.wait_for("\x1b[?1049l", T);
     c.wait_for("\x1b[H\x1b[J", T);

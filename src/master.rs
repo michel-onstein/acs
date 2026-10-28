@@ -408,13 +408,6 @@ fn fg_pgrp(pty: RawFd) -> Option<i32> {
         .and_then(|p| sys::valid_pgrp(p, sys::getpgrp()))
 }
 
-/// The pty's poll entry. With nothing to wait for it is left out (`fd -1`):
-/// Linux reports POLLHUP on a hung-up pty whatever `events` asks for, and
-/// while the ring is full that would spin the loop (acs-gkl).
-fn pty_pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
-    sys::pollfd(if events == 0 { -1 } else { fd }, events)
-}
-
 /// After the child's exit status is known: whether the pty has nothing
 /// more to read. Only a poll that runs its full course afterwards can say
 /// so — the poll that saw the status may have been cut short by SIGCHLD, or
@@ -506,6 +499,15 @@ impl Master {
             .position(|c| matches!(c.state, ConnState::Active { .. }) && !c.dead)
     }
 
+    /// How much more the ring takes before it overwrites what the active
+    /// client has not been sent; unbounded with no active client.
+    fn ring_room(&self) -> usize {
+        match self.active().map(|i| &self.conns[i].state) {
+            Some(ConnState::Active { next }) => self.ring.room_before_overwrite(*next),
+            _ => usize::MAX,
+        }
+    }
+
     fn run(mut self) -> io::Result<()> {
         let mut buf = vec![0u8; 64 * 1024];
         // Without a child after a while nobody is coming: give up.
@@ -536,11 +538,11 @@ impl Master {
             // empties the client's buffer must be followed by a refill from
             // the ring, or with the ring full (no pty POLLIN) and the buffer
             // empty (no POLLOUT) nothing would ever wake us.
-            self.pump_output();
+            self.pump_output(OUT_HIGH_WATER);
             for c in &mut self.conns {
                 c.flush();
             }
-            self.pump_output();
+            self.pump_output(OUT_HIGH_WATER);
 
             // Ping the attached client after silence, and give up one that
             // stays silent: a client that vanished without closing (a laptop
@@ -561,7 +563,6 @@ impl Master {
             }
             self.conns.retain(|c| !c.dead);
 
-            let active = self.active();
             let mut fds = vec![
                 sys::pollfd(self.listener.as_raw_fd(), libc::POLLIN),
                 sys::pollfd(self.signals.as_raw_fd(), libc::POLLIN),
@@ -570,18 +571,14 @@ impl Master {
             let mut pty_events = 0;
             if let Some(ch) = &self.child {
                 if ch.pty_open {
-                    let room = match active.map(|i| &self.conns[i].state) {
-                        Some(ConnState::Active { next }) => self.ring.room_before_overwrite(*next),
-                        _ => usize::MAX,
-                    };
-                    if room > 0 {
+                    if self.ring_room() > 0 {
                         pty_events |= libc::POLLIN;
                     }
                     if !self.pty_in.is_empty() {
                         pty_events |= libc::POLLOUT;
                     }
                 }
-                fds.push(pty_pollfd(ch.pty.as_raw_fd(), pty_events));
+                fds.push(sys::wait_for(ch.pty.as_raw_fd(), pty_events));
             }
             let conn_base = fds.len();
             for c in &self.conns {
@@ -676,7 +673,7 @@ impl Master {
                     self.read_conn(i, &mut buf);
                 }
             }
-            self.pump_output();
+            self.pump_output(OUT_HIGH_WATER);
             for c in &mut self.conns {
                 c.flush();
                 if c.state == ConnState::Closing && c.out.is_empty() {
@@ -1148,22 +1145,11 @@ impl Master {
     }
 
     fn read_pty(&mut self, buf: &mut [u8]) {
+        let want = buf.len().min(self.ring_room());
         let Some(ch) = &mut self.child else { return };
         if !ch.pty_open {
             return;
         }
-        let room = match self
-            .conns
-            .iter()
-            .find(|c| matches!(c.state, ConnState::Active { .. }) && !c.dead)
-        {
-            Some(Conn {
-                state: ConnState::Active { next },
-                ..
-            }) => self.ring.room_before_overwrite(*next),
-            _ => buf.len(),
-        };
-        let want = buf.len().min(room);
         if want == 0 {
             return;
         }
@@ -1226,16 +1212,13 @@ impl Master {
         }
     }
 
-    /// Move ring data into the active client's buffer.
-    fn pump_output(&mut self) {
-        self.queue_ring(OUT_HIGH_WATER);
-    }
-
     /// Queue ring data for the active client as DATA frames until its
-    /// buffer holds `high_water` bytes or the ring has no more. Each
+    /// buffer holds `high_water` bytes or the ring has no more —
+    /// [`OUT_HIGH_WATER`] while the session runs, `usize::MAX` once it is
+    /// over. Each
     /// frame's payload is the ring's two slices copied straight into the
     /// buffer, the one copy of the output the master makes (acs-m08z).
-    fn queue_ring(&mut self, high_water: usize) {
+    fn pump_output(&mut self, high_water: usize) {
         let Some(a) = self.active() else { return };
         let end = self.ring.end();
         let c = &mut self.conns[a];
@@ -1418,7 +1401,7 @@ impl Master {
         mlog!("session ended with status {status:#x}");
         // Stop accepting new clients right away.
         self.cleanup();
-        self.pump_output_all();
+        self.pump_output(usize::MAX);
         if let Some(a) = self.active() {
             self.conns[a].send(&Msg::Exit { status });
         }
@@ -1438,12 +1421,6 @@ impl Master {
             }
         }
         Ok(())
-    }
-
-    /// Queue everything left in the ring for the active client, ignoring
-    /// the high-water mark (the session is over).
-    fn pump_output_all(&mut self) {
-        self.queue_ring(usize::MAX);
     }
 }
 
@@ -1468,11 +1445,5 @@ mod tests {
         assert!(sys::read(m, &mut buf).unwrap() > 0);
         // Read out, with the slave still open (a background job): drained.
         assert!(pty_drained(m));
-    }
-
-    #[test]
-    fn an_idle_pty_is_left_out_of_the_poll() {
-        assert_eq!(pty_pollfd(7, 0).fd, -1);
-        assert_eq!(pty_pollfd(7, libc::POLLIN).fd, 7);
     }
 }

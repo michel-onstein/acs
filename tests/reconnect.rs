@@ -9,19 +9,10 @@ use std::time::{Duration, Instant};
 
 use common::*;
 
-/// Fast timers so a test takes seconds, not minutes.
-const FAST: &[(&str, &str)] = &[
-    ("ACS_BACKOFF_MS", "100"),
-    ("ACS_PING_MS", "200"),
-    ("ACS_DEAD_MS", "800"),
-];
-
 /// The dead interval `frozen_link_is_declared_dead_and_replaced` runs with,
 /// in place of `FAST`'s: long enough that the bound it reads against has
 /// room, and the only test here that waits out a whole one.
 const DEAD: Duration = Duration::from_secs(4);
-
-const TICKER: &str = "i=0; while true; do i=$((i+1)); printf '#%d#\\n' $i; sleep 0.01; done";
 
 fn start(remote: &Remote, session: &str, cmd: &str, env: &[(&str, &str)]) -> Client {
     Client::start_env(
@@ -65,15 +56,16 @@ fn frames(ticks: &Path) -> u64 {
 /// into a four kilobyte ring, so the overwrite is a fact before the client
 /// is let back and a stalled host only makes the test slower.
 fn wait_frames(ticks: &Path, base: u64, more: u64) {
-    let deadline = Instant::now() + T;
-    while frames(ticks) < base + more {
-        assert!(
-            Instant::now() < deadline,
-            "{} frames, waiting for {more} more than the {base} there were",
-            frames(ticks),
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || frames(ticks) >= base + more,
+        || {
+            format!(
+                "{} frames, waiting for {more} more than the {base} there were",
+                frames(ticks),
+            )
+        },
+    );
 }
 
 /// Frames of 2001 bytes to overwrite `ACS_RING` at 4096 — ten kilobytes
@@ -334,25 +326,26 @@ fn a_stalled_terminal_is_not_a_dead_link() {
     // what this test is about is whether the stall costs one *more*.
     let dialled = remote.connections();
     c.set_paused(true);
-    let deadline = Instant::now() + T;
-    let mut cols = 80;
-    let want = loop {
-        cols += 1;
-        let want = format!("24 {cols}\n");
-        c.resize(cols, 24);
-        let asked = Instant::now();
-        while reported() != want && asked.elapsed() < STUCK {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if reported() != want {
-            break want;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the client never blocked on the paused terminal: {} resizes got through",
-            cols - 80
-        );
-    };
+    let cols = std::cell::Cell::new(80);
+    let want = poll(
+        T,
+        || {
+            cols.set(cols.get() + 1);
+            let want = format!("24 {}\n", cols.get());
+            c.resize(cols.get(), 24);
+            let asked = Instant::now();
+            while reported() != want && asked.elapsed() < STUCK {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (reported() != want).then_some(want)
+        },
+        || {
+            format!(
+                "the client never blocked on the paused terminal: {} resizes got through",
+                cols.get() - 80
+            )
+        },
+    );
     c.set_paused(false);
     // The resize the blocked client sat on goes through once its write
     // does: it was stuck, not lost.
@@ -618,15 +611,15 @@ fn output_lost_to_a_small_ring_is_a_gap_and_redraw() {
     remote.release_dial();
     // After reconnecting with an overwritten offset the client clears the
     // screen for the program's redraw.
-    let deadline = Instant::now() + T;
-    loop {
-        let out = c.output();
-        if out[before..].windows(6).any(|w| w == b"\x1b[H\x1b[J") {
-            break;
-        }
-        assert!(Instant::now() < deadline, "no clear after the gap");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || {
+            c.output()[before..]
+                .windows(6)
+                .any(|w| w == b"\x1b[H\x1b[J")
+        },
+        || "no clear after the gap",
+    );
 }
 
 /// Regression (acs-xk4): the modes a program turned on before a gap are
@@ -702,11 +695,11 @@ fn modes_of_a_restarted_session_are_reset() {
     remote.cut_link();
     a.wait_for("reconnecting in 120s", T);
     // The first program ends while the link is down; another takes its name.
-    let deadline = Instant::now() + T;
-    while remote.session_exists("restart") {
-        assert!(Instant::now() < deadline, "the first program did not end");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || !remote.session_exists("restart"),
+        || "the first program did not end",
+    );
     let mut b = start(&remote, "restart", "echo second; sleep 30", &[]);
     b.wait_for("second", T);
     b.send(&command(b'd'));

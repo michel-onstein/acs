@@ -141,11 +141,7 @@ fn connect_or_start(
     loop {
         match UnixStream::connect(&path) {
             Ok(s) => return Ok(Some(s)),
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::ENOENT) | Some(libc::ECONNREFUSED)
-                ) => {}
+            Err(e) if refused(&e) => {}
             Err(e) => return Err(format!("connect {}: {e}", path.display())),
         }
         if !create {
@@ -352,13 +348,6 @@ fn relay(master: UnixStream, to_master: Vec<u8>) -> io::Result<()> {
     relay_fds(master, to_master, STDIN, STDOUT)
 }
 
-/// A poll entry, or none (`fd -1`) when there is nothing to wait for: a
-/// closed pipe reports POLLHUP whatever `events` asks, which would spin the
-/// loop while the other direction is stuck (acs-wza).
-fn wait_for(fd: RawFd, events: libc::c_short) -> libc::pollfd {
-    sys::pollfd(if events == 0 { -1 } else { fd }, events)
-}
-
 fn relay_fds(
     master: UnixStream,
     to_master: Vec<u8>,
@@ -378,7 +367,7 @@ fn relay_fds(
     let limit = 1 << 20;
     loop {
         let mut fds = [
-            wait_for(
+            sys::wait_for(
                 input,
                 if stdin_open && to_master.len() < limit {
                     libc::POLLIN
@@ -386,7 +375,7 @@ fn relay_fds(
                     0
                 },
             ),
-            sys::pollfd(m, {
+            sys::wait_for(m, {
                 let mut ev = 0;
                 if to_client.len() < limit {
                     ev |= libc::POLLIN;
@@ -396,7 +385,7 @@ fn relay_fds(
                 }
                 ev
             }),
-            wait_for(
+            sys::wait_for(
                 output,
                 if to_client.is_empty() {
                     0
