@@ -24,15 +24,6 @@ fn session(host: &str, extra: &[&'static str]) -> Vec<&'static str> {
     args
 }
 
-/// Wait until `f` holds.
-fn until(what: &str, f: impl Fn() -> bool) {
-    let deadline = Instant::now() + T;
-    while !f() {
-        assert!(Instant::now() < deadline, "never: {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 const ALIAS: &str = "\
 reachability_interval: 200ms
 aliases:
@@ -51,7 +42,7 @@ fn an_alias_with_no_host_answering_is_waited_for_from_the_start() {
         T,
     );
     // Pinged again every interval, and nothing dialled meanwhile.
-    until("three pings", || net.pinged().len() >= 3);
+    wait_until(T, || net.pinged().len() >= 3, || "never: three pings");
     assert!(
         remote.transport_pids().is_empty(),
         "dialled before an answer"
@@ -86,9 +77,11 @@ fn a_dropped_plain_host_is_pinged_until_it_answers_then_resumed() {
     let pinged = net.pinged().len();
     remote.cut_link();
     c.wait_for("devbox is not answering — pinging it every 200ms", T);
-    until("three pings after the drop", || {
-        net.pinged().len() >= pinged + 3
-    });
+    wait_until(
+        T,
+        || net.pinged().len() >= pinged + 3,
+        || "never: three pings after the drop",
+    );
     assert_eq!(
         remote.connections(),
         dials,
@@ -126,10 +119,11 @@ fn a_lost_host_is_pinged_fast_at_first_then_every_interval() {
     let lost = Instant::now();
     // Fast at first: five pings well inside the first 10 s interval.
     let fast = Duration::from_secs(2);
-    while net.pinged().len() < pinged + 5 {
-        assert!(lost.elapsed() < fast, "not pinged fast after the loss");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        fast.saturating_sub(lost.elapsed()),
+        || net.pinged().len() >= pinged + 5,
+        || "not pinged fast after the loss",
+    );
     // Then backed off: after the 3 s of fast pings, none for a while.
     std::thread::sleep(Duration::from_millis(3500).saturating_sub(lost.elapsed()));
     let settled = net.pinged().len();
@@ -194,7 +188,11 @@ fn a_first_connect_that_fails_is_waited_out_before_any_session() {
     );
     net.set_up(&[]);
     let pinged = net.pinged().len();
-    until("pings while down", || net.pinged().len() >= pinged + 2);
+    wait_until(
+        T,
+        || net.pinged().len() >= pinged + 2,
+        || "never: pings while down",
+    );
     std::fs::write(dir.path().join("up"), "").unwrap();
     net.set_up(&["devbox"]);
     c.wait_for("new session 's' on devbox", T);

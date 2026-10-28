@@ -38,7 +38,7 @@
 //! watcher that quietly stopped emitting visible there.
 
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use acs::netwatch::NetWatch;
 
@@ -85,18 +85,15 @@ fn nets() -> Vec<String> {
 /// it never does. Nothing in this process writes to that descriptor, so
 /// whatever is there came from the kernel.
 fn wait_readable(w: &NetWatch, what: &str) {
-    let deadline = Instant::now() + T;
-    loop {
-        let mut fds = [acs::sys::pollfd(w.fd(), libc::POLLIN)];
-        let _ = acs::sys::poll(&mut fds, 50);
-        if fds[0].revents != 0 {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the kernel said nothing about {what}"
-        );
-    }
+    acs::testutil::wait_until(
+        T,
+        || {
+            let mut fds = [acs::sys::pollfd(w.fd(), libc::POLLIN)];
+            let _ = acs::sys::poll(&mut fds, 50);
+            fds[0].revents != 0
+        },
+        || format!("the kernel said nothing about {what}"),
+    );
 }
 
 /// Take the interfaces away however the test ends.

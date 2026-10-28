@@ -7,6 +7,14 @@ use std::time::{Duration, Instant};
 
 use common::*;
 
+/// The words of the row of `out` whose column `col` is `name`.
+fn row<'a>(out: &'a str, col: usize, name: &str) -> Vec<&'a str> {
+    out.lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|w| w.get(col) == Some(&name))
+        .unwrap_or_else(|| panic!("no row for {name}:\n{out}"))
+}
+
 fn list(remote: &Remote) -> (i32, String) {
     let out = acs_cmd()
         .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
@@ -40,17 +48,9 @@ fn lists_attached_detached_and_drops_stale_sockets() {
     assert_eq!(code, 0, "{out}");
     let lines: Vec<&str> = out.lines().collect();
     assert!(lines[0].starts_with("NAME"), "{out}");
-    let row = |name: &str| {
-        lines
-            .iter()
-            .find(|l| l.split_whitespace().next() == Some(name))
-            .unwrap_or_else(|| panic!("no row for {name}:\n{out}"))
-            .split_whitespace()
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(row("main")[1..3], ["attached", "tester@local"]);
-    assert_eq!(row("work")[1..3], ["detached", "(tester@local)"]);
-    assert!(row("work")
+    assert_eq!(row(&out, 0, "main")[1..3], ["attached", "tester@local"]);
+    assert_eq!(row(&out, 0, "work")[1..3], ["detached", "(tester@local)"]);
+    assert!(row(&out, 0, "work")
         .join(" ")
         .ends_with("/bin/sh -c echo b; sleep 30"));
     assert!(!out.contains("old"), "stale session listed:\n{out}");
@@ -208,19 +208,12 @@ fn every_alias_is_listed_and_a_dead_one_gets_a_line() {
         ["HOST", "NAME", "STATE", "WHO", "IDLE", "AGE", "COMMAND"],
         "{out}"
     );
-    let row = |name: &str| {
-        lines
-            .iter()
-            .map(|l| l.split_whitespace().collect::<Vec<_>>())
-            .find(|w| w.get(1) == Some(&name))
-            .unwrap_or_else(|| panic!("no row for {name}:\n{out}"))
-    };
     assert_eq!(
-        row("main")[..4],
+        row(&out, 1, "main")[..4],
         ["devbox", "main", "attached", "tester@local"]
     );
     assert_eq!(
-        row("work")[..4],
+        row(&out, 1, "work")[..4],
         ["devbox", "work", "detached", "(tester@local)"]
     );
     assert_eq!(
