@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::cli::{ClientArgs, Target};
 use crate::client::{self, code, Link, Picked};
-use crate::list::{self, Failure};
+use crate::list::{self, Failure, Listing, Until};
 use crate::menu::{Answer, Choice, Menu};
 use crate::proto::{self, Decoder, Marker, Msg, StatusInfo};
 use crate::ssh::{self, Call};
@@ -200,13 +200,6 @@ struct Pick {
     owed: Vec<u8>,
 }
 
-/// One list from the proxy: every session's STATUS, and the message of an
-/// ERROR sent along (a session that would not end).
-struct Listing {
-    sessions: Vec<StatusInfo>,
-    error: Option<String>,
-}
-
 impl Pick {
     /// The connection for the attach. `greeted`: the proxy attached the
     /// HELLO sent ahead, which carried that terminal size; what of it is
@@ -247,49 +240,19 @@ impl Pick {
     fn list(&mut self) -> Result<Listing, Failure> {
         let deadline = Instant::now() + self.timeout;
         let from = self.link.from_fd().as_raw_fd();
-        let mut answer = Listing {
-            sessions: Vec::new(),
-            error: None,
-        };
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match self.dec.next_msg() {
-                // Bounded, as the listing is (acs-rip).
-                Ok(Some(Msg::StatusReply(s))) => {
-                    crate::list::push_session(&mut answer.sessions, s)?
-                }
-                Ok(Some(Msg::Error { message, .. })) => answer.error = Some(message),
-                Ok(Some(Msg::ListEnd)) => return Ok(answer),
-                Ok(Some(other)) => {
-                    return Err(Failure::BadReply(format!("unexpected {other:?}")));
-                }
-                Ok(None) => match self.wait(from, deadline) {
-                    Ok(true) => match sys::read(from, &mut buf) {
-                        // An ERROR and then the end: the host could not
-                        // read its sessions, which is what to report
-                        // (acs-5jrq), not the connection closing.
-                        Ok(0) => {
-                            return Err(match answer.error {
-                                Some(e) => Failure::BadReply(e),
-                                None => Failure::Unreachable(
-                                    "the connection closed before the session list".into(),
-                                ),
-                            })
-                        }
-                        Ok(n) => self.dec.push(&buf[..n]),
-                        Err(e) => return Err(Failure::Unreachable(e.to_string())),
-                    },
-                    Ok(false) => {
-                        return Err(Failure::Unreachable(format!(
-                            "no answer within {} s",
-                            self.timeout.as_secs_f32()
-                        )))
-                    }
-                    Err(e) => return Err(Failure::Unreachable(e.to_string())),
-                },
-                Err(e) => return Err(Failure::BadReply(e.to_string())),
-            }
-        }
+        let late = format!("no answer within {} s", self.timeout.as_secs_f32());
+        // Out of `self` while it is read, for `wait` to write what is owed.
+        let mut dec = std::mem::take(&mut self.dec);
+        let listed = list::read_listing(
+            &mut dec,
+            from,
+            deadline,
+            Until::End,
+            &late,
+            &mut |fd, by| self.wait(fd, by),
+        );
+        self.dec = dec;
+        listed
     }
 
     /// End `name` on the host and read the list that answers it. Says who
