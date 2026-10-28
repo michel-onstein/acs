@@ -8,14 +8,9 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::*;
-
-/// A session that answers each line typed with `got-<name>:<line>`.
-fn echo(name: &str) -> String {
-    format!("echo ready-{name}; while read l; do echo got-{name}:$l; done")
-}
 
 /// Start session `name` running [`echo`] and detach from it.
 fn detached(remote: &Remote, name: &str) {
@@ -43,19 +38,6 @@ fn attached_to(c: &mut Client, name: &str) {
     c.wait_for("\x1b[H\x1b[J", T);
     c.send(b"hi\r");
     c.wait_for(&format!("got-{name}:\x0chi"), T);
-}
-
-/// The last screen the menu drew.
-fn last_screen(c: &Client) -> String {
-    let text = c.text();
-    // The last one drawn in full: a redraw may be read half-way, so skip
-    // one that has not reached its closing erase yet.
-    let mut screens: Vec<&str> = text.split("\x1b[Hacs: ").skip(1).collect();
-    if screens.last().is_some_and(|s| !s.contains("\x1b[J")) && screens.len() > 1 {
-        screens.pop();
-    }
-    let last = screens.last().expect("no menu drawn");
-    format!("\x1b[Hacs: {last}")
 }
 
 #[test]
@@ -355,11 +337,11 @@ fn without_a_terminal_for_the_menu_it_attaches_main() {
         }
     });
     let wait_for = |needle: &str| {
-        let deadline = Instant::now() + T;
-        while !String::from_utf8_lossy(&out.lock().unwrap()).contains(needle) {
-            assert!(Instant::now() < deadline, "no {needle:?}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_until(
+            T,
+            || String::from_utf8_lossy(&out.lock().unwrap()).contains(needle),
+            || format!("no {needle:?}"),
+        );
     };
     wait_for("\x1b[H\x1b[J");
     acs::sys::write_all(pty.as_raw_fd(), b"hi\r").unwrap();

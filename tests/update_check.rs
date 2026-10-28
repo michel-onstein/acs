@@ -13,7 +13,7 @@ mod common;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use acs::testutil::TempDir;
 use common::*;
@@ -94,15 +94,11 @@ impl Setup {
     }
 
     fn wait_state(&self, want: &str) {
-        let deadline = Instant::now() + T;
-        while !self.read_state().contains(want) {
-            assert!(
-                Instant::now() < deadline,
-                "state never had {want:?}: {:?}",
-                self.read_state()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_until(
+            T,
+            || self.read_state().contains(want),
+            || format!("state never had {want:?}: {:?}", self.read_state()),
+        );
     }
 }
 

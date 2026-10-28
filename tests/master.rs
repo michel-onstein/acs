@@ -4,14 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use acs::proto::{AttachKind, Mode, Msg, Resume, Welcome};
-use acs::testutil::{hello, FrameConn, TempDir};
+use acs::testutil::{hello, poll, wait_idle, wait_until, FrameConn, TempDir};
 
 mod common;
-use common::T;
-
-fn exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_acs"))
-}
+use common::{exe, T};
 
 fn sock(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.sock"))
@@ -29,15 +25,7 @@ fn start_env(
     identity: &str,
     env: &[(&str, &str)],
 ) -> (FrameConn, Welcome) {
-    acs::master::spawn_with_env(&exe(), dir, name, env).expect("spawn master");
-    let mut c = FrameConn::connect(&sock(dir, name)).unwrap();
-    let mut h = hello(name, Mode::AttachOrCreate, identity);
-    h.command = command.iter().map(|s| s.to_string()).collect();
-    c.send(&Msg::Hello(h));
-    match c.recv_control(T) {
-        Some(Msg::Welcome(w)) => (c, w),
-        other => panic!("expected WELCOME, got {other:?}"),
-    }
+    acs::testutil::start_master(&exe(), dir, name, command, identity, env)
 }
 
 fn attach(dir: &Path, name: &str, identity: &str, resume: Option<Resume>) -> (FrameConn, Msg) {
@@ -73,29 +61,24 @@ fn attach_conn(
 /// Connecting is the question the test is really asking, so it is the one
 /// that is asked, and the connection that answers is the one used.
 fn attach_when_bound(dir: &Path, name: &str, identity: &str) -> (FrameConn, Msg) {
-    let deadline = Instant::now() + T;
-    loop {
-        if let Ok(c) = FrameConn::connect(&sock(dir, name)) {
-            return attach_conn(c, name, identity, None);
-        }
-        assert!(Instant::now() < deadline, "the socket never answered again");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let c = poll(
+        T,
+        || FrameConn::connect(&sock(dir, name)).ok(),
+        || "the socket never answered again",
+    );
+    attach_conn(c, name, identity, None)
 }
 
 fn wait_exit(c: &mut FrameConn) -> i32 {
-    match c.recv_control(Duration::from_secs(15)) {
-        Some(Msg::Exit { status }) => status,
-        other => panic!("expected EXIT, got {other:?}"),
-    }
+    c.expect_exit(Duration::from_secs(15))
 }
 
 fn wait_gone(path: &Path) {
-    let deadline = Instant::now() + T;
-    while path.exists() {
-        assert!(Instant::now() < deadline, "{} still exists", path.display());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || !path.exists(),
+        || format!("{} still exists", path.display()),
+    );
 }
 
 // ---- lifecycle (acs-5v9.9) --------------------------------------------------
@@ -183,22 +166,25 @@ fn socket_is_rebound_after_deletion() {
 /// The proxy's `connect_or_start`: connect, and start a master while
 /// nothing answers, treating "already has a master" as "try again".
 fn connect_or_start(dir: &Path, name: &str) -> (FrameConn, Vec<String>) {
-    let deadline = Instant::now() + T;
     let mut refusals = Vec::new();
-    loop {
-        if let Ok(c) = FrameConn::connect(&sock(dir, name)) {
-            return (c, refusals);
-        }
-        assert!(Instant::now() < deadline, "the session never came up");
-        match acs::master::spawn(&exe(), dir, name) {
-            Ok(()) => {}
-            Err(e) if e.to_string().contains("already has a master") => {
-                refusals.push(e.to_string());
-                std::thread::sleep(Duration::from_millis(20));
+    let c = poll(
+        T,
+        || {
+            if let Ok(c) = FrameConn::connect(&sock(dir, name)) {
+                return Some(c);
             }
-            Err(e) => panic!("spawn: {e}"),
-        }
-    }
+            match acs::master::spawn(&exe(), dir, name) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("already has a master") => {
+                    refusals.push(e.to_string());
+                }
+                Err(e) => panic!("spawn: {e}"),
+            }
+            None
+        },
+        || "the session never came up",
+    );
+    (c, refusals)
 }
 
 /// A client reconnecting between a cleaner deleting the socket and the
@@ -259,14 +245,11 @@ fn socket_directory_is_recreated_after_deletion() {
         &[("ACS_MASTER_REBIND_MS", "100")],
     );
     std::fs::remove_dir_all(&dir).unwrap();
-    let deadline = Instant::now() + T;
-    while !sock(&dir, "gone").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "socket directory never recreated"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || sock(&dir, "gone").exists(),
+        || "socket directory never recreated",
+    );
     use std::os::unix::fs::MetadataExt;
     assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
     // As above: the path being back is not the socket listening yet.
@@ -536,11 +519,7 @@ fn no_backpressure_while_detached() {
         &[("ACS_RING", "65536")],
     );
     a.send(&Msg::Detach);
-    let deadline = Instant::now() + T;
-    while !marker.exists() {
-        assert!(Instant::now() < deadline, "program blocked while detached");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_until(T, || marker.exists(), || "program blocked while detached");
 }
 
 /// Fast liveness timers for the master (DESIGN §5.3).
@@ -566,14 +545,11 @@ fn a_client_that_vanishes_without_closing_is_dropped() {
     h.command = vec!["/bin/sh".into(), "-c".into(), cmd];
     std::io::Write::write_all(&mut s, &Msg::Hello(h).to_bytes()).unwrap();
     // Never read, never write, never close.
-    let deadline = Instant::now() + T;
-    while !marker.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "program blocked by a vanished client"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_until(
+        T,
+        || marker.exists(),
+        || "program blocked by a vanished client",
+    );
     // The master hung up on it.
     let mut buf = vec![0u8; 1 << 16];
     loop {
@@ -779,25 +755,6 @@ fn the_last_output_before_exit_is_never_lost() {
             });
         }
     });
-}
-
-/// Wait, up to `T`, for `pid` to spend under a tenth of a half-second
-/// window on the CPU (acs-ci9u). It replaces a fixed 200 ms settle after
-/// the event under test, a deadline for the process's legitimate work that
-/// a starved host could miss, so that the work spilled into the window the
-/// test then measures. A process that spins never gets here at all.
-fn wait_idle(pid: u32, what: &str) {
-    let deadline = Instant::now() + T;
-    loop {
-        let burnt = acs::testutil::cpu_over(pid, Duration::from_millis(500));
-        if burnt < Duration::from_millis(50) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{what} never went idle: {burnt:?} of CPU in its last 500 ms"
-        );
-    }
 }
 
 /// Regression (acs-gkl): while a stalled client has the ring full, a pty

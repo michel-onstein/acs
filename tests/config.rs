@@ -5,24 +5,12 @@ mod common;
 use acs::testutil::TempDir;
 use common::*;
 
-const CMD: &[&str] = &["--", "/bin/sh", "-c", "echo up; sleep 30"];
-
-fn args(session: &str) -> Vec<&str> {
-    let mut a = vec!["devbox", session];
-    a.extend_from_slice(CMD);
-    a
-}
-
-fn env_refs(env: &[(String, String)]) -> Vec<(&str, &str)> {
-    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
-}
-
 #[test]
 fn install_on_remote_false_stops_a_remote_install() {
     let remote = Remote::new();
     let cfg = TempDir::new();
     let env = config_env(cfg.path(), "# no installs\ninstall_on_remote: false\n");
-    let mut c = Client::start_env(&remote, &args("s"), &env_refs(&env));
+    let mut c = Client::start_env(&remote, &up_args("s"), &refs(&env));
     assert_eq!(c.wait(T), 254);
     c.wait_for(
         &format!("acs {} is not installed on devbox (", acs::VERSION),
@@ -43,7 +31,7 @@ fn the_local_file_overrides_the_global_one() {
     std::fs::write(&global, "install_on_remote: false\n").unwrap();
     let mut env = config_env(cfg.path(), "install_on_remote: true\n");
     env.push(("ACS_GLOBAL_CONFIG".into(), global.display().to_string()));
-    let mut c = Client::start_env(&remote, &args("s"), &env_refs(&env));
+    let mut c = Client::start_env(&remote, &up_args("s"), &refs(&env));
     c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
     c.wait_for("up", T);
 
@@ -53,7 +41,7 @@ fn the_local_file_overrides_the_global_one() {
         ("ACS_GLOBAL_CONFIG", global.to_str().unwrap()),
         ("XDG_CONFIG_HOME", NO_CONFIG),
     ];
-    let mut c = Client::start_env(&remote, &args("g"), &only_global);
+    let mut c = Client::start_env(&remote, &up_args("g"), &only_global);
     assert_eq!(c.wait(T), 254);
     c.wait_for("global.yaml:1)", T);
 }

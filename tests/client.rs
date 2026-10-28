@@ -115,11 +115,11 @@ fn exit_command_ends_the_session() {
     // The shell dies of SIGHUP: 128 + 1.
     assert_eq!(c.wait(T), 129);
     assert!(c.echo_on());
-    let deadline = std::time::Instant::now() + T;
-    while remote.session_exists("gone") {
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || !remote.session_exists("gone"),
+        || "the session outlived its exit",
+    );
 }
 
 #[test]
@@ -203,16 +203,14 @@ fn resize_reaches_the_program() {
     );
     c.wait_for("ready", T);
     c.resize(101, 33);
-    let deadline = std::time::Instant::now() + T;
-    while !c.text().contains("33 101") {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the program never reported the new size:\n{}",
-            c.text()
-        );
-        c.send(b"\r");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    c.wait_until(
+        "the program reports the new size",
+        |c| {
+            c.send(b"\r");
+            c.text().contains("33 101")
+        },
+        T,
+    );
 }
 
 #[test]
