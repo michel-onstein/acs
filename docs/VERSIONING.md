@@ -7,8 +7,9 @@ are all built: a fork publishes a complete release — binaries, packaged
 installer, Homebrew formula and notes — without editing a tracked source
 file (acs-x57).
 
-acs follows semantic versioning, and the version moves **automatically** after
-every merge to `main`. The version lives in `Cargo.toml` (and so in
+acs follows semantic versioning, and the version moves after every merge to
+`main` — when whoever landed it runs the bump ("Who runs it"). The version
+lives in `Cargo.toml` (and so in
 `Cargo.lock`, in `acs --version`, and in the remote install path
 `~/.local/share/acs/<version>/`); each release is an annotated tag `vX.Y.Z` on
 a `chore(release): vX.Y.Z` commit.
@@ -67,9 +68,26 @@ scripts/version-bump.sh --major     # a new major version (manual only)
 - It never touches your checkout: it releases from a throwaway worktree of
   `origin/main` and pushes the commit and tag atomically. Afterwards update
   your `main` with `git pull --ff-only`.
-- The `ship` workflow runs it after every merge, then pulls again.
+- The `ship` skill runs it after every merge, then pulls again.
 - The first run on a repository without tags releases the current
   `Cargo.toml` version as it is.
+
+### Who runs it: there is no CI
+
+The repository has **no CI** — no `.github/`, no GitHub Actions, nothing
+that runs on a push, a merge or a schedule. `gh pr checks` saying "no checks
+reported" is the expected answer, not a broken pipeline.
+
+- **`scripts/verify.sh` is the gate.** It runs where the person landing the
+  change runs it, on their machine, before the merge; the container, ssh and
+  installer suites (`scripts/test_linux.sh`, `scripts/e2e_ssh.sh`,
+  `scripts/test_install.sh`) likewise run only when someone runs them.
+- **The version bump is a local step, not an automated one.** The `ship`
+  skill runs `scripts/version-bump.sh` at its version-bump step, after the
+  merge and on the lander's machine. If nobody runs `ship`, or it is told to
+  skip that step, nothing bumps: `main` simply sits ahead of its last tag,
+  with its changes unreleased, until someone runs the script. That is safe —
+  the next run releases everything since the tag ("Running it").
 
 ## Binaries
 
