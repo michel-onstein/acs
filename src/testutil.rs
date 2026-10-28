@@ -454,6 +454,20 @@ pub fn start_master(
 /// step than an idle machine does. A test that truly hangs still fails,
 /// only later; one that merely lost the CPU for a second does not, and a
 /// gate that cries wolf teaches people to re-run rather than to read.
+///
+/// **It stays 30 s, on purpose (acs-hsw, DESIGN §9.1 and decision 11).**
+/// It is not a free lever: the suite proves "only X can have happened" by
+/// waiting at most `T` against timers sized to outlast it — a minute of
+/// master liveness, `reachability_timeout` and silenced host, two minutes
+/// of backoff and redial, at least twice `T` each. Raising `T` alone turns
+/// those into races, so it moves only together with all of them. And the
+/// evidence (acs-2dc) says it would buy little: the suite is green at a
+/// load average of 20 with no I/O pressure; what reds it is a dial starved
+/// of I/O — two shells and a cold debug binary — which no deadline short
+/// of minutes fixes. The suite is not expected to pass under sustained I/O
+/// starvation; a red in a dial wait taken under it (a docker build beside
+/// it) is re-run alone before it is read, and one that is red idle is a
+/// bug — as acs-br2's "only under load" turned out to be.
 pub const T: Duration = Duration::from_secs(30);
 
 /// How long [`poll`] sleeps between looks.
@@ -540,6 +554,20 @@ mod tests {
         assert!(r.is_err());
         // Reaped as well as killed, so not even a zombie is left.
         assert!(!alive(pid), "child {pid} still running");
+    }
+
+    /// acs-hsw: [`super::T`] is at most half the minute the suite's
+    /// outlasting timers give (master liveness, `reachability_timeout`, a
+    /// silenced host), so a wait to `T` still ends before any of them can.
+    /// Raising it means raising those with it — read the comment at `T`.
+    #[test]
+    fn the_deadline_stays_under_half_the_suites_minute_timers() {
+        let minute = std::time::Duration::from_secs(60);
+        assert!(
+            super::T * 2 <= minute,
+            "T = {:?}: move the 60 s and 120 s timers in tests/ with it",
+            super::T
+        );
     }
 
     /// `poll` hands back what `f` found, on the try that found it.
