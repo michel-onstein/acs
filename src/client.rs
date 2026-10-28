@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use crate::cli::{self, ClientArgs, Parsed, Target};
 use crate::keys::{self, Action, Detector};
 use crate::modes::ModeObserver;
+use crate::outq::OutQueue;
 use crate::proto::{self, AttachKind, Decoder, Hello, Marker, MarkerScanner, Mode, Msg, Resume};
 use crate::resume::Unacked;
 use crate::ssh::{self, Call};
@@ -1065,10 +1066,10 @@ fn dial_once(
     // cannot stall the dial: what the pipe takes goes now, the rest goes
     // with the first write of the session. A write that fails says nothing
     // the read loop below will not say better.
-    let mut pending = first;
+    let mut pending = OutQueue::from(first);
     if !pending.is_empty() {
         let _ = sys::set_nonblocking(to.as_raw_fd(), true);
-        let _ = write_link(to.as_raw_fd(), &mut pending);
+        pending.flush(to.as_raw_fd());
         let _ = sys::set_nonblocking(to.as_raw_fd(), false);
         // The greeting's own phase (acs-ftn). Normally the whole of it
         // went, here, before the marker is even awaited — which is the
@@ -1182,7 +1183,7 @@ fn dial_once(
             child,
             to,
             from,
-            pending,
+            pending: pending.into(),
             muxed: args.transport.multiplexes(call),
         },
         marker,
@@ -1475,8 +1476,7 @@ pub fn run(
 pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
     crate::reconnect::clear_status(state);
     debug_assert!(notes::agrees(&state.observer), "notes lost the stream");
-    let mut out = state.observer.interrupt_sequence().to_vec();
-    out.extend_from_slice(&state.observer.reset_sequence());
+    let out = state.observer.leave_sequence();
     if !out.is_empty() {
         let _ = sys::write_all(STDOUT, &out);
     }
@@ -1791,26 +1791,24 @@ fn await_installed(link: &mut Link) -> Result<(u16, Vec<u8>), Option<i32>> {
 /// Leave detached: the terminal put back, and the way to reattach told.
 fn detached(state: &mut State, raw: &mut Option<RawMode>) -> Outcome {
     leave(state, raw);
-    let name = state.session.clone().unwrap_or_default();
-    note(&format!(
-        "detached from {}/{name} — reattach with: acs {} {name}",
-        state.host, state.host
-    ));
+    note_detached(state);
     Outcome::Exit(code::DETACHED)
 }
 
-fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
-    while !buf.is_empty() {
-        match sys::write(fd, buf) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => {
-                buf.drain(..n);
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
+/// Tell the user the session was left detached, and how to reattach.
+pub(crate) fn note_detached(state: &State) {
+    let name = state.session.as_deref().unwrap_or_default();
+    note(&format!(
+        "detached from {}/{name} — {}",
+        state.host,
+        reattach_hint(&state.host, name)
+    ));
+}
+
+/// How to get back to the session `name` on `host`, for the notes that end
+/// a client while the session keeps running.
+pub(crate) fn reattach_hint(host: &str, name: &str) -> String {
+    format!("reattach with: acs {host} {name}")
 }
 
 /// After feeding or ticking the command detector: ring the bell when
@@ -1914,7 +1912,7 @@ fn serve(
     let _ = sys::set_nonblocking(from, true);
     let mut dec = Decoder::new();
     dec.push(&early);
-    let mut out = std::mem::take(&mut link.pending);
+    let mut out = OutQueue::from(std::mem::take(&mut link.pending));
     // How much of `out` is still the greeting (acs-ftn). Nothing in the
     // common case, where the dial wrote it whole and has said so; the tail
     // the dial's pipe would not take; or all of it on the menu's
@@ -2009,8 +2007,7 @@ fn serve(
                             // Another program: undo the modes the last one
                             // left on before forgetting them, or leave()
                             // could not (acs-xk4).
-                            let mut out = state.observer.interrupt_sequence().to_vec();
-                            out.extend_from_slice(&state.observer.reset_sequence());
+                            let mut out = state.observer.leave_sequence();
                             if !w.created {
                                 // dtach's attach: clear, the program redraws.
                                 out.extend_from_slice(b"\x1b[H\x1b[J");
@@ -2045,7 +2042,7 @@ fn serve(
                                 seq: seq + (i * proto::MAX_CHUNK) as u64,
                                 bytes: chunk.to_vec(),
                             }
-                            .encode(&mut out);
+                            .encode(out.tail());
                         }
                     }
                     // Then Ctrl-L, so the program repaints (DESIGN §5.2):
@@ -2055,7 +2052,7 @@ fn serve(
                     // program just started, which has nothing to repaint,
                     // nor into a paste the program has not seen the end of.
                     if !w.created && state.redraw_on_reconnect && !state.paste.open() {
-                        queue_input(state, &mut out, &[CTRL_L]);
+                        queue_input(state, out.tail(), &[CTRL_L]);
                     }
                     // The size went out with the HELLO, which now leaves
                     // before ssh has even connected (acs-trw): a window
@@ -2066,10 +2063,10 @@ fn serve(
                     if let Ok(s) = sys::get_winsize(STDIN) {
                         if s != sent_size {
                             sent_size = s;
-                            Msg::Resize(s).encode(&mut out);
+                            Msg::Resize(s).encode(out.tail());
                         }
                     }
-                    crate::reconnect::on_welcome(state, w.kind, &mut out);
+                    crate::reconnect::on_welcome(state, w.kind, out.tail());
                 }
                 Msg::Busy { identity, since } if !welcomed => {
                     match crate::reconnect::ask_takeover(state, &identity, since) {
@@ -2079,7 +2076,7 @@ fn serve(
                             state.force_next = true;
                             let again = hello(args, state, true);
                             sent_size = again.size;
-                            Msg::Hello(again).encode(&mut out)
+                            Msg::Hello(again).encode(out.tail())
                         }
                         false => {
                             link.close();
@@ -2130,7 +2127,7 @@ fn serve(
                 // the network moved are not evidence the link survived it.
                 Msg::Pong(n) => liveness.pong(n),
                 // The master checks on us too (DESIGN §5.3, acs-ode).
-                Msg::Ping(n) => Msg::Pong(n).encode(&mut out),
+                Msg::Ping(n) => Msg::Pong(n).encode(out.tail()),
                 Msg::Exit { status } => {
                     link.close();
                     return Outcome::Exit(sys::exit_code(status));
@@ -2140,8 +2137,9 @@ fn serve(
                     let name = state.session.clone().unwrap_or_default();
                     leave(state, raw);
                     note(&format!(
-                        "another client took over {}/{name} — reattach with: acs {} {name}",
-                        state.host, state.host
+                        "another client took over {}/{name} — {}",
+                        state.host,
+                        reattach_hint(&state.host, &name)
                     ));
                     return Outcome::Exit(code::TAKEN_OVER);
                 }
@@ -2154,7 +2152,7 @@ fn serve(
         }
 
         let before = out.len();
-        if let Err(_e) = write_link(to, &mut out) {
+        if !out.flush(to) {
             return lost(link, LinkEnd::Transport);
         }
         if owed > 0 {
@@ -2207,7 +2205,7 @@ fn serve(
             for sig in sys::signals::drain(signals.as_raw_fd()) {
                 if sig == libc::SIGWINCH && welcomed {
                     if let Ok(s) = sys::get_winsize(STDIN) {
-                        Msg::Resize(s).encode(&mut out);
+                        Msg::Resize(s).encode(out.tail());
                     }
                 }
             }
@@ -2235,7 +2233,7 @@ fn serve(
         if fds[4].revents != 0 {
             if let Some(change) = netwatch.and_then(|w| w.changed()) {
                 if welcomed {
-                    liveness.netcheck(&mut out);
+                    liveness.netcheck(out.tail());
                     change.acted();
                 } else if change.removed() {
                     change.acted();
@@ -2250,8 +2248,8 @@ fn serve(
             match sys::read(STDIN, &mut buf) {
                 Ok(0) | Err(_) => {
                     // The terminal went away: leave the session running.
-                    Msg::Detach.encode(&mut out);
-                    let _ = write_link(to, &mut out);
+                    Msg::Detach.encode(out.tail());
+                    out.flush(to);
                     link.close();
                     return Outcome::Exit(code::DETACHED);
                 }
@@ -2259,7 +2257,7 @@ fn serve(
                     let was = state.detector.armed();
                     let o = state.detector.feed(&buf[..n], sys::now_ms());
                     follow_detector(state, was);
-                    queue_input(state, &mut out, &o.forward);
+                    queue_input(state, out.tail(), &o.forward);
                     action = o.action;
                 }
             }
@@ -2276,15 +2274,15 @@ fn serve(
             // DESIGN §6.1). Stdin is not read until then, so this is the
             // only way a key reaches here early.
             if welcomed {
-                queue_input(state, &mut out, &o.forward);
+                queue_input(state, out.tail(), &o.forward);
             }
         }
         match action {
             Some(Action::Detach) => {
-                Msg::Detach.encode(&mut out);
+                Msg::Detach.encode(out.tail());
                 let deadline = Instant::now() + Duration::from_millis(500);
                 while !out.is_empty() && Instant::now() < deadline {
-                    if write_link(to, &mut out).is_err() {
+                    if !out.flush(to) {
                         break;
                     }
                     let mut p = [sys::pollfd(to, libc::POLLOUT)];
@@ -2301,7 +2299,7 @@ fn serve(
                     identity: identity(),
                     force: true,
                 }
-                .encode(&mut out);
+                .encode(out.tail());
                 exiting = true;
             }
             None => {}
@@ -2329,7 +2327,7 @@ fn serve(
         }
 
         if welcomed {
-            match liveness.tick(&mut out) {
+            match liveness.tick(out.tail()) {
                 crate::reconnect::Health::Ok => {}
                 crate::reconnect::Health::Dead => return lost(link, LinkEnd::Silent),
             }

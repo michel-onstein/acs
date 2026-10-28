@@ -176,8 +176,8 @@ pub fn run(
             // running, and for `--new` no name to reattach to (acs-rsn5).
             note(&match state.instance {
                 Some(_) => format!(
-                    "connection lost — the session keeps running; reattach with: acs {} {name}",
-                    state.host
+                    "connection lost — the session keeps running; {}",
+                    client::reattach_hint(&state.host, &name)
                 ),
                 None => format!(
                     "connection to {} lost before the session started",
@@ -228,16 +228,12 @@ pub fn run(
         // A session to resume, or (persisting) still the first attach.
         resuming = state.instance.is_some();
         if detached {
-            clear_status(state);
             client::leave(state, raw);
             if state.instance.is_none() {
                 note(&format!("stopped waiting for {}", state.host));
                 return code::UNREACHABLE;
             }
-            note(&format!(
-                "detached from {}/{name} — reattach with: acs {} {name}",
-                state.host, state.host
-            ));
+            client::note_detached(state);
             return code::DETACHED;
         }
     }
@@ -459,7 +455,7 @@ fn offline(
 /// the text, the row, the sequence it steps over — or when a note has been
 /// written since, which may have scrolled it off its row.
 pub(crate) fn show_status(state: &mut State, msg: &str) {
-    let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
+    let rows = status_row();
     let mut line = format!("\x1b]2;acs: {} — {msg}\x07", state.host).into_bytes();
     line.extend_from_slice(
         format!("\x1b7\x1b[{rows};1H\x1b[2K\x1b[7macs: {msg}\x1b[0m\x1b8").as_bytes(),
@@ -475,6 +471,12 @@ pub(crate) fn show_status(state: &mut State, msg: &str) {
     state.status_drawn = drawn;
     state.status_shown = true;
     crate::tty::set_status_shown(true);
+}
+
+/// The terminal's last row, where the status line goes: 24 when the size
+/// cannot be read.
+fn status_row() -> u16 {
+    sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1)
 }
 
 /// Take the title back (pop the stack) and blank the status row, if we
@@ -502,7 +504,7 @@ pub fn clear_status(state: &mut State) {
 /// terminal had before acs ran.
 fn take_status_down(state: &mut State, retitle: bool) {
     if state.status_shown {
-        let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
+        let rows = status_row();
         let mut out = b"\x1b[23;0t".to_vec();
         if retitle {
             out.extend_from_slice(&restored_title(state));
