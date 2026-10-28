@@ -23,9 +23,13 @@ Work is tracked as beads (`br`, prefix `acs`): start with `bv --robot-triage`.
 
 ## Versioning
 
-The version moves automatically after every merge to `main`
-(`scripts/version-bump.sh`, run by the ship workflow): PATCH for a small fix,
-MINOR for a feature or a larger fix, MAJOR only with `--major`. **Title pull
+**There is no CI** — no `.github/`, so "no checks reported" on a pull request
+is expected. `scripts/verify.sh` is the gate, run by whoever lands the change
+on their own machine. The version bump is local too: `scripts/version-bump.sh`,
+run by the `ship` skill's version-bump step after each merge; skip that and
+`main` sits ahead of its last tag until someone bumps (VERSIONING "Who runs
+it"). It picks PATCH for a small fix, MINOR for a feature or a larger fix,
+MAJOR only with `--major`. **Title pull
 requests in Conventional Commits form** (`fix: …`, `feat: …`, `docs: …`) —
 the squash commit takes the title — and add a `Semver: minor` trailer or a
 `semver:minor` label to a fix that deserves a minor release. Each release's
