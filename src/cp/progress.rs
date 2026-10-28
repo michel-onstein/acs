@@ -18,21 +18,42 @@ pub struct Progress {
     drawn: Option<Instant>,
 }
 
+/// `num / den` rounded to the nearest whole number, a tie to the even one,
+/// as `{:.0}` rounds an `f64` that holds the quotient exactly.
+fn rounded(num: u128, den: u128) -> u64 {
+    let (q, r) = (num / den, num % den);
+    let q = match (2 * r).cmp(&den) {
+        std::cmp::Ordering::Less => q,
+        std::cmp::Ordering::Equal => q + (q & 1),
+        std::cmp::Ordering::Greater => q + 1,
+    };
+    q.min(u64::MAX as u128) as u64
+}
+
+/// `num / den` with one decimal and then `unit`, as `{:.1}` shows the
+/// number. Integers rather than an `f64`: float formatting is some 3 KB
+/// of the binary (DESIGN §8.1).
+pub fn tenths(num: u128, den: u128, unit: &str) -> String {
+    let t = rounded(num * 10, den);
+    format!("{}.{}{unit}", t / 10, t % 10)
+}
+
 /// `n` bytes as `scp` shows them: `512B`, `12KB`, `3.4MB`.
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
     if n < 1024 {
         return format!("{n}B");
     }
-    let mut v = n as f64 / 1024.0;
+    let n = n as u128;
+    let mut unit = 1024u128;
     let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
+    while n >= unit * 1024 && u < UNITS.len() - 1 {
+        unit *= 1024;
         u += 1;
     }
-    match v < 10.0 {
-        true => format!("{v:.1}{}", UNITS[u]),
-        false => format!("{v:.0}{}", UNITS[u]),
+    match n < 10 * unit {
+        true => tenths(n, unit, UNITS[u]),
+        false => format!("{}{}", rounded(n, unit), UNITS[u]),
     }
 }
 
@@ -58,10 +79,9 @@ pub fn line(
         0 => 100,
         _ => (done.min(size) as u128 * 100 / size as u128) as u64,
     };
-    let secs = elapsed.as_secs_f64();
-    let rate = match secs > 0.0 {
-        true => (done as f64 / secs) as u64,
-        false => 0,
+    let rate = match elapsed.as_nanos() {
+        0 => 0,
+        ns => (done as u128 * 1_000_000_000 / ns).min(u64::MAX as u128) as u64,
     };
     let time = match (finished, rate) {
         (true, _) => clock(elapsed.as_secs()),
@@ -156,6 +176,48 @@ mod tests {
         assert_eq!(clock(0), "00:00");
         assert_eq!(clock(61), "01:01");
         assert_eq!(clock(3661), "1:01:01");
+    }
+
+    /// The sizes are shown with integers rather than an `f64`, to keep
+    /// float formatting out of the binary (acs-hofu.10): they read as the
+    /// float formatting read them, ties and unit boundaries included.
+    #[test]
+    fn sizes_read_as_float_formatting_reads_them() {
+        fn by_float(n: u64) -> String {
+            const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+            if n < 1024 {
+                return format!("{n}B");
+            }
+            let mut v = n as f64 / 1024.0;
+            let mut u = 0;
+            while v >= 1024.0 && u < UNITS.len() - 1 {
+                v /= 1024.0;
+                u += 1;
+            }
+            match v < 10.0 {
+                true => format!("{v:.1}{}", UNITS[u]),
+                false => format!("{v:.0}{}", UNITS[u]),
+            }
+        }
+        let mut ns: Vec<u64> = (0..200_000).collect();
+        for k in 1..=5u32 {
+            let unit = 1024u64.pow(k);
+            for m in [1, 2, 9, 10, 11, 512, 1023, 1024, 1025, 4096] {
+                let base = m * unit;
+                for d in [0, 1, unit / 20, unit / 10, unit / 2, unit - 1] {
+                    ns.extend([base + d, base.saturating_sub(d)]);
+                }
+                // Ties at the shown digit: x.25 (a tenth's half) and x.5.
+                ns.extend([base + unit / 4, base + unit / 2, base + unit / 4 * 3]);
+            }
+        }
+        // The first 200,000 cover every tie of the KB range: 1.25KB is 1280.
+        ns.extend([1280, 2560, 3 * 1024 * 1024 / 2, 1 << 52, (1 << 53) - 1]);
+        // From 2^53 bytes (8 PB) on, `n as f64` itself rounded: the
+        // integers are the exact ones there.
+        for n in ns.into_iter().filter(|&n| n < 1 << 53) {
+            assert_eq!(bytes(n), by_float(n), "{n}");
+        }
     }
 
     #[test]

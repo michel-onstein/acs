@@ -19,7 +19,7 @@
 //!   everything inside them is done — which, since the sender's headers
 //!   run ahead of its data, may be after their `DIR_END`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime};
 
 use super::proto::{err, Hello, Meta, Msg, Role, Time};
 use super::walk::{reason, MAX_DEPTH};
-use super::{note, Endpoint, Halt, Options, Outcome};
+use super::{note_on, Endpoint, Halt, Options, Outcome};
 use crate::outq::OutQueue;
 use crate::sys;
 
@@ -84,9 +84,10 @@ pub struct Receiver {
     umask: u32,
     dirs: Vec<Dir>,
     levels: Vec<Level>,
-    parts: HashMap<u32, Part>,
-    /// Files refused or failed, whose data may still be on the way.
-    dropped: HashSet<u32>,
+    /// The files by id: `Some` a part being written, `None` a file refused
+    /// or failed, whose data may still be on the way. One map rather than
+    /// a map and a set, which would be two copies of the table code.
+    parts: HashMap<u32, Option<Part>>,
     report: bool,
     outcome: Outcome,
 }
@@ -163,7 +164,6 @@ impl Receiver {
             dirs: Vec::new(),
             levels: Vec::new(),
             parts: HashMap::new(),
-            dropped: HashSet::new(),
             report: opts.report,
             outcome: Outcome::default(),
         }
@@ -177,9 +177,9 @@ impl Receiver {
         self.outcome
     }
 
-    fn report(&self, msg: &str) {
+    fn report(&self, what: &str, why: &str) {
         if self.report {
-            note(msg);
+            note_on(what, why);
         }
     }
 
@@ -241,9 +241,9 @@ impl Receiver {
     fn fail(&mut self, id: u32, name: &str, message: String, out: &mut OutQueue) {
         self.outcome.failed += 1;
         if id != 0 {
-            self.dropped.insert(id);
+            self.parts.insert(id, None);
         }
-        self.report(&format!("{name}: {message}"));
+        self.report(name, &message);
         Msg::Fail {
             id,
             name: name.into(),
@@ -327,7 +327,7 @@ impl Receiver {
                 }
             }
             if let Some(m) = problem {
-                self.report(&format!("{}: {m}", d.path.display()));
+                self.report(&d.path.display().to_string(), &m);
             }
             match d.parent {
                 Some(p) => {
@@ -347,7 +347,7 @@ impl Receiver {
         meta: Meta,
         out: &mut OutQueue,
     ) -> Result<(), Halt> {
-        if id == 0 || self.parts.contains_key(&id) || self.dropped.contains(&id) {
+        if id == 0 || self.parts.contains_key(&id) {
             return Err(Halt::Protocol(format!("FILE with id {id} out of place")));
         }
         let (dest, dir) = match self.place(&name) {
@@ -382,7 +382,7 @@ impl Receiver {
         }
         self.parts.insert(
             id,
-            Part {
+            Some(Part {
                 file,
                 part,
                 dest,
@@ -391,7 +391,7 @@ impl Receiver {
                 written: 0,
                 meta,
                 dir,
-            },
+            }),
         );
         Msg::Go { id, offset: 0 }.encode(out.tail());
         Ok(())
@@ -414,13 +414,14 @@ impl Receiver {
     }
 
     fn data(&mut self, id: u32, bytes: &[u8], out: &mut OutQueue) -> Result<(), Halt> {
-        let Some(p) = self.parts.get_mut(&id) else {
-            return match self.dropped.contains(&id) {
-                true => Ok(()),
-                false => Err(Halt::Protocol(format!(
+        let p = match self.parts.get_mut(&id) {
+            Some(Some(p)) => p,
+            Some(None) => return Ok(()),
+            None => {
+                return Err(Halt::Protocol(format!(
                     "DATA for file {id}, which is not open"
-                ))),
-            };
+                )))
+            }
         };
         if p.written + bytes.len() as u64 > p.size {
             return Err(Halt::Protocol(format!(
@@ -434,7 +435,7 @@ impl Receiver {
                 self.outcome.bytes += bytes.len() as u64;
             }
             Err(e) => {
-                let p = self.parts.remove(&id).expect("just found");
+                let p = self.parts.remove(&id).flatten().expect("just found");
                 self.abandon(id, p, reason(&e), out);
             }
         }
@@ -442,13 +443,14 @@ impl Receiver {
     }
 
     fn file_end(&mut self, id: u32, out: &mut OutQueue) -> Result<(), Halt> {
-        let Some(p) = self.parts.remove(&id) else {
-            return match self.dropped.remove(&id) {
-                true => Ok(()),
-                false => Err(Halt::Protocol(format!(
+        let p = match self.parts.remove(&id) {
+            Some(Some(p)) => p,
+            Some(None) => return Ok(()),
+            None => {
+                return Err(Halt::Protocol(format!(
                     "FILE_END for file {id}, which is not open"
-                ))),
-            };
+                )))
+            }
         };
         if p.written != p.size {
             let m = format!(
@@ -513,10 +515,10 @@ impl Endpoint for Receiver {
             (State::Running, Msg::FileEnd { id }) => return self.file_end(id, out),
             (State::Running, Msg::Skip { name, reason }) => {
                 self.outcome.skipped += 1;
-                self.report(&format!("{name}: {reason}"));
+                self.report(&name, &reason);
             }
             (State::Running, Msg::End) => {
-                if !self.levels.is_empty() || !self.parts.is_empty() {
+                if !self.levels.is_empty() || self.parts.values().any(Option::is_some) {
                     return Err(Halt::Protocol("END with entries still open".into()));
                 }
                 Msg::Done {
@@ -633,6 +635,43 @@ mod tests {
             mode: 0o755,
             ..Meta::default()
         }
+    }
+
+    /// A file refused is kept in the same map as the parts being written
+    /// (acs-hofu.10): its late data is dropped, its id cannot be reused, an
+    /// `END` with it never ended is not an entry left open, and once its
+    /// `FILE_END` came the id is unknown.
+    #[test]
+    fn a_refused_file_is_dropped_not_open() {
+        let t = TempDir::new();
+        let (mut rx, r) = Rx::new(t.path(), &["a", "b"]);
+        r.unwrap();
+        let file = |id, name: &str| Msg::File {
+            id,
+            name: name.into(),
+            size: 1,
+            meta: Meta::default(),
+        };
+        // Not a name that was asked for: refused, with its data on the way.
+        rx.send(file(1, "z")).unwrap();
+        rx.send(Msg::Data { id: 1, bytes: b"Z" }).unwrap();
+        assert!(matches!(rx.send(file(1, "a")), Err(Halt::Protocol(_))));
+        rx.send(Msg::FileEnd { id: 1 }).unwrap();
+        assert!(matches!(
+            rx.send(Msg::Data { id: 1, bytes: b"Z" }),
+            Err(Halt::Protocol(_))
+        ));
+        // Refused, and its FILE_END never sent: the copy still ends.
+        rx.send(file(2, "y")).unwrap();
+        rx.file(3, "a", b"A").unwrap();
+        rx.send(Msg::End).unwrap();
+        let answers = rx.answers();
+        assert_eq!(
+            answers.last().map(String::as_str),
+            Some("DONE 1 2"),
+            "{answers:?}"
+        );
+        assert!(!t.path().join("z").exists());
     }
 
     /// ACSCP_DESIGN §6's placement table, against a scratch directory.

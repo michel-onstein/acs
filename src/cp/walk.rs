@@ -69,11 +69,16 @@ pub fn top_name(path: &Path) -> Option<String> {
 /// What an I/O error says, without the `(os error N)` the standard library
 /// appends.
 pub fn reason(e: &std::io::Error) -> String {
-    let s = e.to_string();
-    match s.rfind(" (os error ") {
-        Some(i) => s[..i].to_string(),
-        None => s,
+    // The suffix holds the last `(`: a scan for that one byte, not a search
+    // for the whole suffix, which would bring a substring searcher of its
+    // own into the binary.
+    let mut s = e.to_string();
+    if let Some(i) = s.bytes().rposition(|b| b == b'(') {
+        if s[..i].ends_with(' ') && s[i..].starts_with("(os error ") {
+            s.truncate(i - 1);
+        }
     }
+    s
 }
 
 /// The checks a local source passes before a copy starts (ACSCP_DESIGN
@@ -96,6 +101,35 @@ pub fn check_source(path: &Path, recursive: bool) -> Result<String, String> {
         return Err("not a regular file".into());
     }
     top_name(path).ok_or_else(|| "has no name to copy it under that is UTF-8".into())
+}
+
+/// The names in directory `path`, in byte order, as `OsString`'s own
+/// `sort` puts them.
+///
+/// Sorted as [`sort_key`]s: the binary keeps the one `Vec<String>` sort it
+/// already has rather than gain a second, some 3 KB, for `OsString`
+/// (DESIGN §8.1).
+fn sorted_names(path: &Path) -> std::io::Result<Vec<OsString>> {
+    let mut keys = Vec::new();
+    for e in std::fs::read_dir(path)? {
+        keys.push(sort_key(&e?.file_name()));
+    }
+    keys.sort();
+    Ok(keys.iter().map(|k| name_of_key(k)).collect())
+}
+
+/// `name` as a `String` that sorts as it does: each byte one `char` of the
+/// same value. Code point order is byte order, so the `String` order is the
+/// name's, UTF-8 or not.
+fn sort_key(name: &std::ffi::OsStr) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes().iter().map(|&b| b as char).collect()
+}
+
+/// The name [`sort_key`] made `key` of.
+fn name_of_key(key: &str) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(key.chars().map(|c| c as u8).collect())
 }
 
 struct Level {
@@ -147,14 +181,10 @@ impl Walk {
             if self.stack.iter().any(|l| l.id == id) {
                 return skip("directory loop: already being copied".into());
             }
-            let mut entries: Vec<OsString> = match std::fs::read_dir(&path) {
-                Ok(rd) => match rd.map(|e| e.map(|e| e.file_name())).collect() {
-                    Ok(v) => v,
-                    Err(e) => return skip(reason(&e)),
-                },
+            let entries = match sorted_names(&path) {
+                Ok(v) => v,
                 Err(e) => return skip(reason(&e)),
             };
-            entries.sort();
             self.stack.push(Level {
                 path,
                 entries: entries.into_iter(),
@@ -237,6 +267,50 @@ mod tests {
             }
         })
         .collect()
+    }
+
+    /// Names are sorted through `String` keys to share the binary's one
+    /// string sort (acs-hofu.10): the order is still `OsString`'s, byte by
+    /// byte, for names that are not UTF-8 and for ones that are but sort
+    /// differently as `char`s than as bytes would if the keys were wrong.
+    #[test]
+    fn names_sort_in_byte_order() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw: [&[u8]; 12] = [
+            b"b",
+            b"a",
+            b"\xff",
+            b"\xc3\xa9",
+            b"Z",
+            b"a\x80",
+            b"a",
+            b"\x7f",
+            b"\xc2\x80",
+            b"",
+            b"\xe2\x82\xac",
+            b"ab",
+        ];
+        let names: Vec<OsString> = raw.iter().map(|b| OsString::from_vec(b.to_vec())).collect();
+        let mut keys: Vec<String> = names.iter().map(|n| sort_key(n)).collect();
+        keys.sort();
+        let sorted: Vec<OsString> = keys.iter().map(|k| name_of_key(k)).collect();
+        let mut want = names.clone();
+        want.sort();
+        assert_eq!(sorted, want);
+    }
+
+    /// The reason drops std's `(os error N)` and nothing else.
+    #[test]
+    fn a_reason_has_no_os_error_suffix() {
+        let e = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert!(e
+            .to_string()
+            .ends_with(&format!(" (os error {})", libc::ENOENT)));
+        assert_eq!(reason(&e), "No such file or directory");
+        let e = std::io::Error::other("a (custom) one");
+        assert_eq!(reason(&e), "a (custom) one");
+        let e = std::io::Error::other("ends (os error 2)");
+        assert_eq!(reason(&e), "ends");
     }
 
     #[test]
