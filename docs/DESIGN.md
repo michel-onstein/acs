@@ -2298,7 +2298,8 @@ their YAML shape:
 - Removing something that lives in the other file fails with a pointer to it
   (`it is set in /etc/acs/config.yaml:1 (use --global)`).
 - `config` is a reserved **first** argument (as are `upgrade`, §7.5,
-  `list`, §7, and `cp`, kept for copying files, which is not built yet). A
+  `list`, §7, and `cp`, for copying files: local copies only so far, and
+  in debug builds only until the copy's remote end lands). A
   host literally called `config` (or `upgrade`, `list` or `cp`) is reached
   as `user@config`, or with any option before it (`acs -p 22 config`);
   `acs list list` lists a host called `list`. The binary run under the name

@@ -10,6 +10,12 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod config_cmd;
+// The copy is phase 1 of ACSCP_DESIGN §12: local copies only. It stays out
+// of release builds until phase 2, the first that puts it in one, since the
+// complete build has no room for it until its size budget is raised
+// (ACSCP_DESIGN §10.4).
+#[cfg(debug_assertions)]
+pub mod cp;
 pub mod install;
 pub mod keys;
 pub mod layout;
@@ -73,8 +79,9 @@ pub enum Role {
     List,
     /// Background check for a newer release, started by the client.
     UpdateCheck,
-    /// `acscp …` or `acs cp …`: copy files to and from a host. The name is
-    /// taken; the copy itself is not built yet.
+    /// `acscp …` or `acs cp …`: copy files to and from a host. Local
+    /// copies are built (ACSCP_DESIGN phase 1), in debug builds only for
+    /// now; a host in the arguments is refused.
     Copy,
 }
 
@@ -146,6 +153,20 @@ pub fn print_version() {
     let _ = writeln!(out, "installs remotes: {}{slim}", targets.join(", "));
 }
 
+/// The copy's arguments in `args`: after the program name when it is
+/// `acscp`, after `cp` when it is `acs cp`.
+#[cfg(debug_assertions)]
+fn copy_args(args: &[OsString]) -> &[OsString] {
+    let named = args
+        .first()
+        .and_then(|a| std::path::Path::new(a).file_name())
+        .is_some_and(|n| n == layout::COPY_NAME);
+    match named {
+        true => &args[1..],
+        false => &args[2..],
+    }
+}
+
 /// Entry point shared by `main` and the integration tests.
 pub fn run(args: Vec<OsString>) -> ExitCode {
     let role = Role::from_argv(&args);
@@ -162,6 +183,9 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         Role::Config => config_cmd::main(&args[2..]),
         Role::Upgrade => upgrade::main(&args[2..]),
         Role::UpdateCheck => update_check::check_main(),
+        #[cfg(debug_assertions)]
+        Role::Copy => cp::main(copy_args(&args)),
+        #[cfg(not(debug_assertions))]
         Role::Copy => {
             eprintln!("acs: copying files is not built yet");
             ExitCode::from(client::code::USAGE)
