@@ -63,33 +63,22 @@ pub fn resolve(
     network: &dyn Fn() -> Network,
     log: &mut dyn FnMut(String),
 ) -> Result<Option<HostEntry>, String> {
-    resolve_remembering(name, config, reachable, network, None, log)
+    let ssh = [crate::ssh::program()];
+    resolve_remembering(name, config, reachable, network, None, &ssh, log)
 }
 
 /// [`resolve`], with the entry used last on these networks taken as soon
 /// as it answers its own ping (acs-zpj, DESIGN §7.3): `memory` says which
-/// that was and is told the choice made, for the next time.
+/// that was and is told the choice made, for the next time. `ssh` is what
+/// `reachability_tcp`'s `ssh -G` runs: the program, then the command
+/// line's own ssh options (acs-nhrq).
 pub fn resolve_remembering(
     name: &str,
     config: &Config,
     reachable: Arc<Reachable>,
     network: &dyn Fn() -> Network,
     memory: Option<&Memory>,
-    log: &mut dyn FnMut(String),
-) -> Result<Option<HostEntry>, String> {
-    let ssh = crate::ssh::program();
-    resolve_probing(name, config, reachable, network, memory, ssh, log)
-}
-
-/// [`resolve_remembering`] with `ssh` as the program `ssh -G` runs, for
-/// `reachability_tcp`.
-fn resolve_probing(
-    name: &str,
-    config: &Config,
-    reachable: Arc<Reachable>,
-    network: &dyn Fn() -> Network,
-    memory: Option<&Memory>,
-    ssh: OsString,
+    ssh: &[OsString],
     log: &mut dyn FnMut(String),
 ) -> Result<Option<HostEntry>, String> {
     let (user, alias_name) = split_user(name);
@@ -115,7 +104,10 @@ fn resolve_probing(
     let how = How {
         timeout,
         reachable,
-        tcp: config.reachability_tcp_for(alias).value.then_some(ssh),
+        tcp: config
+            .reachability_tcp_for(alias)
+            .value
+            .then(|| ssh.to_vec()),
         locality,
         memory,
     };
@@ -135,9 +127,9 @@ pub fn split_user(name: &str) -> (Option<&str>, &str) {
 struct How {
     timeout: Duration,
     reachable: Arc<Reachable>,
-    /// `reachability_tcp`: the ssh program whose `-G` names each host's
-    /// port, to connect to instead of pinging.
-    tcp: Option<OsString>,
+    /// `reachability_tcp`: the ssh program and options whose `-G` names
+    /// each host's port, to connect to instead of pinging.
+    tcp: Option<Vec<OsString>>,
     locality: Option<Locality>,
     memory: Option<Remembered>,
 }
@@ -732,13 +724,22 @@ fn target(out: &str) -> Option<Target> {
 }
 
 /// Check `host` by connecting to the port ssh dials for `dest` (`ssh -G`,
-/// run with `ssh`) — or, when ssh reaches it through a proxy, by `ping`.
+/// run with `ssh`: the program, then the command line's options, which
+/// change the port as they change the dial) — or, when ssh reaches it
+/// through a proxy, by `ping`.
 /// `ssh -G`, the name's lookup and the connect all share `deadline`, as
 /// one ping has it (acs-fbes). The connection is closed at once.
-fn probe_port(ssh: &OsStr, host: &str, dest: &str, ping: &Reachable, deadline: Duration) -> Answer {
+fn probe_port(
+    ssh: &[OsString],
+    host: &str,
+    dest: &str,
+    ping: &Reachable,
+    deadline: Duration,
+) -> Answer {
     let end = Instant::now() + deadline;
-    let mut c = Command::new(ssh);
-    c.args(["-G", "--", dest]).stdout(Stdio::piped());
+    let mut c = Command::new(&ssh[0]);
+    c.arg("-G").args(&ssh[1..]).args(["--", dest]);
+    c.stdout(Stdio::piped());
     let found = run_until(c, deadline)
         .filter(|(code, _)| *code == 0)
         .and_then(|(_, out)| target(&String::from_utf8_lossy(&out)));
@@ -1276,6 +1277,7 @@ aliases:
             fake.reachable(),
             &no_network,
             Some(memory),
+            &[crate::ssh::program()],
             &mut |m| log.push(m),
         );
         let took = start.elapsed();
@@ -1515,6 +1517,7 @@ aliases:
             fake.reachable(),
             &|| on(&["192.168.1.5/24"], HOME_NAMES, 5000),
             Some(&home),
+            &[crate::ssh::program()],
             &mut |m| log.push(m),
         );
         assert_eq!(r.unwrap().unwrap().destination(), "devbox.example.com");
@@ -2075,13 +2078,13 @@ aliases:
         let c = config(yaml);
         let mut log = Vec::new();
         let start = Instant::now();
-        let r = resolve_probing(
+        let r = resolve_remembering(
             name,
             &c,
             fake.reachable(),
             &no_network,
             memory,
-            ssh.clone(),
+            std::slice::from_ref(ssh),
             &mut |m| log.push(m),
         );
         (r.map(|e| e.unwrap().destination()), log, start.elapsed())

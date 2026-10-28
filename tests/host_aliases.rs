@@ -616,3 +616,56 @@ fn reachability_tcp_pings_a_host_behind_a_proxy_jump() {
     wait_up(&mut c, "s");
     net.wait_pinged(&["jumped"]);
 }
+
+/// acs-nhrq: `ssh -G` is given the command line's ssh options, so a `-p`
+/// there is the port probed, as it is the port dialled. This fake names
+/// the `-p` it was given, the closed port without one.
+#[test]
+fn reachability_tcp_probes_the_command_lines_port() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    let dir = acs::testutil::TempDir::new();
+    let (_listener, open, closed) = ports();
+    let ssh = dir.path().join("ssh");
+    let body = format!(
+        "#!/bin/sh\n[ \"$1\" = -G ] || exit 2\nport={closed}\n\
+         while [ $# -gt 0 ]; do [ \"$1\" = -p ] && port=$2; shift; done\n\
+         printf 'hostname 127.0.0.1\\nport %s\\n' \"$port\"\n"
+    );
+    write_executable(&ssh, body);
+    let mut env = net.env(&format!("reachability_tcp: true\n{CONFIG}"));
+    env.push(("ACS_SSH".into(), ssh.display().to_string()));
+    let port = open.to_string();
+    let mut args = vec!["-p", &port];
+    args.extend(session("devbox"));
+    let mut c = Client::start_env(&remote, &args, &refs(&env));
+    c.wait_for(
+        &format!("devbox: devbox.lan answers on port {open}, using devbox.lan"),
+        T,
+    );
+    wait_up(&mut c, "s");
+    assert!(net.pinged().is_empty(), "{:?}", net.pinged());
+}
+
+/// acs-nhrq: `--ssh` names the program `ssh -G` runs, over `ACS_SSH`.
+#[test]
+fn reachability_tcp_asks_the_ssh_named_by_the_command_line() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    let dir = acs::testutil::TempDir::new();
+    let (_listener, open, closed) = ports();
+    // ACS_SSH names no port for anything: were it asked, nothing answers.
+    let none = dir.path().join("no-ssh");
+    write_executable(&none, "#!/bin/sh\nexit 255\n");
+    let mut env = net.env(&format!("reachability_tcp: true\n{CONFIG}"));
+    env.push(("ACS_SSH".into(), none.display().to_string()));
+    let ssh = port_ssh(&dir, open, closed);
+    let mut args = vec!["--ssh", &ssh];
+    args.extend(session("devbox"));
+    let mut c = Client::start_env(&remote, &args, &refs(&env));
+    c.wait_for(
+        &format!("devbox: devbox.example.com answers on port {open}, using me@devbox.example.com"),
+        T,
+    );
+    wait_up(&mut c, "s");
+}

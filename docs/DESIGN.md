@@ -2031,10 +2031,14 @@ one of the alias's entries instead of `<name>`:
   - *The port* is `ssh -G <destination>`'s `hostname` and `port`, so
     `~/.ssh/config` decides it as it decides the dial (`Host`, `Match`,
     `HostName`, `Port`). The destination is the entry's, `user@host` when
-    it has a user, since a `Match user` may change either. `ACS_SSH` names
-    the program. The command line's own ssh options (`-p`, `-F`, `-o
-    Port=…`) and `--ssh` are not seen by it yet: the alias is resolved
-    without them.
+    it has a user, since a `Match user` may change either. `--ssh`, else
+    `ACS_SSH`, names the program, and the command line's own ssh options
+    (`-p`, `-F`, `-J`, `-o`, `-i`) go before the destination, as in the
+    dial (acs-nhrq): `acs -p 2222 devbox` probes port 2222, and a `-J` or
+    `-o ProxyJump=…` there makes the entry pinged, as below. All five are
+    passed: `-G` only prints the configuration they make, and an option
+    ssh rejects there (a bad `-o`) would fail the dial as well, so the entry
+    is reported down either way.
   - *The deadline* is the ping's: `ssh -G` (killed at it, as a ping is),
     the name's lookup (the system resolver, given up on at it) and the
     connect all share one `reachability_timeout`, from a thread per entry
