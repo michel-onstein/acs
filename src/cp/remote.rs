@@ -113,7 +113,7 @@ pub fn main() -> ExitCode {
     let home = PathBuf::from(sys::env_nonempty("HOME").unwrap_or_else(|| ".".into()));
     let mut out = OutQueue::default();
     let done = match endpoint(h, &home, &mut out) {
-        Some(mut ep) => drive(ep.as_mut(), STDIN, STDOUT, dec, out).is_ok(),
+        Some(mut ep) => drive(ep.as_mut(), STDIN, STDOUT, dec, out, None).is_ok(),
         None => {
             let _ = sys::write_all(STDOUT, out.queued());
             false

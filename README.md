@@ -235,10 +235,20 @@ commands, the connect timings and a summary.
 A copy uses acs's own ssh connection, so it shares the master of a session
 already open to the host, and on a host that has never seen acs it installs
 it on that one connection first, as `acs host` does (unless
-`install_on_remote` is `false`). Not built yet: resuming a copy after a
-lost link (the part file is kept, and the copy ends), copying between two
-hosts or from local and remote sources at once, and wildcards in a remote
-path — name each remote file.
+`install_on_remote` is `false`).
+
+A copy survives a lost link the way a session does: it redials at once,
+then backs off from 1 s to 30 s (sooner when this machine's network
+changes), and carries on from where the file had got to. A file is written
+to `.<name>.acscp-part` beside its final name and renamed into place when
+whole; a part found there is checked against the source by a hash of its
+bytes and resumed, or written again when it is not the file's start. That
+part is the only state, so a copy you stop with Ctrl-C — or one
+`--no-reconnect` ended — is finished from it by running the same `acs cp`
+again. A part no later run claims stays until you remove it.
+
+Not built yet: copying between two hosts or from local and remote sources
+at once, and wildcards in a remote path — name each remote file.
 
 ### ssh options
 

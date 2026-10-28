@@ -11,10 +11,15 @@
 //! A copy to or from a host runs one endpoint here and the other in
 //! [`remote`], `acs _cp`, at the end of the session's own dial (§3, §8).
 //!
-//! Built so far: phases 1 and 2 of the design's plan (§12) — the
-//! protocol, the two endpoints, local copies, and uploads and downloads
-//! with one host. A drop ends the copy with the part kept until phase 3
-//! resumes it; two hosts (the relay) are phase 5.
+//! A copy survives its link (§7): a lost one is redialled on the
+//! session's backoff, and the receiver answers a file whose part is on
+//! disk with `HAVE` — its length and a hash of it — so the sender goes on
+//! after it, or `RESTART`s it when it is not the file's start. The part is
+//! the only state, so a later run resumes an earlier one the same way.
+//!
+//! Built so far: phases 1–3 of the design's plan (§12) — the protocol,
+//! the two endpoints, local copies, uploads and downloads with one host,
+//! and resume. Two hosts (the relay) are phase 5.
 
 pub mod cli;
 pub mod progress;
@@ -25,15 +30,20 @@ pub mod sender;
 pub mod walk;
 
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::Read;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::client::code;
+use crate::netwatch::NetWatch;
 use crate::outq::OutQueue;
 use crate::proto::Decoder;
+use crate::reconnect::{Backoff, Health, Liveness};
+use crate::sha256::Sha256;
 use crate::ssh::Call;
 use crate::sys;
 use crate::timing::{Phase, Timing};
@@ -112,6 +122,66 @@ pub enum Halt {
     Protocol(String),
     /// The far end sent an `ERROR`, or this end already did.
     Ended(String),
+    /// The link went before the copy was done: a new one may finish it.
+    Lost(String),
+}
+
+/// Why [`drive`] returned before the copy was done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// The copy itself ended: an `ERROR`, a protocol error.
+    Fatal(String),
+    /// The link went; the copy may go on over another (ACSCP_DESIGN §7).
+    Lost(String),
+}
+
+impl Stop {
+    fn message(self) -> String {
+        match self {
+            Stop::Fatal(m) | Stop::Lost(m) => m,
+        }
+    }
+}
+
+/// How much of a part, or of the source it is checked against, is hashed
+/// in one turn of the poll loop (ACSCP_DESIGN §7, decision 12): a long
+/// `HAVE` never keeps the pings from being answered.
+const SLICE: u64 = 1024 * 1024;
+
+/// The first `len` bytes of a file, hashed a [`SLICE`] at a time from the
+/// file's current position, which ends at `len`.
+pub(crate) struct Prefix {
+    pub len: u64,
+    left: u64,
+    hash: Sha256,
+}
+
+impl Prefix {
+    pub fn new(len: u64) -> Prefix {
+        Prefix {
+            len,
+            left: len,
+            hash: Sha256::new(),
+        }
+    }
+
+    /// Hash the next slice from `f`: the digest once all `len` bytes are
+    /// in, `UnexpectedEof` if the file is shorter.
+    pub fn step(&mut self, f: &mut File) -> std::io::Result<Option<[u8; 32]>> {
+        let mut buf = [0u8; 64 * 1024];
+        let mut slice = self.left.min(SLICE);
+        while slice > 0 {
+            let want = slice.min(buf.len() as u64) as usize;
+            let n = f.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            self.hash.update(&buf[..n]);
+            slice -= n as u64;
+            self.left -= n as u64;
+        }
+        Ok((self.left == 0).then(|| std::mem::take(&mut self.hash).finish()))
+    }
 }
 
 /// One endpoint's state machine, as [`drive`] runs it.
@@ -125,6 +195,15 @@ pub(crate) trait Endpoint {
     fn on_eof(&mut self) -> Result<(), Halt>;
     /// The copy is over for this end, once `out` is written.
     fn finished(&self) -> bool;
+    /// The far end's `WELCOME` came, or this end sent its own.
+    fn welcomed(&self) -> bool;
+    /// Work of its own before the next poll may wait: a part being hashed.
+    fn busy(&self) -> bool {
+        false
+    }
+    /// A new link replaces a lost one, to a new far end that knows nothing
+    /// of the old: forget what was in flight on it (ACSCP_DESIGN §7).
+    fn reconnect(&mut self) {}
 }
 
 /// Note `msg` on stderr as the copy's own, made safe to print: it may hold
@@ -141,10 +220,20 @@ pub fn note_on(what: &str, why: &str) {
     note(&[what, ": ", why].concat());
 }
 
-/// Hand `ep` every whole message `dec` holds.
-fn take_msgs(ep: &mut dyn Endpoint, dec: &mut Decoder, out: &mut OutQueue) -> Result<(), Halt> {
+/// Hand `ep` every whole message `dec` holds. `PING` and `PONG` are the
+/// link's, not the endpoint's: answered and heard here.
+fn take_msgs(
+    ep: &mut dyn Endpoint,
+    dec: &mut Decoder,
+    out: &mut OutQueue,
+    live: &mut Liveness,
+) -> Result<(), Halt> {
     while let Some(m) = Msg::next(dec).map_err(|e| Halt::Protocol(e.to_string()))? {
-        ep.on_msg(m, out)?;
+        match m {
+            Msg::Ping(n) => Msg::Pong(n).encode(out.tail()),
+            Msg::Pong(n) => live.pong(n),
+            m => ep.on_msg(m, out)?,
+        }
     }
     Ok(())
 }
@@ -152,20 +241,25 @@ fn take_msgs(ep: &mut dyn Endpoint, dec: &mut Decoder, out: &mut OutQueue) -> Re
 /// Run `ep` over the link `rfd`/`wfd` (one socket, or a pipe each way)
 /// until it is finished or stops: `dec` holds what was read already (what
 /// came after the remote's marker), and `out` what is still to be written
-/// (a `HELLO`).
+/// (a `HELLO`). The link's liveness is the session's (ACSCP_DESIGN §5.2):
+/// a ping after silence, lost after longer; with `netwatch`, a change of
+/// this machine's network asks the far end at once.
 pub(crate) fn drive(
     ep: &mut dyn Endpoint,
     rfd: RawFd,
     wfd: RawFd,
     mut dec: Decoder,
     mut out: OutQueue,
-) -> Result<(), String> {
-    let nonblocking = |fd| sys::set_nonblocking(fd, true).map_err(|e| e.to_string());
+    netwatch: Option<&NetWatch>,
+) -> Result<(), Stop> {
+    let nonblocking = |fd| sys::set_nonblocking(fd, true).map_err(|e| Stop::Fatal(e.to_string()));
     nonblocking(rfd)?;
     nonblocking(wfd)?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut eof = false;
-    let fail = |h: Halt, out: &mut OutQueue| -> String {
+    let mut live = Liveness::new();
+    let lost = |m: &str| Err(Stop::Lost(m.into()));
+    let fail = |h: Halt, out: &mut OutQueue| -> Stop {
         match h {
             Halt::Protocol(m) => {
                 Msg::Error {
@@ -176,19 +270,21 @@ pub(crate) fn drive(
                 // Best effort: the far end is broken, and may not read.
                 let _ = sys::set_nonblocking(wfd, false);
                 let _ = sys::write_all(wfd, out.queued());
-                format!("protocol error: {m}")
+                Stop::Fatal(format!("protocol error: {m}"))
             }
             Halt::Ended(m) => {
                 let _ = out.flush(wfd);
-                m
+                Stop::Fatal(m)
             }
+            Halt::Lost(m) => Stop::Lost(m),
         }
     };
-    if let Err(h) = take_msgs(ep, &mut dec, &mut out) {
+    if let Err(h) = take_msgs(ep, &mut dec, &mut out, &mut live) {
         return Err(fail(h, &mut out));
     }
     loop {
-        if out.len() < HIGH {
+        let room = out.len() < HIGH;
+        if room {
             if let Err(h) = ep.pump(&mut out) {
                 return Err(fail(h, &mut out));
             }
@@ -196,19 +292,22 @@ pub(crate) fn drive(
         if ep.finished() && out.is_empty() {
             return Ok(());
         }
-        let mut fds = [
-            sys::wait_for(rfd, if eof { 0 } else { libc::POLLIN }),
-            sys::wait_for(wfd, if out.is_empty() { 0 } else { libc::POLLOUT }),
-        ];
         if eof && out.is_empty() {
             // Nothing to read and nothing to write: only pump could move,
             // and it did not.
-            return Err(fail(
-                Halt::Ended("the link closed before the copy finished".into()),
-                &mut out,
-            ));
+            return lost("the link closed before the copy finished");
         }
-        sys::poll(&mut fds, -1).map_err(|e| e.to_string())?;
+        let mut fds = [
+            sys::wait_for(rfd, if eof { 0 } else { libc::POLLIN }),
+            sys::wait_for(wfd, if out.is_empty() { 0 } else { libc::POLLOUT }),
+            sys::pollfd(netwatch.map_or(-1, |w| w.fd()), libc::POLLIN),
+        ];
+        let wait = match room && ep.busy() {
+            true => 0,
+            false => live.next_deadline_ms().saturating_sub(sys::now_ms()),
+        };
+        sys::poll(&mut fds, sys::poll_timeout(Duration::from_millis(wait)))
+            .map_err(|e| Stop::Fatal(e.to_string()))?;
         if fds[0].revents != 0 {
             match sys::read(rfd, &mut buf) {
                 Ok(0) => {
@@ -218,17 +317,35 @@ pub(crate) fn drive(
                     }
                 }
                 Ok(n) => {
+                    live.heard();
                     dec.push(&buf[..n]);
-                    if let Err(h) = take_msgs(ep, &mut dec, &mut out) {
+                    if let Err(h) = take_msgs(ep, &mut dec, &mut out, &mut live) {
                         return Err(fail(h, &mut out));
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(format!("the link failed: {e}")),
+                Err(e) => return lost(&format!("the link failed: {e}")),
             }
         }
         if fds[1].revents != 0 && !out.flush(wfd) {
-            return Err("the link closed before the copy finished".into());
+            return lost("the link closed before the copy finished");
+        }
+        // A network change while the link is up asks the far end at once;
+        // one still owed its WELCOME is dialled again if the change took a
+        // network away (the session's rules, acs-ft1, acs-xo1).
+        if fds[2].revents != 0 {
+            if let Some(change) = netwatch.and_then(|w| w.changed()) {
+                if ep.welcomed() {
+                    live.netcheck(out.tail());
+                    change.acted();
+                } else if change.removed() {
+                    change.acted();
+                    return lost("the network moved");
+                }
+            }
+        }
+        if !eof && live.tick(out.tail()) == Health::Dead {
+            return lost("no answer from the far end");
         }
     }
 }
@@ -246,8 +363,8 @@ pub fn send(
     let mut out = OutQueue::default();
     *out.tail() = hello(Role::Receive, target, names(&sources), opts);
     let mut s = sender::Sender::new(sources, opts, false);
-    let r = drive(&mut s, fd, fd, Decoder::new(), out);
-    s.outcome(r.err())
+    let r = drive(&mut s, fd, fd, Decoder::new(), out, None);
+    s.outcome(r.err().map(Stop::message))
 }
 
 /// Serve as the receiver over `link`: read the `HELLO`, answer it, and
@@ -255,8 +372,8 @@ pub fn send(
 pub fn receive(link: &UnixStream, opts: &Options) -> Outcome {
     let fd = link.as_raw_fd();
     let mut r = receiver::Receiver::serving(opts);
-    let res = drive(&mut r, fd, fd, Decoder::new(), OutQueue::default());
-    r.outcome(res.err())
+    let res = drive(&mut r, fd, fd, Decoder::new(), OutQueue::default(), None);
+    r.outcome(res.err().map(Stop::message))
 }
 
 /// The names `sources` are copied under: the top-level names their
@@ -297,19 +414,102 @@ pub fn wanted_name(path: &str) -> Option<String> {
     proto::valid_name(n).then(|| n.to_string())
 }
 
-/// Run `ep` against `acs _cp` on `host` (ACSCP_DESIGN §3, §8): the
-/// session's dial — a `Call::Session` on acs's ssh master, the alias
-/// resolved as a session resolves it — with `hello` written the moment ssh
-/// is spawned, and acs installed on the same connection where the host
-/// lacks it. `Err` is the exit code of a copy that never started, told
-/// already; `Ok` is how the copy itself went.
+/// One dial of `acs _cp` on the host `conn` names.
+enum Dialed {
+    /// Up, with what came after the marker.
+    Up(crate::client::Link, Vec<u8>),
+    /// No connection: worth another try on a redial.
+    Down(String),
+    /// The host answered and cannot copy: not installed and not to be, an
+    /// install that failed, another protocol. Final, with its exit code.
+    Refused(String, u8),
+}
+
+/// Dial `acs _cp` once (ACSCP_DESIGN §3, §8): the alias resolved again
+/// first, `hello` written the moment ssh is spawned, acs installed on the
+/// same connection where the host lacks it. The first connection is a
+/// `Call::Session`, on acs's ssh master, with the first connection's
+/// answer timeout; a `redial` is a `Call::Redial` of its own, with the
+/// redial's (§7).
+fn dial_cp(
+    conn: &mut crate::cli::Connection,
+    redial: bool,
+    hello: &[u8],
+    netwatch: Option<&NetWatch>,
+) -> Dialed {
+    use crate::client;
+    let label = if redial { "redial" } else { "first connection" };
+    let mut timing = Timing::start(conn.verbose > 0, label);
+    let name = conn
+        .alias
+        .clone()
+        .unwrap_or_else(|| conn.transport.destination.clone());
+    if let Err(e) = client::resolve_alias(conn, &name) {
+        return Dialed::Down(e);
+    }
+    if conn.alias.is_some() {
+        timing.mark(Phase::AliasResolved);
+    }
+    let (remote, sync) = client::remote_command(conn, &["_cp"]);
+    let again = sync.as_ref().map(|_| hello.to_vec()).unwrap_or_default();
+    let (call, timeout) = match redial {
+        true => (Call::Redial, client::redial_timeout()),
+        false => (Call::Session, client::answer_timeout(false)),
+    };
+    let first = hello.to_vec();
+    let t = &mut timing;
+    let (link, marker) =
+        match client::dial_watching(conn, call, &remote, timeout, t, first, netwatch, None) {
+            Ok(x) => x,
+            Err(e) => return Dialed::Down(e.to_string()),
+        };
+    match client::ready_or_install(conn, link, marker, sync, &again, t) {
+        Ok((link, rest)) => Dialed::Up(link, rest),
+        Err((e, c)) => Dialed::Refused(e, c),
+    }
+}
+
+/// Sit out `wait` before the next dial, cut short by a change of this
+/// machine's network at most once per `ACS_EARLY_MS`, as the session's
+/// offline wait is. True when it was.
+fn sit_out(wait: Duration, netwatch: Option<&NetWatch>, last_early: &mut Option<Instant>) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let mut fds = [sys::pollfd(netwatch.map_or(-1, |w| w.fd()), libc::POLLIN)];
+        let _ = sys::poll(&mut fds, sys::poll_timeout(deadline - now));
+        if fds[0].revents == 0 {
+            continue;
+        }
+        if let Some(change) = netwatch.and_then(|w| w.changed()) {
+            let every = crate::reconnect::early_every();
+            if last_early.map_or(true, |t| t.elapsed() >= every) {
+                change.acted();
+                *last_early = Some(Instant::now());
+                return true;
+            }
+        }
+    }
+}
+
+/// Run `ep` against `acs _cp` on `host` over as many links as it takes
+/// (ACSCP_DESIGN §7): a lost link is redialled at once and then on the
+/// session's backoff, cut short by a network change, until the copy is
+/// done or interrupted — or, with `--no-reconnect`, not at all. Each new
+/// link starts from what is on disk: the sender leaves out what was
+/// placed, and a part is resumed by `HAVE`. `Err` is the exit code of a
+/// copy whose first connection never came up, told already; `Ok` is how
+/// the copy itself went.
 fn over_ssh(
     a: &CopyArgs,
     host: &cli::Remote,
     hello: Vec<u8>,
     ep: &mut dyn Endpoint,
 ) -> Result<Result<(), String>, u8> {
-    use crate::client::{self, note};
+    use crate::client::note;
     let mut conn = a.connection(host);
     conn.config = crate::config::Config::load().map_err(|e| {
         note(&e.to_string());
@@ -322,36 +522,64 @@ fn over_ssh(
     if conn.verbose > 0 {
         note(&decided);
     }
-    let mut timing = Timing::start(conn.verbose > 0, "first connection");
-    let name = conn.transport.destination.clone();
-    client::resolve_alias(&mut conn, &name).map_err(|e| {
-        note(&e);
-        code::UNREACHABLE
-    })?;
-    if conn.alias.is_some() {
-        timing.mark(Phase::AliasResolved);
+    let netwatch = match a.reconnect {
+        true => NetWatch::new(conn.verbose > 0),
+        false => None,
+    };
+    let mut backoff = Backoff::new(sys::env_or("ACS_BACKOFF_MS", 1000));
+    let mut last_early = None;
+    let mut redial = false;
+    loop {
+        let why = match dial_cp(&mut conn, redial, &hello, netwatch.as_ref()) {
+            Dialed::Up(mut link, rest) => {
+                if redial {
+                    ep.reconnect();
+                }
+                let mut dec = Decoder::new();
+                dec.push(&rest);
+                let mut out = OutQueue::default();
+                *out.tail() = link.take_pending();
+                let (r, w) = (link.from_fd().as_raw_fd(), link.to_fd().as_raw_fd());
+                let up = Instant::now();
+                let res = drive(ep, r, w, dec, out, netwatch.as_ref());
+                link.close();
+                match res {
+                    Ok(()) => return Ok(Ok(())),
+                    Err(Stop::Fatal(m)) => return Ok(Err(m)),
+                    Err(Stop::Lost(m)) => {
+                        let served = ep.welcomed().then(|| up.elapsed());
+                        backoff.link_ended(served, crate::reconnect::backoff_reset_after());
+                        m
+                    }
+                }
+            }
+            Dialed::Down(e) if !redial => {
+                note(&e);
+                return Err(code::UNREACHABLE);
+            }
+            Dialed::Refused(e, c) if !redial => {
+                note(&e);
+                return Err(c);
+            }
+            Dialed::Refused(e, _) => return Ok(Err(e)),
+            Dialed::Down(e) => e,
+        };
+        if !a.reconnect {
+            return Ok(Err(why));
+        }
+        redial = true;
+        // On stderr as a line of its own: nothing of the copy's is on the
+        // terminal to protect, and Ctrl-C ends it with the part kept.
+        let wait = backoff.step();
+        let dest = host.destination();
+        self::note(&match wait.is_zero() {
+            true => format!("{dest}: {why} — reconnecting now"),
+            false => format!("{dest}: {why} — reconnecting in {}s", wait.as_secs().max(1)),
+        });
+        if sit_out(wait, netwatch.as_ref(), &mut last_early) {
+            backoff.spent();
+        }
     }
-    let (remote, sync) = client::remote_command(&conn, &["_cp"]);
-    let again = sync.as_ref().map(|_| hello.clone()).unwrap_or_default();
-    let timeout = client::answer_timeout(false);
-    let dialed = client::dial(&conn, Call::Session, &remote, timeout, &mut timing, hello);
-    let (link, marker) = dialed.map_err(|e| {
-        note(&e.to_string());
-        code::UNREACHABLE
-    })?;
-    let (mut link, rest) = client::ready_or_install(&conn, link, marker, sync, &again, &mut timing)
-        .map_err(|(e, c)| {
-            note(&e);
-            c
-        })?;
-    let mut dec = Decoder::new();
-    dec.push(&rest);
-    let mut out = OutQueue::default();
-    *out.tail() = link.take_pending();
-    let (r, w) = (link.from_fd().as_raw_fd(), link.to_fd().as_raw_fd());
-    let res = drive(ep, r, w, dec, out);
-    link.close();
-    Ok(res)
 }
 
 /// A copy to or from one host: an upload of local sources, or a download

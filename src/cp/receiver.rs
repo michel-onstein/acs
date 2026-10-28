@@ -14,14 +14,20 @@
 //!   under the final name. A new part is made `O_EXCL` (a symlink planted
 //!   at its name is refused, not written through); an existing one is
 //!   reopened `O_NOFOLLOW` and used only if it is a regular file.
+//! - **Resume** (ACSCP_DESIGN §7): a part already there is answered with
+//!   `HAVE` — its length and SHA-256, hashed a slice per turn of the poll
+//!   loop so the pings go on — and the data follows on from its end, or
+//!   from 0 after a `RESTART`. Over a new link ([`Endpoint::reconnect`]) a
+//!   file this run placed already is answered `GO` at its size: nothing of
+//!   it is sent again.
 //! - **Directories** are made `0700 | mode`, so their contents can be
 //!   written, and get their final mode and, with `-p`, their times once
 //!   everything inside them is done — which, since the sender's headers
 //!   run ahead of its data, may be after their `DIR_END`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -29,7 +35,7 @@ use std::time::{Duration, SystemTime};
 
 use super::proto::{err, Hello, Meta, Msg, Role, Time};
 use super::walk::{reason, MAX_DEPTH};
-use super::{note_on, Endpoint, Halt, Options, Outcome};
+use super::{note_on, Endpoint, Halt, Options, Outcome, Prefix};
 use crate::outq::OutQueue;
 use crate::sys;
 
@@ -64,6 +70,8 @@ struct Part {
     written: u64,
     meta: Meta,
     dir: Option<usize>,
+    /// The part found on disk, being hashed for its `HAVE`.
+    check: Option<Prefix>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +99,14 @@ pub struct Receiver {
     /// or failed, whose data may still be on the way. One map rather than
     /// a map and a set, which would be two copies of the table code.
     parts: HashMap<u32, Option<Part>>,
+    /// Files this run placed or gave up on, and directories it made:
+    /// what a new link sends again is not written, or made, twice.
+    placed: HashSet<PathBuf>,
+    made: HashSet<PathBuf>,
+    /// What was reported already: a new link meets it again.
+    told: HashSet<String>,
     report: bool,
+    verbose: bool,
     outcome: Outcome,
 }
 
@@ -130,27 +145,33 @@ fn set_times(f: &File, m: &Meta) -> std::io::Result<()> {
     f.set_times(t)
 }
 
-/// Open the part at `part` for writing from its start, made at `mode`.
-fn open_part(part: &Path, mode: u32) -> std::io::Result<File> {
+/// Open the part at `part`, made at `mode` if it is new, and say how long
+/// it is: an earlier link's or an earlier run's, to resume (§7).
+fn open_part(part: &Path, mode: u32) -> std::io::Result<(File, u64)> {
     match sys::create_new_mode(part, mode) {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        other => return other,
+        other => return other.map(|f| (f, 0)),
     }
-    // A part from an earlier run. Only a regular file is used, and never
-    // through a symlink. Until resuming exists (phase 3, HAVE) it is
-    // written again from the start.
+    // Only a regular file is used, and never through a symlink.
     let f = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(part)?;
-    if !f.metadata()?.is_file() {
+    let m = f.metadata()?;
+    if !m.is_file() {
         return Err(std::io::Error::other(
             "a part file is there and is not a regular file",
         ));
     }
-    f.set_len(0)?;
     sys::fchmod(f.as_raw_fd(), mode)?;
-    Ok(f)
+    Ok((f, m.len()))
+}
+
+/// Empty `f` to write it again from its start.
+fn truncate(f: &mut File) -> std::io::Result<()> {
+    f.set_len(0)?;
+    f.seek(SeekFrom::Start(0)).map(drop)
 }
 
 impl Receiver {
@@ -167,7 +188,11 @@ impl Receiver {
             dirs: Vec::new(),
             levels: Vec::new(),
             parts: HashMap::new(),
+            placed: HashSet::new(),
+            made: HashSet::new(),
+            told: HashSet::new(),
             report: opts.report,
+            verbose: opts.report && opts.verbose,
             outcome: Outcome::default(),
         }
     }
@@ -194,10 +219,13 @@ impl Receiver {
         self.outcome
     }
 
-    fn report(&self, what: &str, why: &str) {
-        if self.report {
+    /// Report `what: why` the first time it happens; true if it was.
+    fn tell(&mut self, what: &str, why: &str) -> bool {
+        let first = self.told.insert(what.to_string());
+        if first && self.report {
             note_on(what, why);
         }
+        first
     }
 
     fn hello(&mut self, h: Hello, out: &mut OutQueue) -> Result<(), Halt> {
@@ -254,11 +282,12 @@ impl Receiver {
     }
 
     fn fail(&mut self, id: u32, name: &str, message: String, out: &mut OutQueue) {
-        self.outcome.failed += 1;
+        if self.tell(name, &message) {
+            self.outcome.failed += 1;
+        }
         if id != 0 {
             self.parts.insert(id, None);
         }
-        self.report(name, &message);
         Msg::Fail {
             id,
             name: name.into(),
@@ -289,8 +318,14 @@ impl Receiver {
             .mode((meta.mode | 0o700) & 0o777)
             .create(&path)
         {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => false,
+            Ok(()) => {
+                self.made.insert(path.clone());
+                true
+            }
+            // Made by this run over a link since lost, still is.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {
+                self.made.contains(&path)
+            }
             Err(e) => {
                 let m = match e.kind() {
                     std::io::ErrorKind::AlreadyExists => "exists and is not a directory".into(),
@@ -341,10 +376,12 @@ impl Receiver {
                     problem = Some(reason(&e));
                 }
             }
+            let parent = d.parent;
             if let Some(m) = problem {
-                self.report(&d.path.display().to_string(), &m);
+                let shown = d.path.display().to_string();
+                self.tell(&shown, &m);
             }
-            match d.parent {
+            match parent {
                 Some(p) => {
                     self.dirs[p].open -= 1;
                     i = p;
@@ -377,6 +414,12 @@ impl Receiver {
             }
         };
         let shown = dest.display().to_string();
+        if self.placed.contains(&dest) {
+            // Placed over a link since lost: none of it again.
+            self.parts.insert(id, None);
+            Msg::Go { id, offset: size }.encode(out.tail());
+            return Ok(());
+        }
         if dest.is_dir() {
             self.fail(id, &shown, "is a directory".into(), out);
             return Ok(());
@@ -385,8 +428,15 @@ impl Receiver {
             self.fail(id, &shown, "has no file name to write".into(), out);
             return Ok(());
         };
-        let file = match open_part(&part, meta.mode & 0o777 & !self.umask) {
-            Ok(f) => f,
+        let opened = open_part(&part, meta.mode & 0o777 & !self.umask).and_then(|(mut f, have)| {
+            // A part longer than the file is no start of it.
+            if have > size {
+                truncate(&mut f)?;
+            }
+            Ok((f, (1..=size).contains(&have).then(|| Prefix::new(have))))
+        });
+        let (file, check) = match opened {
+            Ok(x) => x,
             Err(e) => {
                 self.fail(id, &shown, reason(&e), out);
                 return Ok(());
@@ -395,6 +445,8 @@ impl Receiver {
         if let Some(d) = dir {
             self.dirs[d].open += 1;
         }
+        // A part to resume is answered once it is hashed ([`Self::check`]).
+        let go = check.is_none();
         self.parts.insert(
             id,
             Some(Part {
@@ -406,9 +458,73 @@ impl Receiver {
                 written: 0,
                 meta,
                 dir,
+                check,
             }),
         );
-        Msg::Go { id, offset: 0 }.encode(out.tail());
+        if go {
+            Msg::Go { id, offset: 0 }.encode(out.tail());
+        }
+        Ok(())
+    }
+
+    /// Hash the next slice of a part found on disk, and once all of it is
+    /// in, offer it with `HAVE` (§7). A part that cannot be read is
+    /// written again from its start.
+    fn check(&mut self, out: &mut OutQueue) -> Result<(), Halt> {
+        let found = self.parts.iter_mut().find_map(|(&id, p)| match p {
+            Some(p) if p.check.is_some() => Some((id, p)),
+            _ => None,
+        });
+        let Some((id, p)) = found else {
+            return Ok(());
+        };
+        let c = p.check.as_mut().expect("found");
+        let len = c.len;
+        let answer = match c.step(&mut p.file) {
+            Ok(None) => return Ok(()),
+            Ok(Some(hash)) => {
+                if self.verbose {
+                    note_on(
+                        &p.name,
+                        &format!("resuming from the {len} bytes already here"),
+                    );
+                }
+                p.written = len;
+                Msg::Have { id, len, hash }
+            }
+            Err(_) => match truncate(&mut p.file) {
+                Ok(()) => Msg::Go { id, offset: 0 },
+                Err(e) => {
+                    let p = self.parts.remove(&id).flatten().expect("just found");
+                    self.abandon(id, p, reason(&e), out);
+                    return Ok(());
+                }
+            },
+        };
+        p.check = None;
+        answer.encode(out.tail());
+        Ok(())
+    }
+
+    /// The sender's source does not begin as the part does: write it again.
+    fn restart(&mut self, id: u32, out: &mut OutQueue) -> Result<(), Halt> {
+        let p = match self.parts.get_mut(&id) {
+            Some(Some(p)) if p.check.is_none() && p.written > 0 => p,
+            Some(None) => return Ok(()),
+            _ => {
+                return Err(Halt::Protocol(format!(
+                    "RESTART for file {id}, which is not resuming"
+                )))
+            }
+        };
+        p.written = 0;
+        if self.verbose {
+            note_on(&p.name, "the part here is not its start — copying it whole");
+        }
+        if let Err(e) = truncate(&mut p.file) {
+            let p = self.parts.remove(&id).flatten().expect("just found");
+            self.abandon(id, p, reason(&e), out);
+        }
         Ok(())
     }
 
@@ -424,6 +540,7 @@ impl Receiver {
     /// Part `id` cannot be finished: remove it and say so.
     fn abandon(&mut self, id: u32, p: Part, message: String, out: &mut OutQueue) {
         let _ = std::fs::remove_file(&p.part);
+        self.placed.insert(p.dest.clone());
         self.fail(id, &p.name.clone(), message, out);
         self.close(p);
     }
@@ -432,12 +549,18 @@ impl Receiver {
         let p = match self.parts.get_mut(&id) {
             Some(Some(p)) => p,
             Some(None) => return Ok(()),
-            None => {
+            _ => {
                 return Err(Halt::Protocol(format!(
                     "DATA for file {id}, which is not open"
                 )))
             }
         };
+        if p.check.is_some() {
+            return Err(Halt::Protocol(format!(
+                "DATA for {} before its HAVE was answered",
+                p.name
+            )));
+        }
         if p.written + bytes.len() as u64 > p.size {
             return Err(Halt::Protocol(format!(
                 "more DATA for {} than announced",
@@ -488,6 +611,7 @@ impl Receiver {
         match done {
             Ok(()) => {
                 self.outcome.written += 1;
+                self.placed.insert(p.dest.clone());
                 Msg::Ok { id }.encode(out.tail());
                 self.close(p);
             }
@@ -498,14 +622,12 @@ impl Receiver {
 }
 
 impl Endpoint for Receiver {
-    fn pump(&mut self, _out: &mut OutQueue) -> Result<(), Halt> {
-        Ok(())
+    fn pump(&mut self, out: &mut OutQueue) -> Result<(), Halt> {
+        self.check(out)
     }
 
     fn on_msg(&mut self, m: Msg<'_>, out: &mut OutQueue) -> Result<(), Halt> {
         match (self.state, m) {
-            (_, Msg::Ping(n)) => Msg::Pong(n).encode(out.tail()),
-            (_, Msg::Pong(_)) => {}
             (_, Msg::Error { message, .. }) => return Err(Halt::Ended(message)),
             (State::Hello, Msg::Hello(h)) => return self.hello(h, out),
             (State::Welcome, Msg::Welcome { .. }) => self.state = State::Running,
@@ -529,9 +651,11 @@ impl Endpoint for Receiver {
             ) => return self.file(id, name, size, meta, out),
             (State::Running, Msg::Data { id, bytes }) => return self.data(id, bytes, out),
             (State::Running, Msg::FileEnd { id }) => return self.file_end(id, out),
+            (State::Running, Msg::Restart { id }) => return self.restart(id, out),
             (State::Running, Msg::Skip { name, reason }) => {
-                self.outcome.skipped += 1;
-                self.report(&name, &reason);
+                if self.tell(&name, &reason) {
+                    self.outcome.skipped += 1;
+                }
             }
             (State::Running, Msg::End) => {
                 if !self.levels.is_empty() || self.parts.values().any(Option::is_some) {
@@ -560,7 +684,7 @@ impl Endpoint for Receiver {
                 self.state = State::Closed;
                 Ok(())
             }
-            _ => Err(Halt::Ended(
+            _ => Err(Halt::Lost(
                 "the sender went away before the copy finished".into(),
             )),
         }
@@ -568,6 +692,23 @@ impl Endpoint for Receiver {
 
     fn finished(&self) -> bool {
         self.state == State::Closed
+    }
+
+    fn welcomed(&self) -> bool {
+        !matches!(self.state, State::Hello | State::Welcome)
+    }
+
+    fn busy(&self) -> bool {
+        self.parts.values().flatten().any(|p| p.check.is_some())
+    }
+
+    /// A download's new sender walks from the start: wait for its
+    /// `WELCOME`, with nothing open. The parts stay on disk for its `HAVE`s.
+    fn reconnect(&mut self) {
+        self.state = State::Welcome;
+        self.levels.clear();
+        self.dirs.clear();
+        self.parts.clear();
     }
 }
 
@@ -625,6 +766,9 @@ mod tests {
                     Msg::Fail { id, message, .. } => format!("FAIL {id} {message}"),
                     Msg::Error { message, .. } => format!("ERROR {message}"),
                     Msg::Done { written, failed } => format!("DONE {written} {failed}"),
+                    Msg::Have { id, len, hash } => {
+                        format!("HAVE {id} {len} {}", crate::sha256::hex(&hash))
+                    }
                     other => format!("{other:?}"),
                 });
             }
@@ -643,6 +787,12 @@ mod tests {
             })?;
             self.send(Msg::Data { id, bytes: body })?;
             self.send(Msg::FileEnd { id })
+        }
+
+        /// The rest of file `id`'s data, and its end.
+        fn file_rest(&mut self, id: u32, bytes: &[u8]) {
+            self.send(Msg::Data { id, bytes }).unwrap();
+            self.send(Msg::FileEnd { id }).unwrap();
         }
     }
 
@@ -937,6 +1087,162 @@ mod tests {
                 .starts_with("FAIL 2 changed while being read"),
             "{a:?}"
         );
+    }
+
+    fn have(id: u32, prefix: &[u8]) -> String {
+        let h = crate::sha256::hex(&crate::sha256::digest(prefix));
+        format!("HAVE {id} {} {h}", prefix.len())
+    }
+
+    /// Pump `rx` until its hashing is done; how many turns it took.
+    fn hash_all(rx: &mut Rx) -> usize {
+        let mut turns = 0;
+        while rx.r.busy() {
+            rx.r.pump(&mut rx.out).unwrap();
+            turns += 1;
+        }
+        turns
+    }
+
+    /// A part on disk is offered with `HAVE` once it is hashed, a slice per
+    /// turn of the poll loop (decision 12), and nothing is said before; the
+    /// data then follows on from its end. A part that is not the file's
+    /// start is truncated on `RESTART` and written whole (ACSCP_DESIGN §7).
+    #[test]
+    fn a_part_on_disk_is_offered_and_resumed_or_restarted() {
+        let t = TempDir::new();
+        let slice = super::super::SLICE as usize;
+        let body: Vec<u8> = (0..2 * slice + 10).map(|i| (i % 251) as u8).collect();
+        let kept = 2 * slice + 1;
+        std::fs::write(t.path().join(".f.acscp-part"), &body[..kept]).unwrap();
+        std::fs::write(t.path().join(".g.acscp-part"), b"XXXX").unwrap();
+        let (mut rx, r) = Rx::new(t.path(), &["f", "g", "h", "i"]);
+        r.unwrap();
+        assert_eq!(rx.answers(), ["WELCOME dir=true"]);
+
+        let file = |id, name: &str, size| Msg::File {
+            id,
+            name: name.into(),
+            size,
+            meta: dir_meta(),
+        };
+        rx.send(file(1, "f", body.len() as u64)).unwrap();
+        assert!(
+            rx.answers().is_empty(),
+            "answered before the part was hashed"
+        );
+        assert_eq!(hash_all(&mut rx), 3, "a slice per turn");
+        assert_eq!(rx.answers(), [have(1, &body[..kept])]);
+        rx.send(Msg::Data {
+            id: 1,
+            bytes: &body[kept..],
+        })
+        .unwrap();
+        rx.send(Msg::FileEnd { id: 1 }).unwrap();
+        assert!(std::fs::read(t.path().join("f")).unwrap() == body);
+        assert_eq!(rx.r.outcome.bytes, (body.len() - kept) as u64);
+
+        rx.send(file(2, "g", 10)).unwrap();
+        hash_all(&mut rx);
+        rx.send(Msg::Restart { id: 2 }).unwrap();
+        rx.file_rest(2, b"0123456789");
+        assert_eq!(std::fs::read(t.path().join("g")).unwrap(), b"0123456789");
+        assert_eq!(rx.answers(), ["OK 1", &have(2, b"XXXX"), "OK 2"]);
+
+        // DATA before the HAVE is answered, and a RESTART for a file that
+        // is not resuming, are the sender's mistakes.
+        std::fs::write(t.path().join(".h.acscp-part"), b"abc").unwrap();
+        rx.send(file(3, "h", 5)).unwrap();
+        let early = rx.send(Msg::Data { id: 3, bytes: b"x" });
+        assert!(matches!(early, Err(Halt::Protocol(_))), "{early:?}");
+        rx.send(file(4, "i", 5)).unwrap();
+        let wrong = rx.send(Msg::Restart { id: 4 });
+        assert!(matches!(wrong, Err(Halt::Protocol(_))), "{wrong:?}");
+    }
+
+    /// A part longer than the file cannot be its start: it is emptied and
+    /// the file asked for from 0, with no `HAVE`.
+    #[test]
+    fn a_part_longer_than_the_file_is_written_again() {
+        let t = TempDir::new();
+        std::fs::write(t.path().join(".f.acscp-part"), b"far too long").unwrap();
+        let (mut rx, _) = Rx::new(t.path(), &["f"]);
+        rx.answers();
+        rx.file(1, "f", b"new").unwrap();
+        assert!(!rx.r.busy());
+        assert_eq!(rx.answers(), ["GO 1 0", "OK 1"]);
+        assert_eq!(std::fs::read(t.path().join("f")).unwrap(), b"new");
+    }
+
+    /// Over a new link a download's sender walks from the start again: a
+    /// file this run placed is answered `GO` at its size and left alone,
+    /// what was skipped is not counted twice, and the part of the file the
+    /// old link was in is offered (ACSCP_DESIGN §7).
+    #[test]
+    fn a_new_link_sends_nothing_placed_again() {
+        let t = TempDir::new();
+        let mut rx = Rx {
+            r: Receiver::asking(
+                t.path().to_path_buf(),
+                vec!["a".into(), "b".into()],
+                &opts(),
+            ),
+            out: OutQueue::default(),
+        };
+        let welcome = || Msg::Welcome {
+            umask: 0o022,
+            target_is_dir: true,
+        };
+        let skip = || Msg::Skip {
+            name: "gone".into(),
+            reason: "no such file".into(),
+        };
+        rx.send(welcome()).unwrap();
+        assert!(rx.r.welcomed());
+        rx.send(skip()).unwrap();
+        rx.file(1, "a", b"alpha").unwrap();
+        rx.send(Msg::File {
+            id: 2,
+            name: "b".into(),
+            size: 4,
+            meta: dir_meta(),
+        })
+        .unwrap();
+        rx.send(Msg::Data {
+            id: 2,
+            bytes: b"be",
+        })
+        .unwrap();
+        rx.answers();
+
+        rx.r.reconnect();
+        assert!(!rx.r.welcomed());
+        rx.send(welcome()).unwrap();
+        rx.send(skip()).unwrap();
+        rx.send(Msg::File {
+            id: 1,
+            name: "a".into(),
+            size: 5,
+            meta: dir_meta(),
+        })
+        .unwrap();
+        rx.send(Msg::FileEnd { id: 1 }).unwrap();
+        rx.send(Msg::File {
+            id: 2,
+            name: "b".into(),
+            size: 4,
+            meta: dir_meta(),
+        })
+        .unwrap();
+        hash_all(&mut rx);
+        assert_eq!(rx.answers(), ["GO 1 5", &have(2, b"be")]);
+        rx.file_rest(2, b"ta");
+        rx.send(Msg::End).unwrap();
+        assert_eq!(rx.answers(), ["OK 2", "DONE 2 0"]);
+        assert_eq!(std::fs::read(t.path().join("a")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(t.path().join("b")).unwrap(), b"beta");
+        let o = rx.r.outcome(None);
+        assert_eq!((o.written, o.skipped, o.bytes), (2, 1, 9));
     }
 
     /// A symlink planted at the part's name is not written through.

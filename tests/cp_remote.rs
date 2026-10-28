@@ -1,7 +1,9 @@
 //! `acscp` with a host in it (ACSCP_DESIGN §8, §11): uploads and downloads
 //! against a fake remote — `--transport-cmd` with `common::Remote`, whose
 //! prelude execs the real `acs _cp` — first contact installing acs on the
-//! one connection, and a far end that sends names it should not.
+//! one connection, a far end that sends names it should not, and resume
+//! (§7): a link cut mid-file, a part that is not the file's start, and a
+//! Ctrl-C'd copy finished by the next run.
 
 mod common;
 
@@ -354,4 +356,267 @@ fn two_hosts_are_not_built_yet() {
         assert!(err.contains("not built yet"), "{args:?}: {err}");
     }
     assert_eq!(remote.connections(), 0);
+}
+
+/// A transport in front of `remote`'s, written in `dir`: the first
+/// connection runs `first`, every later one `then`, each a shell pipeline
+/// in which `"$REAL" "$1"` is the remote's own transport. `tee` in one is
+/// how a test weighs what that connection carried, and [`CUT`] cuts it.
+fn wrapped(remote: &Remote, dir: &Path, first: &str, then: &str) -> String {
+    let flag = dir.join("first");
+    std::fs::write(&flag, "").unwrap();
+    let script = dir.join("wrapped.sh");
+    write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\nREAL='{real}'\n\
+             if [ -f '{flag}' ]; then rm -f '{flag}'; {first}; exit; fi\n\
+             {then}\n",
+            real = remote.transport(),
+            flag = flag.display(),
+        ),
+    );
+    script.display().to_string()
+}
+
+/// How many bytes the file at `path` holds: what a `tee` weighed, or a part.
+fn weighed(path: &Path) -> usize {
+    std::fs::metadata(path).map_or(0, |m| m.len() as usize)
+}
+
+/// Where the first connection is cut: well inside the files below.
+const CUT: usize = 3_000_000;
+
+/// The cut, made by the test rather than by a shell tool (macOS's `head`
+/// and `dd` both hold a short read back until more comes, which kept the
+/// handshake's first frames from the far end until it gave up on them):
+/// fifos `a` and `b` in `dir`, and a thread passing on the first [`CUT`]
+/// bytes written to `a` to `b` the moment they come. Then it closes `b` —
+/// the link ends mid-stream — or, `stalled`, goes on reading `a` and drops
+/// the rest, as a link that has gone quiet with its host still there.
+fn cut(dir: &Path, stalled: bool) -> (PathBuf, PathBuf) {
+    use std::io::{Read, Write};
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    make_fifo(&a);
+    make_fifo(&b);
+    let (from, to) = (a.clone(), b.clone());
+    std::thread::spawn(move || {
+        let mut from = std::fs::File::open(&from).unwrap();
+        let mut to = std::fs::OpenOptions::new().write(true).open(&to).unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut left = CUT;
+        while left > 0 {
+            let n = match from.read(&mut buf[..left.min(64 * 1024)]) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            if to.write_all(&buf[..n]).is_err() {
+                return;
+            }
+            left -= n;
+        }
+        if stalled {
+            let _ = std::io::copy(&mut from, &mut std::io::sink());
+        }
+    });
+    (a, b)
+}
+
+/// The transport ends mid-file — the first connection carries 3 MB of an
+/// 8 MB download and ends — and the copy redials at once and finishes
+/// (ACSCP_DESIGN §7). The part was reused, not written again: the second
+/// connection carried only what the first had not, so the two together
+/// carried the file about once.
+#[test]
+fn a_download_cut_mid_file_resumes_from_its_part() {
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    let size = 8 << 20;
+    let big = body(size, 3);
+    std::fs::write(remote.home().join("big"), &big).unwrap();
+    let w = TempDir::new();
+    let (a, b) = cut(w.path(), false);
+    let second = w.path().join("second.tee");
+    let transport = wrapped(
+        &remote,
+        w.path(),
+        &format!(
+            "exec 3<&0; \"$REAL\" \"$1\" <&3 >'{}' & exec cat '{}'",
+            a.display(),
+            b.display()
+        ),
+        &format!("\"$REAL\" \"$1\" | tee '{}'", second.display()),
+    );
+    let base = remote.connections();
+    let mut c = cp.cmd(&transport, &["-v", "devbox:big", "out"]);
+    c.envs(FAST.iter().copied());
+    let (status, err) = run(&mut c);
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(remote.connections(), base + 2, "{err}");
+    assert!(err.contains("acscp: devbox: "), "{err}");
+    assert!(err.contains("reconnecting now"), "{err}");
+    assert!(err.contains("out: resuming from the "), "{err}");
+    assert!(std::fs::read(cp.local().join("out")).unwrap() == big);
+    assert!(!cp.local().join(".out.acscp-part").exists());
+    carried_once(weighed(&second), size);
+}
+
+/// What the second connection carried of a `size`-byte file whose first
+/// carried [`CUT`] bytes: only the rest, so about the file once between
+/// them. Without the part it would be all of the file again.
+fn carried_once(second: usize, size: usize) {
+    let what = format!("the second connection carried {second} bytes of {size}, cut at {CUT}");
+    assert!(second > 0 && second < size - CUT / 2, "{what}");
+    assert!(CUT + second < size + 128 * 1024, "{what}");
+}
+
+/// The same for an upload, the cut on the way to the host: the host's
+/// part is offered with `HAVE`, and the sender here hashes its own start
+/// and goes on after it.
+#[test]
+fn an_upload_cut_mid_file_resumes_from_its_part() {
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    let size = 8 << 20;
+    let big = body(size, 4);
+    std::fs::write(cp.local().join("big"), &big).unwrap();
+    let w = TempDir::new();
+    let (a, b) = cut(w.path(), false);
+    let second = w.path().join("second.tee");
+    let transport = wrapped(
+        &remote,
+        w.path(),
+        &format!(
+            "exec 3<&0; cat <&3 >'{}' & exec \"$REAL\" \"$1\" <'{}'",
+            a.display(),
+            b.display()
+        ),
+        &format!("tee '{}' | \"$REAL\" \"$1\"", second.display()),
+    );
+    let mut c = cp.cmd(&transport, &["-v", "big", "devbox:"]);
+    c.envs(FAST.iter().copied());
+    let (status, err) = run(&mut c);
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains("big: resuming after "), "{err}");
+    assert!(std::fs::read(remote.home().join("big")).unwrap() == big);
+    assert!(!remote.home().join(".big.acscp-part").exists());
+    carried_once(weighed(&second), size);
+}
+
+/// A part that is not the start of the file it is named for — another
+/// file's, or the source changed since — is written again from 0: the
+/// connection carries all of the file (ACSCP_DESIGN §7, decision 6).
+#[test]
+fn a_part_with_a_wrong_start_is_written_again() {
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    let size = 1 << 20;
+    let big = body(size, 5);
+    std::fs::write(remote.home().join("big"), &big).unwrap();
+    std::fs::write(cp.local().join(".out.acscp-part"), vec![0xee; size / 2]).unwrap();
+    let w = TempDir::new();
+    let carried = w.path().join("carried");
+    let tee = format!("\"$REAL\" \"$1\" | tee '{}'", carried.display());
+    let transport = wrapped(&remote, w.path(), &tee, &tee);
+    let (status, err) = run(&mut cp.cmd(&transport, &["-v", "devbox:big", "out"]));
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("out: the part here is not its start — copying it whole"),
+        "{err}"
+    );
+    assert!(std::fs::read(cp.local().join("out")).unwrap() == big);
+    assert!(!cp.local().join(".out.acscp-part").exists());
+    assert!(weighed(&carried) >= size, "{}", weighed(&carried));
+}
+
+/// Ctrl-C ends a copy at once and leaves its part (ACSCP_DESIGN §5.5);
+/// the next run of the same copy finishes from it, carrying only the rest.
+/// The part is the only state there is, so nothing else has to survive.
+#[test]
+fn an_interrupted_copy_is_finished_by_the_next_run() {
+    use std::os::unix::process::ExitStatusExt;
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    let size = 8 << 20;
+    let big = body(size, 6);
+    std::fs::write(remote.home().join("big"), &big).unwrap();
+    let w = TempDir::new();
+    let carried = w.path().join("carried");
+    // The first run's link goes quiet after the cut, as a stalled one
+    // does, with the host still there.
+    let (a, b) = cut(w.path(), true);
+    let transport = wrapped(
+        &remote,
+        w.path(),
+        &format!(
+            "exec 3<&0; \"$REAL\" \"$1\" <&3 >'{}' & exec cat '{}'",
+            a.display(),
+            b.display()
+        ),
+        &format!("\"$REAL\" \"$1\" | tee '{}'", carried.display()),
+    );
+    let part = cp.local().join(".out.acscp-part");
+    let mut child = cp
+        .cmd(&transport, &["devbox:big", "out"])
+        .env("ACS_DEAD_MS", "600000")
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(
+        T,
+        || weighed(&part) >= 1 << 20,
+        || format!("the part holds {} bytes", weighed(&part)),
+    );
+    acs::sys::kill(child.id() as i32, libc::SIGINT).unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+    let kept = weighed(&part);
+    assert!(
+        (1 << 20..size).contains(&kept),
+        "the part holds {kept} bytes"
+    );
+    assert!(!cp.local().join("out").exists());
+
+    let (status, err) = run(&mut cp.cmd(&transport, &["-v", "devbox:big", "out"]));
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains(&format!("out: resuming from the {kept} bytes already here")),
+        "{err}"
+    );
+    assert!(std::fs::read(cp.local().join("out")).unwrap() == big);
+    assert!(!part.exists());
+    let second = weighed(&carried);
+    assert!(
+        second >= size - kept && second < size - kept + 64 * 1024,
+        "the second run carried {second} bytes; {kept} of {size} were here"
+    );
+}
+
+/// `--no-reconnect` ends on the first lost link, as `scp` would, with the
+/// part kept for a later run and no second connection.
+#[test]
+fn no_reconnect_ends_on_the_first_lost_link() {
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    std::fs::write(remote.home().join("big"), body(8 << 20, 7)).unwrap();
+    let w = TempDir::new();
+    let (a, b) = cut(w.path(), false);
+    let transport = wrapped(
+        &remote,
+        w.path(),
+        &format!(
+            "exec 3<&0; \"$REAL\" \"$1\" <&3 >'{}' & exec cat '{}'",
+            a.display(),
+            b.display()
+        ),
+        "exit 99",
+    );
+    let base = remote.connections();
+    let (status, err) = run(&mut cp.cmd(&transport, &["--no-reconnect", "devbox:big", "out"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("went away before the copy finished"), "{err}");
+    assert!(!err.contains("reconnecting"), "{err}");
+    assert_eq!(remote.connections(), base + 1);
+    assert!(weighed(&cp.local().join(".out.acscp-part")) > CUT / 2);
+    assert!(!cp.local().join("out").exists());
 }

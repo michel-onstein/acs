@@ -409,3 +409,43 @@ fn small_files_stream_rather_than_pay_a_round_trip_each() {
         took.as_millis() / rtt.as_millis()
     );
 }
+
+/// A part an earlier run left in the target is resumed when it is the
+/// file's start, the sender hashing as much of its source to know, and
+/// written whole when it is not (ACSCP_DESIGN §7). Either way no part is
+/// left once the file is in place.
+#[test]
+fn a_part_left_behind_is_resumed_or_written_whole() {
+    let cp = Acscp::new();
+    let t = TempDir::new();
+    let big = body(3 * 1024 * 1024 + 11, 7);
+    std::fs::write(t.path().join("big"), &big).unwrap();
+    std::fs::write(t.path().join("small"), b"the right bytes").unwrap();
+    let dst = t.path().join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    let kept = 2 * 1024 * 1024 + 3;
+    std::fs::write(dst.join(".big.acscp-part"), &big[..kept]).unwrap();
+    std::fs::write(dst.join(".small.acscp-part"), b"the wrong").unwrap();
+
+    let (status, err) = run(&mut cp.cmd(t.path(), &["-v", "big", "small", "dst"]));
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains(&format!("big: resuming after {kept} bytes already there")),
+        "{err}"
+    );
+    assert!(
+        err.contains("small: the part there is not its start — sending it whole"),
+        "{err}"
+    );
+    assert!(std::fs::read(dst.join("big")).unwrap() == big);
+    assert_eq!(
+        std::fs::read(dst.join("small")).unwrap(),
+        b"the right bytes"
+    );
+    let mut names: Vec<_> = std::fs::read_dir(&dst)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["big", "small"]);
+}
