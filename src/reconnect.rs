@@ -668,6 +668,22 @@ impl Liveness {
         }
     }
 
+    /// The client spent `ms` writing to the terminal (acs-spd). While a
+    /// netcheck is outstanding that time is not the host's: the `PONG` may
+    /// have been in the pipe all along, unread because the terminal was
+    /// not, so the question's deadline moves out by it. The link was not
+    /// slow; the terminal was.
+    ///
+    /// Only the netcheck's deadline moves. The dead interval stays the
+    /// outer bound, and the stale bytes acs-br2 refused still answer
+    /// nothing — a stall that began *before* the change was asked about is
+    /// not counted, since no question was outstanding yet.
+    pub fn wrote_for(&mut self, ms: u64) {
+        if let Some((_, until)) = self.probe.as_mut() {
+            *until += ms;
+        }
+    }
+
     fn netcheck_at(&mut self, now: u64, out: &mut Vec<u8>) {
         if self.probe.is_some() {
             return;
@@ -872,6 +888,45 @@ mod tests {
         l.pong(4000);
         l.heard = 4100;
         assert_eq!(l.tick_at(4150, &mut out), Health::Dead);
+    }
+
+    /// acs-spd: time the client spent blocked writing to a terminal that
+    /// was not reading is not counted against an outstanding netcheck — the
+    /// `PONG` may have been waiting in the pipe all along. Time written
+    /// before the question was asked moves nothing, and the dead interval
+    /// stays the outer bound.
+    #[test]
+    fn time_blocked_on_the_terminal_does_not_count_against_a_netcheck() {
+        let mut l = liveness(1000, 3000, 10_000);
+        let mut out = Vec::new();
+        // A stall with no question outstanding: nothing to move.
+        l.wrote_for(5000);
+        l.netcheck_at(1100, &mut out);
+        assert_eq!(l.next_deadline_ms(), 1150);
+        // The terminal stalls for three seconds with the PONG unread.
+        l.wrote_for(3000);
+        assert_eq!(l.next_deadline_ms(), 1100 + 3000, "the ordinary ping");
+        assert_eq!(l.tick_at(3149, &mut out), Health::Ok);
+        l.heard = 4140;
+        assert_eq!(l.tick_at(4149, &mut out), Health::Ok);
+        // The PONG, read once the terminal drained, answers it.
+        l.pong(1100);
+        assert_eq!(l.probe, None);
+        assert_eq!(l.tick_at(4200, &mut out), Health::Ok);
+
+        // A link that is really gone is still given up on, once the time
+        // the terminal took is over.
+        let mut l = liveness(1000, 3000, 10_000);
+        l.netcheck_at(1100, &mut out);
+        l.wrote_for(3000);
+        l.heard = 4140;
+        assert_eq!(l.tick_at(4150, &mut out), Health::Dead);
+
+        // And the dead interval bounds it whatever the terminal did.
+        let mut l = liveness(1000, 3000, 300);
+        l.netcheck_at(1050, &mut out);
+        l.wrote_for(60_000);
+        assert_eq!(l.tick_at(1300, &mut out), Health::Dead);
     }
 
     /// The change's deadline never outlives the dead interval: a machine
