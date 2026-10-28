@@ -20,11 +20,16 @@
 //! A copy between two hosts runs both endpoints remotely, one on each,
 //! and [`relay`] splices their links here (§5.6).
 //!
+//! A remote source may hold wildcards, which `acs _cp` expands itself
+//! ([`glob`]): there is no remote shell (decision 4).
+//!
 //! Built so far: phases 1–3 of the design's plan (§12) — the protocol,
 //! the two endpoints, local copies, uploads and downloads with one host,
-//! and resume — and phase 5's relay between two hosts.
+//! and resume — and phase 5: the relay between two hosts and remote
+//! wildcards.
 
 pub mod cli;
+pub mod glob;
 pub mod progress;
 pub mod proto;
 pub mod receiver;
@@ -391,10 +396,11 @@ pub fn receive(link: &UnixStream, opts: &Options) -> Outcome {
     r.outcome(res.err().map(Stop::message))
 }
 
-/// The names `sources` are copied under: the top-level names their
-/// receiver is to accept.
+/// The names `sources` are copied under, as the top-level names their
+/// receiver is to accept: each a pattern matching only itself, so a file
+/// called `[x]` is not read as a wildcard (ACSCP_DESIGN §5.4).
 fn names(sources: &[(String, PathBuf)]) -> Vec<String> {
-    sources.iter().map(|(n, _)| n.clone()).collect()
+    sources.iter().map(|(n, _)| glob::literal(n)).collect()
 }
 
 /// The `HELLO` that asks the far end to be `role` (ACSCP_DESIGN §5.2): a
@@ -417,7 +423,8 @@ pub fn hello(role: Role, target: &str, paths: Vec<String>, opts: &Options) -> Ve
 
 /// The name a download of the remote `path` arrives under, which is the
 /// one top-level name its receiver accepts for it (ACSCP_DESIGN §5.4):
-/// the last component as typed. `None` where only the remote could say —
+/// the last component as typed — a pattern, if it is one, that the far
+/// end's names must match ([`glob`]). `None` where only the remote could say —
 /// the home directory, `..`, `/` — and the request is refused rather than
 /// any name the far end chose accepted.
 pub fn wanted_name(path: &str) -> Option<String> {
@@ -645,7 +652,9 @@ fn copy_remote(a: &CopyArgs, opts: &Options) -> Result<Outcome, u8> {
                 paths.push(r.path.clone());
                 wanted.push(n);
             }
-            if paths.len() > 1 && !target.is_dir() {
+            // A wildcard may match several: the target must hold them.
+            let several = paths.len() > 1 || paths.iter().any(|p| glob::is_pattern(p));
+            if several && !target.is_dir() {
                 note_on(&target.display().to_string(), "not a directory");
                 return Err(code::ERROR);
             }

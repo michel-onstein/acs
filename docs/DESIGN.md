@@ -2299,8 +2299,8 @@ their YAML shape:
   (`it is set in /etc/acs/config.yaml:1 (use --global)`).
 - `config` is a reserved **first** argument (as are `upgrade`, §7.5,
   `list`, §7, and `cp`, for copying files: local copies, uploads,
-  downloads with resume, and copies between two hosts relayed through the
-  client, decision 15). A
+  downloads with resume, copies between two hosts relayed through the
+  client, decision 15, and remote wildcards, decision 16). A
   host literally called `config` (or `upgrade`, `list` or `cp`) is reached
   as `user@config`, or with any option before it (`acs -p 22 config`);
   `acs list list` lists a host called `list`. The binary run under the name
@@ -2761,15 +2761,15 @@ affected by someone else's install.
 
 | Target | Slim | Complete |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 1122 KB | 2.25 MB |
-| `aarch64-unknown-linux-musl` | 996 KB | 2.13 MB |
-| `aarch64-apple-darwin` | 841 KB | 1.95 MB |
-| `x86_64-apple-darwin` | 919 KB | 2.06 MB |
+| `x86_64-unknown-linux-musl` | 1137 KB | 2.28 MB |
+| `aarch64-unknown-linux-musl` | 1008 KB | 2.15 MB |
+| `aarch64-apple-darwin` | 841 KB | 1.99 MB |
+| `x86_64-apple-darwin` | 932 KB | 2.09 MB |
 
-The payload set (both Linux builds, gzip'd) is 1129 KB. Measured 2026-10-28
-with the copy's phases 1–4 (`src/cp`: the local copy, `acs _cp`, resume and
-redial; the `acscp` link) and the part's lock (acs-hofu.13) in release
-builds. The
+The payload set (both Linux builds, gzip'd) is 1143 KB. Measured 2026-10-28
+with the copy's phases 1–5 (`src/cp`: the local copy, `acs _cp`, resume and
+redial; the `acscp` link; the relay between two hosts and remote wildcards)
+and the part's lock (acs-hofu.13) in release builds. The
 budget `cargo xtask dist` enforces is slim ≤ 1.15 MB and complete ≤ 2.3 MB
 (goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them, and
 from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9): built into a
@@ -2913,6 +2913,24 @@ the splice loop and the grouping of sources by host, inlined into the
 copy's `main`; the meter's headers are a list rather than a map, since a
 window holds 64 at most, which kept a second `HashMap` instance out
 (1.2 KB). aarch64 macOS moves in whole pages again.
+
+**Phase 5b** (acs-hofu.7: remote wildcards, decision 16), measured with
+`cargo xtask dist` against 803f645, the release with the relay:
+
+| Target | Slim | Wildcards | Copy role | Complete | Wildcards | Copy role |
+| --- | --- | --- | --- | --- | --- | --- |
+| `x86_64-unknown-linux-musl` | 1,137,144 B | +5,328 B | 89,552 B | 2,280,028 B | +10,756 B | 179,739 B |
+| `aarch64-unknown-linux-musl` | 1,008,184 B | +4,496 B | 75,288 B | 2,151,068 B | +9,924 B | 165,475 B |
+| `aarch64-apple-darwin` | 840,800 B | +32 B | 66,752 B | 1,985,136 B | +16,448 B | 132,080 B |
+| `x86_64-apple-darwin` | 931,536 B | +4,112 B | 78,344 B | 2,090,816 B | +12,400 B | 173,824 B |
+
+The copy role is now 89,552 B of x86_64 slim's 100 KB, leaving about
+10.4 KB for phase 6, with 12.9 KB of slim room and 20.0 KB of complete
+room left on x86_64 Linux. The matcher is hand-written — `*`, `?`,
+`[...]` and `\` over one path component, with `*`'s backtracking kept to
+one saved position — rather than a crate; the rest is the component walk
+that expands a pattern on the far end, which reuses the walk's byte-order
+sort. aarch64 macOS moves in whole pages again.
 
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
@@ -3132,3 +3150,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 13 | The copy's size budget (acs-hofu.11) | Decided by the maintainer 2026-10-28: the copy role (`acscp`, `acs cp`, `acs _cp`; ACSCP_DESIGN decision 13, goal 7) may cost **100 KB of the x86_64 musl slim build**, replacing 50 KB. Phases 1 and 2 measured 56,840 B against the old 50,000 B, with no single cheap trim left to close the gap; the larger figure lets the copy ship in release builds (acs-hofu.3) and leaves about 43 KB for phase 3's resume and redial. The overall budget (slim ≤ 1.15 MB, complete ≤ 2.3 MB, goal 2) is unchanged and still holds with the copy in (§8.1) |
 | 14 | Two copies writing one part (acs-hofu.13) | Decided 2026-10-28: **one writer per `.<name>.acscp-part`, by an exclusive `flock`**. A lost link's `acs _cp` lives on until its own liveness ends it (`ACS_DEAD_MS`), still writing what reached it, while the redial's `acs _cp` opens the same part to resume it; two writers would leave bytes past the hashed prefix that nothing re-checks. A receiver takes the part's lock before it measures it and holds it until the file is renamed or given up; a redial's receiver that finds it held answers nothing for that file — the sender's window carries the rest on — and tries again every 100 ms, then measures and hashes what the old one left. Locked, the part must still be the file at its name, or it was renamed into place or removed by its last holder and is opened again. Past twice `ACS_DEAD_MS` the file fails `in use by another copy` and the part is left to its holder; a filesystem without `flock` is written as before. Chosen over having the old end close the part on a lost link: nothing makes the old end learn of the loss before the client redials — the client redials at once on its own detection, which may come first — so only the new end can be made to wait, and the lock also keeps two concurrent `acscp` runs of one file apart |
 | 15 | A copy between two hosts (acs-hofu.6) | Decided 2026-10-28, carrying out ACSCP_DESIGN §5.6 and its decision 10: `acscp h1:a h2:b` dials an `acs _cp` receiver on `h2`, then a sender on `h1`, and `cp::relay` splices their frames, as `scp -3` routes a copy through the local machine. Nothing in the middle opens a file. **Each frame is decoded on its way through**, which is the receiver's own check that a name is one path component, so a `..` or `/` from the source host ends the copy before the target host sees it; the top-level names asked for are the target's receiver's to enforce, as it holds the list (ACSCP_DESIGN §5.4). Each end may send only its own direction's messages after its `WELCOME` — a receiver that sends a `FILE` is a protocol error — and `PING`/`PONG` are each link's own, with each link's own liveness; a side held back because the other's queue is full is not blamed for its silence. A lost link ends the copy, saying it does not reconnect: §7's redial wants an endpoint to resume from, and the relay is neither. The part stays on the target host, and the same command run again resumes it, since the receiver's `HAVE` and the sender's `RESTART` pass through like any frame. A sender's end of output after its `END` is no loss — only the receiver's `DONE` is still owed. Sources on several hosts are one relay per source host, in the order the command line names them; a source may be on the target's own host. Several sources in all need the target to be a directory, which the target's `WELCOME` says (each relay's receiver is told only its own host's names). The install's once-per-process guard is per destination (ACSCP_DESIGN §10.3 item 7), so two fresh hosts are each installed on their own connection. Local and remote sources together, and downloads from several hosts, stay refused |
+| 16 | Remote wildcards (acs-hofu.7) | Decided 2026-10-28, carrying out ACSCP_DESIGN §5.4 and its decision 4: `acscp 'host:logs/*.gz' .` is expanded by **`acs _cp` itself**, since nothing goes through a shell after the prelude. A path component is a pattern when it holds `*`, `?` or `[`; `*` is any run, `?` one character, `[abc]`/`[a-z]`/`[!…]`/`[^…]` one in or out of a set, `\` takes the next character literally, and a `[` with no `]` is itself. A name beginning with `.` is matched only by a pattern that begins with one, as a shell's glob does. Every component may be a pattern; the far end walks them one directory at a time, in byte order, and a pattern that matches nothing is a `SKIP` saying `no match`. A component with no wildcard is a plain name, compared as it is. **The receiver admits at the top level any name the last component matches** — the check modern `scp` makes — so a far end answering `logs/*.gz` with `.bashrc` is refused as before; nesting is still only by `DIR`. An upload's names are sent to the receiver escaped (`glob::literal`), so a file called `[x]` matches only itself. A wildcard source needs the target to be a directory, as several sources do — checked before the dial for a download, from the target's `WELCOME` for a copy between two hosts, where the source host expands it and the target host's receiver admits by it. A remote path meant literally that holds a wildcard character is written with `\` before it, as for `scp` |

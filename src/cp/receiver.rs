@@ -4,7 +4,8 @@
 //! - **Names** are single components (checked as the frame is decoded),
 //!   nesting is only by `DIR`/`DIR_END`, so the current directory is
 //!   always inside the target, and at the top level only the names asked
-//!   for are accepted — CVE-2019-6111's lesson.
+//!   for are accepted — CVE-2019-6111's lesson — or, for a wildcard, the
+//!   names it matches.
 //! - **Placement**: one source into anything but a directory becomes that
 //!   path; otherwise each source goes inside the target, which must then
 //!   be an existing directory (`ERROR` before any data if several sources
@@ -311,7 +312,7 @@ impl Receiver {
         match self.levels.last() {
             Some(Level::Refused) => Ok(None),
             Some(Level::Dir(i)) => Ok(Some((self.dirs[*i].path.join(name), Some(*i)))),
-            None if !self.names.iter().any(|n| n == name) => {
+            None if !self.names.iter().any(|n| super::glob::accepts(n, name)) => {
                 Err("refused: not a name that was asked for".into())
             }
             None if self.target_is_dir => Ok(Some((self.target.join(name), None))),
@@ -1017,6 +1018,31 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["notes.txt"]);
+    }
+
+    /// A wildcard asked for admits at the top level the names it matches
+    /// and nothing else — not a hidden name, not one inside another
+    /// directory's worth — and only at the top level (§5.4).
+    #[test]
+    fn a_wildcard_admits_only_the_names_it_matches() {
+        let t = TempDir::new();
+        let (mut rx, r) = Rx::new(t.path(), &["*.gz", "notes.txt"]);
+        r.unwrap();
+        rx.file(1, "a.gz", b"a").unwrap();
+        rx.file(2, ".bashrc", b"evil").unwrap();
+        rx.file(3, "b.txt", b"evil").unwrap();
+        rx.file(4, "notes.txt", b"n").unwrap();
+        rx.send(Msg::End).unwrap();
+        let a = rx.answers();
+        assert_eq!(a[1..3], ["GO 1 0", "OK 1"], "{a:?}");
+        assert!(a[3].starts_with("FAIL 2 refused"), "{a:?}");
+        assert!(a[4].starts_with("FAIL 3 refused"), "{a:?}");
+        let mut names: Vec<_> = std::fs::read_dir(t.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.gz", "notes.txt"]);
     }
 
     #[test]

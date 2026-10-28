@@ -228,6 +228,7 @@ acs cp notes.txt devbox:                 upload into the home directory
 acs cp -r project devbox:src/            a directory, recursively
 acs cp devbox:/var/log/syslog devbox:a.txt .    download, several sources from one host
 acs cp -r devbox:project nas:backup/     between two hosts, through this machine
+acs cp 'devbox:logs/*.gz' .              a wildcard, expanded on the host
 ```
 
 The same binary run as `acscp` is `acs cp`, a drop-in for `scp`.
@@ -267,9 +268,17 @@ another, and the target's host may be one of them. Such a copy does not
 reconnect: a lost link ends it and says so, and running the same command
 again goes on from the part already on the target.
 
-Not built yet: local and remote sources in one copy, downloads from
-several hosts at once, and wildcards in a remote path — name each remote
-file.
+A remote path may hold wildcards — quote it, so your own shell leaves it
+alone. There is no shell on the far end either: acs expands `*`, `?` and
+`[...]` there itself, in any component of the path, and a name beginning
+with `.` only for a pattern that does. The files that arrive must match the
+pattern, as `scp` checks; a pattern matching nothing is reported, and one
+into what is not a directory is refused. A remote name that holds one of
+those characters literally is written with a `\` before it
+(`'devbox:report\[1].pdf'`).
+
+Not built yet: local and remote sources in one copy, and downloads from
+several hosts at once.
 
 ### ssh options
 

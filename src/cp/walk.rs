@@ -109,7 +109,7 @@ pub fn check_source(path: &Path, recursive: bool) -> Result<String, String> {
 /// Sorted as [`sort_key`]s: the binary keeps the one `Vec<String>` sort it
 /// already has rather than gain a second, some 3 KB, for `OsString`
 /// (DESIGN §8.1).
-fn sorted_names(path: &Path) -> std::io::Result<Vec<OsString>> {
+pub(super) fn sorted_names(path: &Path) -> std::io::Result<Vec<OsString>> {
     let mut keys = Vec::new();
     for e in std::fs::read_dir(path)? {
         keys.push(sort_key(&e?.file_name()));

@@ -340,6 +340,100 @@ fn hostile_names_from_the_far_end_are_refused() {
     assert_eq!(std::fs::read(out.join("notes.txt")).unwrap(), b"notes");
 }
 
+/// Names, in order, of what is in `dir`.
+fn listing(dir: &Path) -> Vec<String> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// A remote wildcard is expanded by `acs _cp` itself — there is no remote
+/// shell (ACSCP_DESIGN §5.4, decision 4): the matching files land, a
+/// hidden one only for a pattern that names the dot; a pattern matching
+/// nothing is reported; a wildcard into what is not a directory is refused
+/// before any dial; and an upload of a file whose name looks like a
+/// pattern lands under that name.
+#[test]
+fn a_remote_wildcard_fetches_the_files_it_matches() {
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    let logs = remote.home().join("logs");
+    std::fs::create_dir_all(logs.join("old")).unwrap();
+    for (name, body) in [
+        ("a.gz", &b"a"[..]),
+        ("b.gz", b"b"),
+        ("c.txt", b"c"),
+        (".h.gz", b"h"),
+        ("old/z.gz", b"z"),
+    ] {
+        std::fs::write(logs.join(name), body).unwrap();
+    }
+    let out = cp.local().join("out");
+    std::fs::create_dir(&out).unwrap();
+
+    let base = remote.connections();
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["devbox:logs/*.gz", "out"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(remote.connections(), base + 1);
+    assert_eq!(listing(&out), ["a.gz", "b.gz"]);
+    assert_eq!(std::fs::read(out.join("b.gz")).unwrap(), b"b");
+
+    // Every component may be a pattern; `?` and `[...]` as a shell's.
+    let out2 = cp.local().join("out2");
+    std::fs::create_dir(&out2).unwrap();
+    let (status, err) = run(&mut cp.cmd(
+        &remote.transport(),
+        &["devbox:l?gs/[ac].*", "devbox:~/logs/*/*.gz", "out2"],
+    ));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(listing(&out2), ["a.gz", "c.txt", "z.gz"]);
+
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["devbox:logs/*.zip", "out"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("logs/*.zip: no match"), "{err}");
+
+    let base = remote.connections();
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["devbox:logs/*.gz", "one.gz"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("not a directory"), "{err}");
+    assert_eq!(remote.connections(), base);
+
+    std::fs::write(cp.local().join("[x]"), b"x").unwrap();
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["[x]", "devbox:logs"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(std::fs::read(logs.join("[x]")).unwrap(), b"x");
+}
+
+/// CVE-2019-6111's lesson for a wildcard: a far end answering
+/// `host:logs/*.gz` may send only names the pattern matches. A hidden
+/// name, or any other, is refused and reported, and only matches land.
+#[test]
+fn a_far_end_answering_a_wildcard_with_another_name_is_refused() {
+    let t = TempDir::new();
+    let cp = Acscp::new();
+    let out = cp.local().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let mut frames = vec![welcome()];
+    frames.extend(file(1, "a.gz", b"a"));
+    frames.extend(file(2, ".bashrc", b"evil"));
+    frames.extend(file(3, "authorized_keys", b"evil"));
+    frames.extend(file(4, ".x.gz", b"evil"));
+    frames.push(Msg::End);
+    let transport = hostile(t.path(), &frames);
+    let (status, err) = run(&mut cp.cmd(&transport, &["devbox:logs/*.gz", "out"]));
+    assert_eq!(status, 1, "{err}");
+    for bad in [".bashrc", "authorized_keys", ".x.gz"] {
+        assert!(
+            err.contains(&format!("{bad}: refused: not a name that was asked for")),
+            "{bad}: {err}"
+        );
+    }
+    assert_eq!(listing(&out), ["a.gz"]);
+}
+
 /// Local and remote sources together, and downloads from several hosts,
 /// are not built: refused before anything is dialled.
 #[test]
@@ -481,6 +575,35 @@ fn a_copy_between_two_hosts_is_relayed_here() {
     assert_eq!(status, 1, "{err}");
     assert!(err.contains("two:renamed: not a directory"), "{err}");
     assert_eq!(std::fs::read(two.home().join("renamed")).unwrap(), b"notes");
+}
+
+/// A wildcard between two hosts is expanded by the source host's `acs _cp`
+/// and admitted by the target host's receiver; into what is not a
+/// directory there it is refused before any data goes (§5.4, §5.6).
+#[test]
+fn a_remote_wildcard_is_relayed_between_two_hosts() {
+    let (one, two) = (Remote::installed(), Remote::installed());
+    let w = TempDir::new();
+    let ssh = router(
+        w.path(),
+        &[("one", &one.transport()), ("two", &two.transport())],
+    );
+    let cp = Acscp::new();
+    let logs = one.home().join("logs");
+    std::fs::create_dir(&logs).unwrap();
+    for name in ["a.gz", "b.gz", "c.txt"] {
+        std::fs::write(logs.join(name), name).unwrap();
+    }
+    std::fs::create_dir(two.home().join("dst")).unwrap();
+    let (status, err) = run(&mut cp.via(&ssh, &["one:logs/*.gz", "two:dst"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(listing(&two.home().join("dst")), ["a.gz", "b.gz"]);
+    assert_eq!(std::fs::read(two.home().join("dst/b.gz")).unwrap(), b"b.gz");
+
+    let (status, err) = run(&mut cp.via(&ssh, &["one:logs/*.gz", "two:one.gz"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("two:one.gz: not a directory"), "{err}");
+    assert!(!two.home().join("one.gz").exists());
 }
 
 /// Two hosts that have never seen acs are each installed on their own

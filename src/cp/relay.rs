@@ -130,7 +130,8 @@ struct Relay {
     ended: bool,
     /// The receiver's `DONE` came and was passed on.
     done: bool,
-    /// More than one source in all: the target must be a directory.
+    /// More than one source in all, or a wildcard that may match several:
+    /// the target must be a directory.
     need_dir: bool,
     meter: Option<Progress>,
     /// The headers seen and not yet ended, for the meter: id, name and
@@ -349,7 +350,11 @@ pub(super) fn copy(a: &CopyArgs, dst: &Remote, opts: &Options) -> Result<Outcome
         outcome: Outcome::default(),
         ended: false,
         done: false,
-        need_dir: a.sources.len() > 1,
+        need_dir: a.sources.len() > 1
+            || a.sources.iter().any(|s| match s {
+                Spec::Remote(r) => super::glob::is_pattern(&r.path),
+                Spec::Local(_) => false,
+            }),
         meter: opts.meter.then(Progress::on_terminal).flatten(),
         files: Vec::new(),
         on: None,
