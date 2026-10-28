@@ -25,6 +25,12 @@ pub const T: Duration = Duration::from_secs(30);
 /// unless a test gives it one.
 pub const NO_CONFIG: &str = "/nonexistent/acs-test-config";
 
+/// A state directory that cannot exist, even for root (`/dev/null/…` is not
+/// a directory): the client remembers no alias's last host (acs-zpj), so
+/// one test's choice cannot steer another's, nor the developer's own. A
+/// test about the memory passes its own `XDG_STATE_HOME`.
+pub const NO_STATE: &str = "/dev/null";
+
 /// `acs` as a plain command (no pty), isolated from the developer's own
 /// configuration.
 pub fn acs_cmd() -> Command {
@@ -37,6 +43,7 @@ pub fn acs_cmd_as(path: &Path) -> Command {
     c.env("ACS_NO_UPDATE_CHECK", "1")
         .env("XDG_CONFIG_HOME", NO_CONFIG)
         .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+        .env("XDG_STATE_HOME", NO_STATE)
         .env("ACS_CONTROL_PERSIST", NO_MASTER);
     c
 }
@@ -998,6 +1005,7 @@ impl Client {
             .env("ACS_NO_UPDATE_CHECK", "1")
             .env("XDG_CONFIG_HOME", NO_CONFIG)
             .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+            .env("XDG_STATE_HOME", NO_STATE)
             .env("ACS_IDENTITY", "tester@local")
             // And never a shared ssh master in the developer's own
             // /tmp/acs-mux-<uid> (acs-9n3); tests/mux.rs sets its own.

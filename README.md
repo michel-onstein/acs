@@ -445,6 +445,14 @@ machine's networks goes first of all: at home on 192.168.1.0/24,
 `devbox.lan` (192.168.1.20) is used before `devbox.example.com` wherever
 it is listed — as long as it answers its ping.
 
+acs remembers which host an alias used last on the networks you are on
+(`~/.local/state/acs/aliases`), so away from home, where `devbox.lan` is
+down, the next `acs devbox` takes `devbox.example.com` as soon as it
+answers instead of waiting out `reachability_timeout` for `devbox.lan`
+every time. Back home it is `devbox.lan` again: the place is the set of
+networks, and a host ranked higher that answers again is the one used from
+the next connection on.
+
 An interface's own prefix is narrower than a site, so that match alone
 misses a host one subnet away: from 172.16.1.65/24 a host at 172.16.8.2 is
 on another network, although both are at the same site. `local_networks`
@@ -607,7 +615,7 @@ reached as `user@config`.
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |
 | `ACS_RELEASES_URL` | where `acs upgrade` and the update check look for releases (default GitHub). Must be `https`, since what is fetched is checked only against sums from the same place and is then run; `acs upgrade --allow-insecure-url` accepts another scheme. Ignored altogether when the real and effective user differ, so a `sudo` upgrade is not steered by the environment |
 | `ACS_NO_UPDATE_CHECK` | `1`: never look for a newer release |
-| `XDG_STATE_HOME` | where the update check keeps its state (default `~/.local/state`) |
+| `XDG_STATE_HOME` | where the update check and the host each alias used last keep their state (default `~/.local/state`) |
 
 ## Development
 
