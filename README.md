@@ -229,6 +229,7 @@ acs cp -r project devbox:src/            a directory, recursively
 acs cp devbox:/var/log/syslog devbox:a.txt .    download, several sources from one host
 acs cp -r devbox:project nas:backup/     between two hosts, through this machine
 acs cp 'devbox:logs/*.gz' .              a wildcard, expanded on the host
+acs cp devbox:a nas:b notes out/         two hosts and a local file at once
 ```
 
 The same binary run as `acscp` is `acs cp`, a drop-in for `scp`.
@@ -277,8 +278,12 @@ into what is not a directory is refused. A remote name that holds one of
 those characters literally is written with a `\` before it
 (`'devbox:report\[1].pdf'`).
 
-Not built yet: local and remote sources in one copy, and downloads from
-several hosts at once.
+Local and remote sources may go in one copy (`acs cp -r notes
+devbox:project .`), and a download may take sources from several hosts:
+acs copies the sources on each host in turn, one host after another, then
+the local ones. Several sources, or a wildcard, need the target to be a
+directory; that is checked before anything is written, so a refused copy
+leaves the target as it was.
 
 ### ssh options
 

@@ -434,23 +434,106 @@ fn a_far_end_answering_a_wildcard_with_another_name_is_refused() {
     assert_eq!(listing(&out), ["a.gz"]);
 }
 
-/// Local and remote sources together, and downloads from several hosts,
-/// are not built: refused before anything is dialled.
+/// A small tree under `dir/name`: a file, an empty one, and a subdirectory
+/// with a file of `seed`'s bytes.
+fn small_tree(dir: &Path, name: &str, seed: u8) -> PathBuf {
+    let t = dir.join(name);
+    std::fs::create_dir_all(t.join("sub")).unwrap();
+    std::fs::write(t.join("a"), name).unwrap();
+    std::fs::write(t.join("empty"), b"").unwrap();
+    std::fs::write(t.join("sub/b"), body(70_000, seed)).unwrap();
+    t
+}
+
+/// Local and remote sources in one copy run in parts (DESIGN decision 17):
+/// each host's sources, then the local ones, into a directory here or on
+/// a host, every tree arriving equal. Several sources into what is not a
+/// directory are refused before anything is written: here before any
+/// dial, on a host by the first part.
 #[test]
-fn mixed_sources_are_not_built_yet() {
-    let remote = Remote::installed();
+fn local_and_remote_sources_copy_together() {
+    let (one, two) = (Remote::installed(), Remote::installed());
+    let w = TempDir::new();
+    let ssh = router(
+        w.path(),
+        &[("one", &one.transport()), ("two", &two.transport())],
+    );
     let cp = Acscp::new();
-    std::fs::write(cp.local().join("a"), b"a").unwrap();
-    for args in [
-        &["devbox:a", "other:b", "."][..],
-        &["a", "devbox:b", "."],
-        &["a", "devbox:b", "other:c"],
-    ] {
-        let (status, err) = run(&mut cp.cmd(&remote.transport(), args));
-        assert_eq!(status, 2, "{args:?}: {err}");
-        assert!(err.contains("not built yet"), "{args:?}: {err}");
-    }
-    assert_eq!(remote.connections(), 0);
+    let mine = small_tree(cp.local(), "mine", 1);
+    let theirs = small_tree(&one.home(), "theirs", 2);
+    std::fs::write(one.home().join("notes.txt"), b"notes").unwrap();
+
+    // Into a directory here.
+    let out = cp.local().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let b1 = one.connections();
+    let (status, err) = run(&mut cp.via(&ssh, &["-r", "mine", "one:theirs", "out"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(one.connections(), b1 + 1);
+    assert!(tree(&mine) == tree(&out.join("mine")), "mine differs");
+    assert!(tree(&theirs) == tree(&out.join("theirs")), "theirs differs");
+
+    // Into a directory on another host.
+    std::fs::create_dir(two.home().join("dst")).unwrap();
+    let (b1, b2) = (one.connections(), two.connections());
+    let (status, err) = run(&mut cp.via(&ssh, &["-r", "one:theirs", "mine", "two:dst"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!((one.connections(), two.connections()), (b1 + 1, b2 + 2));
+    assert!(
+        tree(&mine) == tree(&two.home().join("dst/mine")),
+        "mine differs"
+    );
+    assert!(
+        tree(&theirs) == tree(&two.home().join("dst/theirs")),
+        "theirs differs"
+    );
+
+    // Into what is not a directory: nothing is written.
+    std::fs::write(cp.local().join("file"), b"file").unwrap();
+    let b1 = one.connections();
+    let (status, err) = run(&mut cp.via(&ssh, &["mine/a", "one:notes.txt", "file"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("file: not a directory"), "{err}");
+    assert_eq!(one.connections(), b1, "refused before any dial");
+    std::fs::write(two.home().join("file"), b"file").unwrap();
+    let (status, err) = run(&mut cp.via(&ssh, &["mine/a", "one:notes.txt", "two:file"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("two:file: not a directory"), "{err}");
+    assert_eq!(std::fs::read(two.home().join("file")).unwrap(), b"file");
+}
+
+/// Sources on two hosts into a directory here: one download per host, in
+/// turn, each tree arriving equal; a wildcard counts as several. Into what
+/// is not a directory it is refused before any dial.
+#[test]
+fn a_download_from_two_hosts_lands_here() {
+    let (one, two) = (Remote::installed(), Remote::installed());
+    let w = TempDir::new();
+    let ssh = router(
+        w.path(),
+        &[("one", &one.transport()), ("two", &two.transport())],
+    );
+    let cp = Acscp::new();
+    let t1 = small_tree(&one.home(), "t1", 3);
+    let t2 = small_tree(&two.home(), "t2", 4);
+    std::fs::write(one.home().join("x.gz"), b"x").unwrap();
+    let out = cp.local().join("out");
+    std::fs::create_dir(&out).unwrap();
+
+    let (b1, b2) = (one.connections(), two.connections());
+    let (status, err) = run(&mut cp.via(&ssh, &["-r", "one:t1", "two:t2", "one:*.gz", "out"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!((one.connections(), two.connections()), (b1 + 1, b2 + 1));
+    assert!(tree(&t1) == tree(&out.join("t1")), "t1 differs");
+    assert!(tree(&t2) == tree(&out.join("t2")), "t2 differs");
+    assert_eq!(std::fs::read(out.join("x.gz")).unwrap(), b"x");
+
+    let (b1, b2) = (one.connections(), two.connections());
+    let (status, err) = run(&mut cp.via(&ssh, &["one:x.gz", "two:t2/a", "new"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("new: not a directory"), "{err}");
+    assert_eq!((one.connections(), two.connections()), (b1, b2));
+    assert!(!cp.local().join("new").exists());
 }
 
 /// A fake `ssh`, written in `dir`, that runs each destination's transport
