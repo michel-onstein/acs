@@ -9,7 +9,9 @@ What the unit and integration tests cannot show is checked here: acs over a
 real ssh connection, against a real host, with real terminal programs and
 real interruptions. `scripts/e2e_ssh.sh` automates everything that can be
 automated; `scripts/test_linux.sh` covers Linux, multi-user isolation, and
-the network watcher against the real kernel.
+the network watcher against the real kernel. `scripts/test_linux.sh --only
+netns` (or `multiuser`, or any file under `tests/`) runs one of those with the
+same container and flags, which is the way to iterate on it (acs-pjk).
 
 The tests behind those two scripts — `tests/e2e_ssh.rs`,
 `tests/multiuser.rs` and `tests/netns.rs` — are `#[ignore]`, and the scripts
@@ -25,7 +27,9 @@ those tests ran.
 - Client: `dist/aarch64-apple-darwin/acs` (complete build from
   `cargo xtask dist`), macOS on Apple silicon.
 - Host: Alpine Linux container (`scripts/e2e/Dockerfile`) running OpenSSH
-  `sshd`, user `dev` accepting only a freshly generated ed25519 key, reached
+  `sshd`, users `dev` and `solo` (the user the system-wide install is
+  checked as, with no acs of its own) accepting only a freshly generated
+  ed25519 key, reached
   as `acs -F /dev/null -i <key> -p <port> … dev@127.0.0.1` (a free port docker
   picks, or `ACS_E2E_PORT`). The image sets `AllowTcpForwarding yes`, which
   Alpine ships as `no`, so that `-L` can be exercised at all; that is a test
@@ -41,6 +45,7 @@ those tests ran.
 | `-i` selects the key | same command without `-i` (`IdentitiesOnly=yes`, `BatchMode=yes`) | Pass — exit 255 without it, works with it |
 | `-L` forwards a port, and only on the session's ssh | `scripts/e2e_ssh.sh` (`e2e_14`): `acs -L <free port>:127.0.0.1:22 … dev@127.0.0.1 fwd`, the port read with a plain TCP connect, `acs list` given the same `-L` while the session holds the port, then the session's ssh killed to force a redial (2026-09-23) | Pass — the container's sshd banner comes back through the port; the `acs list` side call succeeds and its stderr never names the port, so its ssh never asked to bind it; after the redial a new ssh rebinds the port and the banner comes back |
 | The ssh master acs owns | `scripts/e2e_ssh.sh` (`e2e_15`, acs-9n3): a session, detached, then the same `acs` again; `ssh -O check` on acs's control socket between each step; then the host's `sshd-session` killed to force a redial (2026-09-23) | Pass — the detach leaves one master (`0600` socket in a `0700` directory), the reattach is served by that same pid rather than a second one, and the redial after the kill ends it (`-O check` then fails). Measured: 51 ms to `ACS-READY` cold against 13 ms on the master, over loopback where a handshake costs almost no round trips |
+| The system-wide install alone, over ssh | `scripts/e2e_ssh.sh` (`e2e_16`, acs-1gy): root puts this tree's Linux build at `/usr/local/lib/acs/<version>/acs` (root-owned, `0755` throughout), then `acs solo@127.0.0.1 sys` as a user with no acs under `$HOME`; the container's process list read while attached, and solo's `~/.local/share/acs` and `~/.local/bin` after (2026-10-27) | Pass — attaches with no "installing acs", the proxy runs as `/usr/local/lib/acs/<version>/acs _proxy …`, and solo is left with no copy and no link of its own. Shown red first by making root's binary `0775`, which the prelude refuses: solo then got a first-contact install, and its proxy ran from `/home/solo/.local/share/acs/<version>/acs` |
 | vim | `vim -u NONE -N`, then `:q` | Pass — alternate screen entered and left, exit status 0, terminal restored |
 | OSC 52 and OSC 8 | program prints a clipboard write and a hyperlink | Pass — both byte-exact at the client |
 | Kitty keyboard protocol | program pushes kitty flags; client sends Ctrl-] Ctrl-] d as `CSI 93;5u` | Pass — detaches; the pushed flags are popped on the way out |

@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+use crate::alias_memory::Memory;
 use crate::config::{format_timeout, Alias, Config, HostEntry};
 use crate::netmatch::{self, LocalNet, Network};
 
@@ -60,8 +61,22 @@ pub fn resolve(
     network: &dyn Fn() -> Network,
     log: &mut dyn FnMut(String),
 ) -> Result<Option<HostEntry>, String> {
-    let (user, alias) = split_user(name);
-    let Some(alias) = config.alias(alias) else {
+    resolve_remembering(name, config, reachable, network, None, log)
+}
+
+/// [`resolve`], with the entry used last on these networks taken as soon
+/// as it answers its own ping (acs-zpj, DESIGN §7.3): `memory` says which
+/// that was and is told the choice made, for the next time.
+pub fn resolve_remembering(
+    name: &str,
+    config: &Config,
+    reachable: Arc<Reachable>,
+    network: &dyn Fn() -> Network,
+    memory: Option<&Memory>,
+    log: &mut dyn FnMut(String),
+) -> Result<Option<HostEntry>, String> {
+    let (user, alias_name) = split_user(name);
+    let Some(alias) = config.alias(alias_name) else {
         return Ok(None);
     };
     if let Some(u) = user {
@@ -76,7 +91,17 @@ pub fn resolve(
         .then(network)
         .filter(|n| !n.local.is_empty())
         .map(|network| Locality { network, by_host });
-    pick(name, alias, user, timeout, reachable, locality, log).map(Some)
+    let memory = memory.map(|m| Remembered {
+        memory: m.clone(),
+        alias: alias_name.to_string(),
+    });
+    let how = How {
+        timeout,
+        reachable,
+        locality,
+        memory,
+    };
+    pick(name, alias, user, how, log).map(Some)
 }
 
 /// `user@host` as its login name and host, split at the last `@` as ssh
@@ -88,6 +113,35 @@ pub fn split_user(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// How an alias is resolved, besides the alias itself.
+struct How {
+    timeout: Duration,
+    reachable: Arc<Reachable>,
+    locality: Option<Locality>,
+    memory: Option<Remembered>,
+}
+
+/// Where the choice is remembered, and under which alias name — the alias
+/// itself, whoever logs in.
+#[derive(Clone)]
+struct Remembered {
+    memory: Memory,
+    alias: String,
+}
+
+impl Remembered {
+    /// Record that `ranked[k]` was chosen: remembered when it is not the
+    /// first in rank, since only then is there a wait to save; forgotten
+    /// when it is, so the next connection walks the rank as usual.
+    fn record(&self, entries: &[HostEntry], ranked: &[usize], k: usize) -> std::io::Result<()> {
+        let host = (k > 0).then(|| entries[ranked[k]].host.as_str());
+        self.memory.remember(&self.alias, host)
+    }
+}
+
+/// The pings' answers as they come in: `(entry, answered)`.
+type Answers = mpsc::Receiver<(usize, bool)>;
+
 /// The entry to use. The entries are ranked ([`rank`]); every checked host
 /// that could be chosen is pinged at once, and the k-th ranked host is taken
 /// as soon as it has answered and every one ranked before it has not — what
@@ -97,15 +151,26 @@ pub fn split_user(name: &str) -> (Option<&str>, &str) {
 /// checked host is pinged then, since the rank is known only once they are.
 /// A caller-side `local_networks` needs no lookup, so that rank is known
 /// before anything is pinged.
+///
+/// With a `memory` naming an entry used last on these networks, that entry
+/// is taken as soon as it answers, the others not waited for; the usual
+/// choice is still made from the same pings, by the same deadline, on a
+/// thread of its own, and remembered for the next time (acs-zpj). When it
+/// does not answer, the walk goes on as without it, within the same
+/// deadline.
 fn pick(
     name: &str,
     alias: &Alias,
     user: Option<&str>,
-    timeout: Duration,
-    reachable: Arc<Reachable>,
-    locality: Option<Locality>,
+    how: How,
     log: &mut dyn FnMut(String),
 ) -> Result<HostEntry, String> {
+    let How {
+        timeout,
+        reachable,
+        locality,
+        memory,
+    } = how;
     let entries: Vec<HostEntry> = alias
         .entries
         .iter()
@@ -128,48 +193,90 @@ fn pick(
             let _ = tx.send((i, reachable(&host, timeout)));
         });
     };
-    // The first unchecked entry in the rank: it is taken as soon as it is
-    // reached, so nothing ranked after it can ever be chosen.
-    let unchecked = |order: &[usize]| order.iter().position(|&i| !entries[i].reachability_check);
-    // Nothing ranked after an unchecked host can be chosen, so nothing
-    // there is pinged.
-    let candidates = |order: &[usize]| -> Vec<usize> {
-        match unchecked(order) {
-            Some(p) => order[..=p].to_vec(),
-            None => order.to_vec(),
-        }
-    };
     // Caller-side first: it is this machine's own addresses against each
     // entry's networks, so it costs no lookup and no wait.
     let mut on_net: Vec<Option<Local>> = match &locality {
         Some(l) => caller_side(&entries, &l.network),
         None => vec![None; entries.len()],
     };
-    // The whole rank, pruned or not: every entry accounts for itself under
-    // `-v`, including the ones never tried (acs-qis).
-    let ranked = match locality.as_ref().filter(|l| l.by_host) {
-        // The rank is already known: only the hosts that could be chosen
-        // are pinged.
-        None => {
-            let ranked = rank(&entries, &on_net);
-            for &i in &candidates(&ranked) {
-                if entries[i].reachability_check {
-                    ping(i);
-                }
+    let by_host = locality.as_ref().is_some_and(|l| l.by_host);
+    // Without host-side matching the rank is already known, and only the
+    // hosts that could be chosen are pinged; with it, every checked host
+    // is, since the rank is known only once the names resolve.
+    let known = (!by_host).then(|| rank(&entries, &on_net));
+    let pinged: Vec<usize> = match &known {
+        Some(ranked) => candidates(&entries, ranked),
+        None => (0..entries.len()).collect(),
+    };
+    pinged
+        .into_iter()
+        .filter(|&i| entries[i].reachability_check)
+        .for_each(ping);
+    drop(tx);
+    // The entry used last on these networks, while it is still one of the
+    // alias's and could be chosen at all. One ranked first is taken as
+    // soon as it answers anyway, so the memory changes nothing for it.
+    let last = memory
+        .as_ref()
+        .and_then(|m| m.memory.recall(&m.alias))
+        .and_then(|h| entries.iter().position(|e| e.host == h))
+        .filter(|&r| match &known {
+            Some(ranked) => candidates(&entries, ranked)[1..].contains(&r),
+            None => true,
+        });
+    let mut answered = vec![None; entries.len()];
+    if let (Some(r), Some(m)) = (last, &memory) {
+        let e = &entries[r];
+        log(format!(
+            "{name}: {} was used last on these networks",
+            e.host
+        ));
+        let up = !e.reachability_check || {
+            wait_for(r, &mut answered, &rx, deadline);
+            answered[r] == Some(true)
+        };
+        if up {
+            let dest = e.destination();
+            match e.reachability_check {
+                true => log(format!("{name}: {} answers ping, using {dest}", e.host)),
+                false => log(format!(
+                    "{name}: using {dest} (reachability_check is off, {})",
+                    e.origin
+                )),
             }
-            ranked
+            // Every entry accounts for itself (acs-qis), in rank order
+            // where the rank is known yet.
+            let others = known
+                .clone()
+                .unwrap_or_else(|| (0..entries.len()).collect());
+            for i in others.into_iter().filter(|&i| i != r) {
+                log(format!(
+                    "{name}: {} not waited for: {} was used last on these networks",
+                    entries[i].host, e.host
+                ));
+            }
+            let chosen = e.clone();
+            let confirm = Confirm {
+                memory: m.clone(),
+                entries,
+                on_net,
+                locality,
+                answers: rx,
+                answered,
+                deadline,
+            };
+            std::thread::spawn(move || confirm.run());
+            return Ok(chosen);
         }
-        Some(l) => {
-            for (i, e) in entries.iter().enumerate() {
-                if e.reachability_check {
-                    ping(i);
-                }
-            }
+    }
+    let ranked = match (known, &locality) {
+        (Some(ranked), _) => ranked,
+        (None, Some(l)) => {
             locate(&mut on_net, &entries, &l.network, deadline);
             rank(&entries, &on_net)
         }
+        (None, None) => rank(&entries, &on_net),
     };
-    let order = candidates(&ranked);
     for (e, local) in entries.iter().zip(&on_net) {
         match local {
             Some(Local::Host(net)) => {
@@ -182,66 +289,166 @@ fn pick(
             None => {}
         }
     }
-    drop(tx);
-    let mut answered = vec![None; entries.len()];
-    let mut tried = Vec::new();
-    let mut chosen = None;
-    for (k, &i) in order.iter().enumerate() {
-        let e = &entries[i];
-        let dest = e.destination();
-        let mut why: Vec<String> = Vec::new();
-        match on_net[i] {
-            Some(Local::Host(net)) => why.push(format!("on {net}")),
-            Some(Local::Caller(net)) => why.push(format!("this machine is on {net}")),
-            None => {}
-        }
-        if e.prefer {
-            why.push("preferred".into());
-        }
-        if !e.reachability_check {
-            why.insert(0, "reachability_check is off".into());
-            why.push(e.origin.to_string());
-            log(format!("{name}: using {dest} ({})", why.join(", ")));
-            chosen = Some(k);
-            break;
-        }
-        // An answer after the deadline counts as none.
-        while answered[i].is_none() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left) {
-                Ok((j, up)) => answered[j] = Some(up),
-                Err(_) => break,
-            }
-        }
-        if answered[i] == Some(true) {
-            let why = match why.is_empty() {
-                true => String::new(),
-                false => format!(" ({})", why.join(", ")),
-            };
-            log(format!(
-                "{name}: {} answers ping, using {dest}{why}",
-                e.host
-            ));
-            chosen = Some(k);
-            break;
-        }
-        log(format!(
-            "{name}: {} does not answer ping within {}",
-            e.host,
-            format_timeout(timeout)
-        ));
-        tried.push(e.host.clone());
-    }
+    let order = candidates(&entries, &ranked);
+    let walk = Walk {
+        entries: &entries,
+        on_net: &on_net,
+        answers: &rx,
+        deadline,
+        timeout,
+    };
+    let (chosen, tried) = walk.run(name, &order, &mut answered, log);
     // Nothing answered: every entry was tried and has its line already, and
-    // the error names them all.
+    // the error names them all. What is remembered stays: nothing answered
+    // in its place.
     let Some(k) = chosen else {
         return Err(format!(
             "no host for '{name}' is reachable (tried {})",
             tried.join(", ")
         ));
     };
-    untried(name, &entries, &ranked, k, unchecked(&ranked), log);
+    untried(
+        name,
+        &entries,
+        &ranked,
+        k,
+        unchecked(&entries, &ranked),
+        log,
+    );
+    if let Some(m) = &memory {
+        if let Err(err) = m.record(&entries, &ranked, k) {
+            log(format!(
+                "{name}: cannot remember the choice in {}: {err}",
+                m.memory.path().display()
+            ));
+        }
+    }
     Ok(entries[ranked[k]].clone())
+}
+
+/// The first unchecked entry in the rank: it is taken as soon as it is
+/// reached, so nothing ranked after it can ever be chosen.
+fn unchecked(entries: &[HostEntry], order: &[usize]) -> Option<usize> {
+    order.iter().position(|&i| !entries[i].reachability_check)
+}
+
+/// The entries that could be chosen: nothing ranked after an unchecked
+/// host can be, so nothing there is pinged.
+fn candidates(entries: &[HostEntry], order: &[usize]) -> Vec<usize> {
+    match unchecked(entries, order) {
+        Some(p) => order[..=p].to_vec(),
+        None => order.to_vec(),
+    }
+}
+
+/// Collect answers until entry `i` has one or the deadline passes. An
+/// answer after the deadline counts as none.
+fn wait_for(i: usize, answered: &mut [Option<bool>], answers: &Answers, deadline: Instant) {
+    while answered[i].is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match answers.recv_timeout(left) {
+            Ok((j, up)) => answered[j] = Some(up),
+            Err(_) => break,
+        }
+    }
+}
+
+/// What walking the rank reads.
+struct Walk<'a> {
+    entries: &'a [HostEntry],
+    on_net: &'a [Option<Local>],
+    answers: &'a Answers,
+    deadline: Instant,
+    timeout: Duration,
+}
+
+impl Walk<'_> {
+    /// Walk `order`, taking the first entry that is unchecked or has
+    /// answered once every one before it has not: its position in `order`,
+    /// and the hosts tried and passed over on the way.
+    fn run(
+        &self,
+        name: &str,
+        order: &[usize],
+        answered: &mut [Option<bool>],
+        log: &mut dyn FnMut(String),
+    ) -> (Option<usize>, Vec<String>) {
+        let mut tried = Vec::new();
+        for (k, &i) in order.iter().enumerate() {
+            let e = &self.entries[i];
+            let dest = e.destination();
+            let mut why: Vec<String> = Vec::new();
+            match self.on_net[i] {
+                Some(Local::Host(net)) => why.push(format!("on {net}")),
+                Some(Local::Caller(net)) => why.push(format!("this machine is on {net}")),
+                None => {}
+            }
+            if e.prefer {
+                why.push("preferred".into());
+            }
+            if !e.reachability_check {
+                why.insert(0, "reachability_check is off".into());
+                why.push(e.origin.to_string());
+                log(format!("{name}: using {dest} ({})", why.join(", ")));
+                return (Some(k), tried);
+            }
+            wait_for(i, answered, self.answers, self.deadline);
+            if answered[i] == Some(true) {
+                let why = match why.is_empty() {
+                    true => String::new(),
+                    false => format!(" ({})", why.join(", ")),
+                };
+                log(format!(
+                    "{name}: {} answers ping, using {dest}{why}",
+                    e.host
+                ));
+                return (Some(k), tried);
+            }
+            log(format!(
+                "{name}: {} does not answer ping within {}",
+                e.host,
+                format_timeout(self.timeout)
+            ));
+            tried.push(e.host.clone());
+        }
+        (None, tried)
+    }
+}
+
+/// After the remembered entry was taken, what the usual choice needs: the
+/// same pings, by the same deadline.
+struct Confirm {
+    memory: Remembered,
+    entries: Vec<HostEntry>,
+    on_net: Vec<Option<Local>>,
+    locality: Option<Locality>,
+    answers: Answers,
+    answered: Vec<Option<bool>>,
+    deadline: Instant,
+}
+
+impl Confirm {
+    /// Make the usual choice and remember it — so a higher-ranked host
+    /// that answers again is the one the next connection waits for. Run on
+    /// a thread of its own, which the connection does not wait for; a
+    /// process that ends first leaves the memory as it was.
+    fn run(mut self) {
+        if let Some(l) = self.locality.as_ref().filter(|l| l.by_host) {
+            locate(&mut self.on_net, &self.entries, &l.network, self.deadline);
+        }
+        let ranked = rank(&self.entries, &self.on_net);
+        let order = candidates(&self.entries, &ranked);
+        let walk = Walk {
+            entries: &self.entries,
+            on_net: &self.on_net,
+            answers: &self.answers,
+            deadline: self.deadline,
+            timeout: Duration::ZERO,
+        };
+        if let (Some(k), _) = walk.run("", &order, &mut self.answered, &mut |_| {}) {
+            let _ = self.memory.record(&self.entries, &ranked, k);
+        }
+    }
 }
 
 /// The entries the choice never reached, each with why — the rest of the
@@ -876,6 +1083,291 @@ aliases:
                 "abc: c does not answer ping within 500ms",
             ]
         );
+    }
+
+    // ---- the entry used last on these networks (acs-zpj) -------------------
+
+    /// A memory in `dir` for a machine on `nets`.
+    fn memory_at(dir: &TempDir, nets: &[&str]) -> Memory {
+        let nets: Vec<LocalNet> = nets.iter().map(|n| LocalNet::parse(n).unwrap()).collect();
+        Memory::new(dir.path().join("acs/aliases"), &nets).unwrap()
+    }
+
+    const HOME: &[&str] = &["192.168.1.5/24"];
+
+    /// [`timed`], remembering in `memory`.
+    fn remembering(
+        yaml: &str,
+        name: &str,
+        fake: &Arc<Fake>,
+        memory: &Memory,
+    ) -> (Result<String, String>, Vec<String>, Duration) {
+        let c = config(yaml);
+        let mut log = Vec::new();
+        let start = Instant::now();
+        let r = resolve_remembering(
+            name,
+            &c,
+            fake.reachable(),
+            &no_network,
+            Some(memory),
+            &mut |m| log.push(m),
+        );
+        let took = start.elapsed();
+        (r.map(|e| e.unwrap().destination()), log, took)
+    }
+
+    /// Wait for the memory to say `want` for `alias`: the confirmation
+    /// after a remembered entry was taken writes on a thread of its own.
+    fn wait_recall(memory: &Memory, alias: &str, want: Option<&str>) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while memory.recall(alias).as_deref() != want {
+            assert!(
+                Instant::now() < end,
+                "{alias} recalls {:?}, want {want:?}",
+                memory.recall(alias)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// a never answers in time, b at once: the deadline is what a
+    /// connection pays, every time, without the memory.
+    fn a_down_b_up() -> Arc<Fake> {
+        Fake::new(&[("a", 5000, true), ("b", 0, true), ("c", 0, true)])
+    }
+
+    fn abc_within(deadline: &str) -> String {
+        format!("reachability_timeout: {deadline}\n{ABC}")
+    }
+
+    #[test]
+    fn the_entry_used_last_here_is_taken_without_waiting_for_a_higher_one() {
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        let yaml = abc_within("1500ms");
+        // The first time: a is waited for, and b, the one chosen, is
+        // remembered.
+        let (r, log, took) = remembering(&yaml, "abc", &a_down_b_up(), &home);
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(log[0], "abc: a does not answer ping within 1500ms");
+        assert!(took >= Duration::from_millis(1500), "{took:?}");
+        assert_eq!(home.recall("abc").as_deref(), Some("b"));
+        // The next time b is taken as soon as it answers.
+        let (r, log, took) = remembering(&yaml, "abc", &a_down_b_up(), &home);
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(
+            log,
+            [
+                "abc: b was used last on these networks",
+                "abc: b answers ping, using b",
+                "abc: a not waited for: b was used last on these networks",
+                "abc: c not waited for: b was used last on these networks",
+            ]
+        );
+        assert!(took < Duration::from_millis(1000), "{took:?}");
+        // The confirmation finds a still down, so b stays.
+        std::thread::sleep(Duration::from_millis(1600));
+        assert_eq!(home.recall("abc").as_deref(), Some("b"));
+        // `user@abc` is the same alias, and logs in as the user given.
+        let (r, _, _) = remembering(&yaml, "you@abc", &a_down_b_up(), &home);
+        assert_eq!(r, Ok("you@b".into()));
+    }
+
+    #[test]
+    fn the_first_in_rank_is_not_remembered_and_forgets_what_was() {
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        let (r, _, _) = remembering(ABC, "abc", &Fake::up(&["b"]), &home);
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(home.recall("abc").as_deref(), Some("b"));
+        // b is down now and a, first in rank, answers: the usual walk,
+        // and nothing left to remember.
+        let (r, log, _) = remembering(ABC, "abc", &Fake::up(&["a"]), &home);
+        assert_eq!(r, Ok("a".into()));
+        assert_eq!(log[0], "abc: b was used last on these networks");
+        assert_eq!(log[1], "abc: a answers ping, using a");
+        assert_eq!(home.recall("abc"), None);
+    }
+
+    #[test]
+    fn an_entry_used_last_that_is_down_costs_nothing_beyond_the_deadline() {
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        home.remember("abc", Some("c")).unwrap();
+        // c does not answer at all now; a down, b up: the usual walk, and
+        // in one deadline, not two.
+        let fake = Fake::new(&[("a", 5000, true), ("b", 0, true), ("c", 5000, true)]);
+        let (r, log, took) = remembering(&abc_within("1s"), "abc", &fake, &home);
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(
+            log,
+            [
+                "abc: c was used last on these networks",
+                "abc: a does not answer ping within 1s",
+                "abc: b answers ping, using b",
+                "abc: c not tried: b was chosen first",
+            ]
+        );
+        assert!(took < Duration::from_millis(1900), "{took:?}");
+        assert_eq!(home.recall("abc").as_deref(), Some("b"));
+        // Nothing answering at all: the error is the usual one, and the
+        // memory stands, nothing having answered in its place.
+        let (r, _, _) = remembering(&abc_within("100ms"), "abc", &Fake::new(&[]), &home);
+        assert_eq!(
+            r,
+            Err("no host for 'abc' is reachable (tried a, b, c)".into())
+        );
+        assert_eq!(home.recall("abc").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_higher_ranked_host_back_up_is_the_one_the_next_connection_takes() {
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        home.remember("abc", Some("b")).unwrap();
+        // a is back, if slower to answer than b: this connection takes b,
+        // the one remembered, and the confirmation sees a answer.
+        let fake = Fake::new(&[("a", 200, true), ("b", 0, true)]);
+        let (r, log, _) = remembering(&abc_within("2s"), "abc", &fake, &home);
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(log[1], "abc: b answers ping, using b");
+        // a is first in rank, so the memory is forgotten: the next
+        // connection waits for a again, as without it.
+        wait_recall(&home, "abc", None);
+        let (r, log, _) = remembering(&abc_within("2s"), "abc", &fake, &home);
+        assert_eq!(r, Ok("a".into()));
+        assert_eq!(log[0], "abc: a answers ping, using a");
+        // And with b remembered but c listed... a second fallback: a down,
+        // b back, c remembered -- the confirmation remembers b.
+        home.remember("abc", Some("c")).unwrap();
+        let fake = Fake::new(&[("a", 0, false), ("b", 200, true), ("c", 0, true)]);
+        let (r, _, _) = remembering(&abc_within("2s"), "abc", &fake, &home);
+        assert_eq!(r, Ok("c".into()));
+        wait_recall(&home, "abc", Some("b"));
+    }
+
+    #[test]
+    fn a_memory_is_for_the_networks_it_was_made_on() {
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        home.remember("abc", Some("b")).unwrap();
+        // At the office b is not what was used last: a is waited for.
+        let office = memory_at(&dir, &["10.1.0.5/16"]);
+        let (r, log, took) = remembering(&abc_within("300ms"), "abc", &a_down_b_up(), &office);
+        assert_eq!(r, Ok("b".into()));
+        assert_eq!(log[0], "abc: a does not answer ping within 300ms");
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        // Remembered there too now, and home's memory is its own.
+        assert_eq!(office.recall("abc").as_deref(), Some("b"));
+        home.remember("abc", Some("c")).unwrap();
+        assert_eq!(office.recall("abc").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_memory_the_configuration_no_longer_allows_is_ignored() {
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        // An entry since removed from the alias: the usual walk, and the
+        // choice made replaces it.
+        home.remember("abc", Some("gone")).unwrap();
+        let (r, log, _) = remembering(&abc_within("200ms"), "abc", &a_down_b_up(), &home);
+        assert_eq!(r, Ok("b".into()));
+        assert!(!log.iter().any(|l| l.contains("used last")), "{log:?}");
+        assert_eq!(home.recall("abc").as_deref(), Some("b"));
+        // An entry ranked behind an unchecked one cannot be chosen, so it
+        // is not taken through the memory either.
+        let lab = "aliases:\n  lab:\n    - host: lab1\n    - host: lab2\n      \
+                   reachability_check: false\n    - host: lab3\n";
+        home.remember("lab", Some("lab3")).unwrap();
+        let (r, log, _) = remembering(lab, "lab", &Fake::up(&["lab3"]), &home);
+        assert_eq!(r, Ok("lab2".into()));
+        assert!(!log.iter().any(|l| l.contains("used last")), "{log:?}");
+    }
+
+    #[test]
+    fn an_unchecked_entry_used_last_is_taken_at_once() {
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        let lab = "reachability_timeout: 2s\naliases:\n  lab:\n    - host: lab1\n    \
+                   - host: lab2\n      reachability_check: false\n";
+        let fake = Fake::new(&[("lab1", 5000, true)]);
+        home.remember("lab", Some("lab2")).unwrap();
+        let (r, log, took) = remembering(lab, "lab", &fake, &home);
+        assert_eq!(r, Ok("lab2".into()));
+        assert!(
+            log[1].starts_with("lab: using lab2 (reachability_check is off, "),
+            "{log:?}"
+        );
+        assert_eq!(
+            log[2],
+            "lab: lab1 not waited for: lab2 was used last on these networks"
+        );
+        assert!(took < Duration::from_millis(1000), "{took:?}");
+    }
+
+    #[test]
+    fn a_memory_that_cannot_be_written_only_says_so() {
+        if crate::sys::getuid() == 0 {
+            return; // root writes through any mode
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        let state = home.path().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (r, log, _) = remembering(ABC, "abc", &Fake::up(&["b"]), &home);
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(r, Ok("b".into()));
+        let last = log.last().unwrap();
+        assert!(
+            last.starts_with(&format!(
+                "abc: cannot remember the choice in {}: ",
+                home.path().display()
+            )),
+            "{log:?}"
+        );
+        assert_eq!(home.recall("abc"), None);
+    }
+
+    #[test]
+    fn with_prefer_local_network_the_entry_used_last_does_not_wait_for_the_resolver() {
+        // devbox.lan would rank first at home, but its name takes longer
+        // than the deadline to resolve and it is down; the memory says
+        // devbox.example.com, which answers.
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        home.remember("devbox", Some("devbox.example.com")).unwrap();
+        let yaml = home_yaml_within("1s");
+        let fake = Fake::new(&[("devbox.example.com", 0, true)]);
+        let c = config(&yaml);
+        let start = Instant::now();
+        let mut log = Vec::new();
+        let r = resolve_remembering(
+            "devbox",
+            &c,
+            fake.reachable(),
+            &|| on(&["192.168.1.5/24"], HOME_NAMES, 5000),
+            Some(&home),
+            &mut |m| log.push(m),
+        );
+        assert_eq!(r.unwrap().unwrap().destination(), "devbox.example.com");
+        assert!(
+            start.elapsed() < Duration::from_millis(800),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            log[2],
+            "devbox: devbox.lan not waited for: devbox.example.com was used last on these networks"
+        );
+    }
+
+    fn home_yaml_within(deadline: &str) -> String {
+        home(&format!(
+            "    prefer_local_network: true\n    reachability_timeout: {deadline}\n"
+        ))
     }
 
     // ---- prefer_local_network, host-side (acs-sia) -------------------------

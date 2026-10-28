@@ -161,6 +161,191 @@ fn test_linux_gives_each_checkout_its_own_target_volume() {
     );
 }
 
+/// What `test_linux.sh` would do in its container: the `docker run` argv,
+/// boundaries kept, and the `cargo` calls its inner script makes when run
+/// here against fake `apk`, `adduser`, `chmod` and `cargo`.
+struct LinuxRun {
+    docker: Vec<String>,
+    cargo: Vec<String>,
+}
+
+impl LinuxRun {
+    fn volume(&self) -> &str {
+        self.docker
+            .iter()
+            .find(|a| a.starts_with("acs-linux-target"))
+            .expect("a target volume")
+    }
+}
+
+const LOGGER: &str = r#"#!/bin/sh
+echo "$(basename "$0") $* [mu=${ACS_MULTIUSER_TEST:-} ns=${ACS_NETNS_TEST:-}]" >>"$FAKE_LOG"
+"#;
+
+/// `test_linux.sh args` against a docker that only keeps its argv; `Err`
+/// with the script's output when it refused before reaching docker.
+fn try_linux_run(dir: &Path, root: &Path, args: &[&str]) -> Result<LinuxRun, std::process::Output> {
+    let bin = dir.join("linux-bin");
+    if !bin.exists() {
+        std::fs::create_dir(&bin).unwrap();
+        let fakes = [
+            ("docker", "#!/bin/sh\nprintf '%s\\0' \"$@\" >\"$ARGV\"\n"),
+            ("apk", LOGGER),
+            ("adduser", LOGGER),
+            ("chmod", LOGGER),
+            ("cargo", LOGGER),
+        ];
+        for (p, body) in fakes {
+            let f = bin.join(p);
+            std::fs::write(&f, body).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let (argv, log) = (dir.join("argv"), dir.join("linux-log"));
+    let _ = std::fs::remove_file(&argv);
+    let _ = std::fs::remove_file(&log);
+    let out = Command::new("sh")
+        .arg(root.join("scripts/test_linux.sh"))
+        .args(args)
+        .env("PATH", &path)
+        .env("ARGV", &argv)
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        assert!(!argv.exists(), "refused, but only after calling docker");
+        return Err(out);
+    }
+    let docker: Vec<String> = std::fs::read_to_string(&argv)
+        .unwrap()
+        .split('\0')
+        .map(String::from)
+        .collect();
+    let env: Vec<(String, String)> = docker
+        .windows(2)
+        .filter(|w| w[0] == "-e")
+        .map(|w| {
+            let (k, v) = w[1].split_once('=').unwrap();
+            (k.to_string(), v.to_string())
+        })
+        .collect();
+    let i = docker.iter().position(|a| a == "-euc").expect("sh -euc");
+    // The script, then `$0` and the positionals; the last split is the
+    // empty string after the final NUL.
+    let rest = &docker[i + 1..docker.len() - 1];
+    let inner = Command::new("sh")
+        .arg("-euc")
+        .args(rest)
+        .envs(env)
+        .env("PATH", &path)
+        .env("FAKE_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(
+        inner.status.success(),
+        "the container's script: {}",
+        String::from_utf8_lossy(&inner.stderr)
+    );
+    let cargo = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("cargo "))
+        .map(String::from)
+        .collect();
+    Ok(LinuxRun { docker, cargo })
+}
+
+fn linux_run(dir: &Path, root: &Path, args: &[&str]) -> LinuxRun {
+    try_linux_run(dir, root, args).unwrap_or_else(|out| {
+        panic!(
+            "test_linux.sh {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// A checkout with `tests/<name>.rs` for each name, for `--only` to find.
+fn linux_checkout(dir: &Path, tests: &[&str]) -> PathBuf {
+    let root = bare_checkout(dir, "a");
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    for t in tests {
+        std::fs::write(root.join("tests").join(format!("{t}.rs")), "").unwrap();
+    }
+    root
+}
+
+const MULTIUSER: &str = "cargo test -p acs --test multiuser -- --include-ignored \
+    --skip peer_helper --test-threads=1";
+const NETNS: &str = "cargo test -p acs --test netns -- --include-ignored \
+    --test-threads=1 --nocapture";
+
+#[test]
+fn test_linux_with_no_arguments_runs_all_three_steps() {
+    let dir = TempDir::new();
+    let root = linux_checkout(dir.path(), &[]);
+    assert_eq!(
+        linux_run(dir.path(), &root, &[]).cargo,
+        [
+            "cargo test -p acs [mu= ns=]".to_string(),
+            format!("{MULTIUSER} [mu=1 ns=]"),
+            format!("{NETNS} [mu= ns=1]"),
+        ]
+    );
+}
+
+/// acs-pjk: `--only` runs one test target, in the same container with the
+/// same volumes, and a privileged one keeps its step's environment and
+/// flags — so iterating on it is iterating on the real thing.
+#[test]
+fn test_linux_only_runs_one_target_as_the_full_run_would() {
+    let dir = TempDir::new();
+    let root = linux_checkout(dir.path(), &["netns", "multiuser", "client"]);
+    let full = linux_run(dir.path(), &root, &[]);
+    let cases: [(&[&str], String); 5] = [
+        (&["--only", "netns"], format!("{NETNS} [mu= ns=1]")),
+        (
+            &["--only", "netns", "--", "address"],
+            format!("{NETNS} address [mu= ns=1]"),
+        ),
+        (&["--only", "multiuser"], format!("{MULTIUSER} [mu=1 ns=]")),
+        (
+            &["--only", "client", "--", "--exact", "a b"],
+            "cargo test -p acs --test client -- --exact a b [mu= ns=]".to_string(),
+        ),
+        (
+            &["--platform", "linux/amd64", "--only", "lib"],
+            "cargo test -p acs --lib -- [mu= ns=]".to_string(),
+        ),
+    ];
+    for (args, want) in cases {
+        let only = linux_run(dir.path(), &root, args);
+        assert_eq!(only.cargo, [want], "{args:?}");
+        assert_eq!(only.volume(), full.volume(), "{args:?}");
+    }
+    // `a b` stayed one argument all the way to the harness.
+    let only = linux_run(dir.path(), &root, &["--only", "client", "--", "a b"]);
+    assert!(only.docker.iter().any(|a| a == "a b"), "{:?}", only.docker);
+}
+
+#[test]
+fn test_linux_refuses_a_bad_selection_before_starting_docker() {
+    let dir = TempDir::new();
+    let root = linux_checkout(dir.path(), &["netns"]);
+    for (args, said) in [
+        (&["--only", "nosuch"][..], "no tests/nosuch.rs"),
+        (&["--only", "../netns"], "takes a test name"),
+        (&["--only"], "usage"),
+        (&["--", "address"], "need --only"),
+        (&["--bogus"], "unknown argument"),
+    ] {
+        let out = try_linux_run(dir.path(), &root, args)
+            .err()
+            .unwrap_or_else(|| panic!("{args:?} was accepted"));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(said), "{args:?}: {err}");
+    }
+}
+
 /// acs-hdj4: the multi-user, netns and e2e tests are `#[ignore]`, so a plain
 /// `cargo test` counts them rather than passing them unrun. The scripts that
 /// can run them have to ask for them, or they go dark there too — counted as
@@ -169,10 +354,10 @@ fn test_linux_gives_each_checkout_its_own_target_volume() {
 fn the_container_scripts_run_the_ignored_tests() {
     let dir = TempDir::new();
     let root = checkout(dir.path(), "a");
-    let linux = run(dir.path(), &root, "test_linux.sh", &[]).join("\n");
+    let linux = linux_run(dir.path(), &root, &[]).cargo.join("\n");
     for step in [
-        "--test multiuser -- \\\n            --include-ignored --skip peer_helper",
-        "--test netns -- \\\n            --include-ignored",
+        "--test multiuser -- --include-ignored --skip peer_helper",
+        "--test netns -- --include-ignored",
     ] {
         assert!(
             linux.contains(step),

@@ -1736,6 +1736,63 @@ one of the alias's entries instead of `<name>`:
   deadline passes kills and reaps it. Once a host is chosen the others'
   pings are not waited for; they end at the deadline. `ACS_PING` names
   another program, which is how the tests avoid ICMP.
+- **The entry used last here** (acs-zpj): a higher-ranked host that is
+  down where you are — `devbox.lan` away from home — costs the whole
+  deadline on every connection, the choice waiting for its ping. So acs
+  remembers which entry it chose, per alias and **set of local networks**,
+  and on those networks takes that entry **as soon as its own ping
+  answers**, not waiting for the ones ranked before it
+  (`alias_memory.rs`, `alias::resolve_remembering`).
+  - *The place* is this machine's usable networks (`getifaddrs`, as for
+    `prefer_local_network`, or `ACS_NETWATCH_NETS` as the watcher reads
+    them), each in network form, sorted: a new lease on the same subnet is
+    the same place; a network more or less — a VPN up, a second interface
+    — is another. On no usable network nothing is remembered or recalled.
+    `user@<alias>` shares the alias's memory.
+  - *What is remembered* is the chosen entry's `host`, and only when it was
+    **not first in the rank**; a choice of the first-ranked entry forgets
+    the memory instead, since there was no wait to save. A choice made
+    without answers (none reachable) leaves it as it was.
+  - *It is still pinged*, not dialled blind: ssh to a host that is down
+    takes its `ConnectTimeout`, far longer than the wait saved. An entry
+    with `reachability_check: false` is taken at once. Every other entry is
+    still pinged, as before, by the same deadline.
+  - *The entry used last is down*: its ping fails or the deadline passes,
+    and the walk goes on as without the memory, from the same pings — so
+    it costs nothing beyond the one deadline the walk has anyway. What was
+    chosen instead is remembered.
+  - *A higher-ranked host back up*: the connection stays on the remembered
+    entry (the entries are ways to reach one machine), and the usual
+    choice is still made from the same pings, by the same deadline, on a
+    thread the connection does not wait for, and remembered — here the
+    higher-ranked host, so the next connection waits for it again. A
+    process that ends before the deadline (a short `acs list`) leaves the
+    memory as it was; the next longer one corrects it.
+  - *The configuration changed*: a remembered host that is no longer an
+    entry of the alias, or is ranked behind an unchecked one so that it
+    could not be chosen, is ignored, and the choice made replaces it.
+    Several entries with the same `host` are taken by the first of them.
+    With `prefer_local_network`, the rank waits for the names to resolve;
+    the remembered entry does not.
+  - *The file* is `$XDG_STATE_HOME/acs/aliases` (default
+    `~/.local/state/acs/aliases`): a line per memory, `alias`, `host` and
+    the networks separated by tabs, newest first, at most 64. It is a
+    hint: a line that does not parse is dropped, an unreadable file is
+    empty, and a whole new file replaces it on each change (written beside
+    it and renamed). A file that cannot be written leaves the memory as it
+    was, and `-v` says why (`cannot remember the choice in …`). Since only
+    a configured entry can be taken through it, an edited file can choose
+    among the alias's hosts and nothing else. Threads of one process
+    (`acs list` over every alias) take turns; between processes the last
+    write wins, losing at most a hint.
+  - `-v` says it: `devbox.example.com was used last on these networks`,
+    then the "using" line, then for every other entry `<host> not waited
+    for: <host> was used last on these networks` (acs-qis's one line per
+    entry). On the walk without it, the lines are the usual ones.
+  - Probing the ssh port with a TCP connect instead of ICMP would be a
+    truer signal, and would serve hosts that drop pings; it is a bead of
+    its own, acs-fbes (it needs the port, from `ssh -G`, and an answer for
+    an entry behind a `ProxyJump`).
 - The chosen entry becomes the ssh destination: `user@host` if it has a
   `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
 - **`user@<alias>`** goes through the alias the same way — same order, same
@@ -2093,6 +2150,24 @@ would not be recognised.
   30 days whose sessions have all ended are removed by the next proxy start —
   only under the user's own `~/.local/share/acs`, never in the system-wide
   `/usr/local/lib/acs`, which holds other users' versions.
+- **Old versions in `/usr/local/lib/acs` are the administrator's to remove**
+  (acs-1gy). acs never deletes there — a user cannot remove root's files,
+  and it is not ours to decide which version another user's client still
+  needs — and it does not touch those directories either, so their times
+  say when they were installed, not when they were last used. A directory
+  populated once per release therefore grows by one version each time until
+  its owner trims it: `rm -rf /usr/local/lib/acs/<version>` as root, for any
+  version no client should be on any more. Removing one is always safe. A
+  session already running keeps its binary (Linux keeps a running file
+  until its last process exits), and a client of that version still works:
+  its prelude finds nothing at either path, prints `ACS-NEED`, and the
+  client installs the version under that user's `$HOME` as on first
+  contact. `ps -eo user,args | grep /usr/local/lib/acs/` shows which
+  versions are attached at the moment, since the proxy is exec'd under the
+  path it was found at. There is no `acs prune` command to say any of this
+  at run time: pruning happens silently at a proxy start, and a message
+  there would reach every user on every connection about a directory none
+  of them can change.
 
 When the client reads `ACS-NEED`, it maps the `uname` pair to a target,
 installs a binary for it (below), and redials. Protocol versions are checked in

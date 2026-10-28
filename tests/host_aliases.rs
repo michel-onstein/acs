@@ -444,3 +444,104 @@ fn list_uses_the_chosen_hosts_key() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert_eq!(ssh.keys(), [key("devbox.example.com", &["/keys/devbox"])]);
 }
+
+// ---- the host used last on these networks (acs-zpj) -------------------------
+
+/// A state directory of the test's own, and the networks the machine is on
+/// (`ACS_NETWATCH_NETS`, which the memory reads as the watcher does).
+struct Place {
+    dir: acs::testutil::TempDir,
+}
+
+impl Place {
+    fn new(nets: &str) -> Place {
+        let p = Place {
+            dir: acs::testutil::TempDir::new(),
+        };
+        p.move_to(nets);
+        p
+    }
+
+    fn move_to(&self, nets: &str) {
+        std::fs::write(self.dir.path().join("networks"), nets).unwrap();
+    }
+
+    fn env(&self, net: &Net) -> Vec<(String, String)> {
+        let mut env = net.env(CONFIG);
+        let dir = self.dir.path();
+        env.push(("XDG_STATE_HOME".into(), dir.display().to_string()));
+        let nets = dir.join("networks").display().to_string();
+        env.push(("ACS_NETWATCH_NETS".into(), nets));
+        env
+    }
+
+    fn remembered(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("acs/aliases")).unwrap_or_default()
+    }
+}
+
+/// Start a `devbox` session, wait for each of `lines`, and end it.
+fn connect_through(remote: &Remote, env: &[(String, String)], lines: &[&str]) -> String {
+    let mut c = Client::start_env(remote, &session("devbox"), &refs(env));
+    for l in lines {
+        c.wait_for(l, T);
+    }
+    wait_up(&mut c, "s");
+    c.send(&command(b'x'));
+    c.wait(T);
+    c.text()
+}
+
+#[test]
+fn the_host_used_last_on_these_networks_is_taken_without_waiting() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.example.com"]);
+    let place = Place::new("192.168.1.5/24\n");
+    let env = place.env(&net);
+    // The first time devbox.lan is tried and passed over, and the fallback
+    // is remembered for this network.
+    connect_through(
+        &remote,
+        &env,
+        &[
+            "devbox: devbox.lan does not answer ping",
+            "devbox: devbox.example.com answers ping, using me@devbox.example.com",
+        ],
+    );
+    assert_eq!(
+        place.remembered(),
+        "devbox\tdevbox.example.com\t192.168.1.0/24\n"
+    );
+    // Now devbox.lan would take 30 s to say it is down, and the deadline
+    // is a minute: the remembered host is taken as soon as it answers, and
+    // devbox.lan is not waited for.
+    net.set_slow(&["devbox.lan"]);
+    let text = connect_through(
+        &remote,
+        &env,
+        &[
+            "devbox: devbox.example.com was used last on these networks",
+            "devbox: devbox.example.com answers ping, using me@devbox.example.com",
+            "devbox: devbox.lan not waited for: devbox.example.com was used last on these networks",
+        ],
+    );
+    assert!(!text.contains("devbox.lan does not answer"), "{text}");
+    // On another network the memory is not this one's: devbox.lan is
+    // tried again, and that network gets a memory of its own.
+    net.set_slow(&[]);
+    place.move_to("10.1.0.5/16\n");
+    let text = connect_through(
+        &remote,
+        &env,
+        &[
+            "devbox: devbox.lan does not answer ping",
+            "devbox: devbox.example.com answers ping, using me@devbox.example.com",
+        ],
+    );
+    assert!(!text.contains("used last"), "{text}");
+    assert_eq!(
+        place.remembered(),
+        "devbox\tdevbox.example.com\t10.1.0.0/16\n\
+         devbox\tdevbox.example.com\t192.168.1.0/24\n"
+    );
+}
