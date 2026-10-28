@@ -1,7 +1,8 @@
 //! `acscp` with no host in it (ACSCP_DESIGN §11): the sender and the
 //! receiver in one process over a socketpair, run as the binary under the
 //! `acscp` name, and the protocol's pipelining over a slow link.
-// The copy is in debug builds only until phase 2 (ACSCP_DESIGN §10.4).
+// The copy is in debug builds only until its size budget allows it in a
+// release (ACSCP_DESIGN §10.4, decision 13).
 #![cfg(debug_assertions)]
 
 mod common;
@@ -288,19 +289,11 @@ fn what_is_checked_before_copying() {
     assert_eq!(status, 2);
 }
 
-/// A host in the arguments is refused until the remote end exists
-/// (phase 2), before anything is dialled.
+/// `./a:b` is a local file, copied as one, not a host `.`.
 #[test]
-fn a_remote_argument_is_not_built_yet() {
+fn a_dotted_colon_path_is_local() {
     let t = TempDir::new();
-    std::fs::write(t.path().join("a"), "a").unwrap();
     let cp = Acscp::new();
-    let mut c = cp.cmd(t.path(), &["a", "box:dst"]);
-    c.env("ACS_SSH", "/nonexistent/ssh");
-    let (status, err) = run(&mut c);
-    assert_eq!(status, 2, "{err}");
-    assert!(err.contains("not built yet"), "{err}");
-    // ./a:b is a local file.
     std::fs::write(t.path().join("a:b"), "colon").unwrap();
     let (status, err) = run(&mut cp.cmd(t.path(), &["./a:b", "c"]));
     assert_eq!(status, 0, "{err}");

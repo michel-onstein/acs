@@ -1,0 +1,360 @@
+//! `acscp` with a host in it (ACSCP_DESIGN §8, §11): uploads and downloads
+//! against a fake remote — `--transport-cmd` with `common::Remote`, whose
+//! prelude execs the real `acs _cp` — first contact installing acs on the
+//! one connection, and a far end that sends names it should not.
+// The copy is in debug builds only until its size budget allows it in a
+// release (ACSCP_DESIGN §10.4, decision 13).
+#![cfg(debug_assertions)]
+
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use acs::cp::proto::{Meta, Msg};
+use acs::testutil::TempDir;
+use common::*;
+
+/// `acs` under the name `acscp`, run against `remote` from `cwd`.
+struct Acscp {
+    dir: TempDir,
+    exe: PathBuf,
+}
+
+impl Acscp {
+    fn new() -> Acscp {
+        let dir = TempDir::new();
+        let link = dir.path().join("acscp");
+        std::os::unix::fs::symlink(exe(), &link).unwrap();
+        Acscp { dir, exe: link }
+    }
+
+    /// A command copying through `transport` (the fake ssh).
+    fn cmd(&self, transport: &str, args: &[&str]) -> Command {
+        let mut c = acs_cmd_as(&self.exe);
+        c.current_dir(self.dir.path())
+            .arg("--transport-cmd")
+            .arg(transport)
+            .args(args);
+        c
+    }
+
+    fn local(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn run(c: &mut Command) -> (i32, String) {
+    let out = output_of(c);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Bytes that are not all one value, so a chunk out of place shows.
+fn body(n: usize, seed: u8) -> Vec<u8> {
+    (0..n)
+        .map(|i| (i as u32).wrapping_mul(2654435761).to_be_bytes()[0] ^ seed)
+        .collect()
+}
+
+/// Several local files to one directory on the host, and one file under a
+/// new name, each over a connection of its own and in one.
+#[test]
+fn uploads_land_on_the_host() {
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    let big = body(5 * 1024 * 1024 + 7, 1);
+    std::fs::write(cp.local().join("a"), b"alpha").unwrap();
+    std::fs::write(cp.local().join("big"), &big).unwrap();
+    std::fs::create_dir(remote.home().join("dst")).unwrap();
+
+    let base = remote.connections();
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["a", "big", "devbox:dst"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(
+        remote.connections(),
+        base + 1,
+        "several sources, one connection"
+    );
+    assert_eq!(
+        std::fs::read(remote.home().join("dst/a")).unwrap(),
+        b"alpha"
+    );
+    assert!(std::fs::read(remote.home().join("dst/big")).unwrap() == big);
+
+    // One file to a new name, relative to the home directory; and to the
+    // home directory itself.
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["a", "devbox:renamed"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(
+        std::fs::read(remote.home().join("renamed")).unwrap(),
+        b"alpha"
+    );
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["a", "devbox:"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(std::fs::read(remote.home().join("a")).unwrap(), b"alpha");
+    // No part file is left behind anywhere.
+    let names: Vec<_> = std::fs::read_dir(remote.home().join("dst"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+}
+
+/// A tree with `-r`, and several sources on one host into a directory,
+/// over one connection; `~/` and absolute paths are the host's.
+#[test]
+fn downloads_land_here() {
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    let tree = remote.home().join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("one"), b"1").unwrap();
+    std::fs::write(tree.join("sub/two"), body(70_000, 2)).unwrap();
+    std::fs::write(remote.home().join("notes.txt"), b"notes").unwrap();
+    let abs = remote.root.path().join("elsewhere.txt");
+    std::fs::write(&abs, b"absolute").unwrap();
+    let out = cp.local().join("out");
+    std::fs::create_dir(&out).unwrap();
+
+    let base = remote.connections();
+    let abs_arg = format!("devbox:{}", abs.display());
+    let (status, err) = run(&mut cp.cmd(
+        &remote.transport(),
+        &["-r", "devbox:tree", "devbox:~/notes.txt", &abs_arg, "out"],
+    ));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(
+        remote.connections(),
+        base + 1,
+        "several sources, one connection"
+    );
+    assert_eq!(std::fs::read(out.join("tree/one")).unwrap(), b"1");
+    assert!(std::fs::read(out.join("tree/sub/two")).unwrap() == body(70_000, 2));
+    assert_eq!(std::fs::read(out.join("notes.txt")).unwrap(), b"notes");
+    assert_eq!(
+        std::fs::read(out.join("elsewhere.txt")).unwrap(),
+        b"absolute"
+    );
+
+    // One file to a new local name.
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["devbox:notes.txt", "mine"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(std::fs::read(cp.local().join("mine")).unwrap(), b"notes");
+
+    // What the host cannot read is reported here and skipped, the rest
+    // copied, and the status says so.
+    let (status, err) = run(&mut cp.cmd(
+        &remote.transport(),
+        &["devbox:missing", "devbox:notes.txt", "out"],
+    ));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("acscp: missing: "), "{err}");
+
+    // Several sources into a local file is refused before any dial.
+    let base = remote.connections();
+    let (status, err) = run(&mut cp.cmd(
+        &remote.transport(),
+        &["devbox:notes.txt", "devbox:tree", "mine"],
+    ));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("not a directory"), "{err}");
+    assert_eq!(remote.connections(), base);
+}
+
+/// The name a download arrives under must be known before the far end
+/// says it: the home directory, `..` or `/` are refused, not dialled.
+#[test]
+fn a_download_needs_a_name_to_land_under() {
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    for src in [
+        "devbox:",
+        "devbox:~",
+        "devbox:~/",
+        "devbox:a/..",
+        "devbox:/",
+    ] {
+        let (status, err) = run(&mut cp.cmd(&remote.transport(), &["-r", src, "out"]));
+        assert_eq!(status, 2, "{src}: {err}");
+        assert!(err.contains("name the file or directory"), "{src}: {err}");
+    }
+    assert_eq!(remote.connections(), 0);
+}
+
+fn leftovers(remote: &Remote) -> Vec<String> {
+    let dir = remote.installed_binary(acs::VERSION);
+    std::fs::read_dir(dir.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n != "acs")
+        .collect()
+}
+
+/// The first `acscp` to a host without acs installs it and copies, on the
+/// one connection, as a session's first contact does
+/// (`tests/one_connection_install.rs`).
+#[test]
+fn first_contact_installs_acs_and_copies_on_one_connection() {
+    let remote = Remote::new();
+    let cp = Acscp::new();
+    std::fs::write(cp.local().join("a"), b"alpha").unwrap();
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["a", "devbox:"]));
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains(&format!("installed acs {} on devbox", acs::VERSION)),
+        "{err}"
+    );
+    assert_eq!(
+        remote.connections(),
+        1,
+        "first contact made more than one connection"
+    );
+    assert_eq!(std::fs::read(remote.home().join("a")).unwrap(), b"alpha");
+    assert_eq!(
+        std::fs::read(remote.installed_binary(acs::VERSION)).unwrap(),
+        std::fs::read(exe()).unwrap()
+    );
+    assert!(leftovers(&remote).is_empty(), "{:?}", leftovers(&remote));
+
+    // And from then on the host serves copies with no install.
+    let (status, err) = run(&mut cp.cmd(&remote.transport(), &["devbox:a", "back"]));
+    assert_eq!(status, 0, "{err}");
+    assert!(!err.contains("installed acs"), "{err}");
+    assert_eq!(std::fs::read(cp.local().join("back")).unwrap(), b"alpha");
+}
+
+/// `install_on_remote: false` refuses as it does for a session, with the
+/// session's message and exit code, and installs nothing.
+#[test]
+fn install_on_remote_false_refuses() {
+    let remote = Remote::new();
+    let cp = Acscp::new();
+    std::fs::write(cp.local().join("a"), b"alpha").unwrap();
+    let cfg = TempDir::new();
+    let env = config_env(cfg.path(), "install_on_remote: false\n");
+    let mut c = cp.cmd(&remote.transport(), &["a", "devbox:"]);
+    c.envs(env);
+    let (status, err) = run(&mut c);
+    assert_eq!(status, 254, "{err}");
+    assert!(
+        err.contains(&format!(
+            "acs {} is not installed on devbox (",
+            acs::VERSION
+        )),
+        "{err}"
+    );
+    assert!(err.contains("install_on_remote is false"), "{err}");
+    assert!(!remote.installed_binary(acs::VERSION).exists());
+    assert!(!remote.home().join("a").exists());
+}
+
+/// A hostile far end: a transport that answers any `HELLO` with `frames`
+/// after the marker, then reads and drops whatever comes, and ends its
+/// output once `frames` are out.
+fn hostile(dir: &Path, frames: &[Msg]) -> String {
+    let mut bytes = acs::proto::ready_line().into_bytes();
+    for m in frames {
+        m.encode(&mut bytes);
+    }
+    let file = dir.join("frames");
+    std::fs::write(&file, bytes).unwrap();
+    let script = dir.join("hostile.sh");
+    write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\ncat '{}' &\nexec cat >/dev/null\n",
+            file.display()
+        ),
+    );
+    script.display().to_string()
+}
+
+fn file(id: u32, name: &str, body: &'static [u8]) -> [Msg<'static>; 3] {
+    [
+        Msg::File {
+            id,
+            name: name.into(),
+            size: body.len() as u64,
+            meta: Meta {
+                mode: 0o644,
+                ..Meta::default()
+            },
+        },
+        Msg::Data { id, bytes: body },
+        Msg::FileEnd { id },
+    ]
+}
+
+fn welcome() -> Msg<'static> {
+    Msg::Welcome {
+        umask: 0o022,
+        target_is_dir: false,
+    }
+}
+
+/// CVE-2019-6111's lesson, on the download side: the receiver here
+/// accepts only the names it asked for, one component each. A `/` or a
+/// `..` in a name ends the copy; a top-level name not asked for — a
+/// `.bashrc` in answer to `host:notes.txt` — is refused and reported, and
+/// only what was asked for lands.
+#[test]
+fn hostile_names_from_the_far_end_are_refused() {
+    let t = TempDir::new();
+    let cp = Acscp::new();
+    let out = cp.local().join("out");
+    std::fs::create_dir(&out).unwrap();
+
+    for bad in ["../escaped", "/etc/x", "..", "a/b"] {
+        let mut frames = vec![welcome()];
+        frames.extend(file(1, bad, b"evil"));
+        frames.push(Msg::End);
+        let transport = hostile(t.path(), &frames);
+        let (status, err) = run(&mut cp.cmd(&transport, &["devbox:notes.txt", "out"]));
+        assert_eq!(status, 1, "{bad}: {err}");
+        assert!(err.contains("protocol error"), "{bad}: {err}");
+        assert!(!cp.local().join("escaped").exists());
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "{bad}");
+    }
+
+    let mut frames = vec![welcome()];
+    frames.extend(file(1, ".bashrc", b"evil"));
+    frames.extend(file(2, "other", b"evil"));
+    frames.extend(file(3, "notes.txt", b"notes"));
+    frames.push(Msg::End);
+    let transport = hostile(t.path(), &frames);
+    let (status, err) = run(&mut cp.cmd(&transport, &["devbox:notes.txt", "out"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(
+        err.contains(".bashrc: refused: not a name that was asked for"),
+        "{err}"
+    );
+    assert!(err.contains("other: refused"), "{err}");
+    let names: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["notes.txt"], "{names:?}");
+    assert_eq!(std::fs::read(out.join("notes.txt")).unwrap(), b"notes");
+}
+
+/// Two hosts, or local and remote sources together, are the relay of a
+/// later phase: refused before anything is dialled.
+#[test]
+fn two_hosts_are_not_built_yet() {
+    let remote = Remote::installed();
+    let cp = Acscp::new();
+    std::fs::write(cp.local().join("a"), b"a").unwrap();
+    for args in [
+        &["devbox:a", "other:b"][..],
+        &["devbox:a", "other:b", "."],
+        &["a", "devbox:b", "."],
+    ] {
+        let (status, err) = run(&mut cp.cmd(&remote.transport(), args));
+        assert_eq!(status, 2, "{args:?}: {err}");
+        assert!(err.contains("not built yet"), "{args:?}: {err}");
+    }
+    assert_eq!(remote.connections(), 0);
+}

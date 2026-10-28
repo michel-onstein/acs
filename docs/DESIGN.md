@@ -2812,6 +2812,32 @@ The trims, each without a change of behaviour, by what each step saved:
   by a byte scan rather than a `char` searcher, and the tenths print their
   unit themselves.
 
+**Phase 2** (acs-hofu.3: `acs _cp`, the dial, the install on the same
+connection) measured the same way at f0299a0 plus the change — the gates
+lifted for the measurement only — against the same tree with them in place:
+
+| Target | Slim, release | Slim, with the copy | Copy role | Complete, release | Complete, with the copy | Copy role |
+| --- | --- | --- | --- | --- | --- | --- |
+| `x86_64-unknown-linux-musl` | 1,046,248 B | 1,103,088 B | +56,840 B | 2,097,787 B | 2,212,459 B | +114,672 B |
+| `aarch64-unknown-linux-musl` | 931,824 B | 980,320 B | +48,496 B | 1,983,363 B | 2,089,691 B | +106,328 B |
+| `aarch64-apple-darwin` | 774,032 B | 824,064 B | +50,032 B | 1,836,640 B | 1,919,264 B | +82,624 B |
+| `x86_64-apple-darwin` | 853,184 B | 902,720 B | +49,536 B | 1,920,992 B | 2,028,752 B | +107,760 B |
+
+Every build is inside the budget, but the whole copy role is 56,840 B of
+x86_64 slim against decision 13's 50,000 B: phase 2 costs about 6,900 B
+over phase 1's 49,960 B. So the copy is still left out of release builds
+(`cfg(debug_assertions)` in `src/lib.rs`, extended to `_cp`) until the
+maintainer raises that figure or the copy is trimmed further. By `nm` on
+unstripped builds, the new code is the copy's dial (`cp::over_ssh`, 2.3 KB),
+`acs _cp` itself (inlined into `run`), and the session's install step,
+which is now one function called from two places (`ready_or_install`,
+6.2 KB) where it was inlined into the session alone — the session's side
+shrank by about as much, so the release build without the copy is only
+288 B larger than at 792c178 while the step shows in the copy's figure; the
+weekly update check and the version
+directory's touch are outlined the same way, now that each has two callers
+(1.6 KB and 0.8 KB).
+
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
 appending the trailer and the macOS builds by rebuilding with
