@@ -1472,6 +1472,44 @@ fn a_held_command_key_survives_a_redial_attempt() {
     c.wait_for("detached from devbox/hk", T);
 }
 
+/// Regression (acs-wnhd): a lone command key whose window runs out during
+/// a redial, before the WELCOME, is dropped like any key typed into a dial
+/// (DESIGN §5.2, §6.1). `serve()` released it as INPUT whether or not the
+/// link had been welcomed, so the same press reached the program or not
+/// depending on whether the window ended a few milliseconds before or
+/// after the host answered.
+///
+/// The press goes in online; the redial is held short of the remote
+/// command for longer than the window, so the window has certainly run
+/// out before the dial can be answered — the sleep is a floor, and a slow
+/// host only makes it longer. After the resume a marker line goes to `cat`,
+/// and the press must not be in front of it: neither the pty's `^]` echo
+/// nor the byte itself.
+#[test]
+fn a_command_key_expiring_in_a_redial_is_dropped() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_ESCAPE_TIMEOUT_MS", "1000"));
+    let mut c = start(&remote, "xd", "echo up; cat", &env);
+    c.wait_for("up", T);
+    c.send(&[0x1d]);
+    let dialled = remote.connections();
+    remote.hold_dial();
+    remote.cut_link();
+    remote.wait_more_connections(dialled, 1, T);
+    std::thread::sleep(Duration::from_millis(2500));
+    remote.release_dial();
+    c.wait_resumed();
+    c.send(b"mark\r");
+    c.wait_for("mark", T);
+    let text = c.text();
+    let after = &text[text.find("up").unwrap_or(0)..];
+    assert!(
+        !after.contains("^]") && !after.contains('\x1d'),
+        "the expired command key reached the program:\n{after:?}"
+    );
+}
+
 // ---- the status line over an unfinished sequence (acs-p4u) -----------------
 
 /// A program that stops in the middle of an escape sequence and stays

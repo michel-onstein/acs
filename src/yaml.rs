@@ -173,10 +173,15 @@ impl Line {
     }
 
     /// A `---` or `...` document marker: kept as written, like a comment, so
-    /// an edit does not drop it (acs-5mmu).
+    /// an edit does not drop it (acs-5mmu). A space or a tab ends the marker
+    /// (acs-u20c).
     fn marker(&self) -> bool {
         self.indent == 0
-            && (self.text == "---" || self.text.starts_with("--- ") || self.text == "...")
+            && ["---", "..."].iter().any(|m| {
+                self.text
+                    .strip_prefix(m)
+                    .is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t']))
+            })
     }
 }
 
@@ -218,7 +223,20 @@ pub fn parse(src: &str) -> Result<Document> {
         // A `---` after content, or content after a `...` that ended it, is
         // a second document.
         if line.marker() {
-            if content && text != "..." {
+            // Content on the marker line would be a top-level scalar or flow
+            // node, never the mapping a configuration is: refused, not
+            // silently kept as trivia (acs-u20c).
+            let rest = text[3..].trim_start_matches(YAML_WS);
+            if !rest.is_empty() && !rest.starts_with('#') {
+                return err(
+                    no,
+                    format!(
+                        "content after '{}' is not supported; start it on the next line",
+                        &text[..3]
+                    ),
+                );
+            }
+            if content && !text.starts_with("...") {
                 return err(no, "only one YAML document is supported");
             }
             ended = content;
@@ -1264,6 +1282,30 @@ list: [a, \"b c\", 3]
         let e = parse("a: 1\n...\nb: 2\n").unwrap_err();
         assert_eq!(e.line, 3, "{e}");
         assert!(e.msg.contains("one YAML document"), "{e}");
+    }
+
+    /// acs-u20c: a tab ends a marker as a space does, and content on the
+    /// marker line is refused with its line rather than silently ignored.
+    #[test]
+    fn a_tab_ends_a_marker_and_content_on_it_is_refused() {
+        for src in ["---\t# d\na: 1\n", "a: 1\n...\t# e\n", "--- \t# d\na: 1\n"] {
+            let d = parse(src).unwrap();
+            assert_eq!(text(get(&d.root, "a")), "1", "{src:?}");
+            assert_eq!(emit(&d), src);
+        }
+        let cases: &[(&str, usize, &str)] = &[
+            ("--- x\n", 1, "content after '---'"),
+            ("# c\n--- {a: 1}\n", 2, "content after '---'"),
+            ("---\ta: 1\n", 1, "content after '---'"),
+            ("a: 1\n...\tb\n", 2, "content after '...'"),
+        ];
+        for (src, line, want) in cases {
+            let e = parse(src).unwrap_err();
+            assert_eq!(e.line, *line, "{src:?}: {e}");
+            assert!(e.msg.contains(want), "{src:?}: {e}");
+        }
+        // Not markers: a plain scalar that starts with dashes or dots.
+        assert!(parse("---x: 1\n").unwrap().root.value.map().is_some());
     }
 
     #[test]

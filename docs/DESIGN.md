@@ -1055,6 +1055,13 @@ could not receive it; what this forwards is one escape press, no older than
 the escape window, released into a live link exactly as the online path
 would have released it.
 
+"Came back" means the `WELCOME`, not the dial. A press whose window runs out
+while a redial is still in its handshake was typed into that dial, and is
+dropped like any key typed into one (§5.2) — it is not sent as `INPUT`
+ahead of the `WELCOME` (acs-wnhd). Which side of the `WELCOME` the window
+ends on is a matter of milliseconds, so either outcome is acceptable; what
+is not is a byte reaching the program from a link that was not yet up.
+
 Command mode prints nothing on the screen — it only rings the bell (below):
 the local terminal shows only what the remote sent. The table is intended to
 grow — `r` (force redraw) and `?` (help, followed by a redraw) are obvious
@@ -1608,6 +1615,9 @@ or a tab, as YAML 1.2 says, and a leading byte-order mark is skipped; a tab
 for *indentation* is still refused, with that advice.
 The tree keeps every node's line and the comments and `---`/`...` markers
 around it, so a file rewritten by the client keeps its comments and order.
+A space or a tab ends a marker; anything but a comment after one is refused
+with its line, since it could only be a top-level scalar or flow node, never
+the mapping a configuration is.
 Measured on the release profile, a minimal load-and-dump binary grows by
 about 100 KB with `yaml-rust2` and 150 KB with `serde_yaml`, and neither
 keeps comments; the hand-written parser adds 17 KB to `acs` (slim build
