@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::cli::ClientArgs;
+use crate::cli::Connection;
 use crate::client::note;
 use crate::payload::{self, Payloads};
 use crate::sha256;
@@ -110,17 +110,17 @@ pub fn installer() -> String {
 }
 
 /// What to say when the remote lacks acs and `install_on_remote` is off.
-pub fn not_installing(args: &ClientArgs, os: &str, arch: &str) -> String {
+pub fn not_installing(conn: &Connection, os: &str, arch: &str) -> String {
     let v = crate::VERSION;
     let installer = installer();
-    let why = match &args.config.install_on_remote.origin {
+    let why = match &conn.config.install_on_remote.origin {
         Some(o) => format!(" ({o})"),
         None => String::new(),
     };
     format!(
         "acs {v} is not installed on {host} ({os} {arch}), and install_on_remote is false{why}; \
          install it there with `curl -fsSL {installer} | ACS_VERSION={v} sh`, or set install_on_remote: true",
-        host = args.transport.destination
+        host = conn.transport.destination
     )
 }
 
@@ -134,14 +134,14 @@ pub fn not_installing(args: &ClientArgs, os: &str, arch: &str) -> String {
 /// A write that fails is not reported here: the remote stopped reading,
 /// and its exit status ([`failed`]) says why far better than `EPIPE`.
 pub fn install(
-    args: &ClientArgs,
+    conn: &Connection,
     os: &str,
     arch: &str,
     sync: &str,
     to: RawFd,
     hello: &[u8],
 ) -> Result<(), String> {
-    let host = &args.transport.destination;
+    let host = &conn.transport.destination;
     if ATTEMPTED.swap(true, Ordering::SeqCst) {
         return Err(format!(
             "acs was installed on {host} but the remote still cannot run it (is $HOME the same for ssh commands?)"
