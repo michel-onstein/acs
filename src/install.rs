@@ -32,30 +32,31 @@ use crate::ssh::{sh_quote, Call};
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 /// What to send for `target`, decided from what this binary carries.
+///
+/// It borrows from the payloads rather than copying them, and the self-copy
+/// carries nothing: our own file is read only once that is the plan, and
+/// the payloads only when it is not (acs-zgof).
 #[derive(Debug, PartialEq, Eq)]
-pub enum Plan {
+pub enum Plan<'a> {
     /// Our own file, streamed as is.
-    SelfCopy { data: Vec<u8> },
+    SelfCopy,
     /// A gzip'd slim build, then the payload blob appended remotely.
     Payload {
-        gz: Vec<u8>,
-        blob: Vec<u8>,
+        gz: &'a [u8],
+        blob: &'a [u8],
         digest: [u8; 32],
     },
 }
 
-/// Decide how to install acs for `target` given our own target, our file,
-/// and the payloads we carry.
-pub fn plan(
+/// Decide how to install acs for `target` given our own target and the
+/// payloads we carry.
+pub fn plan<'a>(
     target: &str,
     own_target: &str,
-    own_file: &[u8],
-    payloads: Option<&Payloads>,
-) -> Result<Plan, String> {
+    payloads: Option<&'a Payloads>,
+) -> Result<Plan<'a>, String> {
     if target == own_target {
-        return Ok(Plan::SelfCopy {
-            data: own_file.to_vec(),
-        });
+        return Ok(Plan::SelfCopy);
     }
     if payload::is_elf_target(target) {
         if let Some(p) = payloads {
@@ -63,8 +64,8 @@ pub fn plan(
                 // `digest` is the slim build's: the finisher checks what
                 // gzip unpacked before completing it with the blob.
                 return Ok(Plan::Payload {
-                    gz: gz.to_vec(),
-                    blob: p.blob().to_vec(),
+                    gz,
+                    blob: p.blob(),
                     digest: entry.sha256,
                 });
             }
@@ -116,11 +117,14 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
     }
     let target = payload::target_for_uname(os, arch)
         .ok_or_else(|| format!("{host} runs {os} {arch}, which acs does not support"))?;
-    let own = crate::sys::self_exe()
-        .and_then(std::fs::read)
-        .map_err(|e| format!("cannot read this acs binary: {e}"))?;
-    let carried = Payloads::from_self();
-    let plan = plan(target, payload::OWN_TARGET, &own, carried.as_ref())?;
+    // A self-copy sends our file and needs no payloads; anything else
+    // needs only the payloads, which are borrowed, not copied (acs-zgof).
+    let carried = if target == payload::OWN_TARGET {
+        None
+    } else {
+        Payloads::from_self()
+    };
+    let plan = plan(target, payload::OWN_TARGET, carried.as_ref())?;
     note(&format!(
         "installing acs {} on {host} ({os} {arch})…",
         crate::VERSION
@@ -132,7 +136,10 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
     let tmp = format!("{dir}/acs.new.{token}");
     let make_dir = make_dir(acs_dir, &dir);
     match plan {
-        Plan::SelfCopy { data } => {
+        Plan::SelfCopy => {
+            let data = crate::sys::self_exe()
+                .and_then(std::fs::read)
+                .map_err(|e| format!("cannot read this acs binary: {e}"))?;
             let digest = sha256::hex(&sha256::digest(&data));
             let check = check_upload(&tmp, &digest);
             let script = format!(
@@ -142,16 +149,16 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
         }
         Plan::Payload { gz, blob, digest } => {
             let slim_digest = sha256::hex(&digest);
-            let blob_digest = sha256::hex(&sha256::digest(&blob));
+            let blob_digest = sha256::hex(&sha256::digest(blob));
             let check = check_upload(&tmp, &slim_digest);
             let script = format!(
                 "set -e; command -v gzip >/dev/null || {{ echo 'acs: the remote has no gzip' >&2; exit 3; }}; {make_dir} gzip -dc > {tmp}; {check} chmod 755 {tmp}"
             );
-            side_call(args, &script, &gz, false)?;
+            side_call(args, &script, gz, false)?;
             let script = format!(
                 "exec {tmp} _install --finish --token {token} --slim-sha256 {slim_digest} --blob-sha256 {blob_digest} --payloads"
             );
-            side_call(args, &script, &blob, true)?;
+            side_call(args, &script, blob, true)?;
         }
     }
     note(&format!("installed acs {v} on {host}"));
@@ -221,12 +228,20 @@ fn side_call(args: &ClientArgs, script: &str, input: &[u8], expect_ok: bool) -> 
         .stderr(Stdio::inherit());
     let mut child = cmd.spawn().map_err(|e| format!("cannot run ssh: {e}"))?;
     let mut stdin = child.stdin.take().unwrap();
-    let data = input.to_vec();
-    let writer = std::thread::spawn(move || {
-        let r = stdin.write_all(&data);
-        drop(stdin);
-        r
-    });
+    // A scoped thread writes `input` where it lies rather than a copy of
+    // it (acs-zgof); the scope joins it before returning.
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let r = stdin.write_all(input);
+            drop(stdin);
+            r
+        });
+        read_reply(&mut child, expect_ok)
+    })
+}
+
+/// Collect the answer to [`side_call`] and judge it.
+fn read_reply(child: &mut std::process::Child, expect_ok: bool) -> Result<(), String> {
     // Bytes, not a String: a login banner in Latin-1 or CP437 is not
     // UTF-8, and read_to_string would throw the whole reply away (acs-vdl).
     // Bounded: the finisher answers with one short line, so a host that
@@ -240,7 +255,6 @@ fn side_call(args: &ClientArgs, script: &str, input: &[u8], expect_ok: bool) -> 
     );
     let out = String::from_utf8_lossy(&buf);
     let status = child.wait().map_err(|e| e.to_string())?;
-    let _ = writer.join();
     if !status.success() {
         return Err(format!("installing acs failed ({status})"));
     }
@@ -329,37 +343,28 @@ fn finish(f: &Finish) -> Result<(), String> {
         ));
     }
     let final_path = dir.join("acs");
+    // The remote shell has checked the upload already (acs-4km); these
+    // digests are belt and braces, so they stream the file through the
+    // hash rather than holding a second copy of it (acs-zgof).
     if f.payloads {
-        // Our own file is the slim build; complete it with the blob.
-        let slim = std::fs::read(&me).map_err(|e| e.to_string())?;
-        if let Some(want) = &f.slim_sha256 {
-            if &sha256::hex(&sha256::digest(&slim)) != want {
-                let _ = std::fs::remove_file(&me);
-                return Err("the uploaded binary is corrupt (checksum mismatch)".into());
-            }
-        }
-        let mut blob = Vec::new();
-        io::stdin()
-            .read_to_end(&mut blob)
-            .map_err(|e| e.to_string())?;
-        if let Some(want) = &f.blob_sha256 {
-            if &sha256::hex(&sha256::digest(&blob)) != want {
-                let _ = std::fs::remove_file(&me);
-                return Err("the payload set does not match its checksum".into());
-            }
-        }
-        if Payloads::parse(&blob).is_none() {
-            let _ = std::fs::remove_file(&me);
-            return Err("the payload set is corrupt".into());
-        }
+        // Our own file is the slim build; complete it with the blob. What
+        // is hashed is what is copied, so nothing can change in between.
         let full = dir.join(format!("acs.full.{}", f.token));
-        write_exe(&full, &[&slim, &blob])?;
-        rename(&full, &final_path)?;
+        let mut out = create_exe(&full)?;
+        let done = complete(f, &me, &mut out);
+        drop(out);
+        if let Err(e) = done
+            .and_then(|()| set_exe_mode(&full))
+            .and_then(|()| rename(&full, &final_path))
+        {
+            let _ = std::fs::remove_file(&full);
+            return Err(e);
+        }
         let _ = std::fs::remove_file(&me);
     } else {
-        let data = std::fs::read(&me).map_err(|e| e.to_string())?;
+        let got = digest_copy(&me, &mut io::sink()).map_err(|e| e.to_string())?;
         if let Some(want) = &f.sha256 {
-            if &sha256::hex(&sha256::digest(&data)) != want {
+            if &sha256::hex(&got) != want {
                 let _ = std::fs::remove_file(&me);
                 return Err("the uploaded binary is corrupt (checksum mismatch)".into());
             }
@@ -378,20 +383,66 @@ fn finish(f: &Finish) -> Result<(), String> {
     Ok(())
 }
 
-fn write_exe(path: &Path, parts: &[&[u8]]) -> Result<(), String> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new()
+/// Write the slim build `me` and then the payload set from stdin into
+/// `out`, checking each against its digest; a mismatch removes `me`.
+fn complete(f: &Finish, me: &Path, out: &mut std::fs::File) -> Result<(), String> {
+    let got = digest_copy(me, out).map_err(|e| e.to_string())?;
+    if let Some(want) = &f.slim_sha256 {
+        if &sha256::hex(&got) != want {
+            let _ = std::fs::remove_file(me);
+            return Err("the uploaded binary is corrupt (checksum mismatch)".into());
+        }
+    }
+    let mut blob = Vec::new();
+    io::stdin()
+        .read_to_end(&mut blob)
+        .map_err(|e| e.to_string())?;
+    if let Some(want) = &f.blob_sha256 {
+        if &sha256::hex(&sha256::digest(&blob)) != want {
+            let _ = std::fs::remove_file(me);
+            return Err("the payload set does not match its checksum".into());
+        }
+    }
+    if !Payloads::is_well_formed(&blob) {
+        let _ = std::fs::remove_file(me);
+        return Err("the payload set is corrupt".into());
+    }
+    out.write_all(&blob).map_err(|e| e.to_string())?;
+    out.sync_all().map_err(|e| e.to_string())
+}
+
+/// Copy the file at `from` into `to` a buffer at a time, returning the
+/// SHA-256 of exactly what was copied.
+fn digest_copy(from: &Path, to: &mut dyn Write) -> io::Result<[u8; 32]> {
+    let mut file = std::fs::File::open(from)?;
+    let mut hash = sha256::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => return Ok(hash.finish()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hash.update(&buf[..n]);
+        to.write_all(&buf[..n])?;
+    }
+}
+
+fn create_exe(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o755)
         .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    for p in parts {
-        f.write_all(p).map_err(|e| e.to_string())?;
-    }
-    f.sync_all().map_err(|e| e.to_string())?;
-    // The mode above is masked by the remote's umask (077 leaves 0700), so
-    // set it for real, as the self-copy path does (acs-28b).
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The mode [`create_exe`] asks for is masked by the remote's umask (077
+/// leaves 0700), so set it for real, as the self-copy path does (acs-28b).
+fn set_exe_mode(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -498,13 +549,16 @@ mod tests {
 
     #[test]
     fn same_target_is_a_self_copy() {
-        let p = plan("aarch64-apple-darwin", "aarch64-apple-darwin", b"me", None).unwrap();
-        assert_eq!(
-            p,
-            Plan::SelfCopy {
-                data: b"me".to_vec()
-            }
+        let p = plan("aarch64-apple-darwin", "aarch64-apple-darwin", None).unwrap();
+        assert_eq!(p, Plan::SelfCopy);
+        // Payloads or not: our own target is always our own file.
+        let carried = blob_for("aarch64-apple-darwin", b"slim");
+        let p = plan(
+            "aarch64-apple-darwin",
+            "aarch64-apple-darwin",
+            Some(&carried),
         );
+        assert_eq!(p.unwrap(), Plan::SelfCopy);
     }
 
     #[test]
@@ -513,7 +567,6 @@ mod tests {
         match plan(
             "aarch64-unknown-linux-musl",
             "x86_64-unknown-linux-musl",
-            b"me",
             Some(&carried),
         )
         .unwrap()
@@ -521,6 +574,9 @@ mod tests {
             Plan::Payload { gz, blob, digest } => {
                 assert_eq!(gz, b"GZ");
                 assert_eq!(blob, carried.blob());
+                // acs-zgof: borrowed from the payloads, not copies of them.
+                assert_eq!(blob.as_ptr(), carried.blob().as_ptr());
+                assert!(carried.blob().as_ptr_range().contains(&gz.as_ptr()));
                 assert_eq!(digest, sha256::digest(b"slim-arm"));
             }
             other => panic!("{other:?}"),
@@ -529,15 +585,9 @@ mod tests {
 
     #[test]
     fn missing_payload_explains_how_to_get_one() {
-        let e = plan(
-            "x86_64-unknown-linux-musl",
-            "aarch64-apple-darwin",
-            b"me",
-            None,
-        )
-        .unwrap_err();
+        let e = plan("x86_64-unknown-linux-musl", "aarch64-apple-darwin", None).unwrap_err();
         assert!(e.contains("cargo xtask dist"), "{e}");
-        let e = plan("x86_64-apple-darwin", "aarch64-apple-darwin", b"me", None).unwrap_err();
+        let e = plan("x86_64-apple-darwin", "aarch64-apple-darwin", None).unwrap_err();
         assert!(e.contains("by hand"), "{e}");
     }
 
@@ -576,6 +626,29 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, "hand-installed").unwrap();
         assert!(!should_link(&link, &new, &share), "a regular file");
+    }
+
+    /// acs-zgof: the finisher's digest streams the file through the hash,
+    /// and is the digest of exactly the bytes it copied.
+    #[test]
+    fn digest_copy_hashes_what_it_copies() {
+        let d = crate::testutil::TempDir::new();
+        let f = d.path().join("acs");
+        // Not a multiple of the buffer, so the last read is a short one.
+        let data: Vec<u8> = (0..200_003u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&f, &data).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(digest_copy(&f, &mut out).unwrap(), sha256::digest(&data));
+        assert_eq!(out, data);
+        assert_eq!(
+            digest_copy(&f, &mut io::sink()).unwrap(),
+            sha256::digest(&data)
+        );
+        std::fs::write(&f, b"").unwrap();
+        assert_eq!(
+            digest_copy(&f, &mut io::sink()).unwrap(),
+            sha256::digest(b"")
+        );
     }
 
     #[test]
