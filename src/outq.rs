@@ -2,8 +2,8 @@
 //! reads its input, rather than drained from the front: `drain(..n)` after
 //! every partial write moved everything still queued down to the start —
 //! a megabyte per write, behind a slow peer (acs-m08z in the master,
-//! acs-x6os in the proxy's relay). Shared by both, and so is its
-//! non-blocking flush loop, [`OutQueue::flush`] (acs-8uxk).
+//! acs-x6os in the proxy's relay). Shared by both and by the client's link,
+//! and so is its non-blocking flush loop, [`OutQueue::flush`] (acs-8uxk).
 //!
 //! The written prefix is let go of when the queue empties — the usual case,
 //! and free — or, failing that, once it is past [`COMPACT`] and at least as
@@ -27,6 +27,15 @@ pub(crate) struct OutQueue {
 impl From<Vec<u8>> for OutQueue {
     fn from(buf: Vec<u8>) -> Self {
         OutQueue { buf, start: 0 }
+    }
+}
+
+/// What is still queued, as a buffer of its own: the dial's HELLO tail,
+/// which the link carries to `serve` (acs-8uxk).
+impl From<OutQueue> for Vec<u8> {
+    fn from(mut q: OutQueue) -> Self {
+        q.buf.drain(..q.start);
+        q.buf
     }
 }
 
@@ -181,6 +190,16 @@ mod tests {
         want.extend_from_slice(&big);
         want.extend_from_slice(b"tail");
         assert!(got == want);
+    }
+
+    /// What is left of a partly written queue converts to exactly the
+    /// unwritten bytes (the dial's HELLO tail, acs-8uxk).
+    #[test]
+    fn a_queue_converts_to_what_is_still_queued() {
+        let mut q = OutQueue::from(b"hello".to_vec());
+        q.consume(2);
+        assert_eq!(Vec::from(q), b"llo");
+        assert!(Vec::from(OutQueue::default()).is_empty());
     }
 
     /// A write that fails mid-`send` leaves the data queued for `flush`,

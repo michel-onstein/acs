@@ -366,6 +366,17 @@ impl ModeObserver {
         }
     }
 
+    /// What a stream that does not carry on is left with (acs-p4u, acs-xk4):
+    /// the open sequence ended ([`ModeObserver::interrupt_sequence`]), then
+    /// every mode seen reset ([`ModeObserver::reset_sequence`]). Written on
+    /// the way out and before another program's stream. Empty when neither
+    /// has anything to do.
+    pub fn leave_sequence(&self) -> Vec<u8> {
+        let mut out = self.interrupt_sequence().to_vec();
+        out.extend_from_slice(&self.reset_sequence());
+        out
+    }
+
     /// Bytes that return the terminal to its defaults for every mode seen.
     /// Empty when nothing needs resetting.
     pub fn reset_sequence(&self) -> Vec<u8> {

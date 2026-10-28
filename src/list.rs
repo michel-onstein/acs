@@ -330,20 +330,25 @@ fn table(head: &[&str], rows: &[Vec<String>]) -> String {
 
 /// The lines of [`table`], each ending in `\n`: the heading, then a line
 /// per row.
+///
+/// Columns are measured in terminal columns ([`crate::menu::width`]), not
+/// characters: a wide character in a cell (an identity in CJK, an emoji)
+/// would otherwise push every column after it out of line (acs-75de).
 fn table_lines(head: &[&str], rows: &[Vec<String>]) -> Vec<String> {
-    let mut width: Vec<usize> = head.iter().map(|h| h.len()).collect();
+    use crate::menu::width as cols;
+    let mut width: Vec<usize> = head.iter().map(|h| cols(h)).collect();
     for r in rows {
         for (w, c) in width.iter_mut().zip(r.iter()) {
-            *w = (*w).max(c.chars().count());
+            *w = (*w).max(cols(c));
         }
     }
     let line = |cells: &[&str]| -> String {
         let mut s = String::new();
         for (i, c) in cells.iter().enumerate() {
-            if i == cells.len() - 1 {
-                s.push_str(c);
-            } else {
-                s.push_str(&format!("{c:<w$}  ", w = width[i]));
+            s.push_str(c);
+            if i < cells.len() - 1 {
+                let pad = width[i] - cols(c) + 2;
+                s.extend(std::iter::repeat(' ').take(pad));
             }
         }
         s.trim_end().to_string() + "\n"
@@ -359,7 +364,12 @@ fn table_lines(head: &[&str], rows: &[Vec<String>]) -> Vec<String> {
 /// heading first (the session menu, DESIGN §4.4).
 pub(crate) fn lines(sessions: &[StatusInfo], now: u64) -> Vec<String> {
     let rows: Vec<Vec<String>> = sessions.iter().map(|s| cells(s, now)).collect();
-    table_lines(&HEAD, &rows)
+    unterminated(table_lines(&HEAD, &rows))
+}
+
+/// `lines` without their `\n`, for the menu.
+fn unterminated(lines: Vec<String>) -> Vec<String> {
+    lines
         .into_iter()
         .map(|mut l| {
             l.pop();
@@ -368,29 +378,33 @@ pub(crate) fn lines(sessions: &[StatusInfo], now: u64) -> Vec<String> {
         .collect()
 }
 
-/// The `acs list` table of every host's sessions under a HOST column, as
-/// lines without their `\n`: the heading, then each host's sessions in
-/// order (the session menu on every host, DESIGN §7.3).
-pub(crate) fn host_lines(hosts: &[(&str, &[StatusInfo])], now: u64) -> Vec<String> {
-    let rows: Vec<Vec<String>> = hosts
+/// Every host's sessions as rows under a HOST column, and that heading:
+/// what [`host_lines`] and [`render_all`] lay out.
+fn host_table<S: AsRef<[StatusInfo]>>(
+    hosts: &[(&str, S)],
+    now: u64,
+) -> ([&'static str; 7], Vec<Vec<String>>) {
+    let rows = hosts
         .iter()
         .flat_map(|(host, sessions)| {
-            sessions.iter().map(move |s| {
+            sessions.as_ref().iter().map(move |s| {
                 let mut row = vec![host.to_string()];
                 row.extend(cells(s, now));
                 row
             })
         })
         .collect();
-    let mut head = vec!["HOST"];
-    head.extend(HEAD);
-    table_lines(&head, &rows)
-        .into_iter()
-        .map(|mut l| {
-            l.pop();
-            l
-        })
-        .collect()
+    let mut head = ["HOST"; 7];
+    head[1..].copy_from_slice(&HEAD);
+    (head, rows)
+}
+
+/// The `acs list` table of every host's sessions under a HOST column, as
+/// lines without their `\n`: the heading, then each host's sessions in
+/// order (the session menu on every host, DESIGN §7.3).
+pub(crate) fn host_lines(hosts: &[(&str, &[StatusInfo])], now: u64) -> Vec<String> {
+    let (head, rows) = host_table(hosts, now);
+    unterminated(table_lines(&head, &rows))
 }
 
 /// The table `acs list <host>` prints.
@@ -405,21 +419,10 @@ pub fn render(host: &str, sessions: &[StatusInfo], now: u64) -> String {
 /// The table `acs list` prints: the sessions of every host that has any,
 /// under a HOST column; empty if none has.
 pub fn render_all(hosts: &[(&str, Vec<StatusInfo>)], now: u64) -> String {
-    let rows: Vec<Vec<String>> = hosts
-        .iter()
-        .flat_map(|(host, sessions)| {
-            sessions.iter().map(move |s| {
-                let mut row = vec![host.to_string()];
-                row.extend(cells(s, now));
-                row
-            })
-        })
-        .collect();
+    let (head, rows) = host_table(hosts, now);
     if rows.is_empty() {
         return String::new();
     }
-    let mut head = vec!["HOST"];
-    head.extend(HEAD);
     table(&head, &rows)
 }
 
@@ -563,6 +566,29 @@ mod tests {
              x     detached  -               0s    0s   sh\n"
         );
         assert_eq!(render("h", &[], now), "no sessions on h\n");
+    }
+
+    /// Regression (acs-75de): columns are padded by terminal columns, so a
+    /// wide identity — two columns a character — leaves IDLE and AGE in
+    /// line with the heading, where padding by characters pushed them left
+    /// by one column a wide character.
+    #[test]
+    fn a_wide_identity_keeps_the_columns_in_line() {
+        let now = 1_000_000;
+        let t = render(
+            "devbox",
+            &[
+                info("main", true, "米歇尔@mbp", 3, now - 7200, "zsh"),
+                info("2", false, "al@x", 900, now - 60, "htop"),
+            ],
+            now,
+        );
+        assert_eq!(
+            t,
+            "NAME  STATE     WHO         IDLE  AGE  COMMAND\n\
+             main  attached  米歇尔@mbp  3s    2h   zsh\n\
+             2     detached  (al@x)      15m   1m   htop\n"
+        );
     }
 
     #[test]

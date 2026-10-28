@@ -551,8 +551,9 @@ impl Menu {
     }
 }
 
-/// How many terminal columns `s` takes: see [`char_width`].
-fn width(s: &str) -> usize {
+/// How many terminal columns `s` takes: see [`char_width`]. The `acs list`
+/// table pads by it too, so the menu's rows and the table line up alike.
+pub(crate) fn width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
