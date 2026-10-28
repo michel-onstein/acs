@@ -178,15 +178,9 @@ fn write(path: &Path, lines: &[Line]) -> std::io::Result<()> {
         .parent()
         .ok_or_else(|| std::io::Error::other("no directory"))?;
     std::fs::create_dir_all(dir)?;
-    // Unpredictable, and created by us or not at all (acs-721).
-    let tmp = dir.join(format!(".aliases.{}", crate::sys::random_token()));
-    let written = crate::sys::create_new(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, format(lines).as_bytes()))
-        .and_then(|()| std::fs::rename(&tmp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    // Which hosts the user reaches from which networks: ours alone to
+    // read, whatever the umask (acs-g4uc).
+    crate::sys::write_atomic(path, 0o600, format(lines).as_bytes())
 }
 
 #[cfg(test)]

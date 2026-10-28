@@ -425,7 +425,6 @@ struct Staged {
 impl Staged {
     /// Copy `from` next to `to` under a temporary name, with `mode`.
     fn new(from: &Path, to: &Path, mode: u32) -> Result<Staged, String> {
-        use std::os::unix::fs::PermissionsExt;
         let dir = to.parent().ok_or("no directory to install into")?;
         make_dirs(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         // Created by us, or not at all: `fs::copy` opens the destination
@@ -434,10 +433,9 @@ impl Staged {
         // when the user was told to re-run under sudo (acs-721).
         let tmp = dir.join(format!(".acs.upgrade.{}", crate::sys::random_token()));
         (|| -> std::io::Result<()> {
-            let mut out = crate::sys::create_new(&tmp)?;
+            let mut out = crate::sys::create_new_mode(&tmp, mode)?;
             let mut src = std::fs::File::open(from)?;
-            std::io::copy(&mut src, &mut out)?;
-            out.set_permissions(std::fs::Permissions::from_mode(mode))
+            std::io::copy(&mut src, &mut out).map(drop)
         })()
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
@@ -495,14 +493,8 @@ fn make_dirs(dir: &Path) -> std::io::Result<()> {
 
 /// Point the symlink `link` at `target`, atomically.
 fn relink(target: &Path, link: &Path) -> Result<(), String> {
-    let dir = link.parent().ok_or("no directory for the link")?;
-    let tmp = dir.join(format!(".acs.link.{}", crate::sys::random_token()));
-    std::os::unix::fs::symlink(target, &tmp)
-        .and_then(|_| std::fs::rename(&tmp, link))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("cannot repoint {}: {e}", link.display())
-        })
+    crate::sys::symlink_atomic(target, link)
+        .map_err(|e| format!("cannot repoint {}: {e}", link.display()))
 }
 
 #[cfg(test)]
