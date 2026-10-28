@@ -2178,7 +2178,9 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   of these limits.
 - **Downloads use `curl`** (or `wget` when there is no curl, as on Alpine):
   an HTTP and TLS client of our own would cost more than the whole binary
-  (§9).
+  (§9). Either tries once (`--retry 0`, `-t 1`), so its timeout is the whole
+  wait: wget's default of 20 tries would hold the 3 s update check for a
+  minute against a refused connection (acs-q6ey).
 - **Decisions**: a newer release installs; the same version does nothing; a
   client newer than the latest release does nothing unless `--version` asks
   for that release, which is how to downgrade. `--check` only reports.
