@@ -63,8 +63,12 @@ impl Host {
     }
 
     fn client(&self, session: &str, cmd: &str, env: &[(&str, &str)]) -> Client {
+        self.client_as("dev", session, cmd, env)
+    }
+
+    fn client_as(&self, user: &str, session: &str, cmd: &str, env: &[(&str, &str)]) -> Client {
         let mut args = self.ssh_args();
-        args.push("dev@127.0.0.1".into());
+        args.push(format!("{user}@127.0.0.1"));
         args.push(session.into());
         if !cmd.is_empty() {
             args.extend(["--", "/bin/sh", "-c", cmd].map(String::from));
@@ -76,6 +80,20 @@ impl Host {
     fn docker(&self, args: &[&str]) {
         let st = Command::new("docker").args(args).status().unwrap();
         assert!(st.success(), "docker {args:?}");
+    }
+
+    /// `sh -c script` in the container, as root; its stdout.
+    fn root_sh(&self, script: &str) -> String {
+        let out = Command::new("docker")
+            .args(["exec", &self.container, "sh", "-c", script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "in the container: {script}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 }
 
@@ -736,4 +754,64 @@ fn e2e_15_a_shared_master_carries_the_second_connection_and_dies_with_the_link()
         "VERIFIED shared ssh master over ssh: {pid} carried the reattach, \
          socket 0600 in a 0700 directory, ended with the lost link"
     );
+}
+
+/// The system-wide install alone (acs-1gy): `solo` has nothing under its
+/// `$HOME`, and root has put this version at `/usr/local/lib/acs/<v>/acs`,
+/// as an administrator following DESIGN §8 would. The dial must attach on
+/// root's copy with no first-contact install and leave no second copy
+/// behind. The binary is the Linux build from this same `dist/`, so the test
+/// does not lean on `e2e_01` having installed one for `dev`.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn e2e_16_the_system_wide_install_alone_attaches_without_installing() {
+    let h = host();
+    let v = acs::VERSION;
+    let arch = h.root_sh("uname -m").trim().to_string();
+    let linux = std::path::Path::new(&h.client)
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .join(format!("{arch}-unknown-linux-musl/acs"));
+    assert!(linux.is_file(), "no Linux build for the host at {linux:?}");
+    let system = format!("/usr/local/lib/acs/{v}");
+    h.root_sh(&format!("mkdir -p {system}"));
+    h.docker(&[
+        "cp",
+        linux.to_str().unwrap(),
+        &format!("{}:{system}/acs", h.container),
+    ]);
+    // Root's, and writable by nobody else: what the prelude accepts.
+    h.root_sh(&format!(
+        "chown -R root:root /usr/local/lib/acs \
+         && chmod 755 /usr/local/lib/acs {system} {system}/acs"
+    ));
+    let own = "ls -A /home/solo/.local/share/acs /home/solo/.local/bin 2>/dev/null; true";
+    assert_eq!(
+        h.root_sh(own).trim(),
+        "",
+        "solo starts with an acs of its own"
+    );
+
+    let mut c = h.client_as("solo", "sys", "echo \"up-as-$(id -un)\"; sleep 60", &[]);
+    c.wait_for("up-as-solo", T);
+    // The prelude `exec`s the binary it picked as the proxy, so the path it
+    // picked is in solo's process list.
+    let ps = h.root_sh("ps -o user,args");
+    assert!(
+        ps.lines()
+            .any(|l| l.trim_start().starts_with("solo")
+                && l.contains(&format!("{system}/acs _proxy"))),
+        "no process of solo's runs {system}/acs:\n{ps}"
+    );
+    c.send(&command(b'x'));
+    c.wait(T);
+    let text = c.text();
+    assert!(!text.contains("installing acs"), "{text}");
+    assert!(!text.contains("installed acs"), "{text}");
+    // No second copy and no `~/.local/bin` link; and the proxy's version
+    // housekeeping, which only ever touches the user's own versions
+    // directory, made none either.
+    assert_eq!(h.root_sh(own).trim(), "", "solo got an acs of its own");
+    eprintln!("VERIFIED the system-wide install alone attaches over ssh, installing nothing");
 }
