@@ -1184,44 +1184,54 @@ fn a_change_the_rate_limit_suppressed_is_offered_again() {
     );
 }
 
+/// The client's arguments for a session `name` running a program that
+/// reads lines and says what it got, under `-v`, which the network tests
+/// read the watcher's decisions off.
+fn echoing(name: &str) -> Vec<&str> {
+    vec![
+        "-v",
+        "devbox",
+        name,
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo up; while read l; do echo got:$l; done",
+    ]
+}
+
+/// The environment of a handshake test: `watch`'s stand-ins, no offline
+/// wait to read a hint in its place (the free first redial goes at once,
+/// acs-iyq, and the one after it waits two minutes), and a dial timeout
+/// of two minutes — four times `T`, so a client that waited one out
+/// cannot pass anything here.
+fn handshake_env(watch: &NetWatch) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
+        ("ACS_DIAL_TIMEOUT_MS".to_string(), "120000".to_string()),
+    ];
+    env.extend(watch.env());
+    env
+}
+
 /// Regression (acs-0n8), the other drop path: a change that arrives between
-/// the dial and the `WELCOME` is not spent either.
+/// the dial and the `WELCOME` is not spent either — when it is one the
+/// handshake lets pass (acs-xo1): a network that appeared beside the one
+/// the dial was made from leaves the dial's own address where it was.
 ///
 /// The host accepts the connection, prints its marker and then says nothing
 /// (as `a_silent_host_is_given_up_on` uses it), so the client sits in the
 /// handshake with a generous dial timeout — long enough that nothing here
-/// is racing it. There the netwatch descriptor is polled and the hint is
-/// read, and **that is all that happens**: acting on it is acs-xo1, which
-/// has the blocking dial to deal with and is still open. What this asserts
-/// is only that the hint is not thrown away, and the connection count says
-/// the dial was neither abandoned nor replaced.
+/// is racing it. The connection count says the dial was neither abandoned
+/// nor replaced.
 ///
 /// Same shape as the test above: two hints for one move, and the second one
 /// has to name the change again rather than answer "not a change".
 #[test]
-fn a_change_during_the_handshake_is_offered_again() {
+fn a_network_that_only_appeared_leaves_the_handshake_alone() {
     let remote = Remote::installed();
     let watch = NetWatch::new("192.168.1.5/24\n");
-    let mut env = vec![
-        // The free first redial goes at once (acs-iyq), so the hints below
-        // cannot be read by an offline wait: there is not one.
-        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
-        ("ACS_DIAL_TIMEOUT_MS".to_string(), "60000".to_string()),
-    ];
-    env.extend(watch.env());
-    let mut c = Client::start_env(
-        &remote,
-        &[
-            "-v",
-            "devbox",
-            "hs",
-            "--",
-            "/bin/sh",
-            "-c",
-            "echo up; sleep 60",
-        ],
-        &refs(&env),
-    );
+    let env = handshake_env(&watch);
+    let mut c = Client::start_env(&remote, &echoing("hs"), &refs(&env));
     c.wait_session("hs");
     c.wait_for("up", T);
     // Every connection from here on goes quiet once accepted.
@@ -1235,23 +1245,157 @@ fn a_change_during_the_handshake_is_offered_again() {
     c.wait_for("timing: redial: ACS-READY seen", T);
     let handshaking = remote.connections();
 
-    // The machine's addresses move while that dial is still owed a WELCOME.
-    watch.set_networks("10.0.0.5/24\n");
+    // A second network appears while that dial is still owed a WELCOME.
+    watch.set_networks("192.168.1.5/24\n10.0.0.5/24\n");
     watch.hint();
-    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    let named = "acs: network changed: 192.168.1.5/24 → 10.0.0.5/24 192.168.1.5/24";
+    c.wait_for(named, T);
     c.wait_for("acs: network change not acted on", T);
 
     // The kernel's next word about the same move.
     watch.hint();
-    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    c.wait_for(named, T);
+    c.wait_for("acs: network change not acted on", T);
     assert_eq!(
         remote.connections(),
         handshaking,
-        "the handshake acted on the change (acs-xo1, not this): {}",
+        "a network appearing abandoned the handshake: {}",
         c.text()
     );
-    // The client is left in its handshake, which is where this bead ends;
-    // dropping it kills it.
+    // The client is left in its handshake; dropping it kills it.
+}
+
+/// acs-xo1: a network change that takes away the network a link past its
+/// marker was made on abandons the handshake and dials again at once,
+/// instead of waiting out the dial timeout for a `WELCOME` that went with
+/// the address.
+///
+/// The connection goes quiet after its marker, and the dial timeout is
+/// two minutes: only abandoning it brings the session back inside `T`.
+#[test]
+fn a_network_that_went_during_the_handshake_is_dialled_again_at_once() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let mut c = Client::start_env(&remote, &echoing("hg"), &refs(&env));
+    c.wait_session("hg");
+    c.wait_for("up", T);
+    remote.silence(Some(&acs::proto::ready_line()));
+    remote.cut_link();
+    c.wait_for("timing: redial: ACS-READY seen", T);
+    let handshaking = remote.connections();
+    // The next connection is a good one: what the client does with the
+    // change is all that decides whether it is ever made.
+    remote.silence(None);
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("the network moved under the handshake — dialing again", T);
+    c.wait_resumed();
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    assert_eq!(remote.connections(), handshaking + 1, "{}", c.text());
+}
+
+/// acs-xo1, before the marker: a redial still in ssh's handshake when the
+/// network it was made from goes is killed and made again at once. The
+/// dial is held short of the remote command for good, so without the
+/// change it would sit there for the whole two minutes.
+#[test]
+fn a_network_that_went_during_a_redial_is_dialled_again_at_once() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let mut c = Client::start_env(&remote, &echoing("dg"), &refs(&env));
+    c.wait_session("dg");
+    c.wait_for("up", T);
+    remote.hold_dial();
+    let dialled = remote.connections();
+    remote.cut_link();
+    remote.wait_more_connections(dialled, 1, T);
+    c.wait_until("the client has left raw mode to redial", |c| c.echo_on(), T);
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("the network moved under the dial — dialing again", T);
+    // The second dial is made while the first is still held.
+    remote.wait_more_connections(dialled, 2, T);
+    remote.release_dial();
+    c.wait_resumed();
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    assert_eq!(remote.connections(), dialled + 2, "{}", c.text());
+}
+
+/// acs-xo1: the first connection too — a named session's, and plain
+/// `acs <host>`'s, whose first dial is the session menu's (DESIGN §4.4).
+/// That is the two-minute case.
+#[test]
+fn a_network_that_went_during_the_first_dial_is_dialled_again_at_once() {
+    for args in [&["-v", "devbox", "fd"][..], &["-v", "devbox"][..]] {
+        let remote = Remote::installed();
+        let watch = NetWatch::new("192.168.1.5/24\n");
+        let env = handshake_env(&watch);
+        remote.hold_dial();
+        let base = remote.connections();
+        let mut c = Client::start_env(&remote, args, &refs(&env));
+        remote.wait_more_connections(base, 1, T);
+        watch.set_networks("10.0.0.5/24\n");
+        watch.hint();
+        c.wait_for("the network moved under the dial — dialing again", T);
+        remote.wait_more_connections(base, 2, T);
+        remote.release_dial();
+        c.wait_for("new session '", T);
+        assert_eq!(remote.connections(), base + 2, "{args:?}: {}", c.text());
+    }
+}
+
+/// acs-xo1 and acs-8ax: a redial whose ssh is asking for a password is not
+/// abandoned for a network change, because that would throw away what the
+/// user is typing at it. The change is dropped, not spent (acs-0n8), and
+/// the answer still reaches ssh.
+#[test]
+fn a_network_change_leaves_a_redial_asking_for_a_password_alone() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let mut c = Client::start_env(&remote, &echoing("pa"), &refs(&env));
+    c.wait_session("pa");
+    c.wait_for("up", T);
+    let answer = remote.prompt_on_next_dial();
+    let dialled = remote.connections();
+    remote.cut_link();
+    c.wait_for("Password: ", T);
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network change not acted on", T);
+    c.send(b"hunter2\r");
+    c.wait_resumed();
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
+    assert_eq!(remote.connections(), dialled + 1, "{}", c.text());
+}
+
+/// acs-xo1: the same on the first connection, whose dial shares acs's
+/// cooked terminal with ssh — there the prompt is seen by the echo it
+/// turns off.
+#[test]
+fn a_network_change_leaves_a_first_dial_asking_for_a_password_alone() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let answer = remote.prompt_on_next_dial();
+    let base = remote.connections();
+    let mut c = Client::start_env(&remote, &echoing("pf"), &refs(&env));
+    c.wait_for("Password: ", T);
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network change not acted on", T);
+    c.send(b"hunter2\r");
+    c.wait_session("pf");
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
+    assert_eq!(remote.connections(), base + 1, "{}", c.text());
 }
 
 /// A flapping interface is still **one** redial (acs-6p8's storm, kept out
