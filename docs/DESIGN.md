@@ -1608,6 +1608,9 @@ or a tab, as YAML 1.2 says, and a leading byte-order mark is skipped; a tab
 for *indentation* is still refused, with that advice.
 The tree keeps every node's line and the comments and `---`/`...` markers
 around it, so a file rewritten by the client keeps its comments and order.
+A space or a tab ends a marker; anything but a comment after one is refused
+with its line, since it could only be a top-level scalar or flow node, never
+the mapping a configuration is.
 Measured on the release profile, a minimal load-and-dump binary grows by
 about 100 KB with `yaml-rust2` and 150 KB with `serde_yaml`, and neither
 keeps comments; the hand-written parser adds 17 KB to `acs` (slim build
