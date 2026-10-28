@@ -79,12 +79,21 @@ pub fn prune(
     removed
 }
 
+/// Mark our version used, and nothing more: what `acs _cp` does on start
+/// (ACSCP_DESIGN §8), since pruning needs the live versions only the
+/// proxy asks the masters for. The versions directory, if this binary
+/// runs from one.
+pub fn touch_own() -> Option<PathBuf> {
+    let root = versions_root()?;
+    let _ = crate::sys::touch(&root.join(crate::VERSION));
+    Some(root)
+}
+
 /// Mark our version used and, if due, prune the others. `live_versions`
 /// asks the running masters which versions they run; it is only called
 /// when a prune is due.
 pub fn on_proxy_start(live_versions: impl FnOnce() -> HashSet<String>) {
-    let Some(root) = versions_root() else { return };
-    let _ = crate::sys::touch(&root.join(crate::VERSION));
+    let Some(root) = touch_own() else { return };
     let marker = root.join(".pruned");
     let now = SystemTime::now();
     if age(&marker, now).is_some_and(|a| a < every()) {

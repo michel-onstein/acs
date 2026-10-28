@@ -69,6 +69,9 @@ struct Part {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Hello,
+    /// A download's receiver, whose `HELLO` went to the remote sender:
+    /// waiting for its `WELCOME`.
+    Welcome,
     Running,
     /// `DONE` is queued; the copy is over once the sender closes.
     Done,
@@ -93,7 +96,7 @@ pub struct Receiver {
 }
 
 /// The process's umask, read without changing it for longer than the read.
-fn umask() -> u32 {
+pub(super) fn umask() -> u32 {
     // SAFETY: umask cannot fail; the old mask is put straight back.
     let mask = unsafe { libc::umask(0o077) };
     unsafe { libc::umask(mask) };
@@ -169,6 +172,20 @@ impl Receiver {
         }
     }
 
+    /// The receiver of a download: it asked the remote sender for its
+    /// sources and accepts at the top level only `names`, theirs
+    /// (ACSCP_DESIGN §5.4), written to `target` by the rules a served
+    /// receiver follows. Several names need `target` to be a directory,
+    /// which the caller has checked.
+    pub fn asking(target: PathBuf, names: Vec<String>, opts: &Options) -> Receiver {
+        let mut r = Receiver::serving(opts);
+        r.state = State::Welcome;
+        r.target_is_dir = target.is_dir();
+        r.target = target;
+        r.names = names;
+        r
+    }
+
     pub fn outcome(mut self, error: Option<String>) -> Outcome {
         // A part not finished is kept, under its part name: it is what a
         // later run resumes from (ACSCP_DESIGN §7).
@@ -192,10 +209,8 @@ impl Receiver {
             .encode(out.tail());
             Err(Halt::Ended(message))
         };
-        if h.version != crate::VERSION {
-            let m = format!("acs {} cannot copy with acs {}", crate::VERSION, h.version);
-            return refuse(err::VERSION, m, out);
-        }
+        // The version is the remote end's to check (`remote::serve`): a
+        // local copy's two halves are one build.
         if h.role != Role::Receive {
             return refuse(
                 err::REQUEST,
@@ -493,6 +508,7 @@ impl Endpoint for Receiver {
             (_, Msg::Pong(_)) => {}
             (_, Msg::Error { message, .. }) => return Err(Halt::Ended(message)),
             (State::Hello, Msg::Hello(h)) => return self.hello(h, out),
+            (State::Welcome, Msg::Welcome { .. }) => self.state = State::Running,
             (State::Running, Msg::Dir { name, meta }) => return self.dir(name, meta, out),
             (State::Running, Msg::DirEnd) => match self.levels.pop() {
                 Some(Level::Dir(i)) => {
@@ -823,26 +839,45 @@ mod tests {
         assert!(matches!(again, Err(Halt::Protocol(_))));
     }
 
+    /// A download's receiver sent its `HELLO` to the remote sender: it
+    /// takes a `WELCOME`, never a `HELLO`, and nothing before the
+    /// `WELCOME`; then only the names it asked for land.
     #[test]
-    fn a_version_mismatch_is_refused_by_name() {
-        let mut r = Receiver::serving(&opts());
-        let mut out = OutQueue::default();
-        let res = r.on_msg(
-            Msg::Hello(Hello {
-                version: "0.0.1".into(),
-                role: Role::Receive,
-                recursive: false,
-                preserve: false,
-                verbose: false,
-                target: ".".into(),
-                paths: vec!["a".into()],
-            }),
-            &mut out,
-        );
-        let Err(Halt::Ended(m)) = res else {
-            panic!("{res:?}")
+    fn a_download_receiver_waits_for_welcome_and_takes_only_its_names() {
+        let t = TempDir::new();
+        let asking = || Rx {
+            r: Receiver::asking(t.path().into(), vec!["notes.txt".into()], &opts()),
+            out: OutQueue::default(),
         };
-        assert!(m.contains("0.0.1") && m.contains(crate::VERSION), "{m}");
+        let mut rx = asking();
+        let early = rx.file(1, "notes.txt", b"x");
+        assert!(matches!(early, Err(Halt::Protocol(_))), "{early:?}");
+        let mut rx = asking();
+        let hello = rx.send(Msg::Hello(Hello {
+            version: crate::VERSION.into(),
+            role: Role::Receive,
+            recursive: false,
+            preserve: false,
+            verbose: false,
+            target: ".".into(),
+            paths: vec!["notes.txt".into()],
+        }));
+        assert!(matches!(hello, Err(Halt::Protocol(_))), "{hello:?}");
+
+        let mut rx = asking();
+        rx.send(Msg::Welcome {
+            umask: 0o022,
+            target_is_dir: false,
+        })
+        .unwrap();
+        rx.file(1, ".bashrc", b"evil").unwrap();
+        rx.file(2, "notes.txt", b"notes").unwrap();
+        rx.send(Msg::End).unwrap();
+        let a = rx.answers();
+        assert!(a[0].starts_with("FAIL 1 refused"), "{a:?}");
+        assert_eq!(a[1..], ["GO 2 0", "OK 2", "DONE 1 1"], "{a:?}");
+        assert!(!t.path().join(".bashrc").exists());
+        assert_eq!(std::fs::read(t.path().join("notes.txt")).unwrap(), b"notes");
     }
 
     /// A file is written under `.<name>.acscp-part` and renamed only when

@@ -10,10 +10,9 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod config_cmd;
-// The copy is phase 1 of ACSCP_DESIGN §12: local copies only. It stays out
-// of release builds until phase 2, the first that puts it in one, since the
-// complete build has no room for it until its size budget is raised
-// (ACSCP_DESIGN §10.4).
+// The copy, phases 1 and 2 of ACSCP_DESIGN §12: local copies, uploads and
+// downloads. It stays out of release builds while it measures more than the
+// 50 KB of x86_64 slim that ACSCP_DESIGN decision 13 gives it (DESIGN §8.1).
 #[cfg(debug_assertions)]
 pub mod cp;
 pub mod install;
@@ -79,10 +78,11 @@ pub enum Role {
     List,
     /// Background check for a newer release, started by the client.
     UpdateCheck,
-    /// `acscp …` or `acs cp …`: copy files to and from a host. Local
-    /// copies are built (ACSCP_DESIGN phase 1), in debug builds only for
-    /// now; a host in the arguments is refused.
+    /// `acscp …` or `acs cp …`: copy files to and from a host
+    /// (ACSCP_DESIGN phases 1 and 2), in debug builds only for now.
     Copy,
+    /// `acs _cp`: the remote end of a copy, started by the prelude.
+    CopyEnd,
 }
 
 impl Role {
@@ -112,6 +112,7 @@ impl Role {
             Some("_master") => Role::Master,
             Some("_install") => Role::Install,
             Some("_update-check") => Role::UpdateCheck,
+            Some("_cp") => Role::CopyEnd,
             Some("_version") | Some("--version") | Some("-V") => Role::Version,
             // Reserved words, only as the very first argument: a host
             // called `config`, `upgrade`, `list` or `cp` is still reachable
@@ -185,8 +186,10 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         Role::UpdateCheck => update_check::check_main(),
         #[cfg(debug_assertions)]
         Role::Copy => cp::main(copy_args(&args)),
+        #[cfg(debug_assertions)]
+        Role::CopyEnd => cp::remote::main(),
         #[cfg(not(debug_assertions))]
-        Role::Copy => {
+        Role::Copy | Role::CopyEnd => {
             eprintln!("acs: copying files is not built yet");
             ExitCode::from(client::code::USAGE)
         }
@@ -207,6 +210,7 @@ mod tests {
         assert_eq!(role("_master"), Role::Master);
         assert_eq!(role("_install"), Role::Install);
         assert_eq!(role("_update-check"), Role::UpdateCheck);
+        assert_eq!(role("_cp"), Role::CopyEnd);
         assert_eq!(role("_version"), Role::Version);
         assert_eq!(role("--version"), Role::Version);
     }

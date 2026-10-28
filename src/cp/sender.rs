@@ -14,7 +14,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use super::progress::Progress;
-use super::proto::{Hello, Msg, Role};
+use super::proto::Msg;
 use super::walk::{Entry, Walk};
 use super::{note_on, Endpoint, Halt, Options, Outcome, HIGH};
 use crate::outq::OutQueue;
@@ -32,8 +32,6 @@ struct Slot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// The `HELLO` is still to be queued.
-    Hello,
     /// Waiting for `WELCOME`.
     Welcome,
     Streaming,
@@ -43,7 +41,6 @@ enum State {
 
 pub struct Sender {
     state: State,
-    hello: Option<Hello>,
     walk: Walk,
     walked: bool,
     window: usize,
@@ -59,21 +56,15 @@ pub struct Sender {
 }
 
 impl Sender {
-    /// A sender of `sources` (name, path) that asks its receiver to write
-    /// them to `target`.
-    pub fn new(target: &str, sources: Vec<(String, PathBuf)>, opts: &Options) -> Sender {
-        let hello = Hello {
-            version: crate::VERSION.into(),
-            role: Role::Receive,
-            recursive: opts.recursive,
-            preserve: opts.preserve,
-            verbose: opts.verbose,
-            target: target.into(),
-            paths: sources.iter().map(|(n, _)| n.clone()).collect(),
-        };
+    /// A sender of `sources` (name, path). The `HELLO` is the caller's to
+    /// send ([`super::hello`]); `welcomed` is a sender that answered one
+    /// itself, as the remote end of a download does, and streams at once.
+    pub fn new(sources: Vec<(String, PathBuf)>, opts: &Options, welcomed: bool) -> Sender {
         Sender {
-            state: State::Hello,
-            hello: Some(hello),
+            state: match welcomed {
+                true => State::Streaming,
+                false => State::Welcome,
+            },
             walk: Walk::new(sources, opts.recursive),
             walked: false,
             window: opts.window.max(1),
@@ -193,16 +184,8 @@ impl Sender {
 
 impl Endpoint for Sender {
     fn pump(&mut self, out: &mut OutQueue) -> Result<(), Halt> {
-        match self.state {
-            State::Hello => {
-                if let Some(h) = self.hello.take() {
-                    Msg::Hello(h).encode(out.tail());
-                }
-                self.state = State::Welcome;
-                return Ok(());
-            }
-            State::Welcome | State::Done => return Ok(()),
-            State::Streaming => {}
+        if self.state != State::Streaming {
+            return Ok(());
         }
         while out.len() < HIGH {
             let had = self.ahead.len();
