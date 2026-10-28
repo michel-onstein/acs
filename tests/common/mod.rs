@@ -106,10 +106,8 @@ impl Net {
                 up = n.up_file().display()
             )
         };
-        use std::os::unix::fs::PermissionsExt;
         for (path, ipv4_only) in [(n.ping(), true), (n.ping6(), false)] {
-            std::fs::write(&path, body(ipv4_only)).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(&path, body(ipv4_only));
         }
         n.set_up(up);
         n.set_slow(&[]);
@@ -397,8 +395,8 @@ impl Ssh {
                 remote.transport()
             ));
         }
-        std::fs::write(
-            s.path(),
+        write_executable(
+            &s.path(),
             format!(
                 "#!/bin/sh\n{log}\
                  while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
@@ -407,10 +405,7 @@ impl Ssh {
                  echo \"ssh: connect to host $dest port 22: Connection refused\" >&2\nexit 255\n",
                 log = log_call_sh(&s.log()),
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(s.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         s
     }
 
@@ -468,13 +463,92 @@ pub fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_acs"))
 }
 
+/// Copy `src` to `dest` in a child `cp`, never in this process (acs-e86g).
+///
+/// A copy made here holds `dest` open for writing, and any other test
+/// thread that forks in that window carries the write descriptor into its
+/// child until the child's exec. Linux refuses to exec a file anything has
+/// open for writing (ETXTBSY), so a remote's exec of a just-copied acs —
+/// inside the fake ssh's `sh`, out of reach of [`output_of`]'s retry —
+/// failed now and then under load. A `cp` child is the only process that
+/// ever opens the file for writing, nothing forks from it, and it has
+/// exited by the time this returns.
+pub fn copy_out_of_process(src: &Path, dest: &Path) {
+    let st = Command::new("cp")
+        .arg(src)
+        .arg(dest)
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        st.success(),
+        "cp {} {}: {st}",
+        src.display(),
+        dest.display()
+    );
+}
+
+/// Write an executable `path` holding `body`, mode 0755, without this
+/// process ever holding it open for writing — see [`copy_out_of_process`].
+/// The body goes to a scratch file beside it first; that one may be "busy"
+/// for a moment, but nothing runs it.
+pub fn write_executable(path: &Path, body: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    let src = PathBuf::from(src);
+    std::fs::write(&src, body).unwrap();
+    copy_out_of_process(&src, path);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_file(&src);
+}
+
+/// Remove `path` (a file, or a directory and everything in it) when this
+/// test binary exits, once no test is running. Only in the process that
+/// asked: a forked child that calls `exit` inherits the handler, not the
+/// job.
+pub fn remove_at_exit(path: PathBuf) {
+    static PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static OWNER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    extern "C" fn remove_all() {
+        if OWNER.get() != Some(&std::process::id()) {
+            return;
+        }
+        let paths = PATHS.lock().map(|p| p.clone()).unwrap_or_default();
+        for p in paths {
+            let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
+        }
+    }
+    OWNER.get_or_init(|| {
+        // SAFETY: registers a plain function with no captured state.
+        unsafe { libc::atexit(remove_all) };
+        std::process::id()
+    });
+    PATHS.lock().unwrap().push(path);
+}
+
+/// `exe()` copied once per test binary onto `/tmp`, the filesystem every
+/// [`TempDir`] lives on, so a remote's install can hard-link it even where
+/// the build directory is on another filesystem (the Linux container's
+/// target volume, where linking `exe()` itself is EXDEV). Removed when the
+/// test binary exits.
+pub fn staged_exe() -> &'static Path {
+    static STAGED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    STAGED.get_or_init(|| {
+        let p = PathBuf::from(format!("/tmp/acst-exe-{}", std::process::id()));
+        copy_out_of_process(&exe(), &p);
+        remove_at_exit(p.clone());
+        p
+    })
+}
+
 /// A copy of this acs installed the way Homebrew does under `dir`: the
 /// binary in `homebrew/Cellar/acs/<version>/bin/`, linked from
 /// `homebrew/bin/acs`, which is returned.
 pub fn brewed_copy(dir: &Path) -> PathBuf {
     let keg = dir.join(format!("homebrew/Cellar/acs/{}/bin", acs::VERSION));
     std::fs::create_dir_all(&keg).unwrap();
-    std::fs::copy(exe(), keg.join("acs")).unwrap();
+    copy_out_of_process(&exe(), &keg.join("acs"));
     let bin = dir.join("homebrew/bin");
     std::fs::create_dir_all(&bin).unwrap();
     let link = bin.join("acs");
@@ -535,12 +609,17 @@ impl Remote {
         // A hard link where the temp directory and the build share a
         // filesystem, so that every remote's acs is the one inode the suite
         // already has warm — a hundred and thirty-odd private copies would
-        // be a hundred and thirty cold execs of four megabytes. A copy
-        // where they do not: the Linux container mounts the target
-        // directory as a volume of its own, and `link` across that is
-        // EXDEV.
-        if std::fs::hard_link(exe(), &acs).is_err() {
-            std::fs::copy(exe(), &acs).unwrap();
+        // be a hundred and thirty cold execs of four megabytes. Where they
+        // do not — the Linux container mounts the target directory as a
+        // volume of its own, and `link` across that is EXDEV — a link to
+        // the one staged copy on `/tmp` instead. Never a copy per remote
+        // made in this process (acs-e86g): a test thread forking while it
+        // was being written kept it "busy", and the remote's exec of it
+        // failed ETXTBSY.
+        if std::fs::hard_link(exe(), &acs).is_err()
+            && std::fs::hard_link(staged_exe(), &acs).is_err()
+        {
+            copy_out_of_process(staged_exe(), &acs);
         }
     }
 
@@ -606,9 +685,7 @@ impl Remote {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tmp = self.root.path().join(format!("transport.sh.{n}"));
-            std::fs::write(&tmp, &body).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(&tmp, &body);
             std::fs::rename(&tmp, &script).unwrap();
         }
         script.display().to_string()
@@ -790,15 +867,12 @@ impl Remote {
     pub fn fake_uname(&self, os: &str, arch: &str) {
         std::fs::create_dir_all(self.fake_bin()).unwrap();
         let script = self.fake_bin().join("uname");
-        std::fs::write(
+        write_executable(
             &script,
             format!(
                 "#!/bin/sh\ncase \"$1\" in -s) echo {os};; -m) echo {arch};; *) echo {os};; esac\n"
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
     }
 
     /// The installed binary for `version`, if any.
