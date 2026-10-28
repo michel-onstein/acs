@@ -483,7 +483,8 @@ pub fn every_host(args: &ClientArgs) -> u8 {
 /// `name`, ready as `acs <name> <session>` would have them before dialing:
 /// its configured `local_forwards` merged in and the shared-master decision
 /// taken (acs-x5wd). The listing itself skipped both on purpose — it asks
-/// every host at once — but the picked session is one ordinary session.
+/// every host at once, so it only ever joins a master that is up
+/// (acs-hmv) — but the picked session is one ordinary session.
 fn picked_session(args: &ClientArgs, name: &str, target: Target, force: bool) -> ClientArgs {
     let mut picked = args.clone();
     picked.list = false;
