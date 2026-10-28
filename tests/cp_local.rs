@@ -1,9 +1,6 @@
 //! `acscp` with no host in it (ACSCP_DESIGN §11): the sender and the
 //! receiver in one process over a socketpair, run as the binary under the
 //! `acscp` name, and the protocol's pipelining over a slow link.
-// The copy is in debug builds only until its size budget allows it in a
-// release (ACSCP_DESIGN §10.4, decision 13).
-#![cfg(debug_assertions)]
 
 mod common;
 

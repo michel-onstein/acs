@@ -144,9 +144,9 @@ acs list [ssh options]                   list sessions on every host alias
 acs host session -- command args…        run a command instead of the login shell
 ```
 
-`list`, `config` and `upgrade` are commands when they come first. A host
-with one of those names is reached as `user@list`, with an option before
-it (`acs -p 22 list`), or listed as `acs list list`.
+`list`, `config`, `upgrade` and `cp` are commands when they come first. A
+host with one of those names is reached as `user@list`, with an option
+before it (`acs -p 22 list`), or listed as `acs list list`.
 
 A plain `acs host` looks at the host's sessions first. With none
 detached, it creates one — `main`, or the lowest free number if `main` is
@@ -211,6 +211,34 @@ the middle of a sequence the program is sending. Turn it off with
 A single Ctrl-], or Ctrl-] followed by any other key, goes to the program as
 usual. The command key works in every keyboard encoding a terminal may use
 (including the kitty keyboard protocol) and never triggers inside a paste.
+
+### Copying files
+
+`acs cp` copies files to and from a host, spelled like `scp`:
+
+```text
+acs cp [-rpqvC46] [-P port] [-i identity] [-J jump] [-F config] [-o opt=value] source ... target
+acs cp notes.txt devbox:                 upload into the home directory
+acs cp -r project devbox:src/            a directory, recursively
+acs cp devbox:/var/log/syslog devbox:a.txt .    download, several sources from one host
+```
+
+The same binary run as `acscp` is `acs cp`, so a link makes it a drop-in
+for `scp`: `ln -s "$(command -v acs)" ~/.local/bin/acscp`. An argument is
+remote when it is `[user@]host:[path]` with no `/` before the first `:`;
+the host may be an acs alias, and `./a:b` is a local file. `-r` copies
+directories (following symlinks), `-p` keeps the modification and access
+times and the exact mode, and the port is `-P` — as in `scp`, `-p` is
+preserve here. `-q` turns off the progress meter, `-v` shows the ssh
+commands, the connect timings and a summary.
+
+A copy uses acs's own ssh connection, so it shares the master of a session
+already open to the host, and on a host that has never seen acs it installs
+it on that one connection first, as `acs host` does (unless
+`install_on_remote` is `false`). Not built yet: resuming a copy after a
+lost link (the part file is kept, and the copy ends), copying between two
+hosts or from local and remote sources at once, and wildcards in a remote
+path — name each remote file.
 
 ### ssh options
 
@@ -624,6 +652,7 @@ reached as `user@config`.
 | `ACS_CONTROL_PERSIST` | seconds an acs-owned ssh master outlives its last use (default 300); `0` turns the shared master off |
 | `ACS_CONTROL_FALLBACK_MS` | how long a connection that joins an existing master may take to answer before the master is ended and the connection made on its own (default 2000) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
+| `ACS_CP_WINDOW` | how many file headers `acs cp` sends ahead of their data (default 64) |
 | `ACS_DIAL_TIMEOUT_MS` | how long a new connection may take to answer (default 120 s, time for a password or a key touch; 30 s for each host of `acs list`) |
 | `ACS_REDIAL_TIMEOUT_MS` | how long a reconnect may take to answer before acs goes back to waiting and tries again (default 30 s); it does not change `ACS_DIAL_TIMEOUT_MS` |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |

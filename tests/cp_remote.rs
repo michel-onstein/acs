@@ -2,9 +2,6 @@
 //! against a fake remote — `--transport-cmd` with `common::Remote`, whose
 //! prelude execs the real `acs _cp` — first contact installing acs on the
 //! one connection, and a far end that sends names it should not.
-// The copy is in debug builds only until its size budget allows it in a
-// release (ACSCP_DESIGN §10.4, decision 13).
-#![cfg(debug_assertions)]
 
 mod common;
 

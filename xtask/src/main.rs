@@ -42,8 +42,10 @@ const MAC: &[&str] = &["aarch64-apple-darwin", "x86_64-apple-darwin"];
 // Raised from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9,
 // ACSCP_DESIGN §10.4): measured, it added about 64 KB to the slim x86_64
 // Linux build and, carried again in both Linux payloads, about 125 KB to the
-// complete one, trimmed to 50 KB and 100 KB since (acs-hofu.10). DESIGN goal
-// 2 and §8.1 state the same figures.
+// complete one, trimmed to 50 KB and 100 KB since (acs-hofu.10); with phase 2
+// it ships at about 57 KB and 115 KB, within the copy's own 100 KB of slim
+// (DESIGN decision 13, acs-hofu.11). DESIGN goal 2 and §8.1 state the same
+// figures.
 const SLIM_BUDGET: u64 = 1_150_000;
 const COMPLETE_BUDGET: u64 = 2_300_000;
 

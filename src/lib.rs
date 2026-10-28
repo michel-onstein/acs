@@ -11,9 +11,8 @@ pub mod client;
 pub mod config;
 pub mod config_cmd;
 // The copy, phases 1 and 2 of ACSCP_DESIGN §12: local copies, uploads and
-// downloads. It stays out of release builds while it measures more than the
-// 50 KB of x86_64 slim that ACSCP_DESIGN decision 13 gives it (DESIGN §8.1).
-#[cfg(debug_assertions)]
+// downloads, within the 100 KB of x86_64 slim that ACSCP_DESIGN decision 13
+// gives it (DESIGN §8.1).
 pub mod cp;
 pub mod install;
 pub mod keys;
@@ -79,7 +78,7 @@ pub enum Role {
     /// Background check for a newer release, started by the client.
     UpdateCheck,
     /// `acscp …` or `acs cp …`: copy files to and from a host
-    /// (ACSCP_DESIGN phases 1 and 2), in debug builds only for now.
+    /// (ACSCP_DESIGN phases 1 and 2).
     Copy,
     /// `acs _cp`: the remote end of a copy, started by the prelude.
     CopyEnd,
@@ -156,7 +155,6 @@ pub fn print_version() {
 
 /// The copy's arguments in `args`: after the program name when it is
 /// `acscp`, after `cp` when it is `acs cp`.
-#[cfg(debug_assertions)]
 fn copy_args(args: &[OsString]) -> &[OsString] {
     let named = args
         .first()
@@ -184,15 +182,8 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         Role::Config => config_cmd::main(&args[2..]),
         Role::Upgrade => upgrade::main(&args[2..]),
         Role::UpdateCheck => update_check::check_main(),
-        #[cfg(debug_assertions)]
         Role::Copy => cp::main(copy_args(&args)),
-        #[cfg(debug_assertions)]
         Role::CopyEnd => cp::remote::main(),
-        #[cfg(not(debug_assertions))]
-        Role::Copy | Role::CopyEnd => {
-            eprintln!("acs: copying files is not built yet");
-            ExitCode::from(client::code::USAGE)
-        }
     }
 }
 
