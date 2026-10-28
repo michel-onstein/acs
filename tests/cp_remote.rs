@@ -3,7 +3,8 @@
 //! prelude execs the real `acs _cp` — first contact installing acs on the
 //! one connection, a far end that sends names it should not, and resume
 //! (§7): a link cut mid-file, a part that is not the file's start, and a
-//! Ctrl-C'd copy finished by the next run.
+//! Ctrl-C'd copy finished by the next run. A copy between two hosts runs
+//! against two fake remotes behind a fake `ssh` (§5.6).
 
 mod common;
 
@@ -339,23 +340,310 @@ fn hostile_names_from_the_far_end_are_refused() {
     assert_eq!(std::fs::read(out.join("notes.txt")).unwrap(), b"notes");
 }
 
-/// Two hosts, or local and remote sources together, are the relay of a
-/// later phase: refused before anything is dialled.
+/// Local and remote sources together, and downloads from several hosts,
+/// are not built: refused before anything is dialled.
 #[test]
-fn two_hosts_are_not_built_yet() {
+fn mixed_sources_are_not_built_yet() {
     let remote = Remote::installed();
     let cp = Acscp::new();
     std::fs::write(cp.local().join("a"), b"a").unwrap();
     for args in [
-        &["devbox:a", "other:b"][..],
-        &["devbox:a", "other:b", "."],
+        &["devbox:a", "other:b", "."][..],
         &["a", "devbox:b", "."],
+        &["a", "devbox:b", "other:c"],
     ] {
         let (status, err) = run(&mut cp.cmd(&remote.transport(), args));
         assert_eq!(status, 2, "{args:?}: {err}");
         assert!(err.contains("not built yet"), "{args:?}: {err}");
     }
     assert_eq!(remote.connections(), 0);
+}
+
+/// A fake `ssh`, written in `dir`, that runs each destination's transport
+/// (`Remote::transport`, or [`hostile`]) and refuses any other.
+fn router(dir: &Path, hosts: &[(&str, &str)]) -> String {
+    let mut cases = String::new();
+    for (dest, transport) in hosts {
+        cases.push_str(&format!("    '{dest}') exec '{transport}' \"$1\" ;;\n"));
+    }
+    let path = dir.join("ssh");
+    write_executable(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+             dest=$2\nshift 2\n\
+             case \"$dest\" in\n{cases}esac\n\
+             echo \"ssh: connect to host $dest port 22: Connection refused\" >&2\nexit 255\n"
+        ),
+    );
+    path.display().to_string()
+}
+
+impl Acscp {
+    /// A command copying through the fake `ssh` at `ssh`.
+    fn via(&self, ssh: &str, args: &[&str]) -> Command {
+        let mut c = acs_cmd_as(&self.exe);
+        c.current_dir(self.dir.path())
+            .arg("--ssh")
+            .arg(ssh)
+            .args(args);
+        c
+    }
+}
+
+/// Every file and directory under `dir`, by its path below it, with a
+/// file's bytes: two trees are equal when these are.
+fn tree(dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Option<Vec<u8>>)>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let rel = p.strip_prefix(base).unwrap().display().to_string();
+            if p.is_dir() {
+                out.push((rel, None));
+                walk(base, &p, out);
+            } else {
+                out.push((rel, Some(std::fs::read(&p).unwrap())));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// A copy between two hosts goes through here, `scp -3`'s way
+/// (ACSCP_DESIGN §5.6): a tree and a file from one host to a directory on
+/// another arrive equal, over one connection to each and with nothing
+/// written here. Sources on several hosts are one relay per host, in
+/// turn, and a source may be on the target's host itself.
+#[test]
+fn a_copy_between_two_hosts_is_relayed_here() {
+    let (one, two) = (Remote::installed(), Remote::installed());
+    let w = TempDir::new();
+    let ssh = router(
+        w.path(),
+        &[("one", &one.transport()), ("two", &two.transport())],
+    );
+    let cp = Acscp::new();
+    let src = one.home().join("tree");
+    std::fs::create_dir_all(src.join("sub/deeper")).unwrap();
+    std::fs::write(src.join("a"), b"alpha").unwrap();
+    std::fs::write(src.join("empty"), b"").unwrap();
+    std::fs::write(src.join("sub/big"), body(5 * 1024 * 1024 + 7, 8)).unwrap();
+    std::fs::write(src.join("sub/deeper/c"), body(70_000, 9)).unwrap();
+    std::fs::write(one.home().join("notes.txt"), b"notes").unwrap();
+    std::fs::create_dir(two.home().join("dst")).unwrap();
+
+    let (b1, b2) = (one.connections(), two.connections());
+    let (status, err) = run(&mut cp.via(&ssh, &["-r", "one:tree", "one:notes.txt", "two:dst"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!((one.connections(), two.connections()), (b1 + 1, b2 + 1));
+    assert!(
+        tree(&src) == tree(&two.home().join("dst/tree")),
+        "the trees differ"
+    );
+    assert_eq!(
+        std::fs::read(two.home().join("dst/notes.txt")).unwrap(),
+        b"notes"
+    );
+    let here: Vec<_> = std::fs::read_dir(cp.local()).unwrap().collect();
+    assert_eq!(here.len(), 1, "only the acscp link is here: {here:?}");
+
+    // One file to a new name; then sources from both hosts into one
+    // directory on the second.
+    std::fs::write(two.home().join("mine.txt"), b"mine").unwrap();
+    let (status, err) = run(&mut cp.via(&ssh, &["one:notes.txt", "two:renamed"]));
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(std::fs::read(two.home().join("renamed")).unwrap(), b"notes");
+    std::fs::create_dir(two.home().join("both")).unwrap();
+    let (status, err) = run(&mut cp.via(
+        &ssh,
+        &["one:notes.txt", "two:mine.txt", "one:tree/a", "two:both"],
+    ));
+    assert_eq!(status, 0, "{err}");
+    for (name, want) in [
+        ("notes.txt", &b"notes"[..]),
+        ("mine.txt", b"mine"),
+        ("a", b"alpha"),
+    ] {
+        let got = std::fs::read(two.home().join("both").join(name)).unwrap();
+        assert_eq!(got, want, "{name}");
+    }
+
+    // What the source host cannot read is reported here; several sources
+    // into what is not a directory are refused before any data goes.
+    let (status, err) = run(&mut cp.via(&ssh, &["one:missing", "one:notes.txt", "two:dst"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("acscp: missing: "), "{err}");
+    let (status, err) = run(&mut cp.via(&ssh, &["one:notes.txt", "two:mine.txt", "two:renamed"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("two:renamed: not a directory"), "{err}");
+    assert_eq!(std::fs::read(two.home().join("renamed")).unwrap(), b"notes");
+}
+
+/// Two hosts that have never seen acs are each installed on their own
+/// connection: the once-per-process guard on an install is per host.
+#[test]
+fn a_copy_between_two_fresh_hosts_installs_both() {
+    let (one, two) = (Remote::new(), Remote::new());
+    let w = TempDir::new();
+    let ssh = router(
+        w.path(),
+        &[("one", &one.transport()), ("two", &two.transport())],
+    );
+    let cp = Acscp::new();
+    std::fs::write(one.home().join("a"), b"alpha").unwrap();
+    let (status, err) = run(&mut cp.via(&ssh, &["one:a", "two:"]));
+    assert_eq!(status, 0, "{err}");
+    for host in ["one", "two"] {
+        assert!(
+            err.contains(&format!("installed acs {} on {host}", acs::VERSION)),
+            "{err}"
+        );
+    }
+    assert_eq!((one.connections(), two.connections()), (1, 1));
+    assert_eq!(std::fs::read(two.home().join("a")).unwrap(), b"alpha");
+}
+
+/// CVE-2019-6111's lesson, between two hosts: a name from the source host
+/// that could leave the target ends the copy here, before the target host
+/// sees it, and a top-level name not asked for is refused by the target's
+/// receiver and reported here. A target host that sends what only a
+/// sender may — or a name made to steer the terminal — is broken, not
+/// obeyed.
+#[test]
+fn hostile_names_from_either_host_are_refused() {
+    let good = Remote::installed();
+    std::fs::write(good.home().join("notes.txt"), b"notes").unwrap();
+    std::fs::create_dir(good.home().join("dst")).unwrap();
+    let cp = Acscp::new();
+    let landed = || -> Vec<_> {
+        std::fs::read_dir(good.home().join("dst"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect()
+    };
+
+    // From the source host.
+    for bad in ["../escaped", "/etc/x", "..", "a/b"] {
+        let t = TempDir::new();
+        let mut frames = vec![welcome()];
+        frames.extend(file(1, bad, b"evil"));
+        frames.push(Msg::End);
+        let evil = hostile(t.path(), &frames);
+        let ssh = router(t.path(), &[("evil", &evil), ("good", &good.transport())]);
+        let (status, err) = run(&mut cp.via(&ssh, &["evil:notes.txt", "good:dst"]));
+        assert_eq!(status, 1, "{bad}: {err}");
+        assert!(err.contains("protocol error from evil"), "{bad}: {err}");
+        assert!(!good.home().join("escaped").exists(), "{bad}");
+        assert!(landed().is_empty(), "{bad}: {:?}", landed());
+    }
+    let t = TempDir::new();
+    let mut frames = vec![welcome()];
+    frames.extend(file(1, ".bashrc", b"evil"));
+    frames.extend(file(2, "notes.txt", b"notes"));
+    frames.push(Msg::End);
+    let evil = hostile(t.path(), &frames);
+    let ssh = router(t.path(), &[("evil", &evil), ("good", &good.transport())]);
+    let (status, err) = run(&mut cp.via(&ssh, &["evil:notes.txt", "good:dst"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(
+        err.contains(".bashrc: refused: not a name that was asked for"),
+        "{err}"
+    );
+    assert_eq!(landed(), ["notes.txt"]);
+
+    // From the target host: a FAIL whose name would steer the terminal,
+    // then a FILE or a DIR, which only a sender sends.
+    for (bad, what) in [
+        (file(1, "x", b"x")[0].clone(), "unexpected message type 7"),
+        (
+            Msg::Dir {
+                name: "../x".into(),
+                meta: Meta::default(),
+            },
+            "protocol error",
+        ),
+    ] {
+        let t = TempDir::new();
+        let frames = [
+            welcome(),
+            Msg::Fail {
+                id: 1,
+                name: "\x1b]0;pwned\x07x".into(),
+                message: "no".into(),
+            },
+            bad,
+        ];
+        let evil = hostile(t.path(), &frames);
+        let ssh = router(t.path(), &[("good", &good.transport()), ("evil", &evil)]);
+        let (status, err) = run(&mut cp.via(&ssh, &["good:notes.txt", "evil:dst"]));
+        assert_eq!(status, 1, "{err}");
+        assert!(err.contains(what) && err.contains("from evil"), "{err}");
+        assert!(!err.contains('\x1b') && !err.contains('\x07'), "{err:?}");
+    }
+}
+
+/// A lost link ends a copy between two hosts and says so — the relay has
+/// nothing to resume from (ACSCP_DESIGN §5.6) — and the part it leaves on
+/// the target host is what the same command run again goes on from.
+#[test]
+fn a_lost_link_ends_a_copy_between_two_hosts() {
+    let (one, two) = (Remote::installed(), Remote::installed());
+    let size = 8 << 20;
+    let big = body(size, 10);
+    std::fs::write(one.home().join("big"), &big).unwrap();
+    let w = TempDir::new();
+    let (a, b) = cut(w.path(), false);
+    let cutting = w.path().join("cutting.sh");
+    write_executable(
+        &cutting,
+        format!(
+            "#!/bin/sh\nexec 3<&0; '{real}' \"$1\" <&3 >'{a}' & exec cat '{b}'\n",
+            real = one.transport(),
+            a = a.display(),
+            b = b.display()
+        ),
+    );
+    let cutting = cutting.display().to_string();
+    let ssh = router(w.path(), &[("one", &cutting), ("two", &two.transport())]);
+    let cp = Acscp::new();
+    let (status, err) = run(&mut cp.via(&ssh, &["one:big", "two:"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(
+        err.contains("one: the link closed before the copy finished"),
+        "{err}"
+    );
+    assert!(err.contains("does not reconnect — run it again"), "{err}");
+    assert_eq!((one.connections(), two.connections()), (1, 1));
+    assert!(!two.home().join("big").exists());
+    let part = two.home().join(".big.acscp-part");
+    assert!(
+        weighed(&part) > CUT / 2,
+        "the part holds {}",
+        weighed(&part)
+    );
+
+    // The second run carries to the target host only what its part lacks.
+    let carried = w.path().join("carried");
+    let weighing = w.path().join("weighing.sh");
+    write_executable(
+        &weighing,
+        format!(
+            "#!/bin/sh\ntee '{}' | '{}' \"$1\"\n",
+            carried.display(),
+            two.transport()
+        ),
+    );
+    let weighing = weighing.display().to_string();
+    let ssh = router(w.path(), &[("one", &one.transport()), ("two", &weighing)]);
+    let (status, err) = run(&mut cp.via(&ssh, &["one:big", "two:"]));
+    assert_eq!(status, 0, "{err}");
+    assert!(std::fs::read(two.home().join("big")).unwrap() == big);
+    assert!(!part.exists());
+    carried_once(weighed(&carried), size);
 }
 
 /// A transport in front of `remote`'s, written in `dir`: the first

@@ -27,7 +27,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use crate::cli::Connection;
 use crate::client::note;
@@ -35,7 +35,11 @@ use crate::payload::{self, Payloads};
 use crate::sha256;
 use crate::ssh::sh_quote;
 
-static ATTEMPTED: AtomicBool = AtomicBool::new(false);
+/// The destinations an install has been attempted on, each at most once
+/// per process: a second `ACS-NEED` after one means the install did not
+/// take. Per destination, since a copy between two hosts may install on
+/// both (ACSCP_DESIGN §5.6, §10.3 item 7).
+static ATTEMPTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// What to send for `target`, decided from what this binary carries.
 ///
@@ -142,11 +146,14 @@ pub fn install(
     hello: &[u8],
 ) -> Result<(), String> {
     let host = &conn.transport.destination;
-    if ATTEMPTED.swap(true, Ordering::SeqCst) {
+    let mut tried = ATTEMPTED.lock().unwrap_or_else(|e| e.into_inner());
+    if tried.contains(host) {
         return Err(format!(
             "acs was installed on {host} but the remote still cannot run it (is $HOME the same for ssh commands?)"
         ));
     }
+    tried.push(host.clone());
+    drop(tried);
     let target = payload::target_for_uname(os, arch)
         .ok_or_else(|| format!("{host} runs {os} {arch}, which acs does not support"))?;
     // A self-copy sends our file and needs no payloads; anything else

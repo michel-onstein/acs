@@ -2298,8 +2298,9 @@ their YAML shape:
 - Removing something that lives in the other file fails with a pointer to it
   (`it is set in /etc/acs/config.yaml:1 (use --global)`).
 - `config` is a reserved **first** argument (as are `upgrade`, §7.5,
-  `list`, §7, and `cp`, for copying files: local copies, uploads and
-  downloads; resume and two-host copies are not built yet). A
+  `list`, §7, and `cp`, for copying files: local copies, uploads,
+  downloads with resume, and copies between two hosts relayed through the
+  client, decision 15). A
   host literally called `config` (or `upgrade`, `list` or `cp`) is reached
   as `user@config`, or with any option before it (`acs -p 22 config`);
   `acs list list` lists a host called `list`. The binary run under the name
@@ -2893,6 +2894,26 @@ The copy role is now 74,880 B of x86_64 slim's 100 KB, leaving about
 complete room left on x86_64 Linux. The macOS figures are whole pages
 again: aarch64's +16,528 B is the page phase 3's +112 B fell short of.
 
+**Phase 5a** (acs-hofu.6: copies between two hosts, relayed through the
+client, decision 15), measured with `cargo xtask dist` against b40b749, the
+release with the part's lock:
+
+| Target | Slim | Relay | Copy role | Complete | Relay | Copy role |
+| --- | --- | --- | --- | --- | --- | --- |
+| `x86_64-unknown-linux-musl` | 1,131,816 B | +9,344 B | 84,224 B | 2,269,272 B | +18,085 B | 168,983 B |
+| `aarch64-unknown-linux-musl` | 1,003,688 B | +7,232 B | 70,792 B | 2,141,144 B | +15,973 B | 155,551 B |
+| `aarch64-apple-darwin` | 840,768 B | +48 B | 66,720 B | 1,968,688 B | +16,448 B | 115,632 B |
+| `x86_64-apple-darwin` | 927,424 B | +8,240 B | 74,232 B | 2,078,416 B | +20,560 B | 161,424 B |
+
+The copy role is now 84,224 B of x86_64 slim's 100 KB, leaving about
+15.8 KB for remote wildcards (phase 5b) and phase 6, with 18.2 KB of slim
+room and 30.7 KB of complete room left on x86_64 Linux. By `nm`, the relay
+is its frame pass (1.6 KB), the dial and set-up of each end (0.7 KB), and
+the splice loop and the grouping of sources by host, inlined into the
+copy's `main`; the meter's headers are a list rather than a map, since a
+window holds 64 at most, which kept a second `HashMap` instance out
+(1.2 KB). aarch64 macOS moves in whole pages again.
+
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
 appending the trailer and the macOS builds by rebuilding with
@@ -3110,3 +3131,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 12 | The dead-link timeout: fixed, shorter or RTT-adaptive (acs-vq1) | Decided 2026-10-28 with acs-pgn's per-phase timings in hand: it stays a fixed 10 s, with a `PING` after 3 s of silence and `ACS_DEAD_MS` as the override. Silence that netwatch does not explain is mostly a blip the existing TCP connection rides out, and a redial cannot succeed before the path is back anyway, so a shorter interval mainly turns survivable blips into redials — each one discarding typed keys, repainting the screen and costing a full handshake (51 ms cold on loopback, several round trips and possibly a key touch on a real host). An RTT-adaptive interval is decided by its floor on every real path, since a few round trips are under a second and the floor must exceed the ping interval; and the silence it must survive (a stalled host, output queued on a slow or bufferbloated uplink) is what an idle round trip underestimates. The fast cases are covered already: netwatch in 2 s, a closed connection at once. Reopen on `-v` evidence of drops netwatch missed whose redial then succeeded at once (§5.3) |
 | 13 | The copy's size budget (acs-hofu.11) | Decided by the maintainer 2026-10-28: the copy role (`acscp`, `acs cp`, `acs _cp`; ACSCP_DESIGN decision 13, goal 7) may cost **100 KB of the x86_64 musl slim build**, replacing 50 KB. Phases 1 and 2 measured 56,840 B against the old 50,000 B, with no single cheap trim left to close the gap; the larger figure lets the copy ship in release builds (acs-hofu.3) and leaves about 43 KB for phase 3's resume and redial. The overall budget (slim ≤ 1.15 MB, complete ≤ 2.3 MB, goal 2) is unchanged and still holds with the copy in (§8.1) |
 | 14 | Two copies writing one part (acs-hofu.13) | Decided 2026-10-28: **one writer per `.<name>.acscp-part`, by an exclusive `flock`**. A lost link's `acs _cp` lives on until its own liveness ends it (`ACS_DEAD_MS`), still writing what reached it, while the redial's `acs _cp` opens the same part to resume it; two writers would leave bytes past the hashed prefix that nothing re-checks. A receiver takes the part's lock before it measures it and holds it until the file is renamed or given up; a redial's receiver that finds it held answers nothing for that file — the sender's window carries the rest on — and tries again every 100 ms, then measures and hashes what the old one left. Locked, the part must still be the file at its name, or it was renamed into place or removed by its last holder and is opened again. Past twice `ACS_DEAD_MS` the file fails `in use by another copy` and the part is left to its holder; a filesystem without `flock` is written as before. Chosen over having the old end close the part on a lost link: nothing makes the old end learn of the loss before the client redials — the client redials at once on its own detection, which may come first — so only the new end can be made to wait, and the lock also keeps two concurrent `acscp` runs of one file apart |
+| 15 | A copy between two hosts (acs-hofu.6) | Decided 2026-10-28, carrying out ACSCP_DESIGN §5.6 and its decision 10: `acscp h1:a h2:b` dials an `acs _cp` receiver on `h2`, then a sender on `h1`, and `cp::relay` splices their frames, as `scp -3` routes a copy through the local machine. Nothing in the middle opens a file. **Each frame is decoded on its way through**, which is the receiver's own check that a name is one path component, so a `..` or `/` from the source host ends the copy before the target host sees it; the top-level names asked for are the target's receiver's to enforce, as it holds the list (ACSCP_DESIGN §5.4). Each end may send only its own direction's messages after its `WELCOME` — a receiver that sends a `FILE` is a protocol error — and `PING`/`PONG` are each link's own, with each link's own liveness; a side held back because the other's queue is full is not blamed for its silence. A lost link ends the copy, saying it does not reconnect: §7's redial wants an endpoint to resume from, and the relay is neither. The part stays on the target host, and the same command run again resumes it, since the receiver's `HAVE` and the sender's `RESTART` pass through like any frame. A sender's end of output after its `END` is no loss — only the receiver's `DONE` is still owed. Sources on several hosts are one relay per source host, in the order the command line names them; a source may be on the target's own host. Several sources in all need the target to be a directory, which the target's `WELCOME` says (each relay's receiver is told only its own host's names). The install's once-per-process guard is per destination (ACSCP_DESIGN §10.3 item 7), so two fresh hosts are each installed on their own connection. Local and remote sources together, and downloads from several hosts, stay refused |

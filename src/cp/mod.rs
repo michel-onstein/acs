@@ -17,14 +17,18 @@
 //! after it, or `RESTART`s it when it is not the file's start. The part is
 //! the only state, so a later run resumes an earlier one the same way.
 //!
+//! A copy between two hosts runs both endpoints remotely, one on each,
+//! and [`relay`] splices their links here (§5.6).
+//!
 //! Built so far: phases 1–3 of the design's plan (§12) — the protocol,
 //! the two endpoints, local copies, uploads and downloads with one host,
-//! and resume. Two hosts (the relay) are phase 5.
+//! and resume — and phase 5's relay between two hosts.
 
 pub mod cli;
 pub mod progress;
 pub mod proto;
 pub mod receiver;
+mod relay;
 pub mod remote;
 pub mod sender;
 pub mod walk;
@@ -506,6 +510,26 @@ fn sit_out(wait: Duration, netwatch: Option<&NetWatch>, last_early: &mut Option<
     }
 }
 
+/// What reaching `host` takes, with the configuration loaded and acs's
+/// ssh master decided; the exit code, told already, for a configuration
+/// that does not load.
+fn prepare(a: &CopyArgs, host: &cli::Remote) -> Result<crate::cli::Connection, u8> {
+    use crate::client::note;
+    let mut conn = a.connection(host);
+    conn.config = crate::config::Config::load().map_err(|e| {
+        note(&e.to_string());
+        code::USAGE
+    })?;
+    crate::update_check::on_client_start(&conn.config);
+    // No local forwards: a copy forwards nothing, and a forward would cost
+    // it the shared master (ACSCP_DESIGN §4.1).
+    let decided = crate::mux::configure(&mut conn.transport);
+    if conn.verbose > 0 {
+        note(&decided);
+    }
+    Ok(conn)
+}
+
 /// Run `ep` against `acs _cp` on `host` over as many links as it takes
 /// (ACSCP_DESIGN §7): a lost link is redialled at once and then on the
 /// session's backoff, cut short by a network change, until the copy is
@@ -521,18 +545,7 @@ fn over_ssh(
     ep: &mut dyn Endpoint,
 ) -> Result<Result<(), String>, u8> {
     use crate::client::note;
-    let mut conn = a.connection(host);
-    conn.config = crate::config::Config::load().map_err(|e| {
-        note(&e.to_string());
-        code::USAGE
-    })?;
-    crate::update_check::on_client_start(&conn.config);
-    // No local forwards: a copy forwards nothing, and a forward would cost
-    // it the shared master (ACSCP_DESIGN §4.1).
-    let decided = crate::mux::configure(&mut conn.transport);
-    if conn.verbose > 0 {
-        note(&decided);
-    }
+    let mut conn = prepare(a, host)?;
     let netwatch = match a.reconnect {
         true => NetWatch::new(conn.verbose > 0),
         false => None,
@@ -593,20 +606,19 @@ fn over_ssh(
     }
 }
 
-/// A copy to or from one host: an upload of local sources, or a download
-/// of sources all on the same `[user@]host`. Anything else — two hosts, or
-/// local and remote sources together — is the relay of phase 5
-/// (ACSCP_DESIGN §5.6) and refused.
+/// A copy with a host in it: an upload of local sources, a download of
+/// sources all on the same `[user@]host`, or a copy between hosts relayed
+/// through here (ACSCP_DESIGN §5.6). Local and remote sources together,
+/// and downloads from several hosts, are refused.
 fn copy_remote(a: &CopyArgs, opts: &Options) -> Result<Outcome, u8> {
     let mut hosts = a.sources.iter().filter_map(|s| match s {
         Spec::Remote(r) => Some(r),
         Spec::Local(_) => None,
     });
     let first = hosts.next();
-    let one_host = first.is_some_and(|f| {
-        hosts.all(|r| r.destination() == f.destination())
-            && a.sources.iter().all(|s| matches!(s, Spec::Remote(_)))
-    });
+    let all_remote = a.sources.iter().all(|s| matches!(s, Spec::Remote(_)));
+    let one_host =
+        all_remote && first.is_some_and(|f| hosts.all(|r| r.destination() == f.destination()));
     match (&a.target, first) {
         (Spec::Remote(host), None) => {
             let (good, skipped) = local_sources(a)?;
@@ -642,8 +654,9 @@ fn copy_remote(a: &CopyArgs, opts: &Options) -> Result<Outcome, u8> {
             let res = over_ssh(a, host, hello, &mut r)?;
             Ok(r.outcome(res.err()))
         }
+        (Spec::Remote(dst), Some(_)) if all_remote => relay::copy(a, dst, opts),
         _ => {
-            note("copying between two hosts, or from local and remote sources at once, is not built yet");
+            note("copying from local and remote sources at once, or from several hosts to this one, is not built yet");
             Err(code::USAGE)
         }
     }
