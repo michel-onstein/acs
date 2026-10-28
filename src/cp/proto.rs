@@ -39,6 +39,8 @@ pub mod ty {
     pub const OK: u8 = 14;
     pub const FAIL: u8 = 15;
     pub const DONE: u8 = 16;
+    pub const HAVE: u8 = 17;
+    pub const RESTART: u8 = 18;
 }
 
 /// What the remote end of a copy is asked to be.
@@ -136,6 +138,19 @@ pub enum Msg<'a> {
     Done {
         written: u64,
         failed: u64,
+    },
+    /// The receiver holds the first `len` bytes of file `id` already, in
+    /// its part, whose SHA-256 is `hash` (ACSCP_DESIGN §7): the answer to
+    /// a `FILE` instead of `GO`.
+    Have {
+        id: u32,
+        len: u64,
+        hash: [u8; 32],
+    },
+    /// The part is not the start of file `id`: truncate it, its `DATA`
+    /// follows from 0.
+    Restart {
+        id: u32,
     },
     Ping(u64),
     Pong(u64),
@@ -288,7 +303,12 @@ impl Msg<'_> {
                 w.u32(*id);
                 w.0.extend_from_slice(bytes);
             }
-            Msg::FileEnd { id } | Msg::Ok { id } => w.u32(*id),
+            Msg::FileEnd { id } | Msg::Ok { id } | Msg::Restart { id } => w.u32(*id),
+            Msg::Have { id, len, hash } => {
+                w.u32(*id);
+                w.u64(*len);
+                w.0.extend_from_slice(hash);
+            }
             Msg::Skip { name, reason } => {
                 w.str(bounded(name));
                 w.str(bounded(reason));
@@ -329,6 +349,8 @@ impl Msg<'_> {
             Msg::Ok { .. } => ty::OK,
             Msg::Fail { .. } => ty::FAIL,
             Msg::Done { .. } => ty::DONE,
+            Msg::Have { .. } => ty::HAVE,
+            Msg::Restart { .. } => ty::RESTART,
             Msg::Ping(_) => ty::PING,
             Msg::Pong(_) => ty::PONG,
         }
@@ -415,6 +437,12 @@ impl Msg<'_> {
                 written: r.u64("written")?,
                 failed: r.u64("failed")?,
             },
+            ty::HAVE => Msg::Have {
+                id: r.u32("id")?,
+                len: r.u64("len")?,
+                hash: r.take(32, "hash")?.try_into().expect("32 bytes taken"),
+            },
+            ty::RESTART => Msg::Restart { id: r.u32("id")? },
             ty::PING => Msg::Ping(r.u64("nonce")?),
             ty::PONG => Msg::Pong(r.u64("nonce")?),
             _ => return Err(ProtoError::UnknownType(t)),
@@ -538,6 +566,12 @@ mod tests {
                 written: 3,
                 failed: 1,
             },
+            Msg::Have {
+                id: 7,
+                len: 1 << 40,
+                hash: [0xa5; 32],
+            },
+            Msg::Restart { id: 7 },
             Msg::Ping(5),
             Msg::Pong(u64::MAX),
         ]

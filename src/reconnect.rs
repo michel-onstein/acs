@@ -35,7 +35,7 @@ fn ping_after() -> u64 {
 
 /// How long a link must have served, WELCOME to loss, for the backoff to
 /// start over at its free attempt (`ACS_BACKOFF_RESET_MS`, acs-omt2).
-fn backoff_reset_after() -> Duration {
+pub(crate) fn backoff_reset_after() -> Duration {
     sys::env_ms("ACS_BACKOFF_RESET_MS", 30_000)
 }
 
@@ -372,7 +372,7 @@ enum Offline {
 /// What it buys is that the change is no longer lost to the machine
 /// settling quietly: any later hint carries it, instead of the backoff
 /// (30 s at worst) having to cover for it.
-fn early_every() -> Duration {
+pub(crate) fn early_every() -> Duration {
     sys::env_ms("ACS_EARLY_MS", 2000)
 }
 
