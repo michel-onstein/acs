@@ -1,7 +1,9 @@
 //! Isolation between Unix accounts (acs-5v9.19, DESIGN §4.5). These need
 //! root and two users, `alice` and `bob`: they run in a Linux container via
-//! `scripts/test_linux.sh`, which sets `ACS_MULTIUSER_TEST=1`. Elsewhere
-//! they are skipped.
+//! `scripts/test_linux.sh`, which sets `ACS_MULTIUSER_TEST=1` and passes
+//! `--include-ignored`. Each is `#[ignore]`, so elsewhere `cargo test`
+//! counts them as ignored rather than passing them unrun (acs-hdj4), and one
+//! asked for without root and the variable fails instead of returning early.
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -17,8 +19,14 @@ use acs::testutil::{hello, FrameConn, KillOnDrop};
 const T: Duration = Duration::from_secs(30);
 const PEER_ENV: &str = "ACS_PEER_HELPER_SOCKET";
 
-fn enabled() -> bool {
-    std::env::var("ACS_MULTIUSER_TEST").is_ok() && acs::sys::getuid() == 0
+/// Fail unless this is the container `scripts/test_linux.sh` set up: a test
+/// only gets here when it was asked for, so not being able to run is a
+/// failure rather than a pass.
+fn require() {
+    assert!(
+        std::env::var_os("ACS_MULTIUSER_TEST").is_some() && acs::sys::getuid() == 0,
+        "needs root and ACS_MULTIUSER_TEST=1: this test runs under scripts/test_linux.sh"
+    );
 }
 
 struct User {
@@ -101,10 +109,9 @@ fn start_session(u: &User, session: &str, extra_env: &[(&str, &str)]) -> (FrameC
 }
 
 #[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
 fn a_squatted_socket_directory_is_refused() {
-    if !enabled() {
-        return;
-    }
+    require();
     let (alice, bob) = (user("alice"), user("bob"));
     let d = dir_of(&bob);
     reset(&d);
@@ -127,10 +134,9 @@ fn a_squatted_socket_directory_is_refused() {
 }
 
 #[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
 fn a_symlinked_socket_directory_is_refused() {
-    if !enabled() {
-        return;
-    }
+    require();
     let (alice, bob) = (user("alice"), user("bob"));
     let d = dir_of(&bob);
     reset(&d);
@@ -154,12 +160,14 @@ fn a_symlinked_socket_directory_is_refused() {
 }
 
 /// Child side of the peer test: connect to a socket and report whether the
-/// master answered a HELLO. Does nothing unless re-run by the parent.
+/// master answered a HELLO. Not a check of its own: ignored, and run only by
+/// `another_uid_is_dropped_by_the_master` with `--ignored --exact`, so
+/// `scripts/test_linux.sh` skips it by name.
 #[test]
+#[ignore = "helper: run by another_uid_is_dropped_by_the_master"]
 fn peer_helper() {
-    let Ok(sock) = std::env::var(PEER_ENV) else {
-        return;
-    };
+    let sock = std::env::var(PEER_ENV)
+        .unwrap_or_else(|_| panic!("{PEER_ENV} is not set: run by its parent test only"));
     let mut c = match FrameConn::connect(Path::new(&sock)) {
         Ok(c) => c,
         Err(e) => {
@@ -182,10 +190,9 @@ fn peer_helper() {
 }
 
 #[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
 fn another_uid_is_dropped_by_the_master() {
-    if !enabled() {
-        return;
-    }
+    require();
     let (alice, bob) = (user("alice"), user("bob"));
     let dir = PathBuf::from("/tmp/acs-peer-test");
     reset(&dir);
@@ -205,7 +212,13 @@ fn another_uid_is_dropped_by_the_master() {
         .unwrap();
 
     let out = as_user(&alice, std::env::current_exe().unwrap().to_str().unwrap())
-        .args(["--exact", "peer_helper", "--nocapture", "--test-threads=1"])
+        .args([
+            "--ignored",
+            "--exact",
+            "peer_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(PEER_ENV, &sock)
         .output()
         .unwrap();
@@ -225,7 +238,13 @@ fn another_uid_is_dropped_by_the_master() {
     // Bob himself is answered (BUSY: his session is attached from another
     // identity) rather than dropped.
     let out = as_user(&bob, std::env::current_exe().unwrap().to_str().unwrap())
-        .args(["--exact", "peer_helper", "--nocapture", "--test-threads=1"])
+        .args([
+            "--ignored",
+            "--exact",
+            "peer_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(PEER_ENV, &sock)
         .output()
         .unwrap();
@@ -242,10 +261,9 @@ fn another_uid_is_dropped_by_the_master() {
 /// session directory (DESIGN §4.5) guard it too — including when someone
 /// else got there first.
 #[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
 fn a_control_directory_is_one_users_and_a_squatted_one_is_refused() {
-    if !enabled() {
-        return;
-    }
+    require();
     use std::os::unix::fs::MetadataExt;
     let (alice, bob) = (user("alice"), user("bob"));
     let d = mux_dir_of(&bob);
@@ -302,10 +320,9 @@ fn a_control_directory_is_one_users_and_a_squatted_one_is_refused() {
 }
 
 #[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
 fn two_users_main_sessions_are_independent() {
-    if !enabled() {
-        return;
-    }
+    require();
     let (alice, bob) = (user("alice"), user("bob"));
     reset(&dir_of(&alice));
     reset(&dir_of(&bob));
@@ -357,10 +374,9 @@ fn set_mode(path: &Path, mode: u32) {
 /// directory holding it. This test is the one that can only run here: it
 /// really is root, and alice and bob really are other users.
 #[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
 fn a_root_installed_binary_is_run_by_every_user() {
-    if !enabled() {
-        return;
-    }
+    require();
     let (alice, bob) = (user("alice"), user("bob"));
     let version = "9.9.9-sys";
     // Only this version's directory is made and removed: the check looks at
@@ -455,10 +471,9 @@ fn a_root_installed_binary_is_run_by_every_user() {
 /// the same rule reaches the first candidate. What it must not reach is a
 /// binary belonging to a third user — which is exactly acs-08m's attack.
 #[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
 fn the_home_candidate_takes_the_same_owners_and_no_others() {
-    if !enabled() {
-        return;
-    }
+    require();
     let (alice, bob) = (user("alice"), user("bob"));
     let version = "9.9.9-home";
     // As above, only this version's directory — the one the check reads —

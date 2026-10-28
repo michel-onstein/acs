@@ -27,12 +27,15 @@
 //! `netwatch`'s and `netmatch`'s own tests read that while asserting it
 //! holds still.
 //!
+//! The test is `#[ignore]` and compiled everywhere, so a plain `cargo test`
+//! — on a Mac too — counts it as ignored instead of passing it unrun or
+//! leaving it out (acs-hdj4); `scripts/test_linux.sh` asks for it with
+//! `--include-ignored`, and asked for anywhere else it fails.
+//!
 //! The macOS `PF_ROUTE` half has no equivalent — a Mac's network cannot be
 //! moved from inside CI — and stays a by-hand item in
 //! `docs/VERIFICATION.md`, with the `-v` trace of acs-4i2 as what makes a
 //! watcher that quietly stopped emitting visible there.
-
-#![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -107,14 +110,14 @@ impl Drop for Cleanup {
 }
 
 #[test]
+#[ignore = "needs a Linux container with CAP_NET_ADMIN: run by scripts/test_linux.sh"]
 fn the_kernel_drives_the_watcher() {
-    if std::env::var_os("ACS_NETNS_TEST").is_none() {
-        eprintln!(
-            "skipped: needs a container of its own with CAP_NET_ADMIN — \
-             scripts/test_linux.sh sets ACS_NETNS_TEST=1"
-        );
-        return;
-    }
+    assert!(
+        cfg!(any(target_os = "linux", target_os = "android"))
+            && std::env::var_os("ACS_NETNS_TEST").is_some(),
+        "needs Linux, a container of its own with CAP_NET_ADMIN and \
+         ACS_NETNS_TEST=1: this test runs under scripts/test_linux.sh"
+    );
     // The real socket and the real `getifaddrs`, or this test is the fifo
     // knob over again and proves nothing about the platform.
     for var in ["ACS_NETWATCH_FIFO", "ACS_NETWATCH_NETS"] {
