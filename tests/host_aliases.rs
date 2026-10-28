@@ -545,3 +545,74 @@ fn the_host_used_last_on_these_networks_is_taken_without_waiting() {
          devbox\tdevbox.example.com\t192.168.1.0/24\n"
     );
 }
+
+// ---- reachability_tcp: the ssh port instead of a ping (acs-fbes) -----------
+
+/// A fake `ssh` for `ACS_SSH` whose `-G` sends `devbox.lan` to a closed
+/// port, `me@devbox.example.com` to `open`, and `jumped` through a
+/// ProxyJump. The session itself goes over the fake transport, so this is
+/// only ever asked `-G`.
+fn port_ssh(dir: &acs::testutil::TempDir, open: u16, closed: u16) -> String {
+    let path = dir.path().join("ssh");
+    let body = format!(
+        "#!/bin/sh\n[ \"$1\" = -G ] || exit 2\nfor d; do :; done\ncase \"$d\" in\n\
+         devbox.lan) printf 'hostname 127.0.0.1\\nport {closed}\\n' ;;\n\
+         me@devbox.example.com) printf 'hostname 127.0.0.1\\nport {open}\\n' ;;\n\
+         jumped) printf 'hostname 10.9.9.9\\nport 22\\nproxyjump bastion\\n' ;;\n\
+         *) exit 255 ;;\n\
+         esac\n"
+    );
+    write_executable(&path, body);
+    path.display().to_string()
+}
+
+/// A listening port and a closed one, on 127.0.0.1.
+fn ports() -> (std::net::TcpListener, u16, u16) {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let open_port = open.local_addr().unwrap().port();
+    (open, open_port, closed_port)
+}
+
+#[test]
+fn reachability_tcp_checks_the_ssh_port_instead_of_pinging() {
+    let remote = Remote::installed();
+    // Both answer a ping: only the ports can tell them apart.
+    let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    let dir = acs::testutil::TempDir::new();
+    let (_listener, open, closed) = ports();
+    let mut env = net.env(&format!("reachability_tcp: true\n{CONFIG}"));
+    env.push(("ACS_SSH".into(), port_ssh(&dir, open, closed)));
+    let mut c = Client::start_env(&remote, &session("devbox"), &refs(&env));
+    c.wait_for(
+        &format!("devbox: devbox.lan does not answer on port {closed} within 60s"),
+        T,
+    );
+    c.wait_for(
+        &format!("devbox: devbox.example.com answers on port {open}, using me@devbox.example.com"),
+        T,
+    );
+    wait_up(&mut c, "s");
+    assert!(net.pinged().is_empty(), "{:?}", net.pinged());
+}
+
+/// An entry ssh reaches through a ProxyJump has no port of its own to try,
+/// so it is pinged as without the setting.
+#[test]
+fn reachability_tcp_pings_a_host_behind_a_proxy_jump() {
+    let remote = Remote::installed();
+    let net = Net::new(&["jumped"]);
+    let dir = acs::testutil::TempDir::new();
+    let (_listener, open, closed) = ports();
+    let mut env = net.env("reachability_tcp: true\naliases:\n  inside: [{host: jumped}]\n");
+    env.push(("ACS_SSH".into(), port_ssh(&dir, open, closed)));
+    let mut c = Client::start_env(&remote, &session("inside"), &refs(&env));
+    c.wait_for(
+        "inside: jumped answers ping (ssh reaches it through a proxy), using jumped",
+        T,
+    );
+    wait_up(&mut c, "s");
+    net.wait_pinged(&["jumped"]);
+}

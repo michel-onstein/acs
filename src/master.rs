@@ -280,10 +280,59 @@ fn clean_identity(identity: &str) -> String {
     crate::safe::display_max(identity.trim(), 128)
 }
 
+/// A connection's queued output, written from a read cursor as `Decoder`
+/// reads its input, rather than drained from the front: `drain(..n)` after
+/// every partial write moved everything still queued down to the start
+/// (acs-m08z). The written prefix is let go of when the queue empties —
+/// the usual case, and free — or, failing that, once it passes
+/// `OUT_COMPACT`, so it is moved at most once per that much written.
+#[derive(Default)]
+struct OutQueue {
+    buf: Vec<u8>,
+    start: usize,
+}
+
+/// Compact an `OutQueue` whose written prefix has grown past this.
+const OUT_COMPACT: usize = 64 * 1024;
+
+impl OutQueue {
+    /// Bytes queued and not yet written.
+    fn len(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    fn is_empty(&self) -> bool {
+        self.start == self.buf.len()
+    }
+
+    /// What is still to be written.
+    fn queued(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    /// `n` bytes of `queued` were written.
+    fn consume(&mut self, n: usize) {
+        self.start += n;
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        }
+    }
+
+    /// The buffer to append frames to.
+    fn tail(&mut self) -> &mut Vec<u8> {
+        if self.start > OUT_COMPACT {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        &mut self.buf
+    }
+}
+
 struct Conn {
     stream: UnixStream,
     dec: Decoder,
-    out: Vec<u8>,
+    out: OutQueue,
     state: ConnState,
     identity: String,
     since: u64,
@@ -307,17 +356,15 @@ struct Conn {
 
 impl Conn {
     fn send(&mut self, m: &Msg) {
-        m.encode(&mut self.out);
+        m.encode(self.out.tail());
     }
 
     /// Write as much queued output as the socket takes.
     fn flush(&mut self) {
         while !self.out.is_empty() && !self.dead {
-            match self.stream.write(&self.out) {
+            match self.stream.write(self.out.queued()) {
                 Ok(0) => self.dead = true,
-                Ok(n) => {
-                    self.out.drain(..n);
-                }
+                Ok(n) => self.out.consume(n),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => self.dead = true,
@@ -558,7 +605,7 @@ impl Master {
                 if !matches!(c.state, ConnState::Active { .. }) || c.dead {
                     continue;
                 }
-                match c.live.tick(&mut c.out) {
+                match c.live.tick(c.out.tail()) {
                     Health::Dead => {
                         mlog!("the client stopped answering: dropping it");
                         c.dead = true;
@@ -718,7 +765,7 @@ impl Master {
                     self.conns.push(Conn {
                         stream,
                         dec: Decoder::new(),
-                        out: Vec::new(),
+                        out: OutQueue::default(),
                         state: ConnState::Pending,
                         identity: String::new(),
                         since: 0,
@@ -1235,19 +1282,25 @@ impl Master {
 
     /// Move ring data into the active client's buffer.
     fn pump_output(&mut self) {
+        self.queue_ring(OUT_HIGH_WATER);
+    }
+
+    /// Queue ring data for the active client as DATA frames until its
+    /// buffer holds `high_water` bytes or the ring has no more. Each
+    /// frame's payload is the ring's two slices copied straight into the
+    /// buffer, the one copy of the output the master makes (acs-m08z).
+    fn queue_ring(&mut self, high_water: usize) {
         let Some(a) = self.active() else { return };
         let end = self.ring.end();
         let c = &mut self.conns[a];
         let ConnState::Active { next } = &mut c.state else {
             return;
         };
-        while c.out.len() < OUT_HIGH_WATER && *next < end {
+        while c.out.len() < high_water && *next < end {
             match self.ring.read_from(*next, proto::MAX_CHUNK) {
                 Read::Data(x, y) => {
-                    let bytes = [x, y].concat();
-                    let offset = *next;
-                    *next += bytes.len() as u64;
-                    Msg::Data { offset, bytes }.encode(&mut c.out);
+                    proto::encode_data(*next, &[x, y], c.out.tail());
+                    *next += (x.len() + y.len()) as u64;
                 }
                 Read::Gap(start) => *next = start,
                 Read::Future => break,
@@ -1444,30 +1497,50 @@ impl Master {
     /// Queue everything left in the ring for the active client, ignoring
     /// the high-water mark (the session is over).
     fn pump_output_all(&mut self) {
-        let Some(a) = self.active() else { return };
-        let end = self.ring.end();
-        let c = &mut self.conns[a];
-        let ConnState::Active { next } = &mut c.state else {
-            return;
-        };
-        while *next < end {
-            match self.ring.read_from(*next, proto::MAX_CHUNK) {
-                Read::Data(x, y) => {
-                    let bytes = [x, y].concat();
-                    let offset = *next;
-                    *next += bytes.len() as u64;
-                    Msg::Data { offset, bytes }.encode(&mut c.out);
-                }
-                Read::Gap(start) => *next = start,
-                Read::Future => break,
-            }
-        }
+        self.queue_ring(usize::MAX);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The out queue hands back exactly what was appended, in order,
+    /// across partial writes, appends between them and a compaction
+    /// (acs-m08z).
+    #[test]
+    fn the_out_queue_writes_every_byte_once_in_order() {
+        let mut q = OutQueue::default();
+        let mut sent = Vec::new();
+        let mut written = Vec::new();
+        let mut b = 0u8;
+        for round in 0..200 {
+            let chunk: Vec<u8> = (0..1000)
+                .map(|_| {
+                    b = b.wrapping_add(1);
+                    b
+                })
+                .collect();
+            q.tail().extend_from_slice(&chunk);
+            sent.extend_from_slice(&chunk);
+            // Write less than was appended, so the written prefix grows
+            // past OUT_COMPACT and the queue never empties on its own.
+            let n = q.len().min(700 + round % 7);
+            written.extend_from_slice(&q.queued()[..n]);
+            q.consume(n);
+            assert_eq!(q.len(), sent.len() - written.len());
+            assert!(
+                q.start <= OUT_COMPACT + 1000,
+                "the written prefix is let go of"
+            );
+        }
+        let n = q.len();
+        written.extend_from_slice(q.queued());
+        q.consume(n);
+        assert!(q.is_empty());
+        assert_eq!((q.start, q.buf.len()), (0, 0), "an emptied queue resets");
+        assert_eq!(written, sent);
+    }
 
     /// Regression (acs-u3c): output the child wrote just before exiting is
     /// seen by the drain check even though an earlier poll saw nothing —
