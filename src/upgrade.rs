@@ -331,6 +331,7 @@ pub fn run(opts: &Opts) -> Result<String, Error> {
     if let Layout::Versioned { links, .. } = &layout {
         for l in links {
             relink(&dest, l)?;
+            link_copy_beside(l);
         }
     }
     let shown = match &layout {
@@ -497,6 +498,22 @@ fn relink(target: &Path, link: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot repoint {}: {e}", link.display()))
 }
 
+/// `acscp -> acs` beside a link `link` this upgrade repointed: the
+/// relative link already follows the new `acs`, and one missing (an
+/// install from before acscp) is made (ACSCP_DESIGN §9). A failure is a
+/// warning — `acs cp` needs no link — not a failed upgrade. A link by
+/// another name (acs run as `~/bin/a`) gets none: `acscp -> acs` beside it
+/// would point at nothing.
+fn link_copy_beside(link: &Path) {
+    if link.file_name() != Some(std::ffi::OsStr::new("acs")) {
+        return;
+    }
+    let Some(dir) = link.parent() else { return };
+    if let Err(e) = crate::install::link_copy_name(dir) {
+        eprintln!("acs: warning: cannot link {e} (`acs cp` works without it)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +610,26 @@ mod tests {
         relink(&l.destination("0.3.0"), &link).unwrap();
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+    }
+
+    /// acs-hofu.5: an upgrade of an install from before acscp makes the
+    /// `acscp -> acs` link beside the `acs` it repointed; a link by another
+    /// name gets none, and one already there keeps following `acs`.
+    #[test]
+    fn an_upgrade_links_acscp_beside_the_acs_it_repointed() {
+        let d = TempDir::new();
+        let bin = d.path();
+        std::fs::write(bin.join("acs"), "new").unwrap();
+        let copy = bin.join(crate::layout::COPY_NAME);
+
+        link_copy_beside(&bin.join("myacs"));
+        assert!(std::fs::symlink_metadata(&copy).is_err(), "not beside acs");
+
+        link_copy_beside(&bin.join("acs"));
+        assert_eq!(std::fs::read_link(&copy).unwrap(), Path::new("acs"));
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "new");
+        link_copy_beside(&bin.join("acs"));
+        assert_eq!(std::fs::read_link(&copy).unwrap(), Path::new("acs"));
     }
 
     /// A staged copy that is not committed leaves nothing behind (acs-x1k).

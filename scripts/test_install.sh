@@ -37,6 +37,17 @@ out() { cat "$t/out"; }
 expect_ok() { [ "$(status)" = 0 ] || fail "$1: exit $(status): $(out)"; }
 expect_fail() { [ "$(status)" != 0 ] || fail "$1: should fail: $(out)"; }
 expect_out() { grep -qF -- "$2" "$t/out" || fail "$1: no '$2' in: $(out)"; }
+# $2/acscp is the relative link acscp -> acs (ACSCP_DESIGN §9), and runs
+# acs version $3. The link is the installer's, so the repository's
+# install.sh makes it whatever release it installs.
+expect_copy() { # expect_copy <case> <dir> <version>
+    [ -L "$2/acscp" ] && [ "$(readlink "$2/acscp")" = acs ] ||
+        fail "$1: $2/acscp is not a link to acs: $(ls -l "$2/acscp" 2>&1)"
+    case $("$2/acscp" --version) in
+        "acs $3 ("*) ;;
+        *) fail "$1: $2/acscp --version is not acs $3" ;;
+    esac
+}
 
 here() {
     t=$(mktemp -d "${TMPDIR:-/tmp}/acs-install-test.XXXXXX")
@@ -69,7 +80,8 @@ here() {
         expect_out "default" "$bin is not on your PATH"
         expect_out "default" ">> ~/.zshrc"
     fi
-    pass "latest ($new) into $bin, linked to $lib/$new"
+    expect_copy "default" "$bin" "$new"
+    pass "latest ($new) into $bin, linked to $lib/$new, with acscp -> acs"
 
     # A pinned older version: installed beside the newer one, which keeps
     # the link (acs-feee, install::should_link).
@@ -80,7 +92,8 @@ here() {
     expect_out "pinned" "left $bin/acs on acs $new, which is newer"
     [ "$(readlink "$bin/acs")" = "$lib/$new/acs" ] || fail "pinned: $bin/acs -> $(readlink "$bin/acs")"
     case $("$lib/$old/acs" --version) in "acs $old ("*) ;; *) fail "pinned: $lib/$old/acs is not $old" ;; esac
-    pass "pinned $old installed beside $new, the link left on $new"
+    expect_copy "pinned" "$bin" "$new"
+    pass "pinned $old installed beside $new, the links left on $new"
 
     # A link of ours to an older version: moved forward in place.
     ln -sf "$lib/$old/acs" "$bin/acs"
@@ -89,7 +102,26 @@ here() {
     expect_out "re-run" "installed acs $new: $bin/acs -> $lib/$new/acs"
     [ "$(readlink "$bin/acs")" = "$lib/$new/acs" ] || fail "re-run: not upgraded"
     case $("$bin/acs" --version) in "acs $new ("*) ;; *) fail "re-run: $bin/acs is not $new" ;; esac
-    pass "a link to $old upgraded in place to $new"
+    expect_copy "re-run" "$bin" "$new"
+    pass "a link to $old upgraded in place to $new, acscp with it"
+
+    # An install from before acscp: a re-run adds the link.
+    rm -f "$bin/acscp"
+    run ACS_VERSION="$new"
+    expect_ok "no acscp yet"
+    expect_copy "no acscp yet" "$bin" "$new"
+    pass "a re-run adds acscp to an install without it"
+
+    # A file of the user's own at acscp: left alone, and said so.
+    rm -f "$bin/acscp"
+    echo mine >"$bin/acscp"
+    run ACS_VERSION="$new"
+    expect_ok "own acscp"
+    expect_out "own acscp" "left $bin/acscp alone: it is not a link this installer made"
+    [ ! -L "$bin/acscp" ] && [ "$(cat "$bin/acscp")" = mine ] || fail "own acscp: $bin/acscp was replaced"
+    rm -f "$bin/acscp"
+    ln -s acs "$bin/acscp"
+    pass "a user's own $bin/acscp left alone"
 
     # A file of the user's own at the link's name: left alone, and said so.
     rm -f "$bin/acs"
@@ -98,7 +130,15 @@ here() {
     expect_ok "own file"
     expect_out "own file" "left $bin/acs alone: it is not a link this installer made"
     [ ! -L "$bin/acs" ] && [ "$(cat "$bin/acs")" = mine ] || fail "own file: $bin/acs was replaced"
+    # The acscp link of ours beside it is neither removed nor remade.
+    [ "$(readlink "$bin/acscp")" = acs ] || fail "own file: $bin/acscp changed"
+    rm -f "$bin/acs" "$bin/acscp"
+    echo mine >"$bin/acs"
+    run ACS_VERSION="$new"
+    expect_ok "own file, no acscp"
+    [ ! -e "$bin/acscp" ] && [ ! -L "$bin/acscp" ] || fail "own file: an acscp was linked to the user's acs"
     rm -f "$bin/acs"
+    ln -s acs "$bin/acscp"
     ln -s "$lib/$new/acs" "$bin/acs"
     pass "a user's own $bin/acs left alone"
 
@@ -107,7 +147,8 @@ here() {
     expect_ok "ACS_INSTALL_DIR"
     [ -f "$t/own bin/acs" ] && [ ! -L "$t/own bin/acs" ] || fail "ACS_INSTALL_DIR: no plain file"
     case $("$t/own bin/acs" --version) in "acs $new ("*) ;; *) fail "ACS_INSTALL_DIR: wrong binary" ;; esac
-    pass "ACS_INSTALL_DIR"
+    expect_copy "ACS_INSTALL_DIR" "$t/own bin" "$new"
+    pass "ACS_INSTALL_DIR, with acscp -> acs"
 
     # A local mirror: the real SHA256SUMS, signed by a throwaway key, and
     # archives that do not match it. The installer only reads SHA256SUMS
