@@ -9,7 +9,9 @@ What the unit and integration tests cannot show is checked here: acs over a
 real ssh connection, against a real host, with real terminal programs and
 real interruptions. `scripts/e2e_ssh.sh` automates everything that can be
 automated; `scripts/test_linux.sh` covers Linux, multi-user isolation, and
-the network watcher against the real kernel.
+the network watcher against the real kernel. `scripts/test_linux.sh --only
+netns` (or `multiuser`, or any file under `tests/`) runs one of those with the
+same container and flags, which is the way to iterate on it (acs-pjk).
 
 The tests behind those two scripts — `tests/e2e_ssh.rs`,
 `tests/multiuser.rs` and `tests/netns.rs` — are `#[ignore]`, and the scripts
