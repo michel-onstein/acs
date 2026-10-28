@@ -93,12 +93,18 @@ pub struct Transport {
     pub mux: Option<crate::mux::Mux>,
 }
 
+/// The ssh program when the command line names none: `ACS_SSH`, else
+/// `ssh`.
+pub fn program() -> OsString {
+    std::env::var_os("ACS_SSH")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ssh".into())
+}
+
 impl Transport {
     pub fn new(destination: impl Into<String>) -> Self {
         Transport {
-            ssh: std::env::var_os("ACS_SSH")
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "ssh".into()),
+            ssh: program(),
             user_opts: Vec::new(),
             destination: destination.into(),
             identity_file: None,

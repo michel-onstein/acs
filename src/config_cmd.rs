@@ -37,14 +37,16 @@ settings: install_on_remote, update_check, command_bell, redraw_on_reconnect,
           persist (true|false: keep waiting for a lost host; default false),
           reachability_timeout (how long an alias's hosts have to answer a ping:
           500ms, 0.5s, 2s; default 500ms),
+          reachability_tcp (true|false: check an alias's hosts by connecting to
+          their ssh port instead of pinging them; default false),
           reachability_interval (how often a lost host is pinged; default 5s),
           prefer_local_network (true|false: try an alias's hosts on a network
           this machine is on first; default false),
           local_forwards (ports every session forwards, as -L spells them:
           8080:localhost:80,5432:db:5432 — or none)
 alias settings: identity_file <key> (the ssh key of its hosts that name none),
-                redraw_on_reconnect, persist, prefer_local_network
-                (true|false, over the global setting),
+                redraw_on_reconnect, persist, prefer_local_network,
+                reachability_tcp (true|false, over the global setting),
                 reachability_timeout, reachability_interval,
                 local_forwards (over the global setting; none for no forward)
 host settings: --local-networks lists the networks that make a host the local
@@ -615,8 +617,12 @@ pub fn host_list(c: &Config) -> String {
     ]];
     for a in &c.hosts {
         // In the order they are tried: preferred hosts first (DESIGN §7.3).
+        let probe = match c.reachability_tcp_for(a).value {
+            true => "tcp",
+            false => "ping",
+        };
         for e in crate::alias::ranked(&a.entries) {
-            let check = if e.reachability_check { "ping" } else { "none" };
+            let check = if e.reachability_check { probe } else { "none" };
             rows.push([
                 a.name.clone(),
                 e.host.clone(),
@@ -1597,7 +1603,7 @@ aliases:
         );
         let e = parse(&args("host set d command_bell false")).unwrap_err();
         assert!(
-            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards)"),
+            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards)"),
             "{e}"
         );
     }
@@ -1671,6 +1677,29 @@ aliases:
             host_list(&Config::default()),
             "no host aliases (add one with: acs config host add <alias> <host>)\n"
         );
+    }
+
+    /// acs-fbes: `reachability_tcp`, global and per alias, is what the
+    /// CHECK column says of the checked hosts — the alias's own value over
+    /// the global one.
+    #[test]
+    fn reachability_tcp_is_global_and_per_alias_and_listed() {
+        let set = apply("", "host set lab reachability_tcp true").unwrap();
+        assert_eq!(set, "aliases:\n  lab:\n    reachability_tcp: true\n");
+        let dir = crate::testutil::TempDir::new();
+        let f = dir.path().join("c.yaml");
+        let yaml = "reachability_tcp: false\naliases:\n  lab:\n    reachability_tcp: true\n    hosts: [{host: lab1}, {host: lab2, reachability_check: false}]\n  nas: [{host: nas.lan}]\n";
+        std::fs::write(&f, yaml).unwrap();
+        let c = Config::load_files(std::slice::from_ref(&f)).unwrap();
+        assert!(c.reachability_tcp_for(c.alias("lab").unwrap()).value);
+        assert!(!c.reachability_tcp_for(c.alias("nas").unwrap()).value);
+        let out = host_list(&c);
+        let check: Vec<&str> = out
+            .lines()
+            .skip(1)
+            .map(|l| l.split_whitespace().nth(3).unwrap())
+            .collect();
+        assert_eq!(check, ["tcp", "none", "ping"], "{out}");
     }
 
     /// acs-odd: `local_forwards` is a list, so it is set, read and written
@@ -1936,7 +1965,7 @@ aliases:
         );
         let e = apply("", "set nope 1").unwrap_err();
         assert!(
-            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards)"),
+            e.contains("(settings: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards)"),
             "{e}"
         );
     }
