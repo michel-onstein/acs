@@ -395,6 +395,44 @@ pub fn remote_candidates(version: &str) -> [String; 2] {
 /// The POSIX sh script run on the remote: exec our own version of acs with
 /// `args`, or report what is missing with an `ACS-NEED` line.
 pub fn prelude(version: &str, args: &[&str]) -> String {
+    prelude_with(version, args, None)
+}
+
+/// [`prelude`] that, after `ACS-NEED`, waits on the same connection for the
+/// client to install acs (acs-6k2, DESIGN §8.1): first contact is then one
+/// ssh handshake rather than four.
+///
+/// It reads stdin a line at a time — the `read` builtin takes one byte at a
+/// time from a pipe, so nothing past the line is consumed — and passes over
+/// everything until the line `ACS-INSTALL <sync>`. That skips the HELLO the
+/// client sent ahead with the dial (acs-trw), which was meant for a proxy
+/// that turned out not to be there. `sync` is random per dial, so no HELLO
+/// can hold it by chance. The line after it is the install script
+/// ([`crate::install`]), which reads exactly the bytes it was told to from
+/// the same stdin, checks them **before** anything is made executable, and
+/// installs. Then the candidates are tried again with every check above —
+/// owner, mode, every directory on the way — and the new binary is exec'd
+/// on the stdin that is left, which starts with the client's next HELLO.
+///
+/// The script arrives on stdin rather than in this command line because it
+/// carries digests and lengths the client only knows once `ACS-NEED` has
+/// said which target to send. It is no more trusted than the command line:
+/// both come from the client, over the one authenticated channel.
+///
+/// The exit statuses: the script's own (3 no gzip, 4 nothing to hash with,
+/// 5 a checksum mismatch, anything else a failed step), or
+/// [`INSTALLED_BUT_REFUSED`] when the install went through and the prelude
+/// still would not run what it put there. End of input before the sync
+/// line — the client chose not to install — exits quietly.
+pub fn prelude_installing(version: &str, args: &[&str], sync: &str) -> String {
+    prelude_with(version, args, Some(sync))
+}
+
+/// The prelude's exit status when it installed acs and then refused to run
+/// it (a directory on the way that someone else can write, say).
+pub const INSTALLED_BUT_REFUSED: i32 = 6;
+
+fn prelude_with(version: &str, args: &[&str], sync: Option<&str>) -> String {
     let args: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
     let [home, system] = remote_candidates(version);
     // Before exec'ing anything, check it is ours or root's and that nobody
@@ -498,14 +536,37 @@ pub fn prelude(version: &str, args: &[&str]) -> String {
          case \"$acs_t\" in /*) acs_p=$acs_t;; *) acs_p=$(dirname \"$acs_p\")/$acs_t;; esac; \
          done; \
          acs_ok \"$acs_p\" && acs_ok \"$(dirname \"$acs_p\")\"; }}; \
+         acs_run() {{ \
          for acs_b in {home} {system}; do \
          if [ -f \"$acs_b\" ] && [ -x \"$acs_b\" ]; then \
          if acs_safe \"$acs_b\"; then exec \"$acs_b\" {args}; fi; \
          printf 'acs: refusing to run %s: %s\\n' \"$acs_b\" \"$acs_w\" >&2; \
          fi; \
-         done; \
-         printf '\\nACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"",
-        args = args.join(" ")
+         done; }}; \
+         acs_run; \
+         printf '\\nACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"{tail}",
+        args = args.join(" "),
+        tail = sync.map(install_tail).unwrap_or_default(),
+    )
+}
+
+/// What [`prelude_installing`] adds after `ACS-NEED`. `(eval …); s=$?`
+/// rather than `(eval …) || exit`: on the left of `||`, `set -e` inside the
+/// script would be ignored, and it is what stops the script at the first
+/// failed step.
+fn install_tail(sync: &str) -> String {
+    format!(
+        "; while IFS= read -r acs_l; do \
+         case $acs_l in *{line}) \
+         IFS= read -r acs_l || exit 1; \
+         (eval \"$acs_l\"); acs_s=$?; \
+         [ \"$acs_s\" = 0 ] || exit \"$acs_s\"; \
+         acs_run; \
+         echo 'acs: the new install cannot be run' >&2; \
+         exit {refused};; \
+         esac; done",
+        line = sh_quote(&format!("{} {sync}", crate::proto::INSTALL_MARKER)),
+        refused = INSTALLED_BUT_REFUSED,
     )
 }
 
@@ -518,6 +579,11 @@ pub fn remote_command(script: &str) -> String {
 /// Convenience: the full remote command to run `acs <args>` of `version`.
 pub fn remote_acs(version: &str, args: &[&str]) -> String {
     remote_command(&prelude(version, args))
+}
+
+/// [`remote_acs`] with [`prelude_installing`].
+pub fn remote_acs_installing(version: &str, args: &[&str], sync: &str) -> String {
+    remote_command(&prelude_installing(version, args, sync))
 }
 
 /// Render argv for `-v` diagnostics.
