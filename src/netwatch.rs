@@ -48,6 +48,7 @@
 use std::cell::RefCell;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
 
 use crate::sys;
 
@@ -61,6 +62,11 @@ pub struct NetWatch {
     /// made, so the first hint of an outage is judged like any other
     /// rather than taken on trust.
     nets: RefCell<Vec<String>>,
+    /// `ACS_NETWATCH_NETS`, read once when the watcher is made rather than
+    /// at every hint (acs-r1k): the machine's networks come from this file
+    /// instead of `getifaddrs` ([`networks`]). A field, not process-wide
+    /// state, so a test sets it without touching the environment.
+    nets_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,8 +81,24 @@ enum Kind {
 impl NetWatch {
     /// Start watching; `None` where the platform offers nothing cheap.
     /// `verbose` is the client's `-v` ([`NetWatch::trace`]).
+    ///
+    /// The environment is read here and nowhere else in this module
+    /// (acs-r1k): `ACS_NETWATCH_FIFO` and `ACS_NETWATCH_NETS` are the tests'
+    /// stand-ins for the kernel's hint and the machine's networks.
     pub fn new(verbose: bool) -> Option<NetWatch> {
-        if let Some(path) = std::env::var_os("ACS_NETWATCH_FIFO") {
+        let path = |var| std::env::var_os(var).map(PathBuf::from);
+        Self::open(
+            verbose,
+            path("ACS_NETWATCH_FIFO"),
+            path("ACS_NETWATCH_NETS"),
+        )
+    }
+
+    /// [`NetWatch::new`] with the stand-ins passed in: hints from the FIFO
+    /// at `fifo` rather than the kernel, the networks from `nets_file`
+    /// rather than `getifaddrs`.
+    fn open(verbose: bool, fifo: Option<PathBuf>, nets_file: Option<PathBuf>) -> Option<NetWatch> {
+        if let Some(path) = fifo {
             use std::os::unix::fs::OpenOptionsExt;
             // Read-write so the FIFO never reports end of file.
             let f = std::fs::OpenOptions::new()
@@ -85,18 +107,23 @@ impl NetWatch {
                 .custom_flags(libc::O_NONBLOCK)
                 .open(path)
                 .ok()?;
-            return Some(NetWatch {
-                fd: f.into(),
-                kind: Kind::Fifo,
-                verbose,
-                nets: RefCell::new(networks()),
-            });
+            return Some(Self::made(f.into(), Kind::Fifo, verbose, nets_file));
         }
-        Self::platform(verbose).ok()
+        Self::platform(verbose, nets_file).ok()
+    }
+
+    fn made(fd: OwnedFd, kind: Kind, verbose: bool, nets_file: Option<PathBuf>) -> NetWatch {
+        NetWatch {
+            fd,
+            kind,
+            verbose,
+            nets: RefCell::new(networks(nets_file.as_deref())),
+            nets_file,
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn platform(verbose: bool) -> io::Result<NetWatch> {
+    fn platform(verbose: bool, nets_file: Option<PathBuf>) -> io::Result<NetWatch> {
         // SAFETY: plain socket creation.
         let fd =
             sys::cvt(unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) })?;
@@ -104,16 +131,11 @@ impl NetWatch {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         sys::set_cloexec(fd.as_raw_fd())?;
         sys::set_nonblocking(fd.as_raw_fd(), true)?;
-        Ok(NetWatch {
-            fd,
-            kind: Kind::Route,
-            verbose,
-            nets: RefCell::new(networks()),
-        })
+        Ok(Self::made(fd, Kind::Route, verbose, nets_file))
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn platform(verbose: bool) -> io::Result<NetWatch> {
+    fn platform(verbose: bool, nets_file: Option<PathBuf>) -> io::Result<NetWatch> {
         // SAFETY: plain socket creation.
         let fd = sys::cvt(unsafe {
             libc::socket(
@@ -136,12 +158,7 @@ impl NetWatch {
                 std::mem::size_of::<libc::sockaddr_nl>() as u32,
             )
         })?;
-        Ok(NetWatch {
-            fd,
-            kind: Kind::Netlink,
-            verbose,
-            nets: RefCell::new(networks()),
-        })
+        Ok(Self::made(fd, Kind::Netlink, verbose, nets_file))
     }
 
     pub fn fd(&self) -> RawFd {
@@ -206,7 +223,7 @@ impl NetWatch {
             }
             return None;
         }
-        let now = networks();
+        let now = networks(self.nets_file.as_deref());
         {
             let held = self.nets.borrow();
             if *held == now {
@@ -292,11 +309,11 @@ fn show(nets: &[String]) -> String {
 /// ([`crate::netmatch::LocalNet::usable`]) — nothing is reached over them,
 /// and they are most of what churns on a laptop.
 ///
-/// `ACS_NETWATCH_NETS` names a file to read them from instead (one CIDR per
-/// line), so a test can say what the machine is on. It is read afresh every
-/// time, as `getifaddrs` is.
-fn networks() -> Vec<String> {
-    let mut nets: Vec<String> = match std::env::var_os("ACS_NETWATCH_NETS") {
+/// `file` (`ACS_NETWATCH_NETS`) is one to read them from instead (one CIDR
+/// per line), so a test can say what the machine is on. It is read afresh
+/// every time, as `getifaddrs` is.
+fn networks(file: Option<&Path>) -> Vec<String> {
+    let mut nets: Vec<String> = match file {
         Some(path) => std::fs::read_to_string(path)
             .unwrap_or_default()
             .split_whitespace()
@@ -356,42 +373,26 @@ mod tests {
         assert!(!route_messages_matter(&[1, 2]));
     }
 
-    /// The two stand-ins are process-wide, so a test that wants them takes
-    /// this first. They are set and removed in [`Standin`] and nowhere else
-    /// in this binary, one test at a time: two of them at once would race
-    /// over which machine the other one is on.
-    static STANDIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// The stand-ins acs-6p8 left, held for as long as one test needs them:
-    /// `ACS_NETWATCH_FIFO` for the kernel's hint (read once, by
-    /// `NetWatch::new`) and `ACS_NETWATCH_NETS` for the machine's networks
-    /// (read afresh by every `changed()`).
+    /// The stand-ins acs-6p8 left, for as long as one test needs them: a
+    /// FIFO of this test's own for the kernel's hint and a file for the
+    /// machine's networks (read afresh by every `changed()`). Both are
+    /// passed to the watcher, not set in the environment (acs-r1k), so tests
+    /// in this binary cannot race over which machine the other is on.
     struct Standin {
         dir: crate::testutil::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Standin {
-        /// A watcher on a machine that is on `nets`, with a FIFO of this
-        /// test's own for the hints.
+        /// A watcher on a machine that is on `nets`.
         fn watching(nets: &str) -> (Standin, NetWatch) {
-            // A test that fails while holding it poisons nothing that
-            // matters: the next one sets both variables itself.
-            let lock = STANDIN.lock().unwrap_or_else(|e| e.into_inner());
             let s = Standin {
                 dir: crate::testutil::TempDir::new(),
-                _lock: lock,
             };
             let c = std::ffi::CString::new(s.fifo().to_str().unwrap()).unwrap();
             // SAFETY: a path in this test's own temporary directory.
             assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
             s.set(nets);
-            std::env::set_var("ACS_NETWATCH_FIFO", s.fifo());
-            std::env::set_var("ACS_NETWATCH_NETS", s.dir.path().join("nets"));
-            let w = NetWatch::new(false).unwrap();
-            // Spent: the watcher has its descriptor, and nothing else in
-            // this process should open the FIFO.
-            std::env::remove_var("ACS_NETWATCH_FIFO");
+            let w = NetWatch::open(false, Some(s.fifo()), Some(s.dir.path().join("nets"))).unwrap();
             (s, w)
         }
 
@@ -411,18 +412,6 @@ mod tests {
                 .open(self.fifo())
                 .and_then(|mut f| std::io::Write::write_all(&mut f, b"x"))
                 .unwrap();
-        }
-
-        /// Give the machine its real networks back, for the assertions that
-        /// are about `getifaddrs` itself.
-        fn release(&self) {
-            std::env::remove_var("ACS_NETWATCH_NETS");
-        }
-    }
-
-    impl Drop for Standin {
-        fn drop(&mut self) {
-            self.release();
         }
     }
 
@@ -467,13 +456,10 @@ mod tests {
         s.set("fd00::5/64\n");
         s.hint();
         assert!(changed());
-        s.release();
         // And this machine's own, read twice with nothing touched in
         // between: the same answer, or every hint would be a change again.
-        // Still holding `STANDIN`, so nothing else in this binary can set
-        // the variable that tells the two apart while this reads them.
-        let own = networks();
-        assert_eq!(own, networks());
+        let own = networks(None);
+        assert_eq!(own, networks(None));
         let mut sorted = own.clone();
         sorted.sort();
         assert_eq!(
@@ -491,8 +477,6 @@ mod tests {
     /// against a set that had already moved and said "not a change". The
     /// change was not deferred, it was gone, and only a covering deadline
     /// (the dial timeout, the backoff) recovered it.
-    ///
-    /// The same stand-ins as the test above, one test at a time.
     #[test]
     fn a_change_nobody_acted_on_is_offered_again() {
         let (s, w) = Standin::watching("192.168.1.5/24\n");
@@ -531,7 +515,7 @@ mod tests {
 
     #[test]
     fn platform_watcher_opens() {
-        assert!(NetWatch::platform(false).is_ok());
+        assert!(NetWatch::platform(false, None).is_ok());
     }
 
     /// The trace's own text, so the line a reader looks for is pinned
