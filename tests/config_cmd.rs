@@ -159,6 +159,49 @@ fn set_get_unset_keep_the_rest_of_the_file() {
     );
 }
 
+/// acs-tacx: a forward to the remote's IPv6 loopback is valid `-L`, but
+/// written plain into the one-line list it broke the re-parse ("unexpected
+/// text after the value"). Globally and on an alias it is now set and read
+/// back intact.
+#[test]
+fn an_ipv6_local_forward_is_set_and_read_back() {
+    let h = Home::new();
+    h.ok(&["config", "set", "local_forwards", "8080:[::1]:80"]);
+    assert_eq!(
+        h.ok(&["config", "get", "local_forwards"]),
+        "8080:[::1]:80\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "local_forwards: [\"8080:[::1]:80\"]\n"
+    );
+    h.ok(&[
+        "config",
+        "set",
+        "local_forwards",
+        "8080:[::1]:80,9090:localhost:90",
+    ]);
+    assert_eq!(
+        h.ok(&["config", "get", "local_forwards"]),
+        "8080:[::1]:80,9090:localhost:90\n"
+    );
+
+    h.ok(&["config", "host", "add", "d", "devbox.lan"]);
+    h.ok(&[
+        "config",
+        "host",
+        "set",
+        "d",
+        "local_forwards",
+        "5432:[::1]:5432",
+    ]);
+    let file = std::fs::read_to_string(h.local()).unwrap();
+    assert!(
+        file.contains("local_forwards: [\"5432:[::1]:5432\"]"),
+        "{file}"
+    );
+}
+
 /// acs-9yv: `local_networks` on a host entry, through the real binary —
 /// added, shown, and refused where the setting used to live.
 #[test]
@@ -266,6 +309,137 @@ fn an_edit_writes_through_a_symlink() {
         "the link was replaced by a regular file"
     );
     assert_eq!(h.ok(&["config", "get", "install_on_remote"]), "false\n");
+}
+
+/// Regression (acs-5mmu): a dotfiles link made before the file it points at
+/// exists. `canonicalize` fails on a dangling link, and the rename used to
+/// land on the link path, replacing the link with a regular file.
+#[test]
+fn the_first_edit_writes_through_a_dangling_symlink() {
+    let h = Home::new();
+    let target = h.dir.path().join("dotfiles/acs.yaml");
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, h.local()).unwrap();
+
+    h.ok(&["config", "set", "install_on_remote", "false"]);
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "install_on_remote: false\n",
+        "the file the link points at was not created"
+    );
+    assert!(
+        std::fs::symlink_metadata(h.local())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link was replaced by a regular file"
+    );
+}
+
+/// Regression (acs-5mmu): an edit keeps a leading `---` and a closing `...`.
+#[test]
+fn an_edit_keeps_the_document_markers() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    std::fs::write(h.local(), "---\ninstall_on_remote: true\n...\n").unwrap();
+    h.ok(&["config", "set", "install_on_remote", "false"]);
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "---\ninstall_on_remote: false\n...\n"
+    );
+}
+
+/// Regression (acs-5mmu): a refused edit named a line of the text it did
+/// not save — line 6 of a five-line file — rather than the file on disk.
+#[test]
+fn a_refused_edit_does_not_cite_a_line_of_the_unsaved_text() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    let before = "# hosts\naliases:\n  web:\n    hosts:\n      - host: web.example\n";
+    std::fs::write(h.local(), before).unwrap();
+    h.fails(
+        &["config", "host", "add", "nas", "me@h"],
+        2,
+        "config.yaml: aliases.nas: host: bad host name 'me@h'",
+    );
+    assert_eq!(std::fs::read_to_string(h.local()).unwrap(), before);
+}
+
+/// Regression (acs-vz64): a value refused from the edit itself said to
+/// fix the file by hand, though the file was fine. Only a file that is
+/// refused on its own gets that advice.
+#[test]
+fn a_refused_edit_says_fix_by_hand_only_for_a_bad_file() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    let good = "aliases:\n  web:\n    hosts:\n      - host: web.example\n";
+    std::fs::write(h.local(), good).unwrap();
+    let (c, _, err) = h.run(&["config", "host", "add", "nas", "me@h"]);
+    assert_eq!(c, 2, "{err}");
+    assert!(
+        err.trim_end()
+            .ends_with("bad host name 'me@h' (put a login name in 'user') (not saved)"),
+        "{err}"
+    );
+    assert!(!err.contains("by hand"), "{err}");
+    assert_eq!(std::fs::read_to_string(h.local()).unwrap(), good);
+
+    // The same edit on a file that is refused without it.
+    let bad = format!("install_on_remote: yes please\n{good}");
+    std::fs::write(h.local(), &bad).unwrap();
+    h.fails(
+        &["config", "host", "add", "nas", "me@h"],
+        2,
+        "(not saved; fix the file by hand)",
+    );
+    assert_eq!(std::fs::read_to_string(h.local()).unwrap(), bad);
+}
+
+/// acs-siqo: an edit reads each file once and hands it to every check, and
+/// gives the answers it gave when each check read the files itself. A host
+/// set needs both files whole and reports the first broken one in file
+/// order (global, then local); any other edit leaves a broken other file
+/// alone, as before; and the hint for a refused unset still finds the
+/// setting in the other file.
+#[test]
+fn an_edit_reads_each_file_once_and_answers_as_before() {
+    let h = Home::new();
+    h.ok(&["config", "host", "add", "devbox", "a.lan"]);
+    std::fs::create_dir_all(h.global().parent().unwrap()).unwrap();
+
+    // A broken global file: the host set names it, though the edit is local.
+    std::fs::write(h.global(), "aliases: [\n").unwrap();
+    h.fails(
+        &["config", "host", "set", "devbox", "persist", "false"],
+        2,
+        "etc/acs/config.yaml:1",
+    );
+    // Both broken: still the global one, read first.
+    let local = std::fs::read_to_string(h.local()).unwrap();
+    std::fs::write(h.local(), "aliases: [\n").unwrap();
+    h.fails(
+        &["config", "host", "set", "devbox", "persist", "false"],
+        2,
+        "etc/acs/config.yaml:1",
+    );
+    std::fs::write(h.local(), &local).unwrap();
+    // Any other edit of the local file does not need the global one.
+    h.ok(&["config", "set", "install_on_remote", "false"]);
+    assert_eq!(std::fs::read_to_string(h.global()).unwrap(), "aliases: [\n");
+
+    // A good global file: the host set goes through, and an unset of what
+    // only the global file sets points there.
+    std::fs::write(h.global(), "update_check: false\n").unwrap();
+    h.ok(&["config", "host", "set", "devbox", "persist", "false"]);
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "aliases:\n  devbox:\n    persist: false\n    hosts:\n      - host: a.lan\ninstall_on_remote: false\n"
+    );
+    h.fails(
+        &["config", "unset", "update_check"],
+        2,
+        "it is set in ~/etc/acs/config.yaml:1 (use --global)",
+    );
 }
 
 #[test]
@@ -441,6 +615,28 @@ fn identity_files_for_a_host_and_for_an_alias() {
     assert!(!h.ok(&["config", "host", "list"]).contains("id_devbox"));
 }
 
+/// acs-m8ts: an identity file ending in U+00A0 is written quoted and read
+/// back whole — it used to be saved bare and read back without it.
+#[test]
+fn an_identity_file_ending_in_a_no_break_space_reads_back_whole() {
+    let h = Home::new();
+    h.ok(&[
+        "config",
+        "host",
+        "add",
+        "a",
+        "b",
+        "--identity-file",
+        "k\u{a0}",
+    ]);
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "aliases:\n  a:\n    - host: b\n      identity_file: \"k\u{a0}\"\n"
+    );
+    let list = h.ok(&["config", "host", "list"]);
+    assert!(list.contains(" k\u{a0}"), "{list:?}");
+}
+
 #[test]
 fn redraw_on_reconnect_globally_and_for_an_alias() {
     // acs-ome: off for everything, back on for one alias.
@@ -493,6 +689,37 @@ fn redraw_on_reconnect_globally_and_for_an_alias() {
     assert_eq!(
         std::fs::read_to_string(h.local()).unwrap(),
         "aliases:\n  devbox:\n    - host: devbox.lan\n"
+    );
+}
+
+#[test]
+fn an_empty_value_means_the_same_globally_and_for_an_alias() {
+    // acs-cdal: `host set <alias> <key> ''` was refused as "bad arguments"
+    // whatever the setting, while `set <key> ''` was not.
+    let h = Home::new();
+    h.ok(&["config", "host", "add", "devbox", "devbox.lan"]);
+    h.ok(&["config", "set", "local_forwards", "8080:localhost:80"]);
+    assert_eq!(
+        h.ok(&["config", "host", "set", "devbox", "local_forwards", ""]),
+        "set local_forwards of devbox to none in ~/.config/acs/config.yaml\n"
+    );
+    assert_eq!(
+        h.ok(&["config", "set", "local_forwards", ""]),
+        "set local_forwards to none in ~/.config/acs/config.yaml\n"
+    );
+    // A setting an empty value means nothing to refuses it by name, the
+    // same way in both forms.
+    let want = "persist is true or false, not ''";
+    h.fails(&["config", "set", "persist", ""], 2, want);
+    h.fails(&["config", "host", "set", "devbox", "persist", ""], 2, want);
+    h.fails(
+        &["config", "host", "set", "devbox", "identity_file", ""],
+        2,
+        "identity_file needs a key file, not an empty value",
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "aliases:\n  devbox:\n    local_forwards: none\n    hosts:\n      - host: devbox.lan\nlocal_forwards: none\n"
     );
 }
 
@@ -550,5 +777,111 @@ fn a_host_called_config_is_reachable_with_a_user_or_an_option_first() {
         let out = acs_cmd().args(&args).output().unwrap();
         assert!(out.status.success(), "{args:?}");
         assert!(String::from_utf8_lossy(&out.stdout).starts_with("no sessions on"));
+    }
+}
+
+/// Regression (acs-36l0): with HOME and XDG_CONFIG_HOME both unset, the
+/// local file used to be `.config/acs/config.yaml` under the working
+/// directory — `acs config set` made it there, and the client read a
+/// different configuration in every directory. Now `acs config` refuses,
+/// and the client reads the global file alone.
+#[test]
+fn no_home_means_no_local_file() {
+    let cwd = TempDir::new();
+    let run = |args: &[&str]| {
+        let out = Command::new(exe())
+            .args(args)
+            .current_dir(cwd.path())
+            .env_remove("HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+            .env("ACS_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    for args in [
+        &["config", "path"][..],
+        &["config", "set", "install_on_remote", "false"],
+        &["config", "host", "add", "d", "a"],
+    ] {
+        let (code, out, err) = run(args);
+        assert_eq!(code, 2, "acs {args:?}: {out}{err}");
+        assert!(err.contains("HOME is not set"), "acs {args:?}: {err}");
+    }
+    assert!(
+        !cwd.path().join(".config").exists(),
+        "acs config wrote under the working directory"
+    );
+    let (code, out, err) = run(&["config", "help"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("acs config"), "{out}");
+
+    // A file where the old path pointed is not read by the client.
+    let stray = cwd.path().join(".config/acs/config.yaml");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, "nonsense: [\n").unwrap();
+    let (_, out, err) = run(&["list"]);
+    assert!(!err.contains("config.yaml:"), "{out}{err}");
+    assert!(err.contains("no configuration"), "{out}{err}");
+}
+
+/// acs-gydj: every row of the settings table goes through the commands the
+/// same way — `set`, `get` and `unset` for a top-level one, `host set`,
+/// `show` and `host unset` for an alias's — so a new row needs no code of
+/// its own in `acs config`.
+#[test]
+fn every_setting_in_the_table_round_trips() {
+    use acs::config::{Kind, SETTINGS};
+    let h = Home::new();
+    h.ok(&["config", "host", "add", "d", "d.lan"]);
+    let pristine = std::fs::read_to_string(h.local()).unwrap();
+    for d in SETTINGS {
+        let value = |current: &str| match d.kind {
+            // Not the default, so `get` shows the edit took.
+            Kind::Bool if current.trim() == "true" => "false",
+            Kind::Bool => "true",
+            Kind::Duration { .. } => "1500ms",
+            Kind::Forwards => "8080:localhost:80",
+            Kind::Path => "~/.ssh/k",
+        };
+        if d.global.is_some() {
+            let before = h.ok(&["config", "get", d.key]);
+            let v = value(&before);
+            h.ok(&["config", "set", d.key, v]);
+            assert_eq!(h.ok(&["config", "get", d.key]).trim(), v, "{}", d.key);
+            h.ok(&["config", "unset", d.key]);
+            assert_eq!(h.ok(&["config", "get", d.key]), before, "{}", d.key);
+        } else {
+            h.fails(&["config", "set", d.key, "x"], 2, "unknown setting");
+        }
+        if d.alias.is_some() {
+            let v = value("");
+            h.ok(&["config", "host", "set", "d", d.key, v]);
+            let show = h.ok(&["config", "show"]);
+            let line = format!("{}: {v}", d.key);
+            let line = match d.kind {
+                Kind::Forwards => format!("{}: [{v}]", d.key),
+                _ => line,
+            };
+            assert!(show.contains(&line), "{} not in:\n{show}", d.key);
+            h.ok(&["config", "host", "unset", "d", d.key]);
+        } else {
+            h.fails(
+                &["config", "host", "set", "d", d.key, "true"],
+                2,
+                "unknown alias setting",
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(h.local()).unwrap(),
+            pristine,
+            "{}",
+            d.key
+        );
     }
 }

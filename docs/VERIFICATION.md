@@ -1,22 +1,35 @@
 # acs — verification
 
-**Status:** Automated end-to-end checks pass (2026-09-24), except
-`scripts/test_install.sh`, which has been stale since release signing landed
-and cannot pass as it stands (see its rows below); the checks that need a
-person at a real terminal are listed at the end, not yet done.
+**Status:** Automated end-to-end checks pass (2026-09-24; the installer
+suite, `scripts/test_install.sh`, back from stale on 2026-10-27, acs-t8t);
+the checks that need a person at a real terminal are listed at the end, not
+yet done.
 
 What the unit and integration tests cannot show is checked here: acs over a
 real ssh connection, against a real host, with real terminal programs and
 real interruptions. `scripts/e2e_ssh.sh` automates everything that can be
 automated; `scripts/test_linux.sh` covers Linux, multi-user isolation, and
-the network watcher against the real kernel.
+the network watcher against the real kernel. `scripts/test_linux.sh --only
+netns` (or `multiuser`, or any file under `tests/`) runs one of those with the
+same container and flags, which is the way to iterate on it (acs-pjk).
+
+The tests behind those two scripts — `tests/e2e_ssh.rs`,
+`tests/multiuser.rs` and `tests/netns.rs` — are `#[ignore]`, and the scripts
+ask for them with `--include-ignored`. A plain `cargo test`, and so
+`scripts/verify.sh` on a Mac, counts them as ignored in each binary's
+summary instead of passing them unrun, and `scripts/verify.sh` ends its test
+step with the total it left out (acs-hdj4). One asked for outside its
+script fails rather than returning early, so a green run of a script means
+those tests ran.
 
 ## Environment
 
 - Client: `dist/aarch64-apple-darwin/acs` (complete build from
   `cargo xtask dist`), macOS on Apple silicon.
 - Host: Alpine Linux container (`scripts/e2e/Dockerfile`) running OpenSSH
-  `sshd`, user `dev` accepting only a freshly generated ed25519 key, reached
+  `sshd`, users `dev` and `solo` (the user the system-wide install is
+  checked as, with no acs of its own) accepting only a freshly generated
+  ed25519 key, reached
   as `acs -F /dev/null -i <key> -p <port> … dev@127.0.0.1` (a free port docker
   picks, or `ACS_E2E_PORT`). The image sets `AllowTcpForwarding yes`, which
   Alpine ships as `no`, so that `-L` can be exercised at all; that is a test
@@ -28,10 +41,11 @@ the network watcher against the real kernel.
 
 | Check | How | Result |
 | --- | --- | --- |
-| First contact installs acs | fresh host; client streams its Linux aarch64 payload, `_install --finish` completes it | Pass — installed, session attached |
+| First contact installs acs | fresh host; client streams its Linux aarch64 payload, `_install --finish` completes it — on the session's own connection since acs-6k2 (2026-10-27) | Pass — installed, session attached; `e2e_01` 0.21 s against 0.47 s before, and one ssh invocation where there were four |
 | `-i` selects the key | same command without `-i` (`IdentitiesOnly=yes`, `BatchMode=yes`) | Pass — exit 255 without it, works with it |
 | `-L` forwards a port, and only on the session's ssh | `scripts/e2e_ssh.sh` (`e2e_14`): `acs -L <free port>:127.0.0.1:22 … dev@127.0.0.1 fwd`, the port read with a plain TCP connect, `acs list` given the same `-L` while the session holds the port, then the session's ssh killed to force a redial (2026-09-23) | Pass — the container's sshd banner comes back through the port; the `acs list` side call succeeds and its stderr never names the port, so its ssh never asked to bind it; after the redial a new ssh rebinds the port and the banner comes back |
 | The ssh master acs owns | `scripts/e2e_ssh.sh` (`e2e_15`, acs-9n3): a session, detached, then the same `acs` again; `ssh -O check` on acs's control socket between each step; then the host's `sshd-session` killed to force a redial (2026-09-23) | Pass — the detach leaves one master (`0600` socket in a `0700` directory), the reattach is served by that same pid rather than a second one, and the redial after the kill ends it (`-O check` then fails). Measured: 51 ms to `ACS-READY` cold against 13 ms on the master, over loopback where a handshake costs almost no round trips |
+| The system-wide install alone, over ssh | `scripts/e2e_ssh.sh` (`e2e_16`, acs-1gy): root puts this tree's Linux build at `/usr/local/lib/acs/<version>/acs` (root-owned, `0755` throughout), then `acs solo@127.0.0.1 sys` as a user with no acs under `$HOME`; the container's process list read while attached, and solo's `~/.local/share/acs` and `~/.local/bin` after (2026-10-27) | Pass — attaches with no "installing acs", the proxy runs as `/usr/local/lib/acs/<version>/acs _proxy …`, and solo is left with no copy and no link of its own. Shown red first by making root's binary `0775`, which the prelude refuses: solo then got a first-contact install, and its proxy ran from `/home/solo/.local/share/acs/<version>/acs` |
 | vim | `vim -u NONE -N`, then `:q` | Pass — alternate screen entered and left, exit status 0, terminal restored |
 | OSC 52 and OSC 8 | program prints a clipboard write and a hyperlink | Pass — both byte-exact at the client |
 | Kitty keyboard protocol | program pushes kitty flags; client sends Ctrl-] Ctrl-] d as `CSI 93;5u` | Pass — detaches; the pushed flags are popped on the way out |
@@ -51,7 +65,8 @@ the network watcher against the real kernel.
 | Multi-user isolation | squatted and symlinked socket directories, foreign peer uid, per-user `main`, and (acs-9n3) a control-socket directory alice created before bob | Pass — bob refuses alice's directory by name and dials with no control path at all; his own comes up `0700` and his, and alice cannot list it (`rust:alpine` as root, `cargo test --test multiuser`, 2026-09-23) |
 | Static Linux binaries run | `dist/*-linux-musl/acs --version` in Alpine (aarch64 native, x86_64 emulated) | Pass |
 | macOS binaries signed | `codesign -v` on both complete macOS builds | Pass |
-| One-line installer | `scripts/test_install.sh` against the real v0.1.0 and v0.2.0 releases: macOS arm64 (curl), Alpine x86_64 (busybox wget) and Ubuntu aarch64 (curl), each as root and as a user | Pass — default layout, pinned version and in-place upgrade, `ACS_INSTALL_DIR`, checksum mismatch, missing version, unsupported platform. **Stale since signing (acs-o9v): the suite cannot pass today.** Its default `ACS_TEST_OLD=0.1.0` predates `SHA256SUMS.sig`, so the pinned-version case dies on a 404, and the checksum-mismatch mirror it builds has no `.sig` either, so the installer refuses before the checksum is reached. Both reproduce unchanged on `origin/main` |
+| One-line installer's link, by `should_link`'s rule | `scripts/test_install.sh` (2026-10-27, acs-feee), same releases and the same five runs as below | Pass, all nine cases in all five runs — the seven below, with the pinned case now pinned v0.12.0 installed beside v0.17.0 and the link left on v0.17.0, a link of ours to v0.12.0 moved forward to v0.17.0, and a user's own regular file at the link's name left alone with the installer saying so |
+| One-line installer | `scripts/test_install.sh` (2026-10-27, acs-t8t) against the real v0.12.0 (the first signed release) and v0.17.0 releases, with the installer from `main` after acs-x57 and #228: macOS arm64 (curl), then `alpine:3` aarch64 (busybox wget, ash) and `ubuntu:24.04` aarch64 (curl), each as root and as a user | Pass, all seven cases in all five runs — default layout, pinned v0.12.0 then upgraded in place to v0.17.0, `ACS_INSTALL_DIR`, a `SHA256SUMS` signed by another key refused, checksum mismatch refused, missing version, unsupported platform. The checksum case now really reaches the checksum check: its local mirror's `SHA256SUMS` is signed by a throwaway key, and that case runs a copy of the installer with the throwaway key substituted for `release_key`, as `cargo xtask package` substitutes a fork's; the same mirror against the unmodified installer is the foreign-signature case. Back from stale since signing (acs-o9v): the old default `ACS_TEST_OLD=0.1.0` predated `SHA256SUMS.sig`, the mirror had no signature, and neither container image had `ssh-keygen` (now `openssh-keygen` on Alpine, `openssh-client` on Ubuntu), so the containers had never been reached since |
 | One-line installer, after acs-x57 | the substituted script by hand (2026-09-25): `shellcheck` and `sh -n`; `scripts/test_install.sh` as far as the stale cases allow (latest into the default layout, pinned v0.15.0 then upgraded in place, `ACS_INSTALL_DIR`); the repository script and the **packaged** one run for real in `alpine:3` (busybox wget, ash) and `ubuntu:24.04`, as root and as a user; a fork-packaged copy run locally | Pass — all three reachable cases green, every container install landed the 0.16.0 release and ran it, and the fork's copy asks `https://github.com/someone/acs-fork/...` and nothing upstream |
 | `acs upgrade` from GitHub, macOS | this code built as 0.1.0 (plain file), `acs upgrade --check`, then `acs upgrade` (2026-09-18) | Pass — replaced by the real 0.2.0 release; `codesign -v`: valid on disk, satisfies its Designated Requirement; no quarantine attribute |
 | `acs upgrade` from GitHub, Linux | the same as a static aarch64 build in Alpine, which has no curl | Pass — downloaded with the wget fallback and replaced by 0.2.0 |

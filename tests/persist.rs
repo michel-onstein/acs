@@ -24,15 +24,6 @@ fn session(host: &str, extra: &[&'static str]) -> Vec<&'static str> {
     args
 }
 
-/// Wait until `f` holds.
-fn until(what: &str, f: impl Fn() -> bool) {
-    let deadline = Instant::now() + T;
-    while !f() {
-        assert!(Instant::now() < deadline, "never: {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 const ALIAS: &str = "\
 reachability_interval: 200ms
 aliases:
@@ -51,7 +42,7 @@ fn an_alias_with_no_host_answering_is_waited_for_from_the_start() {
         T,
     );
     // Pinged again every interval, and nothing dialled meanwhile.
-    until("three pings", || net.pinged().len() >= 3);
+    wait_until(T, || net.pinged().len() >= 3, || "never: three pings");
     assert!(
         remote.transport_pids().is_empty(),
         "dialled before an answer"
@@ -86,9 +77,11 @@ fn a_dropped_plain_host_is_pinged_until_it_answers_then_resumed() {
     let pinged = net.pinged().len();
     remote.cut_link();
     c.wait_for("devbox is not answering — pinging it every 200ms", T);
-    until("three pings after the drop", || {
-        net.pinged().len() >= pinged + 3
-    });
+    wait_until(
+        T,
+        || net.pinged().len() >= pinged + 3,
+        || "never: three pings after the drop",
+    );
     assert_eq!(
         remote.connections(),
         dials,
@@ -102,6 +95,40 @@ fn a_dropped_plain_host_is_pinged_until_it_answers_then_resumed() {
     // After the Ctrl-L every resume sends first (redraw_on_reconnect).
     c.wait_for("got:\x0cback", T);
     assert_eq!(remote.connections(), dials + 1);
+}
+
+/// acs-vxg: a lost host is pinged every second (here `ACS_PERSIST_FAST_MS`,
+/// 100 ms) for the first 30 of them, and only then every
+/// `reachability_interval` — before, it waited the whole 10 s for the first.
+#[test]
+fn a_lost_host_is_pinged_fast_at_first_then_every_interval() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox"]);
+    let env = net.env("persist: true\nreachability_interval: 10s\n");
+    let mut env = refs(&env);
+    env.extend([("ACS_PING_MS", "200"), ("ACS_PERSIST_FAST_MS", "100")]);
+    let mut c = Client::start_env(&remote, &session("devbox", &[]), &env);
+    c.wait_for("up", T);
+    net.set_up(&[]);
+    let pinged = net.pinged().len();
+    remote.cut_link();
+    c.wait_for(
+        "devbox is not answering — pinging it every 100ms at first, then 10s",
+        T,
+    );
+    let lost = Instant::now();
+    // Fast at first: five pings well inside the first 10 s interval.
+    let fast = Duration::from_secs(2);
+    wait_until(
+        fast.saturating_sub(lost.elapsed()),
+        || net.pinged().len() >= pinged + 5,
+        || "not pinged fast after the loss",
+    );
+    // Then backed off: after the 3 s of fast pings, none for a while.
+    std::thread::sleep(Duration::from_millis(3500).saturating_sub(lost.elapsed()));
+    let settled = net.pinged().len();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(net.pinged().len(), settled, "still pinging fast after 3 s");
 }
 
 #[test]
@@ -161,9 +188,43 @@ fn a_first_connect_that_fails_is_waited_out_before_any_session() {
     );
     net.set_up(&[]);
     let pinged = net.pinged().len();
-    until("pings while down", || net.pinged().len() >= pinged + 2);
+    wait_until(
+        T,
+        || net.pinged().len() >= pinged + 2,
+        || "never: pings while down",
+    );
     std::fs::write(dir.path().join("up"), "").unwrap();
     net.set_up(&["devbox"]);
     c.wait_for("new session 's' on devbox", T);
     c.wait_for("up", T);
+}
+
+/// acs-ysx: every ping step shows its status, and while the host stays
+/// down the text is the same each time. A line already up is not drawn
+/// again for nothing: a long outage, when the link is at its worst, does
+/// not send the whole span on every step.
+#[test]
+fn an_unchanged_status_line_is_drawn_once_across_ping_steps() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox"]);
+    let env = net.env("persist: true\nreachability_interval: 100ms\n");
+    let mut env = refs(&env);
+    env.push(("ACS_PING_MS", "100"));
+    let mut c = Client::start_env(&remote, &session("devbox", &[]), &env);
+    c.wait_for("up", T);
+    net.set_up(&[]);
+    let pinged = net.pinged().len();
+    remote.cut_link();
+    let line = "\x1b[7macs: devbox is not answering — pinging it every 100ms";
+    c.wait_for(line, T);
+    wait_until(
+        T,
+        || net.pinged().len() >= pinged + 4,
+        || "never: four pings after the drop",
+    );
+    let drawn = c.text().matches(line).count();
+    assert_eq!(drawn, 1, "the same status line was drawn {drawn} times");
+    // And it still comes down when the host is back.
+    net.set_up(&["devbox"]);
+    c.wait_for("\x1b[23;0t", T);
 }

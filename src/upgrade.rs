@@ -190,10 +190,10 @@ fn link_candidates() -> Vec<PathBuf> {
             v.push(std::path::absolute(&a0).unwrap_or(a0));
         }
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        v.push(PathBuf::from(home).join(".local/bin/acs"));
+    if let Some(home) = crate::sys::env_nonempty("HOME") {
+        v.push(crate::layout::user_bin(Path::new(&home)).join("acs"));
     }
-    v.push(PathBuf::from("/usr/local/bin/acs"));
+    v.push(crate::layout::system_link());
     if let Some(path) = std::env::var_os("PATH") {
         v.extend(std::env::split_paths(&path).map(|d| d.join("acs")));
     }
@@ -240,14 +240,27 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// Create a fresh `<prefix>.<token>` directory under the temp directory,
+/// 0700 whatever the umask (acs-3sae). What is downloaded into it is
+/// verified, re-read, unpacked and run by path, so a directory someone else
+/// could write — 0775 under umask 002 with a shared group — would let them
+/// swap a file between its check and its use. The mode is still masked by
+/// the umask, but no umask in use takes the owner's own bits.
+pub(crate) fn scratch_dir(prefix: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let p = std::env::temp_dir().join(format!("{prefix}.{}", crate::sys::random_token()));
+    std::fs::DirBuilder::new().mode(0o700).create(&p)?;
+    Ok(p)
+}
+
 /// A temporary directory removed on drop.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Result<Scratch, String> {
-        let p = std::env::temp_dir().join(format!("acs-upgrade.{}", crate::sys::random_token()));
-        std::fs::create_dir(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-        Ok(Scratch(p))
+        scratch_dir("acs-upgrade")
+            .map(Scratch)
+            .map_err(|e| format!("cannot create a scratch directory: {e}"))
     }
 }
 
@@ -269,7 +282,7 @@ pub fn run(opts: &Opts) -> Result<String, Error> {
             e.display()
         )));
     }
-    let target = release::archive_target(crate::payload::OWN_TARGET);
+    let target = release::own_archive_target();
     let base = release::releases_url(opts.allow_insecure_url).map_err(Error::Failed)?;
     let tmp = Scratch::new()?;
     let asset = release::lookup(&base, opts.version.as_deref(), &target, &tmp.0, 30)?;
@@ -354,8 +367,8 @@ fn check_writable(dir: &Path) -> Result<(), Error> {
 fn download(base: &str, asset: &Asset, target: &str, tmp: &Path) -> Result<PathBuf, Error> {
     let archive = tmp.join(&asset.file);
     release::fetch(&release::asset_url(base, asset), &archive, 300)?;
-    let data = std::fs::read(&archive).map_err(|e| e.to_string())?;
-    let got = crate::sha256::hex(&crate::sha256::digest(&data));
+    let got = crate::sha256::file(&archive).map_err(|e| e.to_string())?;
+    let got = crate::sha256::hex(&got);
     if got != asset.sha256 {
         return Err(Error::Failed(format!(
             "checksum mismatch for {} (expected {}, got {got}); nothing was changed",
@@ -412,19 +425,17 @@ struct Staged {
 impl Staged {
     /// Copy `from` next to `to` under a temporary name, with `mode`.
     fn new(from: &Path, to: &Path, mode: u32) -> Result<Staged, String> {
-        use std::os::unix::fs::PermissionsExt;
         let dir = to.parent().ok_or("no directory to install into")?;
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        make_dirs(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         // Created by us, or not at all: `fs::copy` opens the destination
         // with create-and-truncate, which follows a symlink planted at
         // that name and writes through to whatever it points at — as root,
         // when the user was told to re-run under sudo (acs-721).
         let tmp = dir.join(format!(".acs.upgrade.{}", crate::sys::random_token()));
         (|| -> std::io::Result<()> {
-            let mut out = crate::sys::create_new(&tmp)?;
+            let mut out = crate::sys::create_new_mode(&tmp, mode)?;
             let mut src = std::fs::File::open(from)?;
-            std::io::copy(&mut src, &mut out)?;
-            out.set_permissions(std::fs::Permissions::from_mode(mode))
+            std::io::copy(&mut src, &mut out).map(drop)
         })()
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
@@ -457,16 +468,33 @@ impl Drop for Staged {
     }
 }
 
+/// Create `dir` and any missing parents as 0755 whatever the umask, as the
+/// remote install's `make_dir` does (acs-91q2). The remote prelude refuses a
+/// binary whose directory others can write, so `root/<version>/` made 0775
+/// under umask 002 (Ubuntu's default with user-private groups) was refused
+/// once and re-uploaded on the first connection to an upgraded host.
+/// Directories that already exist are left alone: in the plain layout that
+/// is wherever the binary lives, which is not ours to change.
+fn make_dirs(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let missing: Vec<&Path> = dir.ancestors().take_while(|d| !d.exists()).collect();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)?;
+    // The mode above is still masked by the umask; set it outright, so a
+    // stricter one than 022 cannot leave a system install that only root
+    // can read.
+    for d in missing.iter().rev() {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 /// Point the symlink `link` at `target`, atomically.
 fn relink(target: &Path, link: &Path) -> Result<(), String> {
-    let dir = link.parent().ok_or("no directory for the link")?;
-    let tmp = dir.join(format!(".acs.link.{}", crate::sys::random_token()));
-    std::os::unix::fs::symlink(target, &tmp)
-        .and_then(|_| std::fs::rename(&tmp, link))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("cannot repoint {}: {e}", link.display())
-        })
+    crate::sys::symlink_atomic(target, link)
+        .map_err(|e| format!("cannot repoint {}: {e}", link.display()))
 }
 
 #[cfg(test)]
@@ -495,6 +523,19 @@ mod tests {
         assert!(parse(&args("now"))
             .unwrap_err()
             .contains("unexpected argument now"));
+    }
+
+    /// acs-3sae: the scratch directory was `create_dir`'d at 0777 & ~umask —
+    /// world-readable under 022, group-writable under 002. The umask is not
+    /// changed here, as it belongs to every test in the process;
+    /// `tests/upgrade.rs` runs `acs upgrade` under 002.
+    #[test]
+    fn the_scratch_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = scratch_dir("acs-test-scratch").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir(&p).unwrap();
+        assert_eq!(mode, 0o700, "{mode:o}");
     }
 
     #[test]

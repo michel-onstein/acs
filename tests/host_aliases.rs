@@ -43,11 +43,15 @@ fn wait_up(c: &mut Client, session: &str) {
 fn an_alias_connects_to_its_first_reachable_host() {
     let remote = Remote::installed();
     let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    net.set_lagging(&["devbox.example.com"]);
     let env = net.env(CONFIG);
     let mut c = Client::start_env(&remote, &session("devbox"), &refs(&env));
     c.wait_for("devbox: devbox.lan answers ping, using devbox.lan", T);
     wait_up(&mut c, "s");
-    assert_eq!(net.pinged(), ["devbox.example.com", "devbox.lan"]);
+    // Both were pinged — but devbox.example.com's answer was never waited
+    // for, so its line lands whenever its shell runs, here 2 s after
+    // devbox.lan has been chosen (acs-uj6).
+    net.wait_pinged(&["devbox.example.com", "devbox.lan"]);
 }
 
 #[test]
@@ -75,11 +79,8 @@ fn an_ipv6_host_is_pinged_with_ping6() {
     let mut c = Client::start_env(&remote, &session("nas"), &refs(&env));
     c.wait_for("nas: fd00:1::20 answers ping, using fd00:1::20", T);
     wait_up(&mut c, "s");
-    assert_eq!(
-        net.pinged(),
-        ["fd00:1::20", "fd00:1::20"],
-        "ping, then ping6"
-    );
+    // Ping, then ping6.
+    net.wait_pinged(&["fd00:1::20", "fd00:1::20"]);
 }
 
 #[test]
@@ -90,7 +91,7 @@ fn an_unchecked_host_is_used_without_a_ping() {
     let mut c = Client::start_env(&remote, &session("lab"), &refs(&env));
     c.wait_for("lab: using lab2 (reachability_check is off, ", T);
     wait_up(&mut c, "s");
-    assert_eq!(net.pinged(), ["lab1"]);
+    net.wait_pinged(&["lab1"]);
 }
 
 #[test]
@@ -243,12 +244,8 @@ fn list_resolves_the_alias_too() {
 /// A client of `name` connected through devbox.lan, with fast redials.
 fn redialling(remote: &Remote, net: &Net, name: &str) -> Client {
     let mut env = net.env(CONFIG);
-    for (k, v) in [
-        ("ACS_BACKOFF_MS", "100"),
-        ("ACS_PING_MS", "200"),
-        ("ACS_DEAD_MS", "800"),
-    ] {
-        env.push((k.into(), v.into()));
+    for (k, v) in FAST {
+        env.push((k.to_string(), v.to_string()));
     }
     let mut c = Client::start_env(
         remote,
@@ -400,12 +397,7 @@ fn a_redial_onto_the_fallback_host_switches_to_its_key() {
     let remote = Remote::installed();
     let ssh = devbox_ssh(&remote);
     let net = Net::new(&["devbox.lan"]);
-    let fast = [
-        ("ACS_BACKOFF_MS", "100"),
-        ("ACS_PING_MS", "200"),
-        ("ACS_DEAD_MS", "800"),
-    ];
-    let mut c = keyed_client(&ssh, &net, &[], &fast);
+    let mut c = keyed_client(&ssh, &net, &[], FAST);
     wait_up(&mut c, "k");
     net.set_up(&["devbox.example.com"]);
     let dialled = remote.connections();
@@ -442,4 +434,229 @@ fn list_uses_the_chosen_hosts_key() {
     );
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert_eq!(ssh.keys(), [key("devbox.example.com", &["/keys/devbox"])]);
+}
+
+// ---- the host used last on these networks (acs-zpj) -------------------------
+
+/// A state directory of the test's own, and the networks the machine is on
+/// (`ACS_NETWATCH_NETS`, which the memory reads as the watcher does).
+struct Place {
+    dir: acs::testutil::TempDir,
+}
+
+impl Place {
+    fn new(nets: &str) -> Place {
+        let p = Place {
+            dir: acs::testutil::TempDir::new(),
+        };
+        p.move_to(nets);
+        p
+    }
+
+    fn move_to(&self, nets: &str) {
+        std::fs::write(self.dir.path().join("networks"), nets).unwrap();
+    }
+
+    fn env(&self, net: &Net) -> Vec<(String, String)> {
+        let mut env = net.env(CONFIG);
+        let dir = self.dir.path();
+        env.push(("XDG_STATE_HOME".into(), dir.display().to_string()));
+        let nets = dir.join("networks").display().to_string();
+        env.push(("ACS_NETWATCH_NETS".into(), nets));
+        env
+    }
+
+    fn remembered(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("acs/aliases")).unwrap_or_default()
+    }
+}
+
+/// Start a `devbox` session, wait for each of `lines`, and end it.
+fn connect_through(remote: &Remote, env: &[(String, String)], lines: &[&str]) -> String {
+    let mut c = Client::start_env(remote, &session("devbox"), &refs(env));
+    for l in lines {
+        c.wait_for(l, T);
+    }
+    wait_up(&mut c, "s");
+    c.send(&command(b'x'));
+    c.wait(T);
+    c.text()
+}
+
+#[test]
+fn the_host_used_last_on_these_networks_is_taken_without_waiting() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.example.com"]);
+    let place = Place::new("192.168.1.5/24\n");
+    let env = place.env(&net);
+    // The first time devbox.lan is tried and passed over, and the fallback
+    // is remembered for this network.
+    connect_through(
+        &remote,
+        &env,
+        &[
+            "devbox: devbox.lan does not answer ping",
+            "devbox: devbox.example.com answers ping, using me@devbox.example.com",
+        ],
+    );
+    assert_eq!(
+        place.remembered(),
+        "devbox\tdevbox.example.com\t192.168.1.0/24\n"
+    );
+    // Now devbox.lan would take 30 s to say it is down, and the deadline
+    // is a minute: the remembered host is taken as soon as it answers, and
+    // devbox.lan is not waited for.
+    net.set_slow(&["devbox.lan"]);
+    let text = connect_through(
+        &remote,
+        &env,
+        &[
+            "devbox: devbox.example.com was used last on these networks",
+            "devbox: devbox.example.com answers ping, using me@devbox.example.com",
+            "devbox: devbox.lan not waited for: devbox.example.com was used last on these networks",
+        ],
+    );
+    assert!(!text.contains("devbox.lan does not answer"), "{text}");
+    // On another network the memory is not this one's: devbox.lan is
+    // tried again, and that network gets a memory of its own.
+    net.set_slow(&[]);
+    place.move_to("10.1.0.5/16\n");
+    let text = connect_through(
+        &remote,
+        &env,
+        &[
+            "devbox: devbox.lan does not answer ping",
+            "devbox: devbox.example.com answers ping, using me@devbox.example.com",
+        ],
+    );
+    assert!(!text.contains("used last"), "{text}");
+    assert_eq!(
+        place.remembered(),
+        "devbox\tdevbox.example.com\t10.1.0.0/16\n\
+         devbox\tdevbox.example.com\t192.168.1.0/24\n"
+    );
+}
+
+// ---- reachability_tcp: the ssh port instead of a ping (acs-fbes) -----------
+
+/// A fake `ssh` for `ACS_SSH` whose `-G` sends `devbox.lan` to a closed
+/// port, `me@devbox.example.com` to `open`, and `jumped` through a
+/// ProxyJump. The session itself goes over the fake transport, so this is
+/// only ever asked `-G`.
+fn port_ssh(dir: &acs::testutil::TempDir, open: u16, closed: u16) -> String {
+    let path = dir.path().join("ssh");
+    let body = format!(
+        "#!/bin/sh\n[ \"$1\" = -G ] || exit 2\nfor d; do :; done\ncase \"$d\" in\n\
+         devbox.lan) printf 'hostname 127.0.0.1\\nport {closed}\\n' ;;\n\
+         me@devbox.example.com) printf 'hostname 127.0.0.1\\nport {open}\\n' ;;\n\
+         jumped) printf 'hostname 10.9.9.9\\nport 22\\nproxyjump bastion\\n' ;;\n\
+         *) exit 255 ;;\n\
+         esac\n"
+    );
+    write_executable(&path, body);
+    path.display().to_string()
+}
+
+/// A listening port and a closed one, on 127.0.0.1.
+fn ports() -> (std::net::TcpListener, u16, u16) {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let open_port = open.local_addr().unwrap().port();
+    (open, open_port, closed_port)
+}
+
+#[test]
+fn reachability_tcp_checks_the_ssh_port_instead_of_pinging() {
+    let remote = Remote::installed();
+    // Both answer a ping: only the ports can tell them apart.
+    let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    let dir = acs::testutil::TempDir::new();
+    let (_listener, open, closed) = ports();
+    let mut env = net.env(&format!("reachability_tcp: true\n{CONFIG}"));
+    env.push(("ACS_SSH".into(), port_ssh(&dir, open, closed)));
+    let mut c = Client::start_env(&remote, &session("devbox"), &refs(&env));
+    c.wait_for(
+        &format!("devbox: devbox.lan does not answer on port {closed} within 60s"),
+        T,
+    );
+    c.wait_for(
+        &format!("devbox: devbox.example.com answers on port {open}, using me@devbox.example.com"),
+        T,
+    );
+    wait_up(&mut c, "s");
+    assert!(net.pinged().is_empty(), "{:?}", net.pinged());
+}
+
+/// An entry ssh reaches through a ProxyJump has no port of its own to try,
+/// so it is pinged as without the setting.
+#[test]
+fn reachability_tcp_pings_a_host_behind_a_proxy_jump() {
+    let remote = Remote::installed();
+    let net = Net::new(&["jumped"]);
+    let dir = acs::testutil::TempDir::new();
+    let (_listener, open, closed) = ports();
+    let mut env = net.env("reachability_tcp: true\naliases:\n  inside: [{host: jumped}]\n");
+    env.push(("ACS_SSH".into(), port_ssh(&dir, open, closed)));
+    let mut c = Client::start_env(&remote, &session("inside"), &refs(&env));
+    c.wait_for(
+        "inside: jumped answers ping (ssh reaches it through a proxy), using jumped",
+        T,
+    );
+    wait_up(&mut c, "s");
+    net.wait_pinged(&["jumped"]);
+}
+
+/// acs-nhrq: `ssh -G` is given the command line's ssh options, so a `-p`
+/// there is the port probed, as it is the port dialled. This fake names
+/// the `-p` it was given, the closed port without one.
+#[test]
+fn reachability_tcp_probes_the_command_lines_port() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    let dir = acs::testutil::TempDir::new();
+    let (_listener, open, closed) = ports();
+    let ssh = dir.path().join("ssh");
+    let body = format!(
+        "#!/bin/sh\n[ \"$1\" = -G ] || exit 2\nport={closed}\n\
+         while [ $# -gt 0 ]; do [ \"$1\" = -p ] && port=$2; shift; done\n\
+         printf 'hostname 127.0.0.1\\nport %s\\n' \"$port\"\n"
+    );
+    write_executable(&ssh, body);
+    let mut env = net.env(&format!("reachability_tcp: true\n{CONFIG}"));
+    env.push(("ACS_SSH".into(), ssh.display().to_string()));
+    let port = open.to_string();
+    let mut args = vec!["-p", &port];
+    args.extend(session("devbox"));
+    let mut c = Client::start_env(&remote, &args, &refs(&env));
+    c.wait_for(
+        &format!("devbox: devbox.lan answers on port {open}, using devbox.lan"),
+        T,
+    );
+    wait_up(&mut c, "s");
+    assert!(net.pinged().is_empty(), "{:?}", net.pinged());
+}
+
+/// acs-nhrq: `--ssh` names the program `ssh -G` runs, over `ACS_SSH`.
+#[test]
+fn reachability_tcp_asks_the_ssh_named_by_the_command_line() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    let dir = acs::testutil::TempDir::new();
+    let (_listener, open, closed) = ports();
+    // ACS_SSH names no port for anything: were it asked, nothing answers.
+    let none = dir.path().join("no-ssh");
+    write_executable(&none, "#!/bin/sh\nexit 255\n");
+    let mut env = net.env(&format!("reachability_tcp: true\n{CONFIG}"));
+    env.push(("ACS_SSH".into(), none.display().to_string()));
+    let ssh = port_ssh(&dir, open, closed);
+    let mut args = vec!["--ssh", &ssh];
+    args.extend(session("devbox"));
+    let mut c = Client::start_env(&remote, &args, &refs(&env));
+    c.wait_for(
+        &format!("devbox: devbox.example.com answers on port {open}, using me@devbox.example.com"),
+        T,
+    );
+    wait_up(&mut c, "s");
 }

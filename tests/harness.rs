@@ -6,8 +6,8 @@ mod common;
 
 use std::process::Command;
 
-use acs::proto::{Marker, Mode, Msg};
-use acs::testutil::{hello, FrameConn};
+use acs::proto::Marker;
+use acs::testutil::{hello_running, FrameConn, KillOnDrop};
 use common::*;
 
 #[test]
@@ -17,26 +17,22 @@ fn remote_chain_is_byte_exact() {
     // Raw bytes: control characters, escape sequences, high bytes.
     let data = binary_pattern(&data_file, 200_000);
 
-    let mut child =
-        remote.run_remote(&["_proxy", "--session", "smoke", "--mode", "attach-or-create"]);
-    let mut c = FrameConn::from_io(child.stdout.take().unwrap(), child.stdin.take().unwrap());
-    assert!(matches!(c.expect_marker(T), Some(Marker::Ready { .. })));
-    let mut h = hello("smoke", Mode::AttachOrCreate, "me");
+    let mut child = KillOnDrop(remote.run_remote(&[
+        "_proxy",
+        "--session",
+        "smoke",
+        "--mode",
+        "attach-or-create",
+    ]));
+    let mut c = FrameConn::ready_over(&mut child);
     // Raw mode on the pty so the terminal line discipline does not touch
     // the bytes, then print them and a marker.
-    h.command = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        format!(
-            "stty raw -echo; cat '{}'; printf '\\nEND'",
-            data_file.display()
-        ),
-    ];
-    c.send(&Msg::Hello(h));
-    match c.recv_control(T) {
-        Some(Msg::Welcome(w)) => assert!(w.created),
-        other => panic!("{other:?}"),
-    }
+    let script = format!(
+        "stty raw -echo; cat '{}'; printf '\\nEND'",
+        data_file.display()
+    );
+    let w = c.greet(hello_running("smoke", "me", &["/bin/sh", "-c", &script]));
+    assert!(w.created);
     c.wait_output("\nEND", T);
     let out = &c.output;
     let start = out
@@ -48,14 +44,12 @@ fn remote_chain_is_byte_exact() {
         &data[..],
         "bytes changed in transit"
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[test]
 fn missing_binary_reports_need() {
     let remote = Remote::new();
-    let mut child = remote.run_remote(&["_proxy", "--list"]);
+    let mut child = KillOnDrop(remote.run_remote(&["_proxy", "--list"]));
     let mut c = FrameConn::from_io(child.stdout.take().unwrap(), child.stdin.take().unwrap());
     match c.expect_marker(T) {
         Some(Marker::Need { os, arch }) => {
@@ -63,7 +57,6 @@ fn missing_binary_reports_need() {
         }
         other => panic!("{other:?}"),
     }
-    let _ = child.wait();
 }
 
 #[test]
@@ -85,14 +78,11 @@ fn dropping_a_remote_ends_its_sessions() {
     let pid = acs::testutil::session_pid(&remote.sockets().join("keep.sock")).unwrap();
     drop(c);
     drop(remote);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while acs::sys::kill(pid as i32, 0).is_ok() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "master {pid} still running"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    wait_until(
+        std::time::Duration::from_secs(10),
+        || acs::sys::kill(pid as i32, 0).is_err(),
+        || format!("master {pid} still running"),
+    );
 }
 
 /// Regression (acs-fzx): the helpers that configure the remote side all

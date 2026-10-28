@@ -13,11 +13,12 @@ use std::time::{Duration, Instant};
 use crate::cli::{self, ClientArgs, Parsed, Target};
 use crate::keys::{self, Action, Detector};
 use crate::modes::ModeObserver;
+use crate::outq::OutQueue;
 use crate::proto::{self, AttachKind, Decoder, Hello, Marker, MarkerScanner, Mode, Msg, Resume};
 use crate::resume::Unacked;
 use crate::ssh::{self, Call};
 use crate::sys;
-use crate::timing::Timing;
+use crate::timing::{Phase, Timing};
 use crate::tty::{self, RawMode};
 
 const STDIN: RawFd = 0;
@@ -85,17 +86,14 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     }
     // The master acs keeps for this host, if it may have one: decided once,
     // before anything dials, so every call this client makes agrees about
-    // it (acs-9n3). Never for `acs list` over every alias, which asks a
-    // dozen hosts at once and would leave a master on each.
+    // it (acs-9n3). Not decided here for `acs list` over every alias, which
+    // asks a dozen hosts at once: it joins a master that answers, in
+    // list.rs, and never starts one, which would leave a master on each.
     // The configured forwards join the command line's (acs-odd, DESIGN
     // §7.1) before the master is decided, so a forward that arrives from
     // the configuration hits the same carve-out a `-L` does: a session that
     // forwards anything gets no shared master (acs-9n3).
-    apply_local_forwards(&mut args);
-    let decided = crate::mux::configure(&mut args.transport);
-    if args.verbose > 0 {
-        note(&decided);
-    }
+    prepare_session(&mut args);
     let name = args.transport.destination.clone();
     let mut timing = Timing::start(args.verbose > 0, "first connection");
     if let Err(e) = resolve_alias(&mut args, &name) {
@@ -107,7 +105,7 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
         wait_for_host(&mut args, &name);
     }
     if args.alias.is_some() {
-        timing.mark("alias resolved");
+        timing.mark(Phase::AliasResolved);
     }
     if args.list && !menu {
         return crate::list::run(&args);
@@ -115,9 +113,12 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     // No session named: pick one on the host just resolved (DESIGN §4.4),
     // over the connection the session then uses.
     let always = args.list;
+    // Made before the first dial, so a change while it waits is seen
+    // (acs-xo1), and the one watcher the whole client keeps.
+    let netwatch = crate::netwatch::NetWatch::new(args.verbose > 0);
     loop {
-        match crate::pick::choose(&mut args, always, &mut timing) {
-            Ok(picked) => return ExitCode::from(run(args, picked, timing)),
+        match crate::pick::choose(&mut args, always, &mut timing, netwatch.as_ref()) {
+            Ok(picked) => return ExitCode::from(run(args, picked, timing, netwatch)),
             // The host could not be reached for the menu: persisting, wait
             // until it answers a ping, then ask again.
             Err(code::UNREACHABLE) if !args.list && persist(&args) => {
@@ -125,6 +126,21 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
             }
             Err(c) => return ExitCode::from(c),
         }
+    }
+}
+
+/// Ready a session's transport before anything dials: the configured
+/// forwards join the command line's (acs-odd), then the shared-master
+/// decision is taken (acs-9n3) — in that order, so a configured forward
+/// vetoes the master as a `-L` does. `args.transport.destination` must
+/// still be the name typed (the alias, not the host it resolves to).
+/// Shared by `acs <host>` and the session picked from the every-host menu
+/// (acs-x5wd), which must not differ.
+pub(crate) fn prepare_session(args: &mut ClientArgs) {
+    apply_local_forwards(args);
+    let decided = crate::mux::configure(&mut args.transport);
+    if args.verbose > 0 {
+        note(&decided);
     }
 }
 
@@ -198,20 +214,64 @@ fn args_alias(args: &ClientArgs) -> Option<&crate::config::Alias> {
     args.config.alias(crate::alias::split_user(name).1)
 }
 
-/// Before any session: wait, pinging every `reachability_interval`, until
-/// the host `name` stands for answers — an alias's hosts as resolving pings
-/// them (and then points `args` at the one that answered), a plain host
-/// itself. Ctrl-C gives up. A host that cannot be pinged (an alias whose
-/// hosts all have `reachability_check: false`) is just waited for once.
+/// The waits between the ping gate's pings (DESIGN §5.3, acs-vxg): every
+/// second (`ACS_PERSIST_FAST_MS`) for the first 30 of them after a loss,
+/// then every `reachability_interval` — a host back in seconds is dialled
+/// within one, and a long outage costs no more pings than it did. Never
+/// slower than `reachability_interval` itself.
+pub(crate) struct PingSteps {
+    fast: Duration,
+    every: Duration,
+    since: Instant,
+}
+
+impl PingSteps {
+    pub(crate) fn new(every: Duration) -> Self {
+        let fast = sys::env_ms("ACS_PERSIST_FAST_MS", 1000);
+        PingSteps {
+            fast: fast.min(every),
+            every,
+            since: Instant::now(),
+        }
+    }
+
+    /// The wait before the next ping.
+    pub(crate) fn next(&self) -> Duration {
+        match self.since.elapsed() < self.fast * 30 {
+            true => self.fast,
+            false => self.every,
+        }
+    }
+
+    /// Start the fast pings over: a new network is a fresh loss.
+    pub(crate) fn restart(&mut self) {
+        self.since = Instant::now();
+    }
+
+    /// "every 1s at first, then 5s", for the status line.
+    pub(crate) fn describe(&self) -> String {
+        let f = crate::config::format_timeout;
+        match self.fast == self.every {
+            true => format!("every {}", f(self.every)),
+            false => format!("every {} at first, then {}", f(self.fast), f(self.every)),
+        }
+    }
+}
+
+/// Before any session: wait, pinging as [`PingSteps`] says, until the host
+/// `name` stands for answers — an alias's hosts as resolving pings them (and
+/// then points `args` at the one that answered), a plain host itself. Ctrl-C
+/// gives up. A host that cannot be pinged (an alias whose hosts all have
+/// `reachability_check: false`) is just waited for once.
 pub(crate) fn wait_for_host(args: &mut ClientArgs, name: &str) {
-    let every = reachability_interval(args);
+    let steps = PingSteps::new(reachability_interval(args));
     note(&format!(
-        "waiting for {} to answer a ping, every {} (Ctrl-C gives up)",
+        "waiting for {} to answer a ping, {} (Ctrl-C gives up)",
         args.host_name(),
-        crate::config::format_timeout(every)
+        steps.describe()
     ));
     loop {
-        std::thread::sleep(every);
+        std::thread::sleep(steps.next());
         if host_answers(args, name).unwrap_or(true) {
             return;
         }
@@ -237,10 +297,13 @@ pub(crate) fn host_answers(args: &mut ClientArgs, name: &str) -> Option<bool> {
 
 /// A session connection already open and past its marker: the pick's
 /// (DESIGN §4.4), which the attach goes on over. `rest` is what arrived
-/// after the pick's last frame.
+/// after the pick's last frame. `greeted` is the terminal size of the HELLO
+/// the proxy has already attached, the one that went ahead with the dial
+/// when nothing was detached (acs-xvg); `None` when the HELLO is still owed.
 pub struct Picked {
     pub link: Link,
     pub rest: Vec<u8>,
+    pub greeted: Option<proto::WinSize>,
 }
 
 /// If `name` is an alias, or `user@<alias>`, point the transport at the host
@@ -249,11 +312,23 @@ pub struct Picked {
 /// resolves it the same way.
 pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
     let verbose = args.verbose > 0;
-    let entry = crate::alias::resolve(
+    // The entry used last on these networks goes first (acs-zpj); asked
+    // only for an alias, since it reads this machine's interfaces.
+    let memory = args
+        .config
+        .alias(crate::alias::split_user(name).1)
+        .and_then(|_| crate::alias_memory::Memory::system());
+    // `reachability_tcp`'s `ssh -G` sees what the dial will: `--ssh` and
+    // the command line's -p/-F/-J/-o/-i (acs-nhrq).
+    let mut ssh = vec![args.transport.ssh.clone()];
+    ssh.extend(args.transport.user_opts.iter().cloned());
+    let entry = crate::alias::resolve_remembering(
         name,
         &args.config,
         std::sync::Arc::new(crate::alias::ping),
         &crate::netmatch::system,
+        memory.as_ref(),
+        &ssh,
         &mut |m| {
             if verbose {
                 note(&m)
@@ -319,12 +394,7 @@ pub(crate) fn escape_config() -> keys::Config {
     {
         cfg.byte = k;
     }
-    if let Some(ms) = std::env::var("ACS_ESCAPE_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        cfg.window_ms = ms;
-    }
+    cfg.window_ms = sys::env_or("ACS_ESCAPE_TIMEOUT_MS", cfg.window_ms);
     cfg
 }
 
@@ -418,11 +488,24 @@ pub fn note_max(msg: &str, max: usize) {
 /// - **A quiet session cannot swallow one.** A program that stops
 ///   mid-sequence, or a link that dies there, would otherwise hold a note
 ///   for ever. The wait is bounded by `ACS_NOTE_HOLD_MS` (500 ms), after
-///   which the note is written where it stands, and leaving [`serve`]
-///   flushes what is left whatever the stream was doing.
+///   which the note is written anyway, and leaving [`serve`] flushes
+///   what is left whatever the stream was doing — each of them *over* the
+///   open sequence, as below.
+/// - **Outside the frame loop nothing lands inside a sequence either**
+///   (acs-ysx). Every note goes through [`raise`], and the terminal's
+///   stream is known here for as long as the client runs, not only while
+///   [`serve`] relays: [`stream`] is told after every frame and whenever
+///   the observer is cleared or resynced. A note written with the stream
+///   open — mid-outage, after the status line has put the terminal back
+///   inside the program's CSI — ends the sequence first and re-opens it
+///   after, the way the status line does ([`write_over_stream`]). A note
+///   added mid-outage therefore needs no knowledge of terminal state, and
+///   [`write_over_stream`] and [`leave`] assert that what is known here is
+///   what the observer says.
 mod notes {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
+    use crate::modes::ModeObserver;
     use crate::sys;
 
     /// How long a note waits for the stream to reach a boundary before it
@@ -430,13 +513,21 @@ mod notes {
     /// a sequence a frame boundary cut in half to arrive over a slow link;
     /// short enough that a diagnostic is never lost for long.
     fn hold_ms() -> u64 {
-        crate::reconnect::env_ms("ACS_NOTE_HOLD_MS", 500)
+        sys::env_or("ACS_NOTE_HOLD_MS", 500)
     }
 
     thread_local! {
         /// Open while the frame loop is relaying; `None` everywhere else,
         /// where every note goes straight out.
         static GATE: RefCell<Option<Gate>> = const { RefCell::new(None) };
+        /// Where the program's stream left the terminal: `None` at a
+        /// boundary, otherwise the bytes that re-open what it left
+        /// unfinished (empty where that cannot be done). Kept across the
+        /// gate, since the terminal stays where the last frame left it.
+        static OPEN: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+        /// How many notes have been written, so the status line knows one
+        /// may have scrolled it off its row.
+        static WRITTEN: Cell<u64> = const { Cell::new(0) };
         /// Where notes go in this crate's own tests, in place of fd 2.
         #[cfg(test)]
         static SINK: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
@@ -444,9 +535,6 @@ mod notes {
 
     #[derive(Default)]
     struct Gate {
-        /// The last frame written left the terminal inside a sequence or a
-        /// character: a note written now would land in the middle of it.
-        mid_sequence: bool,
         /// Notes waiting for the boundary, oldest first.
         held: Vec<String>,
         /// When the oldest of them started waiting.
@@ -476,7 +564,7 @@ mod notes {
         let straight_out = GATE.with(|g| {
             let mut g = g.borrow_mut();
             match g.as_mut() {
-                Some(gate) if gate.mid_sequence => {
+                Some(gate) if open() => {
                     if gate.held.is_empty() {
                         gate.since = sys::now_ms();
                     }
@@ -501,22 +589,39 @@ mod notes {
         })
     }
 
-    /// Where the program's stream stands after a frame was written to the
-    /// terminal. A boundary releases what was held for it.
-    pub fn at_boundary(at: bool) {
-        let release = GATE.with(|g| {
-            let mut g = g.borrow_mut();
-            match g.as_mut() {
-                Some(gate) => {
-                    gate.mid_sequence = !at;
-                    at && !gate.held.is_empty()
-                }
-                None => false,
-            }
-        });
+    /// The last frame written left the terminal inside a sequence or a
+    /// character: a note written now would land in the middle of it.
+    fn open() -> bool {
+        OPEN.with(|s| s.borrow().is_some())
+    }
+
+    /// What [`OPEN`] should hold for `o`.
+    fn open_in(o: &ModeObserver) -> Option<Vec<u8>> {
+        (!o.at_boundary()).then(|| o.reopen_sequence().unwrap_or_default())
+    }
+
+    /// Where the program's stream stands, after a frame was written to the
+    /// terminal or the observer was cleared or resynced. A boundary
+    /// releases what was held for it.
+    pub fn stream(o: &ModeObserver) {
+        let at = o.at_boundary();
+        OPEN.with(|s| *s.borrow_mut() = open_in(o));
+        let release = at && waiting();
         if release {
             flush();
         }
+    }
+
+    /// Whether what is known here is where `o` says the stream is: false
+    /// means the observer moved without [`stream`] being told, and a note
+    /// would be written blind.
+    pub fn agrees(o: &ModeObserver) -> bool {
+        OPEN.with(|s| *s.borrow() == open_in(o))
+    }
+
+    /// How many notes have been written so far.
+    pub fn count() -> u64 {
+        WRITTEN.with(Cell::get)
     }
 
     /// When the oldest held note is written whatever the stream is doing.
@@ -550,12 +655,22 @@ mod notes {
         }
     }
 
+    /// Write one note: over the program's open sequence when there is one
+    /// (`ST` before it on the stream's fd, the sequence again after), so
+    /// neither swallows the other.
     fn write(line: &str) {
+        WRITTEN.with(|n| n.set(n.get() + 1));
+        let open = OPEN.with(|s| s.borrow().clone());
         #[cfg(test)]
         {
             let captured = SINK.with(|s| match s.borrow_mut().as_mut() {
                 Some(lines) => {
-                    lines.push(line.to_string());
+                    lines.push(match &open {
+                        Some(reopen) => {
+                            format!("\x1b\\{line}{}", String::from_utf8_lossy(reopen))
+                        }
+                        None => line.to_string(),
+                    });
                     true
                 }
                 None => false,
@@ -564,7 +679,13 @@ mod notes {
                 return;
             }
         }
+        let Some(reopen) = open else {
+            let _ = sys::write_all(2, line.as_bytes());
+            return;
+        };
+        let _ = sys::write_all(1, b"\x1b\\");
         let _ = sys::write_all(2, line.as_bytes());
+        let _ = sys::write_all(1, &reopen);
     }
 
     /// Collect this thread's notes instead of printing them.
@@ -625,19 +746,151 @@ impl Link {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// What [`dial`] could not write yet: the menu's connection writes it
+    /// itself, ahead of its own frames (acs-xvg).
+    pub(crate) fn take_pending(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Hand bytes still owed back for [`serve`] to write first.
+    pub(crate) fn set_pending(&mut self, pending: Vec<u8>) {
+        self.pending = pending;
+    }
+
+    /// What EOF on the link says, from how ssh exited (acs-b4f, DESIGN
+    /// §7.1). OpenSSH exits 255 for its own failure — the connection, or
+    /// a master that went — and with the remote command's status
+    /// otherwise, which is our channel ending on a connection still up.
+    ///
+    /// Only a channel on the master asks: nothing else has a master to
+    /// keep, and a redial (never muxed) must go at once (acs-iyq). The
+    /// wait is [`REAP_BOUND`]; an ssh that has not exited by then, or
+    /// that a signal ended, is the connection, as before this rule.
+    fn eof(&mut self) -> LinkEnd {
+        let until = Instant::now() + REAP_BOUND;
+        while self.muxed {
+            match self.child.try_wait() {
+                Ok(Some(s)) if s.code().is_some_and(|c| c != 255) => return LinkEnd::Exited,
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
+                _ => break,
+            }
+        }
+        LinkEnd::Transport
+    }
 }
 
-/// How long a connection may take to answer: to print its marker, and then
-/// to WELCOME us (DESIGN §5.3). A first connection may wait on a password
-/// or a key touch, so it gets longer than a redial, which must return to
-/// the backoff wait (where the command keys work) if the host accepted the
-/// connection and then went quiet. `ACS_DIAL_TIMEOUT_MS` sets both.
-pub fn answer_timeout(redial: bool) -> Duration {
-    let ms = std::env::var("ACS_DIAL_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if redial { 30_000 } else { 120_000 });
-    Duration::from_millis(ms)
+/// How long EOF on a channel waits for its ssh to exit ([`Link::eof`]).
+/// A mux client exits as soon as its master hands it the channel's status,
+/// a moment after the EOF; 100 ms is far more than that on any machine,
+/// and well under the handshake the redial that follows pays anyway.
+const REAP_BOUND: Duration = Duration::from_millis(100);
+
+/// How long a fresh connection may take to answer: to print its marker,
+/// and then to WELCOME us (DESIGN §5.3). One the user is in front of may
+/// wait on a password or a key touch, so it gets two minutes; a `batch` one
+/// (`acs list`, the menu's hosts) cannot prompt, and gets the redial's 30 s.
+/// `ACS_DIAL_TIMEOUT_MS` sets both — but not [`redial_timeout`], which is
+/// a knob of its own so that shortening it leaves the first connection's
+/// two minutes alone (acs-p46).
+pub fn answer_timeout(batch: bool) -> Duration {
+    let default = if batch { 30_000 } else { 120_000 };
+    sys::env_ms("ACS_DIAL_TIMEOUT_MS", default)
+}
+
+/// How long a redial after a lost link may take to answer, marker and
+/// WELCOME (`ACS_REDIAL_TIMEOUT_MS`, DESIGN §5.3): shorter than a first
+/// connection's, because a host that accepted the connection and then went
+/// quiet must hand back to the backoff wait, where the command keys work.
+pub fn redial_timeout() -> Duration {
+    sys::env_ms("ACS_REDIAL_TIMEOUT_MS", 30_000)
+}
+
+/// The command keys through a redial (acs-8ax, DESIGN §5.2).
+///
+/// ssh runs in a process group of its own, in the background of the
+/// terminal, so stdin is acs's to read until ssh reaches for the terminal
+/// to ask for something. The kernel stops a background process that sets
+/// the terminal's modes or reads from it — `SIGTTOU`, `SIGTTIN`, sent to
+/// its whole group, so a ProxyCommand's own ssh stops the transport too —
+/// and that stop is the hand-off: the terminal goes back to its cooked
+/// settings, ssh's group is made the foreground and continued, and stdin
+/// is ssh's for the rest of the dial. Nothing ssh asks for can be read by
+/// acs, because ssh cannot write its prompt before the stop.
+pub(crate) struct DialKeys<'a> {
+    state: &'a mut State,
+    raw: &'a mut RawMode,
+    /// ssh has the terminal.
+    handed: bool,
+    /// The user left during the dial, and how.
+    left: Option<Left>,
+}
+
+#[derive(Clone, Copy)]
+enum Left {
+    /// `Ctrl-] Ctrl-] d`, or the terminal went away.
+    Detach,
+    /// The interrupt key: as it would in the cooked terminal, it ends acs.
+    Interrupt,
+}
+
+impl DialKeys<'_> {
+    /// One look at the dial, after a poll in which stdin was `readable`:
+    /// hand the terminal over if ssh stopped for it, otherwise read the
+    /// keys. `true` when the user left.
+    fn step(&mut self, pid: i32, readable: bool) -> bool {
+        if sys::stopped(pid) {
+            if !self.handed {
+                let _ = self.raw.suspend();
+                let _ = sys::tcsetpgrp(STDIN, pid);
+                self.handed = true;
+            }
+            // Again after the hand-off only for a Ctrl-Z at ssh's prompt,
+            // which would otherwise leave the dial stopped until it timed
+            // out.
+            let _ = sys::kill(-pid, libc::SIGCONT);
+            return false;
+        }
+        if self.handed {
+            return false;
+        }
+        let now = sys::now_ms();
+        let was = self.state.detector.armed();
+        let mut buf = [0u8; 256];
+        let o = match readable {
+            true => match sys::read(STDIN, &mut buf) {
+                Ok(n) if n > 0 => self.state.detector.feed(&buf[..n], now),
+                _ => {
+                    self.left = Some(Left::Detach);
+                    return true;
+                }
+            },
+            false => self.state.detector.tick(now),
+        };
+        follow_detector(self.state, was);
+        // Everything else typed into the dial is dropped (DESIGN §5.2).
+        if o.forward.contains(&self.raw.intr()) {
+            self.left = Some(Left::Interrupt);
+        }
+        match o.action {
+            Some(Action::Detach) => self.left = Some(Left::Detach),
+            Some(Action::Exit) => crate::reconnect::show_status(
+                self.state,
+                "ending the session needs the connection — Ctrl-] Ctrl-] d detaches instead",
+            ),
+            None => {}
+        }
+        self.left.is_some()
+    }
+
+    /// The terminal back as a dial without the keys leaves it: acs's again,
+    /// and cooked until the `WELCOME`.
+    fn finish(&mut self) {
+        if self.handed {
+            let _ = sys::tcsetpgrp(STDIN, sys::getpgrp());
+        }
+        let _ = self.raw.suspend();
+    }
 }
 
 /// Start the transport running `remote` and wait, at most `timeout`, for
@@ -665,11 +918,87 @@ pub fn dial(
     timing: &mut Timing,
     first: Vec<u8>,
 ) -> io::Result<(Link, Marker)> {
+    dial_watching(args, call, remote, timeout, timing, first, None, None)
+}
+
+/// [`dial`], watching this machine's network while it waits (acs-xo1,
+/// DESIGN §5.3) and, with `keys`, with the command keys live
+/// ([`DialKeys`]). A change that takes away a network the dial may have
+/// been made from abandons the dial and makes it again at once, rather
+/// than waiting out `timeout` for an answer that went with the address —
+/// unless ssh is asking the user something ([`ssh_is_asking`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dial_watching(
+    args: &ClientArgs,
+    call: Call,
+    remote: &str,
+    timeout: Duration,
+    timing: &mut Timing,
+    first: Vec<u8>,
+    netwatch: Option<&crate::netwatch::NetWatch>,
+    mut keys: Option<&mut DialKeys>,
+) -> io::Result<(Link, Marker)> {
+    loop {
+        let w = Watch {
+            netwatch,
+            keys: keys.as_deref_mut(),
+        };
+        match dial_sharing(args, call, remote, timeout, timing, first.clone(), w) {
+            Err(e) if moved(&e) => {
+                timing.mark(Phase::NetworkMoved);
+                if args.verbose > 0 {
+                    note("the network moved under the dial — dialing again");
+                }
+            }
+            r => return r,
+        }
+    }
+}
+
+/// What a dial watches besides its transport.
+struct Watch<'w, 'k> {
+    netwatch: Option<&'w crate::netwatch::NetWatch>,
+    keys: Option<&'w mut DialKeys<'k>>,
+}
+
+/// The error a dial abandoned for a network change ends in, and only that
+/// one: nothing else in a dial is a `ConnectionAborted`.
+fn moved(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::ConnectionAborted
+}
+
+/// Whether ssh may be asking the user something on a dial that shares
+/// acs's terminal (the cooked one): its password, passphrase and PIN
+/// prompts turn the terminal's echo off while they read. A terminal that
+/// cannot be asked counts as asking — the side to be wrong on.
+fn ssh_is_asking() -> bool {
+    sys::tcgetattr(STDIN).map_or(true, |t| t.c_lflag & libc::ECHO == 0)
+}
+
+/// One dial, through acs's shared ssh master where it may (acs-9n3).
+fn dial_sharing(
+    args: &ClientArgs,
+    call: Call,
+    remote: &str,
+    timeout: Duration,
+    timing: &mut Timing,
+    first: Vec<u8>,
+    mut w: Watch,
+) -> io::Result<(Link, Marker)> {
     if crate::mux::joinable(&args.transport, call) {
-        timing.mark("shared ssh master checked");
+        timing.mark(Phase::MasterChecked);
         let window = timeout.min(crate::mux::fallback_window());
-        match dial_once(args, call, remote, window, timing, first.clone()) {
+        let joined = Watch {
+            netwatch: w.netwatch,
+            keys: w.keys.as_deref_mut(),
+        };
+        match dial_once(args, call, remote, window, timing, first.clone(), joined) {
             Ok(x) => return Ok(x),
+            // The master's connection was made from the network that went.
+            Err(e) if moved(&e) => {
+                crate::mux::stop(&args.transport);
+                return Err(e);
+            }
             // A master that is up but cannot carry a channel is worse than
             // none: take it down, so the dial below and the next client
             // both make their own connection.
@@ -689,9 +1018,10 @@ pub fn dial(
             Err(e) => return Err(e),
         }
     }
-    dial_once(args, call, remote, timeout, timing, first)
+    dial_once(args, call, remote, timeout, timing, first, w)
 }
 
+/// One dial; with `w.keys`, one whose command keys are live ([`DialKeys`]).
 fn dial_once(
     args: &ClientArgs,
     call: Call,
@@ -699,9 +1029,16 @@ fn dial_once(
     timeout: Duration,
     timing: &mut Timing,
     first: Vec<u8>,
+    w: Watch,
 ) -> io::Result<(Link, Marker)> {
+    let Watch { netwatch, mut keys } = w;
     let deadline = Instant::now() + timeout;
     let mut cmd = args.transport.command(call, remote);
+    if let Some(k) = keys.as_deref_mut() {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        let _ = k.raw.dialing();
+    }
     if args.verbose > 0 {
         note_max(
             &format!(
@@ -721,7 +1058,7 @@ fn dial_once(
             format!("cannot run {}: {e}", argv[0].to_string_lossy()),
         )
     })?;
-    timing.mark("ssh spawned");
+    timing.mark(Phase::SshSpawned);
     let to: OwnedFd = child.stdin.take().unwrap().into();
     let from: OwnedFd = child.stdout.take().unwrap().into();
     // The first frames, before anything is read back. Non-blocking, so a
@@ -729,10 +1066,10 @@ fn dial_once(
     // cannot stall the dial: what the pipe takes goes now, the rest goes
     // with the first write of the session. A write that fails says nothing
     // the read loop below will not say better.
-    let mut pending = first;
+    let mut pending = OutQueue::from(first);
     if !pending.is_empty() {
         let _ = sys::set_nonblocking(to.as_raw_fd(), true);
-        let _ = write_link(to.as_raw_fd(), &mut pending);
+        pending.flush(to.as_raw_fd());
         let _ = sys::set_nonblocking(to.as_raw_fd(), false);
         // The greeting's own phase (acs-ftn). Normally the whole of it
         // went, here, before the marker is even awaited — which is the
@@ -743,13 +1080,61 @@ fn dial_once(
     }
     let mut scanner = MarkerScanner::new();
     let mut buf = [0u8; 4096];
+    let pid = child.id() as i32;
     let marker = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let mut p = [sys::pollfd(from.as_raw_fd(), libc::POLLIN)];
-        if left.is_zero() || sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32)? == 0
-        {
+        let mut wait = deadline.saturating_duration_since(Instant::now());
+        if let Some(k) = keys.as_deref() {
+            // ssh stopping for the terminal is noticed by looking, so the
+            // poll never sleeps long.
+            wait = wait.min(Duration::from_millis(50));
+            if let Some(d) = k.state.detector.deadline() {
+                wait = wait.min(Duration::from_millis(d.saturating_sub(sys::now_ms())));
+            }
+        }
+        let stdin = match keys.as_deref() {
+            Some(k) if !k.handed => STDIN,
+            _ => -1,
+        };
+        let mut fds = [
+            sys::pollfd(from.as_raw_fd(), libc::POLLIN),
+            sys::pollfd(stdin, libc::POLLIN),
+            sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
+        ];
+        sys::poll(&mut fds, sys::poll_timeout(wait))?;
+        if let Some(k) = keys.as_deref_mut() {
+            if k.step(pid, fds[1].revents != 0) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+        }
+        // This machine's network moved while the dial waits (acs-xo1). The
+        // drain is unconditional, as in `serve`; a change that only added
+        // a network left the dial's own address alone and is dropped, to
+        // be offered again (acs-0n8). So is one while ssh asks the user
+        // something: killing it would throw away what they are typing.
+        // Looked at after `step`, so a stop for the terminal in this very
+        // pass is already a hand-off.
+        if fds[2].revents != 0 {
+            if let Some(change) = netwatch.and_then(|w| w.changed()) {
+                let asking = match keys.as_deref() {
+                    Some(k) => k.handed,
+                    None => ssh_is_asking(),
+                };
+                if change.removed() && !asking {
+                    change.acted();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "this machine's network moved under the dial",
+                    ));
+                }
+            }
+        }
+        if fds[0].revents == 0 {
             if Instant::now() < deadline {
-                continue; // a signal cut the wait short
+                continue;
             }
             let _ = child.kill();
             let _ = child.wait();
@@ -767,7 +1152,16 @@ fn dial_once(
             if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
                 note(&format!("remote said: {noise}"));
             }
-            let _ = child.wait();
+            let status = child.wait();
+            // A Ctrl-C at ssh's prompt reached ssh alone, which had the
+            // terminal: it ends acs as it did when they shared a group.
+            if let Some(k) = keys.as_deref_mut().filter(|k| k.handed) {
+                use std::os::unix::process::ExitStatusExt;
+                if status.is_ok_and(|s| s.signal() == Some(libc::SIGINT)) {
+                    k.left = Some(Left::Interrupt);
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+            }
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "the connection closed before acs started on the remote",
@@ -778,8 +1172,8 @@ fn dial_once(
         }
     };
     timing.mark(match marker {
-        Marker::Ready { .. } => "ACS-READY seen",
-        Marker::Need { .. } => "ACS-NEED seen",
+        Marker::Ready { .. } => Phase::ReadySeen,
+        Marker::Need { .. } => Phase::NeedSeen,
     });
     if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
         note(&format!("skipped remote login output: {noise:?}"));
@@ -789,7 +1183,7 @@ fn dial_once(
             child,
             to,
             from,
-            pending,
+            pending: pending.into(),
             muxed: args.transport.multiplexes(call),
         },
         marker,
@@ -813,6 +1207,10 @@ pub struct State {
     pub attached_once: bool,
     /// A reconnect status line / title is on the terminal (DESIGN §5.4).
     pub status_shown: bool,
+    /// What the status line last wrote over the stream, and how many notes
+    /// had been written by then: drawing the same again is skipped
+    /// (acs-ysx).
+    pub status_drawn: (Vec<u8>, u64),
     /// Ring the bell when command mode arms (DESIGN §6.1).
     pub command_bell: bool,
     /// A bell waits for the output to reach a boundary.
@@ -844,6 +1242,11 @@ pub struct State {
     /// master is somebody else's live connection, and whose socket is not
     /// the one that just died.
     pub master: Option<ssh::Transport>,
+    /// When the link now in hand was WELCOMEd, or `None` while it has not
+    /// been (acs-omt2). The backoff resets after a link that *served* 30 s
+    /// — measured from here — so a dial that spent its whole timeout
+    /// waiting on a silent host never counts as a connection that lasted.
+    pub welcomed_at: Option<std::time::Instant>,
 }
 
 /// Why a link ended, so far as this side can tell (acs-n1m). It decides
@@ -862,7 +1265,8 @@ pub enum LinkEnd {
     /// or the poll watching them failing. ssh exits when its connection
     /// does — that is what `ServerAliveInterval=0` (DESIGN §3) leaves it
     /// to the TCP stack to notice — so this is the connection having
-    /// failed until something says otherwise.
+    /// failed until something says otherwise — which, for EOF on a
+    /// channel, ssh's exit status may ([`LinkEnd::Exited`]).
     Transport,
     /// Nothing came back in time: `ACS_DEAD_MS` of silence, or
     /// `ACS_NETCHECK_MS` after this machine's network moved (acs-ft1), or
@@ -873,6 +1277,14 @@ pub enum LinkEnd {
     /// not decode. The connection carried those bytes a moment ago, so it
     /// is up; what broke is the conversation on this one channel.
     Channel,
+    /// EOF on a channel whose ssh then exited with the remote command's
+    /// status — anything but 255 ([`Link::eof`], acs-b4f): the command
+    /// ended, and the connection under it said so.
+    Exited,
+    /// This machine's network moved under a link still owed its `WELCOME`
+    /// (acs-xo1): abandoned, and dialled again at once by
+    /// [`connect_and_serve`], which is the only thing that sees this.
+    Moved,
 }
 
 impl LinkEnd {
@@ -886,8 +1298,8 @@ impl LinkEnd {
     /// master is the one that strands somebody.
     pub fn failed_the_connection(self) -> bool {
         match self {
-            LinkEnd::Transport | LinkEnd::Silent => true,
-            LinkEnd::Channel => false,
+            LinkEnd::Transport | LinkEnd::Silent | LinkEnd::Moved => true,
+            LinkEnd::Channel | LinkEnd::Exited => false,
         }
     }
 }
@@ -929,42 +1341,76 @@ fn proxy_args(args: &ClientArgs, state: &State, resuming: bool) -> Vec<String> {
 }
 
 fn hello(args: &ClientArgs, state: &State, force: bool) -> Hello {
-    let size = sys::get_winsize(STDIN).unwrap_or_default();
     let mode = match (&state.session, &args.target) {
         (Some(_), _) if state.instance.is_some() => Mode::Attach,
         (None, Target::New) => Mode::Create,
         _ => Mode::AttachOrCreate,
     };
+    let session = state
+        .session
+        .clone()
+        .or_else(|| match &args.target {
+            Target::Named(n) | Target::Pick(n) => Some(n.clone()),
+            Target::New => None,
+        })
+        .unwrap_or_default();
+    let mut h = fresh_hello(args, session, mode, state.identity.clone(), force);
+    h.resume = state.instance.map(|instance| Resume {
+        instance,
+        offset: state.offset,
+    });
+    h
+}
+
+/// A HELLO that resumes nothing, for `session` in `mode`: the terminal as
+/// it is now, and the command line's command.
+fn fresh_hello(
+    args: &ClientArgs,
+    session: String,
+    mode: Mode,
+    identity: String,
+    force: bool,
+) -> Hello {
     Hello {
         proto: proto::PROTO_VERSION,
-        session: state
-            .session
-            .clone()
-            .or_else(|| match &args.target {
-                Target::Named(n) | Target::Pick(n) => Some(n.clone()),
-                Target::New => None,
-            })
-            .unwrap_or_default(),
+        session,
         mode,
-        identity: state.identity.clone(),
+        identity,
         force,
         term: std::env::var("TERM").unwrap_or_default(),
         colorterm: std::env::var("COLORTERM").unwrap_or_default(),
-        size,
-        resume: state.instance.map(|instance| Resume {
-            instance,
-            offset: state.offset,
-        }),
+        size: sys::get_winsize(STDIN).unwrap_or_default(),
+        resume: None,
         command: args.command.clone(),
     }
+}
+
+/// The HELLO a plain `acs <host>` sends ahead on its menu's connection
+/// (acs-xvg): the one the first connection would send for `default` —
+/// what `run` builds from a fresh state — which `_proxy --pick --eager`
+/// attaches at once when nothing is detached.
+pub fn pick_hello(args: &ClientArgs, default: &str) -> Hello {
+    fresh_hello(
+        args,
+        default.to_string(),
+        Mode::AttachOrCreate,
+        identity(),
+        args.force,
+    )
 }
 
 // ---- running ---------------------------------------------------------------
 
 /// Run the session until it ends or the user leaves; returns the exit code.
 /// `picked` is the first connection when the session menu opened it;
-/// `timing`, the first connection's clock.
-pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
+/// `timing`, the first connection's clock; `netwatch`, the client's network
+/// watcher (DESIGN §5.3).
+pub fn run(
+    args: ClientArgs,
+    picked: Option<Picked>,
+    timing: Timing,
+    netwatch: Option<crate::netwatch::NetWatch>,
+) -> u8 {
     if !sys::isatty(STDIN) {
         eprintln!("acs: stdin is not a terminal");
         return code::USAGE;
@@ -994,6 +1440,7 @@ pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
         identity: identity(),
         attached_once: false,
         status_shown: false,
+        status_drawn: (Vec::new(), 0),
         command_bell: command_bell(&args.config),
         bell_pending: false,
         redraw_on_reconnect: redraw_on_reconnect(&args),
@@ -1004,9 +1451,18 @@ pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
             .as_ref()
             .filter(|p| p.link.muxed)
             .map(|_| args.transport.clone()),
+        welcomed_at: None,
     };
     let mut raw: Option<RawMode> = None;
-    let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals, picked, timing);
+    let result = crate::reconnect::run(
+        &args,
+        &mut state,
+        &mut raw,
+        &signals,
+        picked,
+        timing,
+        netwatch.as_ref(),
+    );
     leave(&mut state, &mut raw);
     result
 }
@@ -1019,12 +1475,13 @@ pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
 /// eat the first bytes of whatever runs next — the shell's own prompt.
 pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
     crate::reconnect::clear_status(state);
-    let mut out = state.observer.interrupt_sequence().to_vec();
-    out.extend_from_slice(&state.observer.reset_sequence());
+    debug_assert!(notes::agrees(&state.observer), "notes lost the stream");
+    let out = state.observer.leave_sequence();
     if !out.is_empty() {
         let _ = sys::write_all(STDOUT, &out);
     }
     state.observer.clear();
+    notes::stream(&state.observer);
     *raw = None;
 }
 
@@ -1040,10 +1497,24 @@ pub fn leave(state: &mut State, raw: &mut Option<RawMode>) {
 /// ([`ModeObserver::reopen_sequence`]), ending it is still better than
 /// writing into it.
 pub fn write_over_stream(state: &State, bytes: &[u8]) {
+    let _ = sys::write_all(STDOUT, &over_stream(state, bytes));
+}
+
+/// What [`write_over_stream`] writes.
+pub(crate) fn over_stream(state: &State, bytes: &[u8]) -> Vec<u8> {
+    // The notes ride on the same knowledge of the stream (acs-ysx): a
+    // mismatch here is an observer that moved without telling them.
+    debug_assert!(notes::agrees(&state.observer), "notes lost the stream");
     let mut out = state.observer.interrupt_sequence().to_vec();
     out.extend_from_slice(bytes);
     out.extend_from_slice(&state.observer.reopen_sequence().unwrap_or_default());
-    let _ = sys::write_all(STDOUT, &out);
+    out
+}
+
+/// How many `acs:` notes have been written: one may have scrolled the
+/// status line off its row (acs-ysx).
+pub(crate) fn notes_written() -> u64 {
+    notes::count()
 }
 
 /// Connect once: dial, handshake, and serve until the link ends.
@@ -1053,8 +1524,46 @@ pub fn write_over_stream(state: &State, bytes: &[u8]) {
 /// dialing. `timing` is this connection's clock. `netwatch` is the client's
 /// network watcher, polled here too so a change is noticed while the link
 /// is up and not only while it is down (acs-ft1).
+///
+/// A handshake this machine's network moved under is made again at once
+/// (acs-xo1, DESIGN §5.3): the dial does that itself while it waits for the
+/// marker, and a link past its marker but not yet WELCOMEd ends in
+/// [`LinkEnd::Moved`], which is answered here and never returned.
 #[allow(clippy::too_many_arguments)]
 pub fn connect_and_serve(
+    args: &ClientArgs,
+    state: &mut State,
+    raw: &mut Option<RawMode>,
+    signals: &OwnedFd,
+    resuming: bool,
+    ended: Option<LinkEnd>,
+    mut picked: Option<Picked>,
+    timing: &mut Timing,
+    netwatch: Option<&crate::netwatch::NetWatch>,
+) -> Outcome {
+    loop {
+        let first = picked.take();
+        match connect_once(
+            args, state, raw, signals, resuming, ended, first, timing, netwatch,
+        ) {
+            Outcome::LinkLost(LinkEnd::Moved) => {
+                // A master is a connection made from the network that went.
+                if let Some(old) = state.master.take() {
+                    crate::mux::stop(&old);
+                }
+                timing.mark(Phase::NetworkMoved);
+                if args.verbose > 0 {
+                    note("the network moved under the handshake — dialing again");
+                }
+            }
+            o => return o,
+        }
+    }
+}
+
+/// One go of [`connect_and_serve`].
+#[allow(clippy::too_many_arguments)]
+fn connect_once(
     args: &ClientArgs,
     state: &mut State,
     raw: &mut Option<RawMode>,
@@ -1065,7 +1574,10 @@ pub fn connect_and_serve(
     timing: &mut Timing,
     netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> Outcome {
-    let timeout = answer_timeout(resuming);
+    let timeout = match resuming {
+        true => redial_timeout(),
+        false => answer_timeout(false),
+    };
     // Built before the dial so it can go out with it (acs-trw); the size
     // it carries is the terminal's as of now, and `serve` follows a
     // SIGWINCH that lands while the handshake is in flight.
@@ -1073,10 +1585,20 @@ pub fn connect_and_serve(
     let size = greeting.size;
     let greeting = Msg::Hello(greeting).to_bytes();
     if let Some(p) = picked {
-        // The menu's connection is past its marker and owes its HELLO:
-        // the proxy read the list's frames from it first (DESIGN §4.4).
         let mut link = p.link;
-        link.pending = greeting;
+        let size = match p.greeted {
+            // The HELLO that went ahead with the dial has been attached
+            // already, nothing being detached (acs-xvg): its WELCOME is on
+            // the way, and only what of it the pipe would not take is
+            // still to write.
+            Some(sent) => sent,
+            // The menu's connection is past its marker and owes the HELLO
+            // of the session the user picked (DESIGN §4.4).
+            None => {
+                link.pending = greeting;
+                size
+            }
+        };
         state.master = link.muxed.then(|| args.transport.clone());
         return serve(
             args, state, raw, signals, link, p.rest, timeout, timing, size, netwatch,
@@ -1120,12 +1642,62 @@ pub fn connect_and_serve(
     };
     let pargs = proxy_args(args, state, resuming);
     let pargs: Vec<&str> = pargs.iter().map(String::as_str).collect();
-    let remote = ssh::remote_acs(crate::VERSION, &pargs);
-    // Cooked mode while ssh may prompt (password, key touch).
-    if let Some(r) = raw.as_mut() {
-        let _ = r.suspend();
-    }
-    let (link, marker) = match dial(args, call, &remote, timeout, timing, greeting) {
+    // Where acs may be installed, the prelude waits after ACS-NEED for the
+    // install on this same connection (acs-6k2), keyed by a token of this
+    // dial's so that nothing else on its stdin can start one.
+    let sync = args.config.install_on_remote.value.then(sys::random_token);
+    let remote = match &sync {
+        Some(s) => ssh::remote_acs_installing(crate::VERSION, &pargs, s),
+        None => ssh::remote_acs(crate::VERSION, &pargs),
+    };
+    // The proxy an install execs needs a HELLO of its own: the one that
+    // went ahead with the dial was read past by the prelude.
+    let again = sync.as_ref().map(|_| greeting.clone()).unwrap_or_default();
+    // A redial honours the command keys while ssh has not asked for the
+    // terminal (DialKeys) — where acs has a terminal to give it: raw mode,
+    // and the foreground of the terminal it reads.
+    let foreground = sys::tcgetpgrp(STDIN).is_ok_and(|p| p == sys::getpgrp());
+    let dialed = match raw.as_mut().filter(|_| resuming && foreground) {
+        Some(r) => {
+            let mut keys = DialKeys {
+                state,
+                raw: r,
+                handed: false,
+                left: None,
+            };
+            let dialed = dial_watching(
+                args,
+                call,
+                &remote,
+                timeout,
+                timing,
+                greeting,
+                netwatch,
+                Some(&mut keys),
+            );
+            keys.finish();
+            match keys.left {
+                Some(Left::Detach) => return detached(state, raw),
+                Some(Left::Interrupt) => {
+                    // The fatal-signal path puts the terminal back and takes
+                    // the status line down (tty::install_emergency_restore).
+                    let _ = sys::kill(std::process::id() as i32, libc::SIGINT);
+                    return Outcome::Exit(130);
+                }
+                None => dialed,
+            }
+        }
+        None => {
+            // Cooked mode while ssh may prompt (password, key touch).
+            if let Some(r) = raw.as_mut() {
+                let _ = r.suspend();
+            }
+            dial_watching(
+                args, call, &remote, timeout, timing, greeting, netwatch, None,
+            )
+        }
+    };
+    let (mut link, marker) = match dialed {
         Ok(x) => x,
         Err(e) => {
             // The dial itself did not come up: nothing reached the host,
@@ -1142,56 +1714,101 @@ pub fn connect_and_serve(
             };
         }
     };
-    let rest = match marker {
-        Marker::Ready { proto: p, rest } => {
-            if p != proto::PROTO_VERSION {
-                note(&format!(
-                    "remote acs speaks protocol {p}, this client {}",
-                    proto::PROTO_VERSION
-                ));
-                link.close();
-                return Outcome::Exit(code::ERROR);
-            }
-            rest
-        }
+    let (p, rest) = match marker {
+        Marker::Ready { proto: p, rest } => (p, rest),
         Marker::Need { os, arch } => {
-            link.close();
-            if !args.config.install_on_remote.value {
+            // No token: install_on_remote is off, and the prelude has gone.
+            let Some(sync) = sync else {
+                link.close();
                 note(&crate::install::not_installing(args, &os, &arch));
                 return Outcome::Exit(code::INSTALL_FAILED);
+            };
+            // The install, and then the session, on this same connection
+            // (acs-6k2, DESIGN §8.1).
+            let to = link.to.as_raw_fd();
+            if let Err(e) = crate::install::install(args, &os, &arch, &sync, to, &again) {
+                link.close();
+                note(&e);
+                return Outcome::Exit(code::INSTALL_FAILED);
             }
-            return match crate::install::install(args, &os, &arch) {
-                Ok(()) => {
-                    timing.mark("acs installed");
-                    connect_and_serve(
-                        args, state, raw, signals, resuming, ended, None, timing, netwatch,
-                    )
+            match await_installed(&mut link) {
+                Ok(x) => {
+                    timing.mark(Phase::Installed);
+                    note(&format!(
+                        "installed acs {} on {}",
+                        crate::VERSION,
+                        args.transport.destination
+                    ));
+                    x
                 }
                 Err(e) => {
-                    note(&e);
-                    Outcome::Exit(code::INSTALL_FAILED)
+                    link.close();
+                    note(&crate::install::failed(&args.transport.destination, e));
+                    return Outcome::Exit(code::INSTALL_FAILED);
                 }
-            };
+            }
         }
     };
+    if p != proto::PROTO_VERSION {
+        note(&format!(
+            "remote acs speaks protocol {p}, this client {}",
+            proto::PROTO_VERSION
+        ));
+        link.close();
+        return Outcome::Exit(code::ERROR);
+    }
     state.master = link.muxed.then(|| args.transport.clone());
     serve(
         args, state, raw, signals, link, rest, timeout, timing, size, netwatch,
     )
 }
 
-fn write_link(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
-    while !buf.is_empty() {
-        match sys::write(fd, buf) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => {
-                buf.drain(..n);
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
+/// After an install was sent over `link`: wait for the proxy the prelude
+/// execs to say `ACS-READY`, and return its protocol and what came after.
+/// `Err` is the remote's exit status when the connection ended first —
+/// a failed step or a refusal, which the remote has already explained on
+/// stderr.
+///
+/// No deadline, as the install's own calls never had one: the upload is
+/// as slow as the link, and the connection's end is what says it failed.
+fn await_installed(link: &mut Link) -> Result<(u16, Vec<u8>), Option<i32>> {
+    let mut scanner = MarkerScanner::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = sys::read(link.from.as_raw_fd(), &mut buf).unwrap_or(0);
+        if n == 0 {
+            return Err(link.child.wait().ok().and_then(|s| s.code()));
+        }
+        match scanner.push(&buf[..n]) {
+            Some(Marker::Ready { proto, rest }) => return Ok((proto, rest)),
+            // The prelude says ACS-NEED once; a second is not an answer.
+            Some(Marker::Need { .. }) => return Err(None),
+            None => {}
         }
     }
-    Ok(())
+}
+
+/// Leave detached: the terminal put back, and the way to reattach told.
+fn detached(state: &mut State, raw: &mut Option<RawMode>) -> Outcome {
+    leave(state, raw);
+    note_detached(state);
+    Outcome::Exit(code::DETACHED)
+}
+
+/// Tell the user the session was left detached, and how to reattach.
+pub(crate) fn note_detached(state: &State) {
+    let name = state.session.as_deref().unwrap_or_default();
+    note(&format!(
+        "detached from {}/{name} — {}",
+        state.host,
+        reattach_hint(&state.host, name)
+    ));
+}
+
+/// How to get back to the session `name` on `host`, for the notes that end
+/// a client while the session keeps running.
+pub(crate) fn reattach_hint(host: &str, name: &str) -> String {
+    format!("reattach with: acs {host} {name}")
 }
 
 /// After feeding or ticking the command detector: ring the bell when
@@ -1217,7 +1834,7 @@ fn write_output(state: &mut State, bytes: &[u8]) -> io::Result<()> {
     let r = write_frame(state, bytes);
     // Where the frame left the stream is where the next note may go, until
     // a frame moves it on.
-    notes::at_boundary(state.observer.at_boundary());
+    notes::stream(&state.observer);
     r
 }
 
@@ -1248,7 +1865,7 @@ fn write_frame(state: &mut State, bytes: &[u8]) -> io::Result<()> {
     // terminal sees them in the order they are written. The rest of the
     // frame follows and may open a sequence of its own; that is the next
     // note's problem, not this one's.
-    notes::at_boundary(true);
+    notes::stream(&state.observer);
     sys::write_all(STDOUT, &bytes[n..])?;
     state.observer.observe(&bytes[n..]);
     Ok(())
@@ -1258,14 +1875,8 @@ fn write_frame(state: &mut State, bytes: &[u8]) -> io::Result<()> {
 /// Ctrl-L after a reconnect.
 fn queue_input(state: &mut State, out: &mut Vec<u8>, bytes: &[u8]) {
     state.paste.feed(bytes);
-    for chunk in bytes.chunks(proto::MAX_CHUNK) {
-        let seq = state.unacked.push(chunk);
-        Msg::Input {
-            seq,
-            bytes: chunk.to_vec(),
-        }
-        .encode(out);
-    }
+    let seq = state.unacked.push(bytes);
+    proto::encode_input(seq, bytes, out);
 }
 
 /// Serve one link: finish the handshake, then relay until something ends
@@ -1295,11 +1906,12 @@ fn serve(
     let _ = sys::set_nonblocking(from, true);
     let mut dec = Decoder::new();
     dec.push(&early);
-    let mut out = std::mem::take(&mut link.pending);
+    let mut out = OutQueue::from(std::mem::take(&mut link.pending));
     // How much of `out` is still the greeting (acs-ftn). Nothing in the
     // common case, where the dial wrote it whole and has said so; the tail
     // the dial's pipe would not take; or all of it on the menu's
-    // connection, which owes its HELLO after the list (DESIGN §4.4). It
+    // connection when a session was picked from the menu, which owes that
+    // session's HELLO after the list (DESIGN §4.4). It
     // sits at the front of `out` and is written before anything else, so
     // it is out once this many bytes have gone, and that is where the
     // clock is told.
@@ -1330,6 +1942,37 @@ fn serve(
     loop {
         // Decode everything available first.
         loop {
+            // Session output, the hottest path there is: written to the
+            // terminal from the decoder's buffer, not copied out of it
+            // into a `Msg` first (acs-atxu). Before the WELCOME a DATA
+            // frame is no output of ours; the generic path ignores it.
+            if welcomed {
+                if let Some((offset, bytes)) = dec.next_data() {
+                    liveness.heard();
+                    // A frame whose end does not fit in a u64 is not one
+                    // the master could have sent: undecodable, like any
+                    // other (acs-shj7).
+                    let Some((skip, end)) = data_span(state.offset, offset, bytes.len()) else {
+                        note("protocol error: DATA frame past the end of the stream");
+                        return lost(link, LinkEnd::Channel);
+                    };
+                    // Skip anything we already wrote (never expected).
+                    if skip < bytes.len() {
+                        timing.first_output();
+                        // Time blocked on a terminal that is not reading is
+                        // not the host's to answer for (acs-spd).
+                        let began = sys::now_ms();
+                        let wrote = write_output(state, &bytes[skip..]);
+                        liveness.wrote_for(sys::now_ms().saturating_sub(began));
+                        if wrote.is_err() {
+                            link.close();
+                            return Outcome::Exit(code::ERROR);
+                        }
+                        state.offset = end;
+                    }
+                    continue;
+                }
+            }
             let msg = match dec.next_msg() {
                 Ok(Some(m)) => m,
                 Ok(None) => break,
@@ -1345,7 +1988,8 @@ fn serve(
             match msg {
                 Msg::Welcome(w) if !welcomed => {
                     welcomed = true;
-                    timing.mark("WELCOME received");
+                    state.welcomed_at = Some(std::time::Instant::now());
+                    timing.mark(Phase::WelcomeReceived);
                     let first = state.instance.is_none();
                     let same = state.instance == Some(w.instance);
                     if !first && !same {
@@ -1388,8 +2032,7 @@ fn serve(
                             // Another program: undo the modes the last one
                             // left on before forgetting them, or leave()
                             // could not (acs-xk4).
-                            let mut out = state.observer.interrupt_sequence().to_vec();
-                            out.extend_from_slice(&state.observer.reset_sequence());
+                            let mut out = state.observer.leave_sequence();
                             if !w.created {
                                 // dtach's attach: clear, the program redraws.
                                 out.extend_from_slice(b"\x1b[H\x1b[J");
@@ -1398,6 +2041,7 @@ fn serve(
                                 let _ = sys::write_all(STDOUT, &out);
                             }
                             state.observer.clear();
+                            notes::stream(&state.observer);
                         }
                         AttachKind::Gap => {
                             // The same program, still in its modes: keep
@@ -1406,6 +2050,7 @@ fn serve(
                             out.extend_from_slice(b"\x1b[H\x1b[J");
                             let _ = sys::write_all(STDOUT, &out);
                             state.observer.resync();
+                            notes::stream(&state.observer);
                         }
                     }
                     state.offset = w.offset;
@@ -1417,13 +2062,7 @@ fn serve(
                     // Resend what the master may not have (DESIGN §5.2).
                     if !state.unacked.is_empty() {
                         let (seq, bytes) = state.unacked.pending();
-                        for (i, chunk) in bytes.chunks(proto::MAX_CHUNK).enumerate() {
-                            Msg::Input {
-                                seq: seq + (i * proto::MAX_CHUNK) as u64,
-                                bytes: chunk.to_vec(),
-                            }
-                            .encode(&mut out);
-                        }
+                        proto::encode_input(seq, &bytes, out.tail());
                     }
                     // Then Ctrl-L, so the program repaints (DESIGN §5.2):
                     // after what was typed before the drop, before anything
@@ -1432,7 +2071,7 @@ fn serve(
                     // program just started, which has nothing to repaint,
                     // nor into a paste the program has not seen the end of.
                     if !w.created && state.redraw_on_reconnect && !state.paste.open() {
-                        queue_input(state, &mut out, &[CTRL_L]);
+                        queue_input(state, out.tail(), &[CTRL_L]);
                     }
                     // The size went out with the HELLO, which now leaves
                     // before ssh has even connected (acs-trw): a window
@@ -1443,10 +2082,10 @@ fn serve(
                     if let Ok(s) = sys::get_winsize(STDIN) {
                         if s != sent_size {
                             sent_size = s;
-                            Msg::Resize(s).encode(&mut out);
+                            Msg::Resize(s).encode(out.tail());
                         }
                     }
-                    crate::reconnect::on_welcome(state, w.kind, &mut out);
+                    crate::reconnect::on_welcome(state, w.kind, out.tail());
                 }
                 Msg::Busy { identity, since } if !welcomed => {
                     match crate::reconnect::ask_takeover(state, &identity, since) {
@@ -1456,7 +2095,7 @@ fn serve(
                             state.force_next = true;
                             let again = hello(args, state, true);
                             sent_size = again.size;
-                            Msg::Hello(again).encode(&mut out)
+                            Msg::Hello(again).encode(out.tail())
                         }
                         false => {
                             link.close();
@@ -1478,25 +2117,13 @@ fn serve(
                     };
                     return Outcome::Exit(exit);
                 }
-                Msg::Data { offset, bytes } if welcomed => {
-                    // Skip anything we already wrote (never expected).
-                    let skip = state.offset.saturating_sub(offset) as usize;
-                    if skip < bytes.len() {
-                        timing.first_output();
-                        if write_output(state, &bytes[skip..]).is_err() {
-                            link.close();
-                            return Outcome::Exit(code::ERROR);
-                        }
-                        state.offset = offset + bytes.len() as u64;
-                    }
-                }
                 Msg::Ack { seq } => state.unacked.ack(seq),
                 // The answer to a question a network change asked, and the
                 // only thing that is (acs-br2): bytes the host wrote before
                 // the network moved are not evidence the link survived it.
                 Msg::Pong(n) => liveness.pong(n),
                 // The master checks on us too (DESIGN §5.3, acs-ode).
-                Msg::Ping(n) => Msg::Pong(n).encode(&mut out),
+                Msg::Ping(n) => Msg::Pong(n).encode(out.tail()),
                 Msg::Exit { status } => {
                     link.close();
                     return Outcome::Exit(sys::exit_code(status));
@@ -1506,8 +2133,9 @@ fn serve(
                     let name = state.session.clone().unwrap_or_default();
                     leave(state, raw);
                     note(&format!(
-                        "another client took over {}/{name} — reattach with: acs {} {name}",
-                        state.host, state.host
+                        "another client took over {}/{name} — {}",
+                        state.host,
+                        reattach_hint(&state.host, &name)
                     ));
                     return Outcome::Exit(code::TAKEN_OVER);
                 }
@@ -1520,7 +2148,7 @@ fn serve(
         }
 
         let before = out.len();
-        if let Err(_e) = write_link(to, &mut out) {
+        if !out.flush(to) {
             return lost(link, LinkEnd::Transport);
         }
         if owed > 0 {
@@ -1535,11 +2163,10 @@ fn serve(
         // waiting for ever: a program that stopped mid-sequence, or a link
         // that died there, must not swallow it (acs-z22).
         notes::flush_due(now);
-        let mut timeout: i64 = -1;
-        let mut consider = |deadline: u64| {
-            let d = deadline.saturating_sub(now) as i64;
-            timeout = if timeout < 0 { d } else { timeout.min(d) };
-        };
+        let mut soonest: Option<u64> = None;
+        // `None` orders below every `Some`, hence the `or`: the soonest
+        // deadline seen, or `d` when it is the first.
+        let mut consider = |d: u64| soonest = soonest.min(Some(d)).or(Some(d));
         if let Some(d) = state.detector.deadline() {
             consider(d);
         }
@@ -1566,7 +2193,7 @@ fn serve(
             sys::pollfd(to, if out.is_empty() { 0 } else { libc::POLLOUT }),
             sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
         ];
-        if sys::poll(&mut fds, timeout.min(i32::MAX as i64) as i32).is_err() {
+        if sys::poll(&mut fds, sys::poll_timeout_ms(soonest, now)).is_err() {
             return lost(link, LinkEnd::Transport);
         }
 
@@ -1574,7 +2201,7 @@ fn serve(
             for sig in sys::signals::drain(signals.as_raw_fd()) {
                 if sig == libc::SIGWINCH && welcomed {
                     if let Ok(s) = sys::get_winsize(STDIN) {
-                        Msg::Resize(s).encode(&mut out);
+                        Msg::Resize(s).encode(out.tail());
                     }
                 }
             }
@@ -1590,19 +2217,23 @@ fn serve(
         // change costs nothing and one that did not is replaced in about a
         // second rather than after ten of silence.
         //
-        // Before the WELCOME the handshake deadline is already the one that
-        // applies, so the change is read and nothing is done with it —
-        // acting on it there is acs-xo1, which has the blocking dial to
-        // deal with as well. It is *not* spent by being read (acs-0n8):
-        // the change is dropped rather than accepted, so the networks held
-        // stay where they were and the kernel's next word about the same
-        // move is the same change again, instead of "not a change" against
-        // a set that has already moved.
+        // Before the WELCOME there is nothing to ask — liveness starts with
+        // it — and a change that took a network away has probably taken
+        // the handshake's connection with it, so the link is abandoned and
+        // dialled again at once (acs-xo1, as the dial does before its
+        // marker). ssh is past its prompts here. A change that only added
+        // a network is read and dropped rather than accepted (acs-0n8): the
+        // networks held stay where they were, and the kernel's next word
+        // about the same move is the same change again, instead of "not a
+        // change" against a set that has already moved.
         if fds[4].revents != 0 {
             if let Some(change) = netwatch.and_then(|w| w.changed()) {
                 if welcomed {
-                    liveness.netcheck(&mut out);
+                    liveness.netcheck(out.tail());
                     change.acted();
+                } else if change.removed() {
+                    change.acted();
+                    return lost(link, LinkEnd::Moved);
                 }
             }
         }
@@ -1613,8 +2244,8 @@ fn serve(
             match sys::read(STDIN, &mut buf) {
                 Ok(0) | Err(_) => {
                     // The terminal went away: leave the session running.
-                    Msg::Detach.encode(&mut out);
-                    let _ = write_link(to, &mut out);
+                    Msg::Detach.encode(out.tail());
+                    out.flush(to);
                     link.close();
                     return Outcome::Exit(code::DETACHED);
                 }
@@ -1622,7 +2253,7 @@ fn serve(
                     let was = state.detector.armed();
                     let o = state.detector.feed(&buf[..n], sys::now_ms());
                     follow_detector(state, was);
-                    queue_input(state, &mut out, &o.forward);
+                    queue_input(state, out.tail(), &o.forward);
                     action = o.action;
                 }
             }
@@ -1634,27 +2265,27 @@ fn serve(
             let was = state.detector.armed();
             let o = state.detector.tick(sys::now_ms());
             follow_detector(state, was);
-            queue_input(state, &mut out, &o.forward);
+            // A press whose window ran out before the WELCOME was typed
+            // into the dial: dropped, as offline() drops it (acs-wnhd,
+            // DESIGN §6.1). Stdin is not read until then, so this is the
+            // only way a key reaches here early.
+            if welcomed {
+                queue_input(state, out.tail(), &o.forward);
+            }
         }
         match action {
             Some(Action::Detach) => {
-                Msg::Detach.encode(&mut out);
+                Msg::Detach.encode(out.tail());
                 let deadline = Instant::now() + Duration::from_millis(500);
                 while !out.is_empty() && Instant::now() < deadline {
-                    if write_link(to, &mut out).is_err() {
+                    if !out.flush(to) {
                         break;
                     }
                     let mut p = [sys::pollfd(to, libc::POLLOUT)];
                     let _ = sys::poll(&mut p, 50);
                 }
                 link.close();
-                leave(state, raw);
-                let name = state.session.clone().unwrap_or_default();
-                note(&format!(
-                    "detached from {}/{name} — reattach with: acs {} {name}",
-                    state.host, state.host
-                ));
-                return Outcome::Exit(code::DETACHED);
+                return detached(state, raw);
             }
             Some(Action::Exit) => {
                 // This connection is the attached one, so the master lets
@@ -1664,7 +2295,7 @@ fn serve(
                     identity: identity(),
                     force: true,
                 }
-                .encode(&mut out);
+                .encode(out.tail());
                 exiting = true;
             }
             None => {}
@@ -1672,7 +2303,10 @@ fn serve(
 
         if fds[0].revents != 0 {
             match sys::read(from, &mut buf) {
-                Ok(0) => return lost(link, LinkEnd::Transport),
+                Ok(0) => {
+                    let why = link.eof();
+                    return lost(link, why);
+                }
                 Ok(n) => {
                     dec.push(&buf[..n]);
                     // Bytes from the host are proof it is there. Their
@@ -1689,7 +2323,7 @@ fn serve(
         }
 
         if welcomed {
-            match liveness.tick(&mut out) {
+            match liveness.tick(out.tail()) {
                 crate::reconnect::Health::Ok => {}
                 crate::reconnect::Health::Dead => return lost(link, LinkEnd::Silent),
             }
@@ -1710,9 +2344,38 @@ fn serve(
     }
 }
 
+/// Where a DATA frame at `offset` with `len` bytes stands against the
+/// `have` bytes already written: how many of its leading bytes to skip
+/// (all of them, or more, for a frame already written) and the stream
+/// offset its end reaches.
+///
+/// `None` for a frame whose end does not fit in a `u64` (acs-shj7, the
+/// client's side of acs-hpf): the offset comes off the wire, and
+/// `offset + len` used to be an unguarded addition that aborted a debug
+/// build and wrapped in a release one.
+fn data_span(have: u64, offset: u64, len: usize) -> Option<(usize, u64)> {
+    let end = offset.checked_add(len as u64)?;
+    let skip = usize::try_from(have.saturating_sub(offset)).unwrap_or(usize::MAX);
+    Some((skip, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-shj7: a DATA frame whose end overflows a u64 is refused rather
+    /// than added up — the unguarded sum panicked a debug build.
+    #[test]
+    fn a_data_frame_past_the_end_of_the_stream_is_refused() {
+        assert_eq!(data_span(0, u64::MAX, 1), None);
+        assert_eq!(data_span(10, u64::MAX - 2, 8), None);
+        // The end exactly at u64::MAX still fits.
+        assert_eq!(data_span(0, u64::MAX - 4, 4), Some((0, u64::MAX)));
+        // Ordinary frames: fresh, partly written, already written.
+        assert_eq!(data_span(10, 10, 5), Some((0, 15)));
+        assert_eq!(data_span(12, 10, 5), Some((2, 15)));
+        assert_eq!(data_span(20, 10, 5), Some((10, 15)));
+    }
 
     /// acs-n1m: which endings take the shared ssh master down with them.
     /// A channel that broke while the connection was demonstrably carrying
@@ -1725,10 +2388,54 @@ mod tests {
         assert!(LinkEnd::Transport.failed_the_connection());
         assert!(LinkEnd::Silent.failed_the_connection());
         assert!(!LinkEnd::Channel.failed_the_connection());
+        assert!(!LinkEnd::Exited.failed_the_connection());
         // No reason at all is the blunt side too: `connect_and_serve` ends
         // the master when it is given `None`.
         let unknown: Option<LinkEnd> = None;
         assert!(unknown.map_or(true, LinkEnd::failed_the_connection));
+    }
+
+    /// acs-b4f: EOF on a channel is read from ssh's exit status. 255 is
+    /// ssh's own failure, the connection; anything else is the remote
+    /// command's. An ssh still running at the bound, and any link that is
+    /// not a channel on the master, keep the old answer — and the latter
+    /// without waiting at all.
+    #[test]
+    fn eof_on_a_channel_is_read_from_how_ssh_exited() {
+        let link = |sh: &str, muxed: bool| {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", sh])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let to: OwnedFd = child.stdin.take().unwrap().into();
+            let from: OwnedFd = child.stdout.take().unwrap().into();
+            Link {
+                child,
+                to,
+                from,
+                pending: Vec::new(),
+                muxed,
+            }
+        };
+        let eof = |sh: &str, muxed: bool| {
+            let mut l = link(sh, muxed);
+            let t = Instant::now();
+            let why = l.eof();
+            l.close();
+            (why, t.elapsed())
+        };
+        assert_eq!(eof("exit 1", true).0, LinkEnd::Exited);
+        assert_eq!(eof("exit 6", true).0, LinkEnd::Exited);
+        assert_eq!(eof("exit 255", true).0, LinkEnd::Transport);
+        assert_eq!(eof("kill -9 $$", true).0, LinkEnd::Transport);
+        let (why, took) = eof("exec sleep 30", true);
+        assert_eq!(why, LinkEnd::Transport);
+        assert!(took >= REAP_BOUND && took < REAP_BOUND * 20, "{took:?}");
+        let (why, took) = eof("exec sleep 30", false);
+        assert_eq!(why, LinkEnd::Transport);
+        assert!(took < REAP_BOUND, "a link off the master waited: {took:?}");
     }
 
     /// acs-odd: the configured `local_forwards` join the command line's
@@ -1807,12 +2514,15 @@ mod tests {
         assert_eq!(notes::written(), ["acs: between frames\r\n"]);
 
         // A frame that ended halfway through an escape sequence.
-        notes::at_boundary(false);
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[1;3");
+        notes::stream(&o);
         note("first");
         note("second");
         assert!(notes::written().is_empty(), "written into the sequence");
         // The frame that finishes it releases both, oldest first.
-        notes::at_boundary(true);
+        o.observe(b"1m");
+        notes::stream(&o);
         assert_eq!(notes::written(), ["acs: first\r\n", "acs: second\r\n"]);
 
         // And nothing is held behind them afterwards.
@@ -1830,7 +2540,9 @@ mod tests {
     fn a_held_note_survives_a_program_that_stops_mid_sequence() {
         notes::capture();
         let relaying = notes::Relaying::open();
-        notes::at_boundary(false);
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[1;3");
+        notes::stream(&o);
         note("held");
         // Nothing is due while the bytes that would finish the sequence
         // may still be on their way.
@@ -1839,19 +2551,81 @@ mod tests {
         assert!(notes::written().is_empty());
         assert!(notes::deadline().is_some_and(|d| d > raised));
         // The sequence never finishes: `ACS_NOTE_HOLD_MS` later the note
-        // is written where it stands rather than lost.
+        // is written rather than lost — over the sequence, not into it
+        // (acs-ysx).
         notes::flush_due(raised + 60_000);
-        assert_eq!(notes::written(), ["acs: held\r\n"]);
+        assert_eq!(notes::written(), ["\x1b\\acs: held\r\n\x1b[1;3"]);
         assert_eq!(notes::deadline(), None);
 
         // The way out of the frame loop writes what is still held, so the
         // notes that end a link — a protocol error, an ERROR frame, the
         // takeover — arrive even when the last frame left a sequence open.
-        notes::at_boundary(false);
         note("on the way out");
         assert!(notes::written().is_empty());
         drop(relaying);
-        assert_eq!(notes::written(), ["acs: on the way out\r\n"]);
+        assert_eq!(notes::written(), ["\x1b\\acs: on the way out\r\n\x1b[1;3"]);
+        notes::stream(&ModeObserver::new());
+    }
+
+    /// acs-ysx: a note raised outside the frame loop — the dial, the
+    /// offline wait, alias resolution, an exit note — knows nothing of the
+    /// terminal, and the terminal may be inside the program's CSI: the
+    /// last frame left it there, and the status line put it back. Such a
+    /// note is written over the sequence, as the status line is, and not
+    /// into it.
+    #[test]
+    fn a_note_outside_the_frame_loop_steps_over_an_open_sequence() {
+        notes::capture();
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[1;31");
+        notes::stream(&o);
+        note("mid-outage");
+        assert_eq!(notes::written(), ["\x1b\\acs: mid-outage\r\n\x1b[1;31"]);
+        // A string cannot be handed back: it is ended and stays ended.
+        o.observe(b"\x1b]2;half a tit");
+        notes::stream(&o);
+        note("in a title");
+        assert_eq!(notes::written(), ["\x1b\\acs: in a title\r\n"]);
+        // At a boundary the note goes out as it is.
+        notes::stream(&ModeObserver::new());
+        note("plain");
+        assert_eq!(notes::written(), ["acs: plain\r\n"]);
+    }
+
+    /// acs-ysx: the knowledge above is only as good as the calls that keep
+    /// it, so the writes that step over the stream check it against the
+    /// observer. An observer that moved without telling the notes is
+    /// caught there, before a note is written blind.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "notes lost the stream")]
+    fn an_observer_that_moves_behind_the_notes_back_is_caught() {
+        let mut state = test_state();
+        state.observer.observe(b"\x1b[1;31");
+        let _ = over_stream(&state, b"status");
+    }
+
+    fn test_state() -> State {
+        State {
+            host: "devbox".into(),
+            session: None,
+            instance: None,
+            offset: 0,
+            unacked: Unacked::new(0),
+            observer: ModeObserver::new(),
+            identity: String::new(),
+            attached_once: false,
+            status_shown: false,
+            status_drawn: (Vec::new(), 0),
+            command_bell: false,
+            bell_pending: false,
+            redraw_on_reconnect: false,
+            paste: keys::PasteTracker::default(),
+            detector: Detector::new(escape_config()),
+            force_next: false,
+            master: None,
+            welcomed_at: None,
+        }
     }
 
     #[test]

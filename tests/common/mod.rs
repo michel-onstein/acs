@@ -13,17 +13,20 @@ use std::time::{Duration, Instant};
 use acs::sys;
 use acs::testutil::TempDir;
 
-/// The deadline test helpers wait to. Generous on purpose (acs-kip): the
-/// whole suite runs its targets in parallel, so a laptop building and
-/// running two dozen binaries at once takes many times longer over any one
-/// step than an idle machine does. A test that truly hangs still fails,
-/// only later; one that merely lost the CPU for a second does not, and a
-/// gate that cries wolf teaches people to re-run rather than to read.
-pub const T: Duration = Duration::from_secs(30);
+/// The deadline test helpers wait to; see [`acs::testutil::T`].
+pub use acs::testutil::T;
+/// Deadline waits as free functions, for any condition (acs-bndl).
+pub use acs::testutil::{poll, wait_until};
 
 /// A directory that does not exist: the client finds no configuration file
 /// unless a test gives it one.
 pub const NO_CONFIG: &str = "/nonexistent/acs-test-config";
+
+/// A state directory that cannot exist, even for root (`/dev/null/…` is not
+/// a directory): the client remembers no alias's last host (acs-zpj), so
+/// one test's choice cannot steer another's, nor the developer's own. A
+/// test about the memory passes its own `XDG_STATE_HOME`.
+pub const NO_STATE: &str = "/dev/null";
 
 /// `acs` as a plain command (no pty), isolated from the developer's own
 /// configuration.
@@ -37,6 +40,7 @@ pub fn acs_cmd_as(path: &Path) -> Command {
     c.env("ACS_NO_UPDATE_CHECK", "1")
         .env("XDG_CONFIG_HOME", NO_CONFIG)
         .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+        .env("XDG_STATE_HOME", NO_STATE)
         .env("ACS_CONTROL_PERSIST", NO_MASTER);
     c
 }
@@ -99,20 +103,33 @@ impl Net {
                 false => "",
             };
             format!(
-                "#!/bin/sh\nfor h; do :; done\necho \"$h\" >> '{log}'\n{refuse}if grep -qx \"$h\" '{slow}'; then sleep 30; fi\ngrep -qx \"$h\" '{up}'\n",
+                "#!/bin/sh\nfor h; do :; done\nif grep -qx \"$h\" '{lag}'; then sleep 2; fi\necho \"$h\" >> '{log}'\n{refuse}if grep -qx \"$h\" '{slow}'; then sleep 30; fi\ngrep -qx \"$h\" '{up}'\n",
+                lag = n.lag_file().display(),
                 log = n.pinged_file().display(),
                 slow = n.slow_file().display(),
                 up = n.up_file().display()
             )
         };
-        use std::os::unix::fs::PermissionsExt;
         for (path, ipv4_only) in [(n.ping(), true), (n.ping6(), false)] {
-            std::fs::write(&path, body(ipv4_only)).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(&path, body(ipv4_only));
         }
         n.set_up(up);
         n.set_slow(&[]);
+        n.set_lagging(&[]);
         n
+    }
+
+    fn lag_file(&self) -> PathBuf {
+        self.dir.path().join("lag")
+    }
+
+    /// Hosts whose ping takes 2 s to get as far as logging itself: what a
+    /// machine too busy to schedule the fake's shell looks like, made to
+    /// happen on every run rather than a few in sixty (acs-uj6).
+    pub fn set_lagging(&self, lagging: &[&str]) {
+        let mut s = lagging.join("\n");
+        s.push('\n');
+        std::fs::write(self.lag_file(), s).unwrap();
     }
 
     fn slow_file(&self) -> PathBuf {
@@ -150,6 +167,12 @@ impl Net {
 
     /// Every host pinged so far, sorted: an alias's hosts are pinged at
     /// once.
+    ///
+    /// **Sound only as a negative** ("X was never pinged"): the fake logs
+    /// a host when its shell gets to run, which on a busy machine can be
+    /// well after acs started it — and after acs has chosen another host
+    /// and stopped waiting for this one. For "X was pinged" use
+    /// [`Net::wait_pinged`] (acs-uj6).
     pub fn pinged(&self) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_to_string(self.pinged_file())
             .unwrap_or_default()
@@ -158,6 +181,22 @@ impl Net {
             .collect();
         v.sort();
         v
+    }
+
+    /// Wait until the hosts pinged are exactly `want`, in any order and a
+    /// host twice for one pinged twice; after [`T`], fail with what was
+    /// pinged instead. A ping acs started but did not wait for — a host
+    /// that lost to the one chosen — logs itself whenever its shell is
+    /// scheduled, so "X was pinged" has to wait for the line rather than
+    /// sample the log once (acs-uj6).
+    pub fn wait_pinged(&self, want: &[&str]) {
+        let mut want: Vec<String> = want.iter().map(|h| h.to_string()).collect();
+        want.sort();
+        wait_until(
+            T,
+            || self.pinged() == want,
+            || format!("hosts pinged: {:?}, want {want:?}", self.pinged()),
+        );
     }
 
     /// The environment for a client with `config` as its configuration and
@@ -353,8 +392,8 @@ impl Ssh {
                 remote.transport()
             ));
         }
-        std::fs::write(
-            s.path(),
+        write_executable(
+            &s.path(),
             format!(
                 "#!/bin/sh\n{log}\
                  while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
@@ -363,10 +402,7 @@ impl Ssh {
                  echo \"ssh: connect to host $dest port 22: Connection refused\" >&2\nexit 255\n",
                 log = log_call_sh(&s.log()),
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(s.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         s
     }
 
@@ -424,13 +460,92 @@ pub fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_acs"))
 }
 
+/// Copy `src` to `dest` in a child `cp`, never in this process (acs-e86g).
+///
+/// A copy made here holds `dest` open for writing, and any other test
+/// thread that forks in that window carries the write descriptor into its
+/// child until the child's exec. Linux refuses to exec a file anything has
+/// open for writing (ETXTBSY), so a remote's exec of a just-copied acs —
+/// inside the fake ssh's `sh`, out of reach of [`output_of`]'s retry —
+/// failed now and then under load. A `cp` child is the only process that
+/// ever opens the file for writing, nothing forks from it, and it has
+/// exited by the time this returns.
+pub fn copy_out_of_process(src: &Path, dest: &Path) {
+    let st = Command::new("cp")
+        .arg(src)
+        .arg(dest)
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        st.success(),
+        "cp {} {}: {st}",
+        src.display(),
+        dest.display()
+    );
+}
+
+/// Write an executable `path` holding `body`, mode 0755, without this
+/// process ever holding it open for writing — see [`copy_out_of_process`].
+/// The body goes to a scratch file beside it first; that one may be "busy"
+/// for a moment, but nothing runs it.
+pub fn write_executable(path: &Path, body: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    let src = PathBuf::from(src);
+    std::fs::write(&src, body).unwrap();
+    copy_out_of_process(&src, path);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_file(&src);
+}
+
+/// Remove `path` (a file, or a directory and everything in it) when this
+/// test binary exits, once no test is running. Only in the process that
+/// asked: a forked child that calls `exit` inherits the handler, not the
+/// job.
+pub fn remove_at_exit(path: PathBuf) {
+    static PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static OWNER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    extern "C" fn remove_all() {
+        if OWNER.get() != Some(&std::process::id()) {
+            return;
+        }
+        let paths = PATHS.lock().map(|p| p.clone()).unwrap_or_default();
+        for p in paths {
+            let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
+        }
+    }
+    OWNER.get_or_init(|| {
+        // SAFETY: registers a plain function with no captured state.
+        unsafe { libc::atexit(remove_all) };
+        std::process::id()
+    });
+    PATHS.lock().unwrap().push(path);
+}
+
+/// `exe()` copied once per test binary onto `/tmp`, the filesystem every
+/// [`TempDir`] lives on, so a remote's install can hard-link it even where
+/// the build directory is on another filesystem (the Linux container's
+/// target volume, where linking `exe()` itself is EXDEV). Removed when the
+/// test binary exits.
+pub fn staged_exe() -> &'static Path {
+    static STAGED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    STAGED.get_or_init(|| {
+        let p = PathBuf::from(format!("/tmp/acst-exe-{}", std::process::id()));
+        copy_out_of_process(&exe(), &p);
+        remove_at_exit(p.clone());
+        p
+    })
+}
+
 /// A copy of this acs installed the way Homebrew does under `dir`: the
 /// binary in `homebrew/Cellar/acs/<version>/bin/`, linked from
 /// `homebrew/bin/acs`, which is returned.
 pub fn brewed_copy(dir: &Path) -> PathBuf {
     let keg = dir.join(format!("homebrew/Cellar/acs/{}/bin", acs::VERSION));
     std::fs::create_dir_all(&keg).unwrap();
-    std::fs::copy(exe(), keg.join("acs")).unwrap();
+    copy_out_of_process(&exe(), &keg.join("acs"));
     let bin = dir.join("homebrew/bin");
     std::fs::create_dir_all(&bin).unwrap();
     let link = bin.join("acs");
@@ -440,13 +555,36 @@ pub fn brewed_copy(dir: &Path) -> PathBuf {
 
 /// A "remote host": its own HOME (with acs installed at the versioned path
 /// the prelude looks for) and its own socket directory.
+///
+/// Its directory is never removed when it is dropped, only when the test
+/// binary exits (acs-hx0m) — see the `Drop` below.
 pub struct Remote {
-    pub root: TempDir,
+    pub root: std::mem::ManuallyDrop<TempDir>,
+}
+
+/// Ends the remote's sessions now, as a [`TempDir`] would, but leaves its
+/// directory to [`remove_at_exit`] (acs-hx0m).
+///
+/// The directory holds the remote's acs, a hard link of [`exe()`] (see
+/// [`Remote::install`]). On macOS, unlinking such a link while another test
+/// thread is spawning a client from [`exe()`] now and then gets that client
+/// SIGKILLed 1–15 ms after the fork, before it writes a byte; nothing is
+/// logged, and its test times out thirty seconds later. In `tests/client.rs`
+/// with one test dropping two installed remotes at once, 10 runs in 270
+/// failed so (several clients at a time); unlinking only the two binaries
+/// and keeping the directories, 2 in 100; keeping everything, 0 in 160.
+/// Removing the directories at exit, when no test is running and nothing is
+/// spawning, takes the unlink out of that window: 0 in 150.
+impl Drop for Remote {
+    fn drop(&mut self) {
+        acs::testutil::end_sessions_under(self.root.path());
+        remove_at_exit(self.root.path().to_path_buf());
+    }
 }
 
 impl Remote {
     pub fn new() -> Remote {
-        let root = TempDir::new();
+        let root = std::mem::ManuallyDrop::new(TempDir::new());
         let r = Remote { root };
         std::fs::create_dir_all(r.home()).unwrap();
         std::fs::create_dir_all(r.sockets()).unwrap();
@@ -491,12 +629,17 @@ impl Remote {
         // A hard link where the temp directory and the build share a
         // filesystem, so that every remote's acs is the one inode the suite
         // already has warm — a hundred and thirty-odd private copies would
-        // be a hundred and thirty cold execs of four megabytes. A copy
-        // where they do not: the Linux container mounts the target
-        // directory as a volume of its own, and `link` across that is
-        // EXDEV.
-        if std::fs::hard_link(exe(), &acs).is_err() {
-            std::fs::copy(exe(), &acs).unwrap();
+        // be a hundred and thirty cold execs of four megabytes. Where they
+        // do not — the Linux container mounts the target directory as a
+        // volume of its own, and `link` across that is EXDEV — a link to
+        // the one staged copy on `/tmp` instead. Never a copy per remote
+        // made in this process (acs-e86g): a test thread forking while it
+        // was being written kept it "busy", and the remote's exec of it
+        // failed ETXTBSY.
+        if std::fs::hard_link(exe(), &acs).is_err()
+            && std::fs::hard_link(staged_exe(), &acs).is_err()
+        {
+            copy_out_of_process(staged_exe(), &acs);
         }
     }
 
@@ -562,9 +705,7 @@ impl Remote {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tmp = self.root.path().join(format!("transport.sh.{n}"));
-            std::fs::write(&tmp, &body).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(&tmp, &body);
             std::fs::rename(&tmp, &script).unwrap();
         }
         script.display().to_string()
@@ -617,6 +758,26 @@ impl Remote {
             .open(self.remote_env_file())
             .unwrap();
         writeln!(f, "{line}").unwrap();
+    }
+
+    /// Make the next connection ask for a password on the terminal the way
+    /// ssh does — the terminal's echo off first, then the prompt, then a
+    /// line read from `/dev/tty` — and return the file the answer is
+    /// written to (acs-8ax). Like ssh's `readpassphrase`, it starts over
+    /// when job control interrupts it: macOS does not restart a
+    /// `tcsetattr` cut short by a stop.
+    pub fn prompt_on_next_dial(&self) -> PathBuf {
+        let flag = self.root.path().join("prompt-next");
+        let answer = self.root.path().join("prompt-answer");
+        self.remote_env_line(&format!(
+            "if [ -f '{flag}' ]; then rm -f '{flag}'; until stty -echo </dev/tty 2>/dev/null; do :; done; \
+             printf 'Password: ' >/dev/tty; read pw </dev/tty; stty echo </dev/tty; \
+             echo \"$pw\" > '{answer}'; fi",
+            flag = flag.display(),
+            answer = answer.display(),
+        ));
+        std::fs::write(&flag, "").unwrap();
+        answer
     }
 
     /// Run the remote side under `mask`, a restrictive umask (077) masking
@@ -724,6 +885,12 @@ impl Remote {
         }
     }
 
+    /// [`Remote::silence`] with bytes, for a host that says a frame or two
+    /// after its marker and then nothing more.
+    pub fn silence_bytes(&self, said: &[u8]) {
+        std::fs::write(self.silent_file(), said).unwrap();
+    }
+
     /// Make every connection print `text` on stdout before the remote
     /// command runs, as a chatty `.bashrc` or motd script would.
     pub fn login_noise(&self, text: &str) {
@@ -740,15 +907,12 @@ impl Remote {
     pub fn fake_uname(&self, os: &str, arch: &str) {
         std::fs::create_dir_all(self.fake_bin()).unwrap();
         let script = self.fake_bin().join("uname");
-        std::fs::write(
+        write_executable(
             &script,
             format!(
                 "#!/bin/sh\ncase \"$1\" in -s) echo {os};; -m) echo {arch};; *) echo {os};; esac\n"
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
     }
 
     /// The installed binary for `version`, if any.
@@ -792,16 +956,16 @@ impl Remote {
     /// Wait until `extra` more connections have been made than the `base`
     /// [`Remote::connections`] returned before the stimulus.
     pub fn wait_more_connections(&self, base: usize, extra: usize, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while self.connections() < base + extra {
-            assert!(
-                Instant::now() < deadline,
-                "{} connections, waiting for {} more than the {base} there were",
-                self.connections(),
-                extra,
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_until(
+            timeout,
+            || self.connections() >= base + extra,
+            || {
+                format!(
+                    "{} connections, waiting for {extra} more than the {base} there were",
+                    self.connections(),
+                )
+            },
+        );
     }
 
     /// Run the remote command a real ssh would run (the prelude), with the
@@ -874,6 +1038,7 @@ impl Client {
             .env("ACS_NO_UPDATE_CHECK", "1")
             .env("XDG_CONFIG_HOME", NO_CONFIG)
             .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+            .env("XDG_STATE_HOME", NO_STATE)
             .env("ACS_IDENTITY", "tester@local")
             // And never a shared ssh master in the developer's own
             // /tmp/acs-mux-<uid> (acs-9n3); tests/mux.rs sets its own.
@@ -947,17 +1112,21 @@ impl Client {
 
     /// Wait until `ready` holds, or fail at the deadline. For the moments
     /// where a test needs the client to have *reached* a state rather than
-    /// to have been given time to (acs-kip).
+    /// to have been given time to (acs-kip). The free [`wait_until`], with
+    /// the client's output in its failure.
+    #[track_caller]
     pub fn wait_until(&self, what: &str, mut ready: impl FnMut(&Self) -> bool, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while !ready(self) {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting until {what}; output so far:\n{}",
-                self.text()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until(
+            timeout,
+            || ready(self),
+            || format!("waiting until {what}; output so far:\n{}", self.text()),
+        );
+    }
+
+    /// How many bytes the client wrote to its terminal so far, without
+    /// copying them: for output too large to search (tests/throughput.rs).
+    pub fn output_len(&self) -> usize {
+        self.output.lock().unwrap().len()
     }
 
     /// Everything the client wrote to its terminal so far.
@@ -986,8 +1155,13 @@ impl Client {
                 }
             }
             if Instant::now() >= deadline {
+                // Whether the client is still there: a client that died
+                // silently (acs-hx0m) reads very differently from one that
+                // is merely waiting.
+                let st = self.child.try_wait();
                 panic!(
-                    "timed out waiting for {needle:?}; output so far:\n{}",
+                    "timed out waiting for {needle:?}; client {}: {st:?}; output so far:\n{}",
+                    self.child.id(),
                     self.text()
                 );
             }
@@ -1041,18 +1215,21 @@ impl Client {
     }
 
     /// Wait for the client to exit; returns its exit code.
+    #[track_caller]
     pub fn wait(&mut self, timeout: Duration) -> i32 {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(st) = self.child.try_wait().unwrap() {
-                use std::os::unix::process::ExitStatusExt;
-                return st.code().unwrap_or(128 + st.signal().unwrap_or(0));
-            }
-            if Instant::now() >= deadline {
-                panic!("client did not exit; output:\n{}", self.text());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        use std::os::unix::process::ExitStatusExt;
+        let (child, output) = (&mut self.child, &self.output);
+        let st = poll(
+            timeout,
+            || child.try_wait().unwrap(),
+            || {
+                format!(
+                    "client did not exit; output:\n{}",
+                    String::from_utf8_lossy(&output.lock().unwrap())
+                )
+            },
+        );
+        st.code().unwrap_or(128 + st.signal().unwrap_or(0))
     }
 }
 
@@ -1192,6 +1369,70 @@ pub fn command(key: u8) -> Vec<u8> {
     vec![0x1d, 0x1d, key]
 }
 
+/// Fast client timers, so a resume takes a fraction of a second.
+pub const FAST: &[(&str, &str)] = &[
+    ("ACS_BACKOFF_MS", "100"),
+    ("ACS_PING_MS", "200"),
+    ("ACS_DEAD_MS", "800"),
+];
+
+/// A program printing `#1#`, `#2#`, … a line every 10 ms, for
+/// [`numbers`] and [`assert_consecutive`] to read.
+pub const TICKER: &str = "i=0; while true; do i=$((i+1)); printf '#%d#\\n' $i; sleep 0.01; done";
+
+/// A program that reports every byte it receives as `in:xx`, as it comes;
+/// [`received`] reads the reports back.
+pub const REPORTER: &str = "stty raw -echo; echo ready; \
+    while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1); printf 'in:%s\\n' $b; done";
+
+/// The bytes a [`REPORTER`] reported, in order, as two hex digits each.
+pub fn received(c: &Client) -> Vec<String> {
+    c.text()
+        .split("in:")
+        .skip(1)
+        .filter_map(|s| s.get(..2).map(String::from))
+        .collect()
+}
+
+/// The command of a session that says `up` and stays: `-- /bin/sh -c …`.
+pub const UP_CMD: &[&str] = &["--", "/bin/sh", "-c", "echo up; sleep 30"];
+
+/// The arguments for session `session` on `devbox` running [`UP_CMD`].
+pub fn up_args(session: &str) -> Vec<&str> {
+    let mut a = vec!["devbox", session];
+    a.extend_from_slice(UP_CMD);
+    a
+}
+
+/// A session that answers each line typed with `got-<name>:<line>`, after
+/// saying `ready-<name>`.
+pub fn echo(name: &str) -> String {
+    format!("echo ready-{name}; while read l; do echo got-{name}:$l; done")
+}
+
+/// The last screen the session menu drew in full: a redraw may be read
+/// half-way, so one that has not reached its closing erase yet is skipped.
+pub fn last_screen(c: &Client) -> String {
+    let text = c.text();
+    let mut screens: Vec<&str> = text.split("\x1b[Hacs: ").skip(1).collect();
+    if screens.last().is_some_and(|s| !s.contains("\x1b[J")) && screens.len() > 1 {
+        screens.pop();
+    }
+    let last = screens.last().expect("no menu drawn");
+    format!("\x1b[Hacs: {last}")
+}
+
+/// The number of session `name`'s row in the [`last_screen`] of the menu.
+pub fn menu_row(c: &Client, name: &str) -> usize {
+    let screen = last_screen(c);
+    let line = screen
+        .split("\r\n")
+        .find(|l| l.contains(&format!(" {name} ")))
+        .unwrap_or_else(|| panic!("no {name} in {screen:?}"));
+    let line = line.trim_start_matches("\x1b[7m");
+    line[2..3].parse().unwrap()
+}
+
 /// A data file with every byte value except `\n` (a pty turns `\n` into
 /// `\r\n`), so output can be compared byte for byte.
 pub fn binary_pattern(path: &Path, len: usize) -> Vec<u8> {
@@ -1230,12 +1471,11 @@ pub fn gzip(data: &[u8]) -> Vec<u8> {
 /// whose `target` entry is this same binary (so a fake remote of that
 /// platform can run what gets installed).
 pub fn complete_client(dir: &Path, target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) {
-    let slim = std::fs::read(exe()).unwrap();
-    let gz = gzip(&slim);
+    let (slim, gz) = slim_and_gz();
     let blob = acs::payload::build(&[acs::payload::Input {
         target,
-        raw: &slim,
-        gz: &gz,
+        raw: slim,
+        gz,
     }]);
     let path = dir.join("acs-complete");
     let mut full = slim.clone();
@@ -1243,7 +1483,20 @@ pub fn complete_client(dir: &Path, target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) 
     std::fs::write(&path, &full).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    (path, slim, blob)
+    (path, slim.clone(), blob)
+}
+
+/// This acs binary and its `gzip -9`, read and compressed once per test
+/// binary (acs-dz3r): the binary does not change while its tests run, and a
+/// `gzip -9` of its ~5 MB costs about 2 s of CPU per call.
+fn slim_and_gz() -> (&'static Vec<u8>, &'static Vec<u8>) {
+    static PAIR: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+    let (slim, gz) = PAIR.get_or_init(|| {
+        let slim = std::fs::read(exe()).unwrap();
+        let gz = gzip(&slim);
+        (slim, gz)
+    });
+    (slim, gz)
 }
 
 /// What a missing `ssh-keygen` is reported as. `Command::status()` answers
@@ -1252,6 +1505,28 @@ pub fn complete_client(dir: &Path, target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) 
 /// tool is named here.
 const NEEDS_KEYGEN: &str =
     "ssh-keygen must be on PATH: the release signature is made and checked with it (acs-o9v)";
+
+/// The release signing pair, `(private key file, public key line)`, made
+/// once per test binary (acs-dz3r) rather than by an `ssh-keygen` per
+/// server: every server signs with it, and the one test that needs a
+/// release signed by somebody else makes that key itself
+/// (`sign_with_another_key`).
+fn release_pair() -> &'static (String, String) {
+    static PAIR: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    PAIR.get_or_init(|| {
+        let dir = TempDir::new();
+        let key = dir.path().join("signer");
+        let st = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"])
+            .arg(&key)
+            .status()
+            .expect(NEEDS_KEYGEN);
+        assert!(st.success());
+        let private = std::fs::read_to_string(&key).unwrap();
+        let public = std::fs::read_to_string(dir.path().join("signer.pub")).unwrap();
+        (private, public.trim().to_string())
+    })
+}
 
 /// A stand-in for GitHub Releases over plain HTTP, for `ACS_RELEASES_URL`:
 /// the real `curl` downloads from it. Paths are as on GitHub
@@ -1328,26 +1603,25 @@ impl ReleaseServer {
     }
 
     /// The public half of the key this server signs its releases with
-    /// (acs-o9v), for `ACS_RELEASE_KEY`. A key per server, made on first
-    /// use, so one test's key is never another's.
+    /// (acs-o9v), for `ACS_RELEASE_KEY`.
     pub fn release_key(&self) -> String {
-        self.signing_key();
-        std::fs::read_to_string(self.root.path().join("signer.pub"))
-            .unwrap()
-            .trim()
-            .to_string()
+        release_pair().1.clone()
     }
 
-    /// The private half's path, making the pair if it is not there yet.
+    /// The private half's path, written into this server's directory on
+    /// first use.
     fn signing_key(&self) -> PathBuf {
         let key = self.root.path().join("signer");
         if !key.is_file() {
-            let st = Command::new("ssh-keygen")
-                .args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"])
-                .arg(&key)
-                .status()
-                .expect(NEEDS_KEYGEN);
-            assert!(st.success());
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&key)
+                .unwrap();
+            f.write_all(release_pair().0.as_bytes()).unwrap();
         }
         key
     }

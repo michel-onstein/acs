@@ -177,9 +177,9 @@ impl SocketDir {
     /// `$ACS_SOCKET_DIR`, else `/tmp/acs-<uid>` — keyed by the numeric uid,
     /// never `$USER` or `$TMPDIR` (DESIGN §4.1).
     pub fn default_path() -> PathBuf {
-        match std::env::var_os("ACS_SOCKET_DIR") {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => PathBuf::from(format!("/tmp/acs-{}", sys::getuid())),
+        match sys::env_nonempty("ACS_SOCKET_DIR") {
+            Some(p) => PathBuf::from(p),
+            None => PathBuf::from(format!("/tmp/acs-{}", sys::getuid())),
         }
     }
 
@@ -188,7 +188,13 @@ impl SocketDir {
         Self::open_at(Self::default_path())
     }
 
+    /// A relative `path` is made absolute against the current directory
+    /// first, once, so the proxy and the master it starts (which runs from
+    /// `/`) name the same directory (acs-7nan). Lexically, not by
+    /// `canonicalize`: the directory need not exist yet, and resolving a
+    /// symlink here would hide it from the check below.
     pub fn open_at(path: PathBuf) -> Result<SocketDir, DirError> {
+        let path = std::path::absolute(&path).map_err(|e| DirError::Io(path, e.to_string()))?;
         let io_err = |e: io::Error| DirError::Io(path.clone(), e.to_string());
         match std::fs::DirBuilder::new().mode(0o700).create(&path) {
             Ok(()) => {}
@@ -235,6 +241,14 @@ impl SocketDir {
             ));
         }
         Ok(p)
+    }
+
+    /// `<name>.master`: locked by the live master for its whole life, with
+    /// its pid inside, so a master starting for the same name can find it
+    /// when the socket is gone (DESIGN §4.2, acs-lbba).
+    pub fn master_path(&self, name: &str) -> Result<PathBuf, String> {
+        validate_name(name)?;
+        Ok(self.path.join(format!("{name}.master")))
     }
 
     /// Lock held while a session is being created.

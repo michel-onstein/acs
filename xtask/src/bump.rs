@@ -56,16 +56,18 @@ pub struct Version {
 }
 
 impl Version {
-    /// `1.2.3` or `v1.2.3`; nothing else (no pre-release suffixes).
+    /// `1.2.3` or `v1.2.3`; nothing else (no pre-release suffixes). Read
+    /// by [`acs::release::parse_version`], so a tag the bump takes is one
+    /// `acs upgrade` takes too.
     pub fn parse(s: &str) -> Option<Version> {
-        let s = s.trim().strip_prefix('v').unwrap_or(s.trim());
-        let mut it = s.split('.');
-        let v = Version {
-            major: it.next()?.parse().ok()?,
-            minor: it.next()?.parse().ok()?,
-            patch: it.next()?.parse().ok()?,
-        };
-        it.next().is_none().then_some(v)
+        match acs::release::parse_version(s.trim())? {
+            ([major, minor, patch], None) => Some(Version {
+                major,
+                minor,
+                patch,
+            }),
+            (_, Some(_)) => None,
+        }
     }
 
     pub fn bump(self, level: Level) -> Version {
@@ -416,7 +418,7 @@ fn release(
     }
     // Unguessable: /tmp is shared, and a name anyone can predict can be
     // planted ahead of us (acs-721).
-    let tmp = std::env::temp_dir().join(format!("acs-release-{new}-{}", random_tag()));
+    let tmp = std::env::temp_dir().join(format!("acs-release-{new}-{}", acs::sys::random_token()));
     let tmp_s = tmp.to_string_lossy().into_owned();
     git(&o.repo, &["worktree", "add", "--detach", &tmp_s, head])?;
     let result = (|| -> Result<(), String> {
@@ -513,26 +515,6 @@ pub fn main(args: &[String]) -> Result<(), String> {
     run(&o)
 }
 
-/// Sixteen hex characters from `/dev/urandom`, for a temporary name in the
-/// shared `/tmp` (acs-721). Falls back to the clock if it cannot be read.
-fn random_tag() -> String {
-    use std::io::Read;
-    let mut b = [0u8; 8];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .is_ok()
-    {
-        return b.iter().map(|x| format!("{x:02x}")).collect();
-    }
-    format!(
-        "{:016x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +538,10 @@ mod tests {
         assert_eq!(v.bump(Level::None), v);
         assert!(Version::parse("1.2").is_none());
         assert!(Version::parse("1.2.3-rc1").is_none());
+        // Read as acs reads a release (acs-sseq): `str::parse` alone took a
+        // sign, so `v1.2.+3` was a tag the bump saw and `acs upgrade` not.
+        assert!(Version::parse("v1.2.+3").is_none());
+        assert_eq!(Version::parse(" v0.17.0\n"), Version::parse("0.17.0"));
         assert!(Version::parse("0.10.0") > Version::parse("0.9.9"));
     }
 

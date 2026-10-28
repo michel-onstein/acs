@@ -141,6 +141,29 @@ impl RawMode {
         Ok(())
     }
 
+    /// The terminal through a redial that honours the command keys
+    /// (acs-8ax, DESIGN §5.2): the cooked settings, but with keys arriving
+    /// one at a time and none of them a signal, so acs can read the double
+    /// tap as it is typed. They still echo, as they did when the dial had
+    /// the cooked terminal to itself. Not the original settings, so
+    /// [`RawMode::suspend`] takes it back, and the `WELCOME`'s
+    /// [`RawMode::resume_discarding`] then drops what was typed.
+    pub fn dialing(&mut self) -> io::Result<()> {
+        let mut t = self.orig;
+        t.c_lflag &= !(libc::ICANON | libc::ISIG | libc::IEXTEN);
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
+        sys::tcsetattr(self.fd, &t)?;
+        self.raw = true;
+        Ok(())
+    }
+
+    /// The key that interrupts in the cooked settings (Ctrl-C, usually),
+    /// which [`RawMode::dialing`] reads as a plain byte.
+    pub fn intr(&self) -> u8 {
+        self.orig.c_cc[libc::VINTR]
+    }
+
     pub fn resume(&mut self) -> io::Result<()> {
         if !self.raw {
             sys::tcsetattr(self.fd, &sys::make_raw(&self.orig))?;

@@ -8,14 +8,9 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::*;
-
-/// A session that answers each line typed with `got-<name>:<line>`.
-fn echo(name: &str) -> String {
-    format!("echo ready-{name}; while read l; do echo got-{name}:$l; done")
-}
 
 /// Start session `name` running [`echo`] and detach from it.
 fn detached(remote: &Remote, name: &str) {
@@ -43,19 +38,6 @@ fn attached_to(c: &mut Client, name: &str) {
     c.wait_for("\x1b[H\x1b[J", T);
     c.send(b"hi\r");
     c.wait_for(&format!("got-{name}:\x0chi"), T);
-}
-
-/// The last screen the menu drew.
-fn last_screen(c: &Client) -> String {
-    let text = c.text();
-    // The last one drawn in full: a redraw may be read half-way, so skip
-    // one that has not reached its closing erase yet.
-    let mut screens: Vec<&str> = text.split("\x1b[Hacs: ").skip(1).collect();
-    if screens.last().is_some_and(|s| !s.contains("\x1b[J")) && screens.len() > 1 {
-        screens.pop();
-    }
-    let last = screens.last().expect("no menu drawn");
-    format!("\x1b[Hacs: {last}")
 }
 
 #[test]
@@ -171,6 +153,38 @@ fn x_ends_a_session_and_the_menu_shows_the_rest() {
     attached_to(&mut c, "two");
 }
 
+/// Regression (acs-5jrq): when the host could not read its sessions the
+/// pick's proxy sent no frame at all, and the menu said only that the
+/// connection closed. The ERROR it now sends is what the menu shows.
+#[test]
+fn a_host_that_cannot_read_its_sessions_says_so_in_the_menu() {
+    let remote = Remote::installed();
+    detached(&remote, "one");
+    let mut c = Client::start(&remote, &["devbox"]);
+    menu_up(&mut c);
+    // The socket directory vanishes under the menu: `x` fails to end the
+    // session, and the list that answers it cannot be read.
+    let moved = remote.home().join("sockets-moved");
+    std::fs::rename(remote.sockets(), &moved).unwrap();
+    c.send(b"x");
+    c.wait_for("end session 'one'? y (or x) ends it", T);
+    c.send(b"y");
+    c.wait_for("cannot list sessions: ", T);
+    let screen = last_screen(&c);
+    assert!(
+        screen.contains("bad reply from devbox: cannot list sessions: "),
+        "{screen:?}"
+    );
+    assert!(
+        !screen.contains("connection closed before the session list"),
+        "{screen:?}"
+    );
+    std::fs::rename(&moved, remote.sockets()).unwrap();
+    c.send(b"\x1b");
+    assert_eq!(c.wait(T), 0);
+    assert!(remote.session_exists("one"));
+}
+
 #[test]
 fn esc_exit_and_ctrl_c_leave_with_the_terminal_restored() {
     let remote = Remote::installed();
@@ -194,6 +208,7 @@ fn an_alias_is_resolved_once_for_the_list_and_the_attach() {
     detached(&remote, "one");
     let ssh = Ssh::new(&[("you@devbox.lan", &remote)]);
     let net = Net::new(&["devbox.lan", "devbox.example.com"]);
+    net.set_lagging(&["devbox.example.com"]);
     let env =
         net.env("aliases:\n  devbox:\n    - host: devbox.lan\n    - host: devbox.example.com\n");
     let path = ssh.path().display().to_string();
@@ -203,7 +218,7 @@ fn an_alias_is_resolved_once_for_the_list_and_the_attach() {
     c.wait_for("> 1  one ", T);
     c.send(b"1");
     attached_to(&mut c, "one");
-    assert_eq!(net.pinged(), ["devbox.example.com", "devbox.lan"]);
+    net.wait_pinged(&["devbox.example.com", "devbox.lan"]);
     let dests: Vec<String> = ssh.keys().into_iter().map(|(d, _)| d).collect();
     assert_eq!(dests, ["you@devbox.lan"], "list and attach on one call");
 }
@@ -253,6 +268,45 @@ fn the_menu_ends_and_attaches_over_one_ssh_connection() {
     assert_eq!(running, 1, "{:?}", c.text());
 }
 
+/// acs-xvg: with nothing detached the session is made over the one
+/// `_proxy --pick --eager` connection, with the HELLO that went ahead with
+/// it — and a session detached on the host still brings the menu up.
+#[test]
+fn with_nothing_detached_the_pick_call_attaches_at_once() {
+    let remote = Remote::installed();
+    let ssh = Ssh::new(&[("devbox", &remote)]);
+    let path = ssh.path().display().to_string();
+    let mut c = Client::spawn(
+        &exe(),
+        &[
+            "--ssh",
+            &path,
+            "devbox",
+            "--",
+            "/bin/sh",
+            "-c",
+            &echo("main"),
+        ],
+        &[],
+    );
+    c.wait_for("new session 'main' on devbox", T);
+    c.wait_for("ready-main", T);
+    c.send(b"hi\r");
+    c.wait_for("got-main:hi", T);
+    let calls = ssh.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].contains("_proxy --pick --eager"), "{calls:?}");
+    assert!(!c.text().contains("\x1b[?1049h"), "no menu: {:?}", c.text());
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+
+    // Now `main` is detached: the same call shows the menu.
+    let mut m = Client::spawn(&exe(), &["--ssh", &path, "devbox"], &[]);
+    menu_up(&mut m);
+    m.send(b"1");
+    attached_to(&mut m, "main");
+}
+
 #[test]
 fn without_a_terminal_for_the_menu_it_attaches_main() {
     let remote = Remote::installed();
@@ -283,11 +337,11 @@ fn without_a_terminal_for_the_menu_it_attaches_main() {
         }
     });
     let wait_for = |needle: &str| {
-        let deadline = Instant::now() + T;
-        while !String::from_utf8_lossy(&out.lock().unwrap()).contains(needle) {
-            assert!(Instant::now() < deadline, "no {needle:?}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_until(
+            T,
+            || String::from_utf8_lossy(&out.lock().unwrap()).contains(needle),
+            || format!("no {needle:?}"),
+        );
     };
     wait_for("\x1b[H\x1b[J");
     acs::sys::write_all(pty.as_raw_fd(), b"hi\r").unwrap();

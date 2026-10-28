@@ -26,14 +26,17 @@ Intel, Linux x86_64 and aarch64), checks it against the release's
 
 so a client of the same version finds acs already there when it connects
 to this machine. It says how to add the directory to your `PATH` if it is
-not on it, and running it again upgrades in place. It needs `curl` or
+not on it, and running it again upgrades in place. The link only moves
+forward: an older `ACS_VERSION` is installed beside the newer one without
+taking the link, and a file or link at that name it did not make is left
+alone. Either way it says so, and where it put the version. It needs `curl` or
 `wget`, `sha256sum`, `shasum` or `openssl`, and `ssh-keygen` (which comes
 with the ssh acs needs anyway).
 
 | Variable | Meaning |
 | --- | --- |
 | `ACS_VERSION=0.2.0` | install that release instead of the latest |
-| `ACS_INSTALL_DIR=~/bin` | put the binary itself in that directory |
+| `ACS_INSTALL_DIR=~/bin` | put the binary itself in that directory (replacing any `acs` there) |
 
 for example `curl -fsSL …/install.sh | ACS_VERSION=0.2.0 sh`.
 
@@ -228,8 +231,10 @@ An ssh handshake is several round trips and, with a hardware key, a touch.
 acs keeps a connection of its own alive for a few minutes after you last
 used a host, so a reattach after a detach — or an `acs list devbox`
 followed by `acs devbox` — opens another channel on it instead of starting
-over. It is acs's own connection, in acs's own `0700` directory
-(`/tmp/acs-mux-<uid>`), never the one your `~/.ssh/config` multiplexes;
+over, and `acs list` over every alias asks any host you have a session
+on through it (a listing never starts one). It is acs's own connection,
+in acs's own `0700` directory (`/tmp/acs-mux-<uid>`), never the one your
+`~/.ssh/config` multiplexes;
 nothing is left behind more than `ACS_CONTROL_PERSIST` seconds (300 by
 default) after the last use, even if acs is killed.
 
@@ -329,8 +334,9 @@ network move — that is worth reporting.
 acs gives up (exit 255) where there is no session to keep: the host
 cannot be reached at the start, or the link drops before the session was
 attached. With `--persist` (or `persist: true` in the configuration, or
-`ACS_PERSIST=1`) it never gives up on a host: it pings it every 5 seconds
-(`reachability_interval`) and dials as soon as it answers — at the start as
+`ACS_PERSIST=1`) it never gives up on a host: it pings it every second for
+the first 30 seconds, then every 5 (`reachability_interval`), and dials as
+soon as it answers — at the start as
 after a drop, where the ping replaces the backoff. It pings an alias's
 hosts as it does to choose one, and a plain host itself; an alias whose
 hosts all have `reachability_check: false` cannot be pinged and keeps the
@@ -418,11 +424,12 @@ into it (`host unset` of its last setting turns it back into a list).
 | `command_bell` | ring the terminal bell when Ctrl-] Ctrl-] arms command mode (default `true`; `ACS_COMMAND_BELL` overrides it) |
 | `redraw_on_reconnect` | send Ctrl-L after reconnecting to a session (default `true`); an alias's own value wins, and `ACS_REDRAW_ON_RECONNECT` over both |
 | `reachability_timeout` | how long an alias's hosts have to answer a ping: `500ms`, `0.5s`, `2s`, up to `60s` (default `500ms`); an alias's own value wins |
+| `reachability_tcp` | check an alias's hosts by connecting to their ssh port (as `ssh -G` names it) instead of pinging them (default `false`); an alias's own value wins |
 | `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
-| `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
+| `reachability_interval` | how often a lost host is pinged while persisting, after the first 30 pings a second apart: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
 | `local_forwards` | ports every session forwards, as `-L` spells them: a list, or one value with commas (`8080:localhost:80,5432:db:5432`); `none` for no forward (default). An alias's own list replaces the global one, and `-L` on the command line adds to it |
-| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist` and `local_networks` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`) and its `hosts` |
+| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist` and `local_networks` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`) and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -444,6 +451,22 @@ host of an alias whose other hosts are in the global file. With
 machine's networks goes first of all: at home on 192.168.1.0/24,
 `devbox.lan` (192.168.1.20) is used before `devbox.example.com` wherever
 it is listed — as long as it answers its ping.
+
+With `reachability_tcp: true` (globally or on an alias) a host is checked by
+connecting to its ssh port instead of a ping — the port `ssh -G` gives for
+it, so `~/.ssh/config` and the command line's `-p`, `-F`, `-J`, `-o` and
+`--ssh` decide it — within the same `reachability_timeout`.
+That suits hosts and networks that drop pings, and a host whose sshd is
+down no longer counts as up. A host ssh reaches through a `ProxyJump` or a
+`ProxyCommand` has no port of its own to try, so it is still pinged.
+
+acs remembers which host an alias used last on the networks you are on
+(`~/.local/state/acs/aliases`), so away from home, where `devbox.lan` is
+down, the next `acs devbox` takes `devbox.example.com` as soon as it
+answers instead of waiting out `reachability_timeout` for `devbox.lan`
+every time. Back home it is `devbox.lan` again: the place is the set of
+networks, and a host ranked higher that answers again is the one used from
+the next connection on.
 
 An interface's own prefix is narrower than a site, so that match alone
 misses a host one subnet away: from 172.16.1.65/24 a host at 172.16.8.2 is
@@ -596,18 +619,19 @@ reached as `user@config`.
 | `ACS_REDRAW_ON_RECONNECT` | `0`: no Ctrl-L after reconnecting; `1`: a Ctrl-L even if the configuration (global or the alias's) turns it off |
 | `ACS_PERSIST` | `1`: never give up on a lost host (as `--persist`); `0`: give up as by default, whatever the configuration says |
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
-| `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`) |
+| `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`); a relative path is taken from the remote login directory, normally home |
 | `ACS_CONTROL_DIR` | local directory for acs's own ssh control sockets (default `/tmp/acs-mux-<uid>`, made `0700`) |
 | `ACS_CONTROL_PERSIST` | seconds an acs-owned ssh master outlives its last use (default 300); `0` turns the shared master off |
 | `ACS_CONTROL_FALLBACK_MS` | how long a connection that joins an existing master may take to answer before the master is ended and the connection made on its own (default 2000) |
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
-| `ACS_DIAL_TIMEOUT_MS` | how long a connection may take to answer (default 120 s at first, 30 s on a redial and for each host of `acs list`) |
+| `ACS_DIAL_TIMEOUT_MS` | how long a new connection may take to answer (default 120 s, time for a password or a key touch; 30 s for each host of `acs list`) |
+| `ACS_REDIAL_TIMEOUT_MS` | how long a reconnect may take to answer before acs goes back to waiting and tries again (default 30 s); it does not change `ACS_DIAL_TIMEOUT_MS` |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |
 | `ACS_RELEASES_URL` | where `acs upgrade` and the update check look for releases (default GitHub). Must be `https`, since what is fetched is checked only against sums from the same place and is then run; `acs upgrade --allow-insecure-url` accepts another scheme. Ignored altogether when the real and effective user differ, so a `sudo` upgrade is not steered by the environment |
 | `ACS_NO_UPDATE_CHECK` | `1`: never look for a newer release |
-| `XDG_STATE_HOME` | where the update check keeps its state (default `~/.local/state`) |
+| `XDG_STATE_HOME` | where the update check and the host each alias used last keep their state (default `~/.local/state`) |
 
 ## Development
 
@@ -620,6 +644,13 @@ scripts/version-bump.sh # release the next version and publish its binaries
 scripts/release-binaries.sh  # (re)publish a tag's binaries to GitHub Releases
 scripts/update-tap.sh vX.Y.Z # point the Homebrew tap at a release
 ```
+
+`scripts/test_linux.sh --only NAME [-- ARGS...]` runs one test target
+instead of the three steps — a file under `tests/` without `.rs`, or `lib` for
+the unit tests — in the same container and with the same flags as the full
+run, so `--only netns` and `--only multiuser` still run as root with their
+ignored tests asked for. Anything after `--` goes to the test harness, such as
+a name filter.
 
 `scripts/e2e_ssh.sh --no-build` reuses the binaries already in `dist/` (about
 20 s instead of a minute), but only when `dist/source.stamp` says they were

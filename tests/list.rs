@@ -7,6 +7,14 @@ use std::time::{Duration, Instant};
 
 use common::*;
 
+/// The words of the row of `out` whose column `col` is `name`.
+fn row<'a>(out: &'a str, col: usize, name: &str) -> Vec<&'a str> {
+    out.lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|w| w.get(col) == Some(&name))
+        .unwrap_or_else(|| panic!("no row for {name}:\n{out}"))
+}
+
 fn list(remote: &Remote) -> (i32, String) {
     let out = acs_cmd()
         .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
@@ -40,17 +48,9 @@ fn lists_attached_detached_and_drops_stale_sockets() {
     assert_eq!(code, 0, "{out}");
     let lines: Vec<&str> = out.lines().collect();
     assert!(lines[0].starts_with("NAME"), "{out}");
-    let row = |name: &str| {
-        lines
-            .iter()
-            .find(|l| l.split_whitespace().next() == Some(name))
-            .unwrap_or_else(|| panic!("no row for {name}:\n{out}"))
-            .split_whitespace()
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(row("main")[1..3], ["attached", "tester@local"]);
-    assert_eq!(row("work")[1..3], ["detached", "(tester@local)"]);
-    assert!(row("work")
+    assert_eq!(row(&out, 0, "main")[1..3], ["attached", "tester@local"]);
+    assert_eq!(row(&out, 0, "work")[1..3], ["detached", "(tester@local)"]);
+    assert!(row(&out, 0, "work")
         .join(" ")
         .ends_with("/bin/sh -c echo b; sleep 30"));
     assert!(!out.contains("old"), "stale session listed:\n{out}");
@@ -69,6 +69,11 @@ fn empty_and_not_installed() {
 
 /// Regression: a host that starts acs and then says nothing is given up on
 /// in time; listing used to wait for it forever.
+///
+/// "In time" is the deadline that fired, not a stopwatch (acs-ci9u): the
+/// message names the 0.5 s it gave the host, and the run cannot have ended
+/// before that half second was up. A 5 s ceiling around it was mostly
+/// process start, which is what a loaded host stretches.
 #[test]
 fn a_host_silent_after_its_marker_is_given_up_on() {
     let remote = Remote::installed();
@@ -79,10 +84,49 @@ fn a_host_silent_after_its_marker_is_given_up_on() {
         .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
         .output()
         .unwrap();
-    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() >= Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
     assert_eq!(out.status.code(), Some(255));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no answer from devbox within 0.5 s"), "{err}");
+}
+
+/// Regression (acs-mum0): a host that answers ERROR (its sessions could not
+/// be read) used to be listed as having no sessions, with exit 0.
+#[test]
+fn a_host_answering_error_is_a_failure_not_an_empty_list() {
+    let remote = Remote::installed();
+    let mut said = acs::proto::ready_line().into_bytes();
+    said.extend(
+        acs::proto::Msg::Error {
+            code: acs::proto::err::INTERNAL,
+            message: "cannot list sessions: /run/acs: Permission denied".into(),
+        }
+        .to_bytes(),
+    );
+    remote.silence_bytes(&said);
+    let out = acs_cmd()
+        .env("ACS_DIAL_TIMEOUT_MS", "5000")
+        .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
+        .output()
+        .unwrap();
+    // Answered on the ERROR, not on the host closing or the deadline — and
+    // the answer says which (acs-ci9u): the silenced host never closes, and
+    // the deadline exits 255 with "no answer", where the ERROR exits 1 with
+    // its own message. A 4 s bound against the 5 s deadline said the same
+    // with a second of room for a loaded host to eat.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{err}");
+    assert!(!stdout.contains("no sessions"), "{stdout}");
+    assert!(!err.contains("no answer"), "{err}");
+    assert!(
+        err.contains("devbox: cannot list sessions: /run/acs: Permission denied"),
+        "{err}"
+    );
 }
 
 // ---- acs list: every alias --------------------------------------------------
@@ -164,19 +208,12 @@ fn every_alias_is_listed_and_a_dead_one_gets_a_line() {
         ["HOST", "NAME", "STATE", "WHO", "IDLE", "AGE", "COMMAND"],
         "{out}"
     );
-    let row = |name: &str| {
-        lines
-            .iter()
-            .map(|l| l.split_whitespace().collect::<Vec<_>>())
-            .find(|w| w.get(1) == Some(&name))
-            .unwrap_or_else(|| panic!("no row for {name}:\n{out}"))
-    };
     assert_eq!(
-        row("main")[..4],
+        row(&out, 1, "main")[..4],
         ["devbox", "main", "attached", "tester@local"]
     );
     assert_eq!(
-        row("work")[..4],
+        row(&out, 1, "work")[..4],
         ["devbox", "work", "detached", "(tester@local)"]
     );
     assert_eq!(

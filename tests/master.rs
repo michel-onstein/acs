@@ -4,15 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use acs::proto::{AttachKind, Mode, Msg, Resume, Welcome};
-use acs::testutil::{hello, FrameConn, TempDir};
+use acs::testutil::{hello, poll, wait_idle, wait_until, FrameConn, TempDir};
 
-/// As `common::T`, which this file cannot reach: generous, because the
-/// suite runs its targets in parallel (acs-kip).
-const T: Duration = Duration::from_secs(30);
-
-fn exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_acs"))
-}
+mod common;
+use common::{exe, T};
 
 fn sock(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.sock"))
@@ -30,15 +25,7 @@ fn start_env(
     identity: &str,
     env: &[(&str, &str)],
 ) -> (FrameConn, Welcome) {
-    acs::master::spawn_with_env(&exe(), dir, name, env).expect("spawn master");
-    let mut c = FrameConn::connect(&sock(dir, name)).unwrap();
-    let mut h = hello(name, Mode::AttachOrCreate, identity);
-    h.command = command.iter().map(|s| s.to_string()).collect();
-    c.send(&Msg::Hello(h));
-    match c.recv_control(T) {
-        Some(Msg::Welcome(w)) => (c, w),
-        other => panic!("expected WELCOME, got {other:?}"),
-    }
+    acs::testutil::start_master(&exe(), dir, name, command, identity, env)
 }
 
 fn attach(dir: &Path, name: &str, identity: &str, resume: Option<Resume>) -> (FrameConn, Msg) {
@@ -74,29 +61,24 @@ fn attach_conn(
 /// Connecting is the question the test is really asking, so it is the one
 /// that is asked, and the connection that answers is the one used.
 fn attach_when_bound(dir: &Path, name: &str, identity: &str) -> (FrameConn, Msg) {
-    let deadline = Instant::now() + T;
-    loop {
-        if let Ok(c) = FrameConn::connect(&sock(dir, name)) {
-            return attach_conn(c, name, identity, None);
-        }
-        assert!(Instant::now() < deadline, "the socket never answered again");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let c = poll(
+        T,
+        || FrameConn::connect(&sock(dir, name)).ok(),
+        || "the socket never answered again",
+    );
+    attach_conn(c, name, identity, None)
 }
 
 fn wait_exit(c: &mut FrameConn) -> i32 {
-    match c.recv_control(Duration::from_secs(15)) {
-        Some(Msg::Exit { status }) => status,
-        other => panic!("expected EXIT, got {other:?}"),
-    }
+    c.expect_exit(Duration::from_secs(15))
 }
 
 fn wait_gone(path: &Path) {
-    let deadline = Instant::now() + T;
-    while path.exists() {
-        assert!(Instant::now() < deadline, "{} still exists", path.display());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || !path.exists(),
+        || format!("{} still exists", path.display()),
+    );
 }
 
 // ---- lifecycle (acs-5v9.9) --------------------------------------------------
@@ -181,6 +163,76 @@ fn socket_is_rebound_after_deletion() {
     c2.wait_output("got:x", T);
 }
 
+/// The proxy's `connect_or_start`: connect, and start a master while
+/// nothing answers, treating "already has a master" as "try again".
+fn connect_or_start(dir: &Path, name: &str) -> (FrameConn, Vec<String>) {
+    let mut refusals = Vec::new();
+    let c = poll(
+        T,
+        || {
+            if let Ok(c) = FrameConn::connect(&sock(dir, name)) {
+                return Some(c);
+            }
+            match acs::master::spawn(&exe(), dir, name) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("already has a master") => {
+                    refusals.push(e.to_string());
+                }
+                Err(e) => panic!("spawn: {e}"),
+            }
+            None
+        },
+        || "the session never came up",
+    );
+    (c, refusals)
+}
+
+/// A client reconnecting between a cleaner deleting the socket and the
+/// master's next check used to start a second master, and with it a
+/// second shell, leaving the first running unreachable (acs-lbba). The
+/// check is set an hour away here, so only the prod can bring it back.
+///
+/// "Only the prod" is not timed (acs-ci9u): it used to be a 10 s bound, a
+/// figure a starved host can reach on its own. Against an hour, the
+/// helper's own `T` deadline already tells the two apart, and the refused
+/// spawn is the prod being what answered.
+#[test]
+fn a_reconnect_after_the_socket_is_deleted_finds_the_same_shell() {
+    let t = TempDir::new();
+    let (mut c, w) = start_env(
+        t.path(),
+        "lb",
+        &["/bin/sh", "-c", "read x; echo got:$x"],
+        "me",
+        &[("ACS_MASTER_REBIND_MS", "3600000")],
+    );
+    std::fs::remove_file(sock(t.path(), "lb")).unwrap();
+    let (c2, refusals) = connect_or_start(t.path(), "lb");
+    assert!(!refusals.is_empty(), "no master was refused");
+    let (mut c2, m) = attach_conn(c2, "lb", "me", None);
+    assert!(
+        matches!(m, Msg::Welcome(ref w2) if w2.instance == w.instance && !w2.created),
+        "a second session was started: {m:?}"
+    );
+    assert!(matches!(c.recv_control(T), Some(Msg::Takeover)));
+    c2.send(&Msg::Input {
+        seq: 0,
+        bytes: b"x\r".to_vec(),
+    });
+    c2.wait_output("got:x", T);
+}
+
+/// Once the session is over its `.master` lock is free again, so the name
+/// can be started afresh.
+#[test]
+fn a_finished_session_frees_its_name() {
+    let t = TempDir::new();
+    let (mut c, _) = start(t.path(), "fin", &["/bin/sh", "-c", "exit 0"], "me");
+    wait_exit(&mut c);
+    wait_gone(&sock(t.path(), "fin"));
+    acs::master::spawn(&exe(), t.path(), "fin").expect("a fresh master");
+}
+
 #[test]
 fn socket_directory_is_recreated_after_deletion() {
     let t = TempDir::new();
@@ -193,14 +245,11 @@ fn socket_directory_is_recreated_after_deletion() {
         &[("ACS_MASTER_REBIND_MS", "100")],
     );
     std::fs::remove_dir_all(&dir).unwrap();
-    let deadline = Instant::now() + T;
-    while !sock(&dir, "gone").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "socket directory never recreated"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || sock(&dir, "gone").exists(),
+        || "socket directory never recreated",
+    );
     use std::os::unix::fs::MetadataExt;
     assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
     // As above: the path being back is not the socket listening yet.
@@ -247,21 +296,30 @@ fn master_rejects_a_mismatched_protocol() {
 
 // ---- session protocol (acs-5v9.10) ------------------------------------------
 
-/// Numbers of the `n<i>` lines in `out`, in order.
-fn numbers(out: &[u8]) -> Vec<u32> {
-    String::from_utf8_lossy(out)
-        .split(['\r', '\n'])
-        .filter_map(|l| l.strip_prefix('n').and_then(|n| n.parse().ok()))
-        .collect()
+/// Numbers of the `#<i>#` ticks in `out`, in order — the shared reader
+/// (`common::numbers`, acs-2dc), so a tick the snapshot cut in half is left
+/// out rather than read as a smaller number (acs-mkb). This file used to
+/// carry its own copy, which parsed a truncated `n17` of `n175` as 17.
+fn numbers(out: &[u8]) -> Vec<u64> {
+    common::numbers(&String::from_utf8_lossy(out))
 }
 
-const TICKER: &str = "i=0; while true; do i=$((i+1)); echo n$i; sleep 0.02; done";
+/// Prints `#1#`, `#2#`, … — the shape `common::numbers` reads.
+const TICKER: &str = "i=0; while true; do i=$((i+1)); echo \"#$i#\"; sleep 0.02; done";
+
+#[test]
+fn numbers_leaves_out_a_tick_the_snapshot_cut_in_half() {
+    assert_eq!(numbers(b"#1#\r\n#2#\r\n#3#\r\n"), [1, 2, 3]);
+    // `#175#` cut after `#17`: not a 17, and so not a gap.
+    assert_eq!(numbers(b"#173#\r\n#174#\r\n#17"), [173, 174]);
+    assert_eq!(numbers(b"#173#\r\n#174#\r\n#"), [173, 174]);
+}
 
 #[test]
 fn resume_replays_exactly_the_missed_bytes() {
     let t = TempDir::new();
     let (mut a, w) = start(t.path(), "r", &["/bin/sh", "-c", TICKER], "me");
-    a.wait_output("n3\r\n", T);
+    a.wait_output("#3#\r\n", T);
     let seen = a.next_offset.unwrap();
     let before = a.output.clone();
     drop(a); // the link drops: no DETACH
@@ -285,14 +343,14 @@ fn resume_replays_exactly_the_missed_bytes() {
         other => panic!("{other:?}"),
     }
     b.next_offset = Some(seen);
-    let target = format!("n{}\r\n", numbers(&before).last().unwrap() + 20);
+    let target = format!("#{}#\r\n", numbers(&before).last().unwrap() + 20);
     b.wait_output(&target, T);
     let mut all = before;
     all.extend_from_slice(&b.output);
     let n = numbers(&all);
     assert_eq!(
         n,
-        (1..=n.len() as u32).collect::<Vec<_>>(),
+        (1..=n.len() as u64).collect::<Vec<_>>(),
         "lines lost or repeated"
     );
 }
@@ -399,6 +457,12 @@ fn kill_escalates_to_sigkill_for_a_group_ignoring_sighup() {
     wait_gone(&sock(t.path(), "k"));
 }
 
+/// "Quickly" means the SIGHUP ended it, without the escalation after the
+/// 3 s grace that the test above waits out. That used to be read off the
+/// clock — under 2 s — which a loaded host breaks by starving the master or
+/// the test, however promptly the master acts (acs-ci9u). The exit status
+/// says it instead: 128 + SIGHUP is a session the hangup ended, where one
+/// that sat out the grace would report 128 + SIGKILL.
 #[test]
 fn kill_ends_a_normal_session_quickly() {
     let t = TempDir::new();
@@ -409,13 +473,11 @@ fn kill_ends_a_normal_session_quickly() {
         "me",
     );
     a.wait_output("armed", T);
-    let t0 = Instant::now();
     a.send(&Msg::Kill {
         identity: "me".into(),
         force: true,
     });
     let status = wait_exit(&mut a);
-    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     assert_eq!(acs::sys::exit_code(status), 128 + libc::SIGHUP as u8);
 }
 
@@ -457,11 +519,7 @@ fn no_backpressure_while_detached() {
         &[("ACS_RING", "65536")],
     );
     a.send(&Msg::Detach);
-    let deadline = Instant::now() + T;
-    while !marker.exists() {
-        assert!(Instant::now() < deadline, "program blocked while detached");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_until(T, || marker.exists(), || "program blocked while detached");
 }
 
 /// Fast liveness timers for the master (DESIGN §5.3).
@@ -487,14 +545,11 @@ fn a_client_that_vanishes_without_closing_is_dropped() {
     h.command = vec!["/bin/sh".into(), "-c".into(), cmd];
     std::io::Write::write_all(&mut s, &Msg::Hello(h).to_bytes()).unwrap();
     // Never read, never write, never close.
-    let deadline = Instant::now() + T;
-    while !marker.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "program blocked by a vanished client"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_until(
+        T,
+        || marker.exists(),
+        || "program blocked by a vanished client",
+    );
     // The master hung up on it.
     let mut buf = vec![0u8; 1 << 16];
     loop {
@@ -578,12 +633,22 @@ fn input_is_acked_only_as_fast_as_the_pty_takes_it() {
         seq: w.input_seq,
         bytes: vec![b'x'; n],
     });
+    let mut acked = None;
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
         if let Some(Msg::Ack { seq }) = c.recv(Duration::from_millis(200)) {
             assert!(seq < end, "acked {seq}: input the pty never took");
+            acked = Some(seq);
         }
     }
+    // An upper bound alone passes against a master that never acks at all
+    // (acs-n7w9): what the terminal did take must be acknowledged, and that
+    // is about its input buffer — some 1 KiB on macOS, 12–16 KiB on Linux.
+    let acked = acked.expect("no ACK for the input the pty took") - w.input_seq;
+    assert!(
+        (512..=1 << 17).contains(&acked),
+        "acked {acked} of {n}: not about a pty input buffer"
+    );
 }
 
 #[test]
@@ -665,20 +730,31 @@ fn duplicate_input_after_a_resend_is_written_once() {
 /// poll after the exit was seen, not by the poll SIGCHLD cut short.
 #[test]
 fn the_last_output_before_exit_is_never_lost() {
-    // A burst right before the exit leaves the most in flight.
-    for i in 0..100 {
-        let t = TempDir::new();
-        let cmd = format!("head -c 30000 /dev/zero | tr '\\0' y; echo last-{i}");
-        let (mut c, _) = start(t.path(), "e", &["/bin/sh", "-c", &cmd], "me");
-        let status = wait_exit(&mut c);
-        assert_eq!(acs::sys::exit_code(status), 0);
-        let out = String::from_utf8_lossy(&c.output);
-        assert!(
-            out.contains(&format!("last-{i}")),
-            "run {i}: output ends {:?}",
-            &out[out.len().saturating_sub(40)..]
-        );
-    }
+    // A burst right before the exit leaves the most in flight. Still 100
+    // runs, but ten at a time (acs-dz3r): each is its own master in its own
+    // directory, so they share nothing, and the load they put on each other
+    // only widens the window between the last write and the exit.
+    const RUNS: usize = 100;
+    const LANES: usize = 10;
+    std::thread::scope(|s| {
+        for lane in 0..LANES {
+            s.spawn(move || {
+                for i in (lane..RUNS).step_by(LANES) {
+                    let t = TempDir::new();
+                    let cmd = format!("head -c 30000 /dev/zero | tr '\\0' y; echo last-{i}");
+                    let (mut c, _) = start(t.path(), "e", &["/bin/sh", "-c", &cmd], "me");
+                    let status = wait_exit(&mut c);
+                    assert_eq!(acs::sys::exit_code(status), 0, "run {i}");
+                    let out = String::from_utf8_lossy(&c.output);
+                    assert!(
+                        out.contains(&format!("last-{i}")),
+                        "run {i}: output ends {:?}",
+                        &out[out.len().saturating_sub(40)..]
+                    );
+                }
+            });
+        }
+    });
 }
 
 /// Regression (acs-gkl): while a stalled client has the ring full, a pty
@@ -706,8 +782,11 @@ fn a_hangup_while_the_client_is_stalled_does_not_spin_the_master() {
     std::thread::sleep(Duration::from_millis(1500));
     // The child dies; its pty hangs up while nothing can be read.
     acs::sys::kill(pid, libc::SIGKILL).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     let master = acs::testutil::session_pid(&sock(t.path(), "hs")).unwrap();
+    wait_idle(master, "master");
+    // Once idle, it stays idle. An upper bound on CPU time, unlike one on
+    // wall time, is one load cannot push up: a starved process only gets
+    // less of the CPU. Load can only hide a spin, never invent one.
     let burnt = acs::testutil::cpu_over(master, Duration::from_secs(1));
     assert!(
         burnt < Duration::from_millis(300),
@@ -1005,7 +1084,7 @@ fn the_session_shell_does_not_inherit_the_creating_logins_environment() {
         ("XDG_SESSION_ID", "7"),
         ("SSH_AGENT_PID", "4242"),
     ];
-    let (mut c, _) = start_env(
+    let (mut c, w) = start_env(
         t.path(),
         "env",
         &[
@@ -1017,18 +1096,42 @@ fn the_session_shell_does_not_inherit_the_creating_logins_environment() {
         &env,
     );
     c.wait_output("armed", T);
-    for (k, _) in env {
-        c.send(&Msg::Input {
-            seq: 0,
-            bytes: format!("{k}\r").into_bytes(),
-        });
+    // One frame carrying every name (acs-dvkg). Ten frames each sent at
+    // seq 0 overlap one another, so the master's input dedupe wrote only
+    // the first name and a stray `\r`: the other nine were never asked
+    // about, and their asserts passed vacuously.
+    let names: String = env.iter().map(|(k, _)| format!("{k}\r")).collect();
+    c.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: names.into_bytes(),
+    });
+    // The shell prints one `got:` line per name, in order. Wait for all ten
+    // to be complete — not for the first and a settle — then every one must
+    // be empty.
+    let lines = |out: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(out)
+            .split("got:")
+            .skip(1)
+            .filter_map(|rest| {
+                rest.find('\n')
+                    .map(|end| rest[..end].trim_end().to_string())
+            })
+            .collect()
+    };
+    let deadline = Instant::now() + T;
+    while lines(&c.output).len() < env.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            c.recv(left).is_some() || Instant::now() < deadline,
+            "timed out waiting for {} got: lines; got {:?}",
+            env.len(),
+            String::from_utf8_lossy(&c.output)
+        );
     }
-    // The shell prints one line per name; every one must be empty.
-    c.wait_output("got:", T);
-    std::thread::sleep(Duration::from_millis(400));
-    let text = String::from_utf8_lossy(&c.output).into_owned();
-    for (k, v) in env {
-        assert!(!text.contains(v), "{k} survived into the session: {text}");
+    let got = lines(&c.output);
+    assert_eq!(got.len(), env.len(), "{got:?}");
+    for ((k, _), value) in env.iter().zip(&got) {
+        assert_eq!(value, "", "{k} survived into the session: {got:?}");
     }
 
     // What a session does need is still there.
@@ -1068,4 +1171,52 @@ fn the_socket_is_created_private_whatever_the_umask() {
         "the socket is {:o}, not 0600",
         mode & 0o777
     );
+}
+
+/// Regression (acs-3anc): a connection that never sends a HELLO used to
+/// stay Pending for good, and since the "nobody is coming" exit waits for
+/// no connections, it kept a childless master — and its line in `acs list`
+/// — alive indefinitely. It is dropped once its first message is overdue,
+/// and the master then exits.
+#[test]
+fn a_silent_connection_does_not_keep_a_childless_master_alive() {
+    let t = TempDir::new();
+    acs::master::spawn_with_env(
+        &exe(),
+        t.path(),
+        "mute",
+        &[
+            ("ACS_MASTER_HELLO_MS", "300"),
+            ("ACS_MASTER_ORPHAN_MS", "500"),
+        ],
+    )
+    .unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(sock(t.path(), "mute")).unwrap();
+    s.set_read_timeout(Some(T)).unwrap();
+    // Say nothing, and keep the connection open: the master hangs up.
+    let mut buf = [0u8; 64];
+    let n = std::io::Read::read(&mut s, &mut buf).expect("the master hung up in time");
+    assert_eq!(n, 0, "the master sent something to a silent connection");
+    wait_gone(&sock(t.path(), "mute"));
+}
+
+/// The HELLO deadline (acs-3anc) is for a connection that has said
+/// nothing: one answered BUSY stays pending while its user decides.
+#[test]
+fn a_client_answered_busy_may_take_its_time() {
+    let t = TempDir::new();
+    let (_a, _) = start_env(
+        t.path(),
+        "slow",
+        &["/bin/sh", "-c", "sleep 30"],
+        "me@one",
+        &[("ACS_MASTER_HELLO_MS", "200")],
+    );
+    let (mut b, m) = attach(t.path(), "slow", "alice@two", None);
+    assert!(matches!(m, Msg::Busy { .. }), "{m:?}");
+    std::thread::sleep(Duration::from_millis(800));
+    let mut h = hello("slow", Mode::Attach, "alice@two");
+    h.force = true;
+    b.send(&Msg::Hello(h));
+    assert!(matches!(b.recv_control(T), Some(Msg::Welcome(_))));
 }

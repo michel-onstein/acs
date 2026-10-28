@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::outq::OutQueue;
 use crate::proto::{self, err, AttachKind, Decoder, Hello, Mode, Msg, StatusInfo, WinSize};
 use crate::reconnect::{Health, Liveness};
 use crate::resume::{InputDedupe, OutputRing, Read, DEFAULT_RING};
@@ -20,14 +21,26 @@ use crate::sys;
 
 /// Grace between SIGHUP and SIGKILL when a session is killed.
 const KILL_GRACE: Duration = Duration::from_secs(3);
-/// How often the socket path is checked (tmpfiles may remove it).
-/// `ACS_MASTER_REBIND_MS` shortens it for tests.
+/// How often the socket path is checked (tmpfiles may remove it). A
+/// master starting for this name prods the old one at once (acs-lbba), so
+/// this is the backstop for a cleaner that took the `.master` file too.
+/// `ACS_MASTER_REBIND_MS` changes it for tests.
 fn rebind_every() -> Duration {
-    std::env::var("ACS_MASTER_REBIND_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(60))
+    sys::env_ms("ACS_MASTER_REBIND_MS", 5_000)
+}
+/// How often the socket and the `.master` file get their times refreshed,
+/// so an age-based cleaner never sees them as old (acs-lbba).
+const TOUCH_EVERY: Duration = Duration::from_secs(3600);
+/// How long a new connection may take to send its first whole message
+/// (HELLO, STATUS or KILL) before it is dropped (acs-3anc).
+/// `ACS_MASTER_HELLO_MS` shortens it for tests.
+fn hello_within() -> Duration {
+    sys::env_ms("ACS_MASTER_HELLO_MS", 10_000)
+}
+/// How long a master waits for a client to create its session before it
+/// gives up. `ACS_MASTER_ORPHAN_MS` shortens it for tests.
+fn orphan_after() -> Duration {
+    sys::env_ms("ACS_MASTER_ORPHAN_MS", 30_000)
 }
 /// Stop filling a client's buffer beyond this; the rest waits in the ring.
 const OUT_HIGH_WATER: usize = 64 * 1024;
@@ -133,10 +146,7 @@ fn parse_args(args: &[OsString]) -> Result<Args, String> {
     let mut session = None;
     let mut ready_fd = None;
     // Output history kept for resume (DESIGN §4.2); `ACS_RING` in bytes.
-    let mut ring = std::env::var("ACS_RING")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_RING);
+    let mut ring = sys::env_or("ACS_RING", DEFAULT_RING);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || {
@@ -146,7 +156,11 @@ fn parse_args(args: &[OsString]) -> Result<Args, String> {
                 .ok_or_else(|| format!("{} needs a value", a.to_string_lossy()))
         };
         match a.to_str() {
-            Some("--dir") => dir = Some(PathBuf::from(val()?)),
+            // Absolute before the daemon's chdir to `/` (acs-7nan).
+            Some("--dir") => {
+                let d = PathBuf::from(val()?);
+                dir = Some(std::path::absolute(&d).unwrap_or(d));
+            }
             Some("--session") => session = Some(val()?),
             Some("--ready-fd") => ready_fd = Some(val()?.parse().map_err(|_| "bad --ready-fd")?),
             Some("--ring") => ring = val()?.parse().map_err(|_| "bad --ring")?,
@@ -261,7 +275,7 @@ fn clean_identity(identity: &str) -> String {
 struct Conn {
     stream: UnixStream,
     dec: Decoder,
-    out: Vec<u8>,
+    out: OutQueue,
     state: ConnState,
     identity: String,
     since: u64,
@@ -273,25 +287,25 @@ struct Conn {
     /// with the connection, so the debug log says how many liveness rounds
     /// *one* link survived rather than how many went by (acs-o6x).
     answered: u64,
+    /// Until the first whole message arrives: when the connection is given
+    /// up. Without it a connection that never says anything — a stuck or
+    /// hostile process of this uid — stayed Pending for good, and since
+    /// the "nobody is coming" exit waits for no connections, it kept a
+    /// childless master (and its line in `acs list`) alive indefinitely
+    /// (acs-3anc). Cleared by the first message, so a client answered BUSY
+    /// may take its time deciding whether to take over.
+    first_by: Option<Instant>,
 }
 
 impl Conn {
     fn send(&mut self, m: &Msg) {
-        m.encode(&mut self.out);
+        m.encode(self.out.tail());
     }
 
     /// Write as much queued output as the socket takes.
     fn flush(&mut self) {
-        while !self.out.is_empty() && !self.dead {
-            match self.stream.write(&self.out) {
-                Ok(0) => self.dead = true,
-                Ok(n) => {
-                    self.out.drain(..n);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => self.dead = true,
-            }
+        if !self.dead && !self.out.flush(self.stream.as_raw_fd()) {
+            self.dead = true;
         }
     }
 }
@@ -325,6 +339,56 @@ struct Master {
     last_activity: Instant,
     kill_deadline: Option<Instant>,
     next_rebind: Instant,
+    next_touch: Instant,
+    /// `<dir>/<session>.master`, see [`MasterFile`].
+    master_path: PathBuf,
+    master_file: Option<MasterFile>,
+}
+
+/// `<dir>/<session>.master`, flocked by the live master for as long as it
+/// serves the session, with its pid inside (acs-lbba). A cleaner may delete
+/// the socket under a live master; a master starting for the same name then
+/// finds this lock held, prods the holder with `SIGUSR1` to re-bind at once,
+/// and steps aside — instead of starting a second shell beside the first,
+/// which would leave the old one running unreachable for good.
+struct MasterFile {
+    _lock: sys::Flock,
+    ino: (u64, u64),
+}
+
+impl MasterFile {
+    /// Take the lock and write our pid; `Ok(None)` while another master
+    /// holds it.
+    fn take(path: &Path) -> io::Result<Option<MasterFile>> {
+        let Some(lock) = sys::Flock::try_lock(path)? else {
+            return Ok(None);
+        };
+        // SAFETY: plain syscalls on a descriptor we own.
+        if unsafe { libc::ftruncate(lock.fd(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        sys::write_all(lock.fd(), format!("{}\n", sys::getpid()).as_bytes())?;
+        let m = std::fs::metadata(path)?;
+        Ok(Some(MasterFile {
+            _lock: lock,
+            ino: (m.dev(), m.ino()),
+        }))
+    }
+
+    /// Ask the master holding `path` to re-bind its socket now.
+    fn prod_holder(path: &Path) {
+        let pid = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok());
+        // Never 0 or -1: those would signal a group, or everything we own.
+        match pid.filter(|&p| p > 1) {
+            Some(p) => {
+                mlog!("socket gone under live master {p}: asking it to re-bind");
+                let _ = sys::kill(p, libc::SIGUSR1);
+            }
+            None => mlog!("{} is locked but names no pid", path.display()),
+        }
+    }
 }
 
 /// The pty's foreground process group, if it is one we may signal
@@ -333,13 +397,6 @@ fn fg_pgrp(pty: RawFd) -> Option<i32> {
     sys::tcgetpgrp(pty)
         .ok()
         .and_then(|p| sys::valid_pgrp(p, sys::getpgrp()))
-}
-
-/// The pty's poll entry. With nothing to wait for it is left out (`fd -1`):
-/// Linux reports POLLHUP on a hung-up pty whatever `events` asks for, and
-/// while the ring is full that would spin the loop (acs-gkl).
-fn pty_pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
-    sys::pollfd(if events == 0 { -1 } else { fd }, events)
 }
 
 /// After the child's exit status is known: whether the pty has nothing
@@ -384,11 +441,23 @@ impl Master {
         if UnixStream::connect(&sock_path).is_ok() {
             return Err(format!("session '{}' already has a master", args.session));
         }
+        // No socket answers, but the master may still be alive: a cleaner
+        // can delete the socket under it. Then it re-binds, not us.
+        let master_path = dir.master_path(&args.session)?;
+        let master_file = match MasterFile::take(&master_path) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                MasterFile::prod_holder(&master_path);
+                return Err(format!("session '{}' already has a master", args.session));
+            }
+            Err(e) => return Err(format!("lock {}: {e}", master_path.display())),
+        };
         let _ = std::fs::remove_file(&sock_path);
         let (listener, sock_ino) =
             bind(&sock_path).map_err(|e| format!("bind {}: {e}", sock_path.display()))?;
-        let signals = sys::signals::install(&[libc::SIGCHLD, libc::SIGTERM, libc::SIGINT])
-            .map_err(|e| e.to_string())?;
+        let signals =
+            sys::signals::install(&[libc::SIGCHLD, libc::SIGTERM, libc::SIGINT, libc::SIGUSR1])
+                .map_err(|e| e.to_string())?;
         Ok(Master {
             session: args.session.clone(),
             sock_path,
@@ -409,6 +478,9 @@ impl Master {
             last_activity: Instant::now(),
             kill_deadline: None,
             next_rebind: Instant::now() + rebind_every(),
+            next_touch: Instant::now() + TOUCH_EVERY,
+            master_path,
+            master_file: Some(master_file),
         })
     }
 
@@ -418,15 +490,31 @@ impl Master {
             .position(|c| matches!(c.state, ConnState::Active { .. }) && !c.dead)
     }
 
+    /// How much more the ring takes before it overwrites what the active
+    /// client has not been sent; unbounded with no active client.
+    fn ring_room(&self) -> usize {
+        match self.active().map(|i| &self.conns[i].state) {
+            Some(ConnState::Active { next }) => self.ring.room_before_overwrite(*next),
+            _ => usize::MAX,
+        }
+    }
+
     fn run(mut self) -> io::Result<()> {
         let mut buf = vec![0u8; 64 * 1024];
         // Without a child after a while nobody is coming: give up.
-        let born = Instant::now();
+        let give_up = Instant::now() + orphan_after();
         loop {
-            if self.child.is_none()
-                && self.conns.is_empty()
-                && born.elapsed() > Duration::from_secs(30)
-            {
+            // A connection that has said nothing in time is dropped, so it
+            // cannot hold off the exit below (acs-3anc).
+            let now = Instant::now();
+            for c in &mut self.conns {
+                if c.state == ConnState::Pending && c.first_by.is_some_and(|d| now >= d) {
+                    mlog!("a connection sent nothing in time: dropping it");
+                    c.dead = true;
+                }
+            }
+            self.conns.retain(|c| !c.dead);
+            if self.child.is_none() && self.conns.is_empty() && now >= give_up {
                 mlog!("no client ever created the session; exiting");
                 self.cleanup();
                 return Ok(());
@@ -441,11 +529,11 @@ impl Master {
             // empties the client's buffer must be followed by a refill from
             // the ring, or with the ring full (no pty POLLIN) and the buffer
             // empty (no POLLOUT) nothing would ever wake us.
-            self.pump_output();
+            self.pump_output(OUT_HIGH_WATER);
             for c in &mut self.conns {
                 c.flush();
             }
-            self.pump_output();
+            self.pump_output(OUT_HIGH_WATER);
 
             // Ping the attached client after silence, and give up one that
             // stays silent: a client that vanished without closing (a laptop
@@ -456,7 +544,7 @@ impl Master {
                 if !matches!(c.state, ConnState::Active { .. }) || c.dead {
                     continue;
                 }
-                match c.live.tick(&mut c.out) {
+                match c.live.tick(c.out.tail()) {
                     Health::Dead => {
                         mlog!("the client stopped answering: dropping it");
                         c.dead = true;
@@ -466,7 +554,6 @@ impl Master {
             }
             self.conns.retain(|c| !c.dead);
 
-            let active = self.active();
             let mut fds = vec![
                 sys::pollfd(self.listener.as_raw_fd(), libc::POLLIN),
                 sys::pollfd(self.signals.as_raw_fd(), libc::POLLIN),
@@ -475,18 +562,14 @@ impl Master {
             let mut pty_events = 0;
             if let Some(ch) = &self.child {
                 if ch.pty_open {
-                    let room = match active.map(|i| &self.conns[i].state) {
-                        Some(ConnState::Active { next }) => self.ring.room_before_overwrite(*next),
-                        _ => usize::MAX,
-                    };
-                    if room > 0 {
+                    if self.ring_room() > 0 {
                         pty_events |= libc::POLLIN;
                     }
                     if !self.pty_in.is_empty() {
                         pty_events |= libc::POLLOUT;
                     }
                 }
-                fds.push(pty_pollfd(ch.pty.as_raw_fd(), pty_events));
+                fds.push(sys::wait_for(ch.pty.as_raw_fd(), pty_events));
             }
             let conn_base = fds.len();
             for c in &self.conns {
@@ -505,6 +588,16 @@ impl Master {
             if let Some(d) = self.kill_deadline {
                 timeout = timeout.min(d.saturating_duration_since(now));
             }
+            for c in &self.conns {
+                if let Some(d) = c.first_by {
+                    timeout = timeout.min(d.saturating_duration_since(now));
+                }
+            }
+            // Wake for the "nobody is coming" exit too: the rebind check
+            // alone would leave it to the next minute.
+            if self.child.is_none() {
+                timeout = timeout.min(give_up.saturating_duration_since(now));
+            }
             if wake != u64::MAX {
                 let ms = wake.saturating_sub(sys::now_ms());
                 timeout = timeout.min(Duration::from_millis(ms));
@@ -513,12 +606,15 @@ impl Master {
             if self.child.as_ref().is_some_and(|c| c.status.is_some()) {
                 timeout = timeout.min(Duration::from_millis(50));
             }
-            sys::poll(&mut fds, timeout.as_millis().min(i32::MAX as u128) as i32)?;
+            sys::poll(&mut fds, sys::poll_timeout(timeout))?;
 
             if fds[1].revents != 0 {
                 for sig in sys::signals::drain(self.signals.as_raw_fd()) {
                     match sig {
                         libc::SIGCHLD => self.reap(),
+                        // A master starting for our name found the socket
+                        // gone: re-bind it now (acs-lbba).
+                        libc::SIGUSR1 => self.next_rebind = Instant::now(),
                         _ => {
                             mlog!("signal {sig}: killing session");
                             self.start_kill();
@@ -568,7 +664,7 @@ impl Master {
                     self.read_conn(i, &mut buf);
                 }
             }
-            self.pump_output();
+            self.pump_output(OUT_HIGH_WATER);
             for c in &mut self.conns {
                 c.flush();
                 if c.state == ConnState::Closing && c.out.is_empty() {
@@ -603,13 +699,14 @@ impl Master {
                     self.conns.push(Conn {
                         stream,
                         dec: Decoder::new(),
-                        out: Vec::new(),
+                        out: OutQueue::default(),
                         state: ConnState::Pending,
                         identity: String::new(),
                         since: 0,
                         dead: false,
                         live: Liveness::new(),
                         answered: 0,
+                        first_by: Some(Instant::now() + hello_within()),
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -647,7 +744,10 @@ impl Master {
         self.conns[i].dec.push(&buf[..n]);
         loop {
             let msg = match self.conns[i].dec.next_msg() {
-                Ok(Some(m)) => m,
+                Ok(Some(m)) => {
+                    self.conns[i].first_by = None;
+                    m
+                }
                 Ok(None) => break,
                 Err(e) => {
                     mlog!("protocol error: {e}");
@@ -762,7 +862,7 @@ impl Master {
                 self.trail("kill", &clean_identity(&identity));
                 self.start_kill();
             }
-            other => mlog!("ignoring unexpected {other:?}"),
+            other => mlog!("ignoring unexpected {}", other.kind()),
         }
     }
 
@@ -1036,22 +1136,11 @@ impl Master {
     }
 
     fn read_pty(&mut self, buf: &mut [u8]) {
+        let want = buf.len().min(self.ring_room());
         let Some(ch) = &mut self.child else { return };
         if !ch.pty_open {
             return;
         }
-        let room = match self
-            .conns
-            .iter()
-            .find(|c| matches!(c.state, ConnState::Active { .. }) && !c.dead)
-        {
-            Some(Conn {
-                state: ConnState::Active { next },
-                ..
-            }) => self.ring.room_before_overwrite(*next),
-            _ => buf.len(),
-        };
-        let want = buf.len().min(room);
         if want == 0 {
             return;
         }
@@ -1114,21 +1203,24 @@ impl Master {
         }
     }
 
-    /// Move ring data into the active client's buffer.
-    fn pump_output(&mut self) {
+    /// Queue ring data for the active client as DATA frames until its
+    /// buffer holds `high_water` bytes or the ring has no more —
+    /// [`OUT_HIGH_WATER`] while the session runs, `usize::MAX` once it is
+    /// over. Each
+    /// frame's payload is the ring's two slices copied straight into the
+    /// buffer, the one copy of the output the master makes (acs-m08z).
+    fn pump_output(&mut self, high_water: usize) {
         let Some(a) = self.active() else { return };
         let end = self.ring.end();
         let c = &mut self.conns[a];
         let ConnState::Active { next } = &mut c.state else {
             return;
         };
-        while c.out.len() < OUT_HIGH_WATER && *next < end {
+        while c.out.len() < high_water && *next < end {
             match self.ring.read_from(*next, proto::MAX_CHUNK) {
                 Read::Data(x, y) => {
-                    let bytes = [x, y].concat();
-                    let offset = *next;
-                    *next += bytes.len() as u64;
-                    Msg::Data { offset, bytes }.encode(&mut c.out);
+                    proto::encode_data(*next, &[x, y], c.out.tail());
+                    *next += (x.len() + y.len()) as u64;
                 }
                 Read::Gap(start) => *next = start,
                 Read::Future => break,
@@ -1178,30 +1270,85 @@ impl Master {
         }
     }
 
+    /// Keep the socket (and the `.master` file) where clients look for
+    /// them (DESIGN §4.1). Runs every [`rebind_every`], and at once when a
+    /// master starting for this name prods us with `SIGUSR1`.
     fn check_socket(&mut self) {
-        self.next_rebind = Instant::now() + rebind_every();
-        match std::fs::metadata(&self.sock_path) {
-            Ok(m) if (m.dev(), m.ino()) == self.sock_ino => {}
-            Ok(_) => mlog!("socket path now belongs to something else; leaving it"),
-            Err(_) => {
-                // A cleaner may have removed the whole directory: recreate
-                // it (with the usual ownership checks) so the session stays
-                // reachable instead of lingering unreachable forever.
-                if let Some(dir) = self.sock_path.parent() {
-                    if let Err(e) = SocketDir::open_at(dir.to_path_buf()) {
-                        mlog!("cannot recreate {}: {e}", dir.display());
-                        return;
-                    }
-                }
-                match bind(&self.sock_path) {
-                    Ok((l, ino)) => {
-                        mlog!("socket was removed; re-bound");
-                        self.listener = l;
-                        self.sock_ino = ino;
-                    }
-                    Err(e) => mlog!("re-bind failed: {e}"),
-                }
+        let now = Instant::now();
+        self.next_rebind = now + rebind_every();
+        let ours = |path: &Path, ino: (u64, u64)| {
+            std::fs::metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == ino)
+        };
+        let master_ino = self.master_file.as_ref().map(|f| f.ino);
+        if ours(&self.sock_path, self.sock_ino)
+            && master_ino.map_or(true, |ino| ours(&self.master_path, ino))
+        {
+            if now >= self.next_touch {
+                self.next_touch = now + TOUCH_EVERY;
+                let _ = sys::touch(&self.sock_path);
+                let _ = sys::touch(&self.master_path);
             }
+            return;
+        }
+        // A cleaner may have removed the whole directory: recreate it
+        // (with the usual ownership checks) so the session stays reachable
+        // instead of lingering unreachable forever.
+        let Some(parent) = self.sock_path.parent() else {
+            return;
+        };
+        let dir = match SocketDir::open_at(parent.to_path_buf()) {
+            Ok(d) => d,
+            Err(e) => {
+                mlog!("cannot recreate {}: {e}", parent.display());
+                return;
+            }
+        };
+        // Re-bind under the create lock, as `Master::bind` binds: unlocked,
+        // a master starting for this name could bind between our look and
+        // our bind. Never block the loop on it; try again shortly.
+        let _lock = match dir.try_create_lock(&self.session) {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                self.next_rebind = now + Duration::from_millis(20);
+                return;
+            }
+            Err(e) => {
+                mlog!("create lock: {e}");
+                return;
+            }
+        };
+        if master_ino.is_some_and(|ino| !ours(&self.master_path, ino)) {
+            match MasterFile::take(&self.master_path) {
+                Ok(Some(f)) => {
+                    mlog!("{} was removed; re-created", self.master_path.display());
+                    self.master_file = Some(f);
+                }
+                Ok(None) => mlog!(
+                    "{} now belongs to another master",
+                    self.master_path.display()
+                ),
+                Err(e) => mlog!("cannot re-create {}: {e}", self.master_path.display()),
+            }
+        }
+        match std::fs::metadata(&self.sock_path) {
+            Ok(m) if (m.dev(), m.ino()) == self.sock_ino => return,
+            Ok(_) if UnixStream::connect(&self.sock_path).is_ok() => {
+                mlog!("socket path now belongs to a live master; leaving it");
+                return;
+            }
+            // Nothing listens on what is there: a stale file, ours to replace.
+            Ok(_) => {
+                let _ = std::fs::remove_file(&self.sock_path);
+            }
+            Err(_) => {}
+        }
+        match bind(&self.sock_path) {
+            Ok((l, ino)) => {
+                mlog!("socket was removed; re-bound");
+                self.listener = l;
+                self.sock_ino = ino;
+            }
+            Err(e) => mlog!("re-bind failed: {e}"),
         }
     }
 
@@ -1228,12 +1375,15 @@ impl Master {
     }
 
     /// Only remove the socket if it is still the one we bound.
-    fn cleanup(&self) {
+    fn cleanup(&mut self) {
         if let Ok(m) = std::fs::metadata(&self.sock_path) {
             if (m.dev(), m.ino()) == self.sock_ino {
                 let _ = std::fs::remove_file(&self.sock_path);
             }
         }
+        // The session is over: a new one may start under this name at once
+        // rather than prod us to re-bind. The file stays, as `.lock` does.
+        self.master_file = None;
     }
 
     /// The child is gone and the pty drained: deliver EXIT and leave.
@@ -1242,7 +1392,7 @@ impl Master {
         mlog!("session ended with status {status:#x}");
         // Stop accepting new clients right away.
         self.cleanup();
-        self.pump_output_all();
+        self.pump_output(usize::MAX);
         if let Some(a) = self.active() {
             self.conns[a].send(&Msg::Exit { status });
         }
@@ -1262,29 +1412,6 @@ impl Master {
             }
         }
         Ok(())
-    }
-
-    /// Queue everything left in the ring for the active client, ignoring
-    /// the high-water mark (the session is over).
-    fn pump_output_all(&mut self) {
-        let Some(a) = self.active() else { return };
-        let end = self.ring.end();
-        let c = &mut self.conns[a];
-        let ConnState::Active { next } = &mut c.state else {
-            return;
-        };
-        while *next < end {
-            match self.ring.read_from(*next, proto::MAX_CHUNK) {
-                Read::Data(x, y) => {
-                    let bytes = [x, y].concat();
-                    let offset = *next;
-                    *next += bytes.len() as u64;
-                    Msg::Data { offset, bytes }.encode(&mut c.out);
-                }
-                Read::Gap(start) => *next = start,
-                Read::Future => break,
-            }
-        }
     }
 }
 
@@ -1309,11 +1436,5 @@ mod tests {
         assert!(sys::read(m, &mut buf).unwrap() > 0);
         // Read out, with the slave still open (a background job): drained.
         assert!(pty_drained(m));
-    }
-
-    #[test]
-    fn an_idle_pty_is_left_out_of_the_poll() {
-        assert_eq!(pty_pollfd(7, 0).fd, -1);
-        assert_eq!(pty_pollfd(7, libc::POLLIN).fd, 7);
     }
 }

@@ -9,17 +9,6 @@ use std::time::Duration;
 
 use common::*;
 
-/// A program that reports every byte it receives as `in:xx`, as it comes.
-const REPORTER: &str = "stty raw -echo; echo ready; \
-    while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1); printf 'in:%s\\n' $b; done";
-
-/// Fast timers so a resume takes a fraction of a second.
-const FAST: &[(&str, &str)] = &[
-    ("ACS_BACKOFF_MS", "100"),
-    ("ACS_PING_MS", "200"),
-    ("ACS_DEAD_MS", "800"),
-];
-
 fn start(remote: &Remote, host: &str, session: &str, env: &[(&str, &str)]) -> Client {
     let mut c = Client::start_env(
         remote,
@@ -28,15 +17,6 @@ fn start(remote: &Remote, host: &str, session: &str, env: &[(&str, &str)]) -> Cl
     );
     c.wait_for("ready", T);
     c
-}
-
-/// The bytes the program reported, in order.
-fn received(c: &Client) -> Vec<String> {
-    c.text()
-        .split("in:")
-        .skip(1)
-        .filter_map(|s| s.get(..2).map(String::from))
-        .collect()
 }
 
 /// Type `z` and wait for the program to report it, so everything the client

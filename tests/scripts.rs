@@ -161,6 +161,220 @@ fn test_linux_gives_each_checkout_its_own_target_volume() {
     );
 }
 
+/// What `test_linux.sh` would do in its container: the `docker run` argv,
+/// boundaries kept, and the `cargo` calls its inner script makes when run
+/// here against fake `apk`, `adduser`, `chmod` and `cargo`.
+struct LinuxRun {
+    docker: Vec<String>,
+    cargo: Vec<String>,
+}
+
+impl LinuxRun {
+    fn volume(&self) -> &str {
+        self.docker
+            .iter()
+            .find(|a| a.starts_with("acs-linux-target"))
+            .expect("a target volume")
+    }
+}
+
+const LOGGER: &str = r#"#!/bin/sh
+echo "$(basename "$0") $* [mu=${ACS_MULTIUSER_TEST:-} ns=${ACS_NETNS_TEST:-}]" >>"$FAKE_LOG"
+"#;
+
+/// `test_linux.sh args` against a docker that only keeps its argv; `Err`
+/// with the script's output when it refused before reaching docker.
+fn try_linux_run(dir: &Path, root: &Path, args: &[&str]) -> Result<LinuxRun, std::process::Output> {
+    let bin = dir.join("linux-bin");
+    if !bin.exists() {
+        std::fs::create_dir(&bin).unwrap();
+        let fakes = [
+            ("docker", "#!/bin/sh\nprintf '%s\\0' \"$@\" >\"$ARGV\"\n"),
+            ("apk", LOGGER),
+            ("adduser", LOGGER),
+            ("chmod", LOGGER),
+            ("cargo", LOGGER),
+        ];
+        for (p, body) in fakes {
+            let f = bin.join(p);
+            std::fs::write(&f, body).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let (argv, log) = (dir.join("argv"), dir.join("linux-log"));
+    let _ = std::fs::remove_file(&argv);
+    let _ = std::fs::remove_file(&log);
+    let out = Command::new("sh")
+        .arg(root.join("scripts/test_linux.sh"))
+        .args(args)
+        .env("PATH", &path)
+        .env("ARGV", &argv)
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        assert!(!argv.exists(), "refused, but only after calling docker");
+        return Err(out);
+    }
+    let docker: Vec<String> = std::fs::read_to_string(&argv)
+        .unwrap()
+        .split('\0')
+        .map(String::from)
+        .collect();
+    let env: Vec<(String, String)> = docker
+        .windows(2)
+        .filter(|w| w[0] == "-e")
+        .map(|w| {
+            let (k, v) = w[1].split_once('=').unwrap();
+            (k.to_string(), v.to_string())
+        })
+        .collect();
+    let i = docker.iter().position(|a| a == "-euc").expect("sh -euc");
+    // The script, then `$0` and the positionals; the last split is the
+    // empty string after the final NUL.
+    let rest = &docker[i + 1..docker.len() - 1];
+    let inner = Command::new("sh")
+        .arg("-euc")
+        .args(rest)
+        .envs(env)
+        .env("PATH", &path)
+        .env("FAKE_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(
+        inner.status.success(),
+        "the container's script: {}",
+        String::from_utf8_lossy(&inner.stderr)
+    );
+    let cargo = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("cargo "))
+        .map(String::from)
+        .collect();
+    Ok(LinuxRun { docker, cargo })
+}
+
+fn linux_run(dir: &Path, root: &Path, args: &[&str]) -> LinuxRun {
+    try_linux_run(dir, root, args).unwrap_or_else(|out| {
+        panic!(
+            "test_linux.sh {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// A checkout with `tests/<name>.rs` for each name, for `--only` to find.
+fn linux_checkout(dir: &Path, tests: &[&str]) -> PathBuf {
+    let root = bare_checkout(dir, "a");
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    for t in tests {
+        std::fs::write(root.join("tests").join(format!("{t}.rs")), "").unwrap();
+    }
+    root
+}
+
+const MULTIUSER: &str = "cargo test -p acs --test multiuser -- --include-ignored \
+    --skip peer_helper --test-threads=1";
+const NETNS: &str = "cargo test -p acs --test netns -- --include-ignored \
+    --test-threads=1 --nocapture";
+
+#[test]
+fn test_linux_with_no_arguments_runs_all_three_steps() {
+    let dir = TempDir::new();
+    let root = linux_checkout(dir.path(), &[]);
+    assert_eq!(
+        linux_run(dir.path(), &root, &[]).cargo,
+        [
+            "cargo test -p acs [mu= ns=]".to_string(),
+            format!("{MULTIUSER} [mu=1 ns=]"),
+            format!("{NETNS} [mu= ns=1]"),
+        ]
+    );
+}
+
+/// acs-pjk: `--only` runs one test target, in the same container with the
+/// same volumes, and a privileged one keeps its step's environment and
+/// flags — so iterating on it is iterating on the real thing.
+#[test]
+fn test_linux_only_runs_one_target_as_the_full_run_would() {
+    let dir = TempDir::new();
+    let root = linux_checkout(dir.path(), &["netns", "multiuser", "client"]);
+    let full = linux_run(dir.path(), &root, &[]);
+    let cases: [(&[&str], String); 5] = [
+        (&["--only", "netns"], format!("{NETNS} [mu= ns=1]")),
+        (
+            &["--only", "netns", "--", "address"],
+            format!("{NETNS} address [mu= ns=1]"),
+        ),
+        (&["--only", "multiuser"], format!("{MULTIUSER} [mu=1 ns=]")),
+        (
+            &["--only", "client", "--", "--exact", "a b"],
+            "cargo test -p acs --test client -- --exact a b [mu= ns=]".to_string(),
+        ),
+        (
+            &["--platform", "linux/amd64", "--only", "lib"],
+            "cargo test -p acs --lib -- [mu= ns=]".to_string(),
+        ),
+    ];
+    for (args, want) in cases {
+        let only = linux_run(dir.path(), &root, args);
+        assert_eq!(only.cargo, [want], "{args:?}");
+        assert_eq!(only.volume(), full.volume(), "{args:?}");
+    }
+    // `a b` stayed one argument all the way to the harness.
+    let only = linux_run(dir.path(), &root, &["--only", "client", "--", "a b"]);
+    assert!(only.docker.iter().any(|a| a == "a b"), "{:?}", only.docker);
+}
+
+#[test]
+fn test_linux_refuses_a_bad_selection_before_starting_docker() {
+    let dir = TempDir::new();
+    let root = linux_checkout(dir.path(), &["netns"]);
+    for (args, said) in [
+        (&["--only", "nosuch"][..], "no tests/nosuch.rs"),
+        (&["--only", "../netns"], "takes a test name"),
+        (&["--only"], "usage"),
+        (&["--", "address"], "need --only"),
+        (&["--bogus"], "unknown argument"),
+    ] {
+        let out = try_linux_run(dir.path(), &root, args)
+            .err()
+            .unwrap_or_else(|| panic!("{args:?} was accepted"));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(said), "{args:?}: {err}");
+    }
+}
+
+/// acs-hdj4: the multi-user, netns and e2e tests are `#[ignore]`, so a plain
+/// `cargo test` counts them rather than passing them unrun. The scripts that
+/// can run them have to ask for them, or they go dark there too — counted as
+/// ignored in the one place they were meant to run.
+#[test]
+fn the_container_scripts_run_the_ignored_tests() {
+    let dir = TempDir::new();
+    let root = checkout(dir.path(), "a");
+    let linux = linux_run(dir.path(), &root, &[]).cargo.join("\n");
+    for step in [
+        "--test multiuser -- --include-ignored --skip peer_helper",
+        "--test netns -- --include-ignored",
+    ] {
+        assert!(
+            linux.contains(step),
+            "test_linux.sh lacks {step:?}:\n{linux}"
+        );
+    }
+    let e2e = run(dir.path(), &root, "e2e_ssh.sh", &["--no-build"]);
+    let test = e2e
+        .iter()
+        .find(|l| l.starts_with("cargo test"))
+        .expect("e2e_ssh.sh ran no cargo test");
+    assert!(
+        test.contains("--test e2e_ssh -- --include-ignored"),
+        "{test}"
+    );
+}
+
 #[test]
 fn e2e_gives_each_checkout_its_own_host_on_a_free_port() {
     let dir = TempDir::new();
@@ -426,40 +640,49 @@ fn version_bump_without_a_new_tag_releases_nothing() {
 /// that walks out of the temporary directory and out of `$lib` — which the
 /// root branch writes as root. The Rust side was always strict; the two
 /// now agree.
-#[test]
-fn the_installer_takes_only_an_x_y_z_version_from_the_sums() {
-    let t = TempDir::new();
-    let script =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
-            .unwrap();
-    // The line the script greps SHA256SUMS with, lifted from the script so
-    // the test cannot drift from it.
-    let pattern = script
+/// The pattern `scripts/install.sh` greps SHA256SUMS with for `target`,
+/// lifted from the script so a test cannot drift from it.
+fn installer_sums_pattern(target: &str) -> String {
+    let line = installer()
         .lines()
         .find(|l| l.contains("grep -E") && l.contains("SHA256SUMS"))
-        .expect("the sums grep");
-    let pattern = pattern
-        .split('"')
+        .expect("the sums grep")
+        .to_string();
+    line.split('"')
         .nth(1)
         .expect("the quoted pattern")
         // Undo what the shell would do to the double-quoted string before
         // grep ever sees it.
         .replace("\\\\", "\\")
         .replace("\\$", "$")
-        .replace("$target", "x86_64-unknown-linux-musl");
+        .replace("$target", target)
+}
 
-    let sums = t.path().join("SHA256SUMS");
+fn installer() -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
+        .unwrap()
+}
+
+/// Whether `pattern` matches the one-line file `line`, as `grep -E` says.
+fn greps(dir: &Path, pattern: &str, line: &str) -> bool {
+    let sums = dir.join("SHA256SUMS");
+    std::fs::write(&sums, format!("{line}\n")).unwrap();
+    Command::new("grep")
+        .arg("-E")
+        .arg(pattern)
+        .arg(&sums)
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+#[test]
+fn the_installer_takes_only_an_x_y_z_version_from_the_sums() {
+    let t = TempDir::new();
+    let pattern = installer_sums_pattern("x86_64-unknown-linux-musl");
     let hash = "0".repeat(64);
-    let check = |name: &str| {
-        std::fs::write(&sums, format!("{hash}  {name}\n")).unwrap();
-        let out = Command::new("grep")
-            .arg("-E")
-            .arg(&pattern)
-            .arg(&sums)
-            .output()
-            .unwrap();
-        out.status.success()
-    };
+    let check = |name: &str| greps(t.path(), &pattern, &format!("{hash}  {name}"));
 
     assert!(
         check("acs-1.2.3-x86_64-unknown-linux-musl.tar.gz"),
@@ -477,6 +700,276 @@ fn the_installer_takes_only_an_x_y_z_version_from_the_sums() {
         "acs-..-x86_64-unknown-linux-musl.tar.gz",
     ] {
         assert!(!check(bad), "accepted {bad}");
+    }
+}
+
+/// acs-sseq: the installer and acs read SHA256SUMS by one rule. The two
+/// cannot share code, so the script's grep is run against
+/// `release::find_asset` line by line — the separators `sha256sum` writes
+/// and the ones it does not, the case of the hash, and the version shape —
+/// and whichever of the installer and `acs upgrade` a release reaches, it
+/// is the same archive or neither.
+#[test]
+fn the_installer_and_acs_read_sha256sums_alike() {
+    let t = TempDir::new();
+    let target = "x86_64-unknown-linux-musl";
+    let pattern = installer_sums_pattern(target);
+    let hash = "0123456789abcdef".repeat(4);
+    let name = format!("acs-1.2.3-{target}.tar.gz");
+    let lines = [
+        // What sha256sum writes, in text and binary mode.
+        (format!("{hash}  {name}"), true),
+        (format!("{hash} *{name}"), true),
+        // Runs of the two separators.
+        (format!("{hash}   {name}"), true),
+        (format!("{hash}  *{name}"), true),
+        (format!("{hash} **{name}"), true),
+        // No separator, the wrong one, or one too early.
+        (format!("{hash}{name}"), false),
+        (format!("{hash}\t{name}"), false),
+        (format!(" {hash}  {name}"), false),
+        (format!("{hash}*{name}"), false),
+        // The hash: lowercase, and exactly 64 digits.
+        (format!("{}  {name}", hash.to_ascii_uppercase()), false),
+        (format!("{}  {name}", &hash[1..]), false),
+        (format!("{hash}0  {name}"), false),
+        (format!("{}  {name}", "g".repeat(64)), false),
+        // The version: X.Y.Z and nothing else.
+        (format!("{hash}  acs-v1.2.3-{target}.tar.gz"), false),
+        (format!("{hash}  acs-1.2.3-rc1-{target}.tar.gz"), false),
+        (format!("{hash}  acs-1.2-{target}.tar.gz"), false),
+        (format!("{hash}  acs-1.2.3-{target}.tar.gz.sig"), false),
+        (
+            format!("{hash}  acs-1.2.3-aarch64-unknown-linux-musl.tar.gz"),
+            false,
+        ),
+    ];
+    for (line, want) in &lines {
+        let rust = acs::release::find_asset(line, target);
+        assert_eq!(rust.is_some(), *want, "acs on {line:?}: {rust:?}");
+        assert_eq!(
+            greps(t.path(), &pattern, line),
+            *want,
+            "install.sh on {line:?}"
+        );
+        if let Some(a) = rust {
+            assert_eq!(a.file, name, "{line:?}");
+            assert_eq!(a.sha256, hash, "{line:?}");
+        }
+    }
+
+    // And what the script cuts out of an accepted line is what acs does.
+    let cut = include_str!("../scripts/install.sh")
+        .lines()
+        .skip_while(|l| !l.starts_with("sum=${line%%"))
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(cut.contains("file="), "the script's cut moved:\n{cut}");
+    for (line, _) in lines.iter().filter(|(_, ok)| *ok) {
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{cut}\nprintf '%s %s' \"$sum\" \"$file\""))
+            .env("line", line)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{hash} {name}"),
+            "install.sh cut {line:?}"
+        );
+    }
+}
+
+/// acs-sseq: the installer lays acs out where acs looks for it. The paths
+/// live in `acs::layout`; the script spells them, so this holds the two
+/// together.
+#[test]
+fn the_installer_uses_the_layout_acs_looks_in() {
+    use acs::layout::{SYSTEM_BIN, SYSTEM_ROOT, USER_BIN, USER_ROOT};
+    let script = installer();
+    for want in [
+        format!("lib={SYSTEM_ROOT}\n"),
+        format!("bin={SYSTEM_BIN}\n"),
+        format!("lib=\"$HOME/{USER_ROOT}\"\n"),
+        format!("bin=\"$HOME/{USER_BIN}\"\n"),
+    ] {
+        assert!(script.contains(&want), "install.sh has no {want:?}");
+    }
+}
+
+/// Run the installer's `link_bin` for `version` with `lib` and `bin` as
+/// its directories, and say what it did: `linked`, `newer` or `theirs`.
+/// The helpers are cut out of the script itself, from the first of them to
+/// where it picks the directories, so the test runs exactly what ships.
+fn installer_link(lib: &Path, bin: &Path, version: &str) -> String {
+    let script = installer();
+    let helpers = script
+        .lines()
+        .skip_while(|l| !l.starts_with("rand() {"))
+        .take_while(|l| !l.starts_with("if [ -n \"${ACS_INSTALL_DIR:-}\" ]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        helpers.contains("link_bin() {"),
+        "the installer's link helpers moved:\n{helpers}"
+    );
+    std::fs::create_dir_all(lib.join(version)).unwrap();
+    std::fs::write(lib.join(version).join("acs"), "new\n").unwrap();
+    std::fs::create_dir_all(bin).unwrap();
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "set -eu\n{helpers}\nlink_bin \"$lib/$version/acs\" \"$bin/acs\"\nprintf %s \"$linked\""
+        ))
+        .env("lib", lib)
+        .env("bin", bin)
+        .env("version", version)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// An installed version under `lib`, as an earlier run left it.
+fn installed(lib: &Path, version: &str) -> PathBuf {
+    let path = lib.join(version).join("acs");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "old\n").unwrap();
+    path
+}
+
+fn symlink(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+fn points_at(link: &Path) -> PathBuf {
+    std::fs::read_link(link).unwrap()
+}
+
+/// acs-feee: the installer moves `bin/acs` by `install::should_link`'s
+/// rule, as acs does on a remote — a link of ours forward only, never
+/// back, and nothing it did not make — instead of renaming over whatever
+/// is there, which as `curl | sh` run by root replaced a user's own file.
+#[test]
+fn the_installer_links_where_nothing_is() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    assert_eq!(installer_link(&lib, &bin, "0.13.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.13.0/acs"));
+}
+
+#[test]
+fn the_installer_moves_its_link_forward() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    // 0.9.0 to 0.10.0: by number, not as text.
+    symlink(&installed(&lib, "0.9.0"), &bin.join("acs"));
+    assert_eq!(installer_link(&lib, &bin, "0.10.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.10.0/acs"));
+    // The same version again: still linked, which is a re-run's no-op.
+    assert_eq!(installer_link(&lib, &bin, "0.10.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.10.0/acs"));
+}
+
+#[test]
+fn the_installer_never_moves_its_link_back() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    let newer = installed(&lib, "0.10.0");
+    symlink(&newer, &bin.join("acs"));
+    // ACS_VERSION=0.9.0: installed beside it, the link left on 0.10.0.
+    assert_eq!(installer_link(&lib, &bin, "0.9.0"), "newer");
+    assert_eq!(points_at(&bin.join("acs")), newer);
+    assert!(lib.join("0.9.0/acs").is_file());
+}
+
+#[test]
+fn the_installer_relinks_from_a_removed_version() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    let gone = installed(&lib, "0.14.0");
+    symlink(&gone, &bin.join("acs"));
+    std::fs::remove_dir_all(gone.parent().unwrap()).unwrap();
+    assert_eq!(installer_link(&lib, &bin, "0.13.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.13.0/acs"));
+}
+
+#[test]
+fn the_installer_knows_its_link_through_a_symlinked_directory() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    installed(&lib, "0.12.0");
+    // As a link made through a symlinked $HOME reads.
+    symlink(&lib, &t.path().join("alias"));
+    symlink(&t.path().join("alias/0.12.0/acs"), &bin.join("acs"));
+    assert_eq!(installer_link(&lib, &bin, "0.13.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.13.0/acs"));
+}
+
+#[test]
+fn the_installer_leaves_a_users_own_file_alone() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("acs"), "mine\n").unwrap();
+    assert_eq!(installer_link(&lib, &bin, "0.13.0"), "theirs");
+    let meta = std::fs::symlink_metadata(bin.join("acs")).unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!(std::fs::read_to_string(bin.join("acs")).unwrap(), "mine\n");
+}
+
+#[test]
+fn the_installer_leaves_a_foreign_link_alone() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    // An acs of the user's own, in a directory laid out like ours, and a
+    // dangling one: neither is under lib, so neither is ours to move.
+    let theirs = installed(&t.path().join("src/target"), "release");
+    for target in [theirs, t.path().join("nowhere/0.1.0/acs")] {
+        let _ = std::fs::remove_file(bin.join("acs"));
+        symlink(&target, &bin.join("acs"));
+        assert_eq!(installer_link(&lib, &bin, "0.13.0"), "theirs");
+        assert_eq!(points_at(&bin.join("acs")), target);
+    }
+}
+
+/// acs-sseq: `scripts/update-tap.sh` decides "older than the tap's" with
+/// `sort`, and acs with `release::compare`. They must agree on every pair
+/// of releases, or the tap could be moved backwards.
+#[test]
+fn the_tap_orders_releases_as_acs_does() {
+    let script = include_str!("../scripts/update-tap.sh");
+    let sort = script
+        .lines()
+        .find_map(|l| {
+            let at = l.find("sort -t.")?;
+            Some(l[at..].split(" | ").next().unwrap().to_string())
+        })
+        .expect("the sort in update-tap.sh");
+    let versions = [
+        "0.9.9", "0.10.0", "0.2.0", "1.0.0", "0.99.99", "0.17.0", "0.17.1", "2.0.10", "2.0.9",
+        "10.0.0",
+    ];
+    for a in versions {
+        for b in versions {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s\\n%s\\n' {a} {b} | {sort} | tail -n 1"))
+                .output()
+                .unwrap();
+            let newest = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let want = match acs::release::compare(a, b).unwrap() {
+                std::cmp::Ordering::Less => b,
+                _ => a,
+            };
+            assert_eq!(newest, want, "{sort} on {a}, {b}");
+        }
     }
 }
 

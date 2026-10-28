@@ -4,7 +4,9 @@
 //! With `--list` it reports every session's STATUS instead. With `--pick`
 //! it serves the session menu on the session's own connection (DESIGN
 //! §4.4): the list first, sessions ended on request, and then the client's
-//! HELLO names the session to relay.
+//! HELLO names the session to relay. With `--pick --eager` the client's
+//! HELLO comes first, and with nothing detached the proxy attaches it at
+//! once, after the list, saving the client a round trip.
 
 use std::ffi::OsString;
 use std::io;
@@ -14,6 +16,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use crate::master;
+use crate::outq::OutQueue;
 use crate::proto::{self, err, Decoder, Mode, Msg};
 use crate::session::{self, SocketDir};
 use crate::sys;
@@ -28,8 +31,12 @@ enum What {
         mode: Mode,
     },
     List,
-    /// The list, then whatever session the client's HELLO names.
-    Pick,
+    /// The list, then whatever session the client's HELLO names. `eager`:
+    /// the client's first frame is a HELLO for the session it would make
+    /// with nothing detached, attached at once if nothing is (acs-xvg).
+    Pick {
+        eager: bool,
+    },
 }
 
 fn parse_args(args: &[OsString]) -> Result<What, String> {
@@ -37,6 +44,8 @@ fn parse_args(args: &[OsString]) -> Result<What, String> {
     let mut mode = Mode::AttachOrCreate;
     let mut new = false;
     let mut list = false;
+    let mut pick = false;
+    let mut eager = false;
     let mut it = args.iter().map(|a| a.to_string_lossy().into_owned());
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -51,9 +60,16 @@ fn parse_args(args: &[OsString]) -> Result<What, String> {
             }
             "--new" => new = true,
             "--list" => list = true,
-            "--pick" => return Ok(What::Pick),
+            "--pick" => pick = true,
+            "--eager" => eager = true,
             other => return Err(format!("unexpected argument {other}")),
         }
+    }
+    if pick {
+        return Ok(What::Pick { eager });
+    }
+    if eager {
+        return Err("--eager needs --pick".into());
     }
     if list {
         return Ok(What::List);
@@ -100,12 +116,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     crate::prune::on_proxy_start(|| live_versions(&dir));
     match what {
-        What::List => list(&dir),
+        What::List => list(&dir, STDOUT),
         What::Session { name, mode } => match session(&dir, name, mode) {
             Ok(code) => code,
             Err(e) => fail(e),
         },
-        What::Pick => match pick(&dir) {
+        What::Pick { eager } => match pick(&dir, eager) {
             Ok(code) => code,
             Err(e) => fail(e),
         },
@@ -125,11 +141,7 @@ fn connect_or_start(
     loop {
         match UnixStream::connect(&path) {
             Ok(s) => return Ok(Some(s)),
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::ENOENT) | Some(libc::ECONNREFUSED)
-                ) => {}
+            Err(e) if refused(&e) => {}
             Err(e) => return Err(format!("connect {}: {e}", path.display())),
         }
         if !create {
@@ -205,10 +217,37 @@ fn reply_err(code: u16, message: String) -> Result<ExitCode, String> {
 /// the HELLO of the session it wants — `mode` and name as the proxy's own
 /// arguments would give them, an empty name with `Create` for a new
 /// numbered one. From there it is an ordinary session connection.
-fn pick(dir: &SocketDir) -> Result<ExitCode, String> {
+///
+/// `eager` (acs-xvg): the client's first frame is a HELLO for the session
+/// it would make with nothing detached — its default name, sent ahead with
+/// the dial. With nothing detached in the list just sent that HELLO is
+/// attached at once, so its WELCOME follows the LIST_END and the client
+/// owes no second request; its name is taken by an attached session, a new
+/// numbered one, as the client's own choice would be. Otherwise it is moot
+/// and the menu goes on as without it.
+fn pick(dir: &SocketDir, eager: bool) -> Result<ExitCode, String> {
     sys::write_all(STDOUT, proto::ready_line().as_bytes()).map_err(|e| e.to_string())?;
-    send_list(dir, None)?;
+    let sessions = send_list(dir, None, STDOUT)?;
     let mut dec = Decoder::new();
+    if eager {
+        let mut hello = match next_from_client(&mut dec)? {
+            None => return Ok(ExitCode::SUCCESS),
+            Some(Msg::Hello(h)) => h,
+            Some(other) => {
+                return reply_err(
+                    err::BAD_REQUEST,
+                    format!("expected the HELLO first, got {}", other.kind()),
+                )
+            }
+        };
+        if !sessions.iter().any(|s| !s.attached) {
+            if sessions.iter().any(|s| s.name == hello.session) {
+                hello.session.clear();
+                hello.mode = Mode::Create;
+            }
+            return attach_picked(dir, hello, dec);
+        }
+    }
     let hello = loop {
         match next_from_client(&mut dec)? {
             // Leaving the menu closes the connection.
@@ -217,18 +256,24 @@ fn pick(dir: &SocketDir) -> Result<ExitCode, String> {
                 name,
                 identity,
                 force,
-            }) => send_list(dir, Some((&name, &identity, force)))?,
+            }) => {
+                send_list(dir, Some((&name, &identity, force)), STDOUT)?;
+            }
             Some(Msg::Hello(h)) => break h,
             Some(other) => {
                 return reply_err(
                     err::BAD_REQUEST,
-                    format!("expected HELLO or END_SESSION, got {other:?}"),
+                    format!("expected HELLO or END_SESSION, got {}", other.kind()),
                 )
             }
         }
     };
-    // A new numbered session is chosen under the directory lock, as
-    // `--new` does.
+    attach_picked(dir, hello, dec)
+}
+
+/// Attach the session a pick's HELLO names: an empty name with `Create` is
+/// a new numbered one, chosen under the directory lock as `--new` does.
+fn attach_picked(dir: &SocketDir, hello: proto::Hello, dec: Decoder) -> Result<ExitCode, String> {
     let new = hello.session.is_empty();
     if new && hello.mode != Mode::Create {
         return reply_err(err::BAD_REQUEST, "HELLO names no session".into());
@@ -263,7 +308,12 @@ fn attach(
 ) -> Result<ExitCode, String> {
     let mut hello = match hello {
         Msg::Hello(h) => h,
-        other => return reply_err(err::BAD_REQUEST, format!("expected HELLO, got {other:?}")),
+        other => {
+            return reply_err(
+                err::BAD_REQUEST,
+                format!("expected HELLO, got {}", other.kind()),
+            )
+        }
     };
     if hello.proto != proto::PROTO_VERSION {
         return reply_err(
@@ -298,16 +348,9 @@ fn relay(master: UnixStream, to_master: Vec<u8>) -> io::Result<()> {
     relay_fds(master, to_master, STDIN, STDOUT)
 }
 
-/// A poll entry, or none (`fd -1`) when there is nothing to wait for: a
-/// closed pipe reports POLLHUP whatever `events` asks, which would spin the
-/// loop while the other direction is stuck (acs-wza).
-fn wait_for(fd: RawFd, events: libc::c_short) -> libc::pollfd {
-    sys::pollfd(if events == 0 { -1 } else { fd }, events)
-}
-
 fn relay_fds(
     master: UnixStream,
-    mut to_master: Vec<u8>,
+    to_master: Vec<u8>,
     input: RawFd,
     output: RawFd,
 ) -> io::Result<()> {
@@ -315,13 +358,16 @@ fn relay_fds(
     sys::set_nonblocking(input, true)?;
     sys::set_nonblocking(output, true)?;
     let m = master.as_raw_fd();
-    let mut to_client: Vec<u8> = Vec::new();
+    // Each direction writes straight through from `buf` and queues only
+    // what the other side would not take yet (acs-x6os).
+    let mut to_master = OutQueue::from(to_master);
+    let mut to_client = OutQueue::default();
     let mut buf = vec![0u8; 64 * 1024];
     let mut stdin_open = true;
     let limit = 1 << 20;
     loop {
         let mut fds = [
-            wait_for(
+            sys::wait_for(
                 input,
                 if stdin_open && to_master.len() < limit {
                     libc::POLLIN
@@ -329,7 +375,7 @@ fn relay_fds(
                     0
                 },
             ),
-            sys::pollfd(m, {
+            sys::wait_for(m, {
                 let mut ev = 0;
                 if to_client.len() < limit {
                     ev |= libc::POLLIN;
@@ -339,7 +385,7 @@ fn relay_fds(
                 }
                 ev
             }),
-            wait_for(
+            sys::wait_for(
                 output,
                 if to_client.is_empty() {
                     0
@@ -353,7 +399,7 @@ fn relay_fds(
         if fds[0].revents != 0 {
             match sys::read(input, &mut buf) {
                 Ok(0) => stdin_open = false,
-                Ok(n) => to_master.extend_from_slice(&buf[..n]),
+                Ok(n) => to_master.send(m, &buf[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => stdin_open = false,
             }
@@ -364,17 +410,17 @@ fn relay_fds(
                     // The master is done: deliver what it said, then leave.
                     return drain(output, &to_client);
                 }
-                Ok(n) => to_client.extend_from_slice(&buf[..n]),
+                Ok(n) => to_client.send(output, &buf[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => return drain(output, &to_client),
             }
         }
-        if flush(m, &mut to_master).is_err() {
+        if !to_master.flush(m) {
             // The master closed after its last words (an EXIT just read):
             // they still go to the client (acs-er6).
             return drain(output, &to_client);
         }
-        if flush(output, &mut to_client).is_err() {
+        if !to_client.flush(output) {
             // The client side is gone.
             return Ok(());
         }
@@ -386,63 +432,83 @@ fn relay_fds(
     }
 }
 
-fn flush(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
-    while !buf.is_empty() {
-        match sys::write(fd, buf) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => {
-                buf.drain(..n);
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
+fn drain(fd: RawFd, q: &OutQueue) -> io::Result<()> {
+    sys::write_all(fd, q.queued())
 }
 
-fn drain(fd: RawFd, buf: &[u8]) -> io::Result<()> {
-    sys::write_all(fd, buf)
-}
-
-/// `--list`: one STATUS_REPLY frame per live session.
-fn list(dir: &SocketDir) -> ExitCode {
-    if sys::write_all(STDOUT, proto::ready_line().as_bytes()).is_err() {
+/// `--list`: one STATUS_REPLY frame per live session, to `out`. When the
+/// sessions cannot be read an ERROR ends the list, so the client reports
+/// the failure instead of an empty host (acs-mum0): stderr alone reaches
+/// nobody, ssh hands it to a terminal the listing does not show.
+fn list(dir: &SocketDir, out: RawFd) -> ExitCode {
+    if sys::write_all(out, proto::ready_line().as_bytes()).is_err() {
         return ExitCode::from(1);
     }
-    match write_statuses(dir) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => fail(e),
+    match listed(dir, out) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(message) => fail(message),
     }
+}
+
+/// [`write_statuses`], with an ERROR to `out` when the sessions cannot be
+/// read, so the client reports that rather than an empty or cut-short list
+/// (acs-mum0 for `--list`, acs-5jrq for `--pick`). The error is returned
+/// too, for the proxy to end on.
+fn listed(dir: &SocketDir, out: RawFd) -> Result<Vec<proto::StatusInfo>, String> {
+    write_statuses(dir, out).map_err(|e| {
+        let message = format!("cannot list sessions: {e}");
+        let _ = sys::write_all(
+            out,
+            &Msg::Error {
+                code: err::INTERNAL,
+                message: message.clone(),
+            }
+            .to_bytes(),
+        );
+        message
+    })
 }
 
 /// The list for `--pick`: as `--list` sends it, then LIST_END, since the
 /// connection stays open. With `kill` (END_SESSION, the menu's `x`) that
 /// session is ended first, and an ERROR goes ahead of the list if it could
-/// not be.
-fn send_list(dir: &SocketDir, kill: Option<(&str, &str, bool)>) -> Result<(), String> {
-    let mut out = Vec::new();
+/// not be. Returns the sessions listed. When the sessions cannot be read
+/// an ERROR goes out instead of LIST_END and the pick ends: the client
+/// reports it rather than taking the silence for an empty host (acs-5jrq).
+fn send_list(
+    dir: &SocketDir,
+    kill: Option<(&str, &str, bool)>,
+    out: RawFd,
+) -> Result<Vec<proto::StatusInfo>, String> {
+    let mut first = Vec::new();
     if let Some(Err((code, message))) =
         kill.map(|(name, identity, force)| end_session(dir, name, identity, force))
     {
-        Msg::Error { code, message }.encode(&mut out);
+        Msg::Error { code, message }.encode(&mut first);
     }
-    sys::write_all(STDOUT, &out).map_err(|e| e.to_string())?;
-    write_statuses(dir)?;
-    sys::write_all(STDOUT, &Msg::ListEnd.to_bytes()).map_err(|e| e.to_string())
+    sys::write_all(out, &first).map_err(|e| e.to_string())?;
+    let sessions = listed(dir, out)?;
+    sys::write_all(out, &Msg::ListEnd.to_bytes()).map_err(|e| e.to_string())?;
+    Ok(sessions)
 }
 
 /// One STATUS_REPLY frame per live session; stale sockets are removed.
-fn write_statuses(dir: &SocketDir) -> Result<(), String> {
+/// Returns the sessions written.
+fn write_statuses(dir: &SocketDir, out: RawFd) -> Result<Vec<proto::StatusInfo>, String> {
     let names = dir
         .sessions()
         .map_err(|e| format!("{}: {e}", dir.path().display()))?;
+    let mut listed = Vec::new();
     for name in names {
         let Ok(path) = dir.socket_path(&name) else {
             continue;
         };
         match status_of(&path) {
-            Ok(info) => sys::write_all(STDOUT, &Msg::StatusReply(info).to_bytes())
-                .map_err(|e| e.to_string())?,
+            Ok(info) => {
+                sys::write_all(out, &Msg::StatusReply(info.clone()).to_bytes())
+                    .map_err(|e| e.to_string())?;
+                listed.push(info);
+            }
             Err(e) if refused(&e) => {
                 // Nobody listening: a master that died without cleaning up.
                 // Remove it only under the create lock, as a starting master
@@ -457,7 +523,7 @@ fn write_statuses(dir: &SocketDir) -> Result<(), String> {
             Err(_) => {}
         }
     }
-    Ok(())
+    Ok(listed)
 }
 
 /// How long END_SESSION waits for the session to end: the master's grace
@@ -500,8 +566,20 @@ fn end_session(
             Ok(0) => return Ok(()),
             Ok(n) => {
                 dec.push(&buf[..n]);
-                if let Ok(Some(Msg::Error { code, message })) = dec.next_msg() {
-                    return Err((code, message));
+                while let Ok(Some(m)) = dec.next_msg() {
+                    match m {
+                        Msg::Error { code, message } => return Err((code, message)),
+                        // Someone else is attached and the asker has not agreed
+                        // to take the session from them (acs-wwy0). The master
+                        // leaves this connection open for a forced retry, so
+                        // no EOF is coming: answer now, with who holds it,
+                        // rather than wait out KILL_WAIT and call it a timeout.
+                        Msg::Busy { identity, .. } => {
+                            let why = format!("is attached from {identity}, so it was not ended");
+                            return Err((err::BUSY, format!("session '{name}' {why}")));
+                        }
+                        _ => {}
+                    }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -591,12 +669,66 @@ mod tests {
             })
         );
         assert_eq!(p(&["--list"]), Ok(What::List));
-        assert_eq!(p(&["--pick"]), Ok(What::Pick));
+        assert_eq!(p(&["--pick"]), Ok(What::Pick { eager: false }));
+        assert_eq!(p(&["--pick", "--eager"]), Ok(What::Pick { eager: true }));
+        assert!(p(&["--eager", "--session", "a"]).is_err());
         // The menu ends sessions over its --pick connection now.
         assert!(p(&["--kill", "work"]).is_err());
         assert!(p(&["--session", "../x"]).is_err());
         assert!(p(&[]).is_err());
         assert!(p(&["--mode", "sideways", "--session", "a"]).is_err());
+    }
+
+    /// Regression (acs-x6os): a megabyte backed up behind a peer that reads
+    /// a few bytes at a time goes through whole and in order, now that the
+    /// relay writes from a cursor instead of moving everything still queued
+    /// down to the front after every partial write.
+    #[test]
+    fn a_backlog_drains_through_a_slow_peer_whole_and_in_order() {
+        use std::io::{Read, Write};
+        const TOTAL: usize = 4 << 20;
+        let sent: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        // A small send buffer, so that every write the relay makes to the
+        // slow peer is a partial one.
+        let size: libc::c_int = 2048;
+        for (fd, opt) in [
+            (ours.as_raw_fd(), libc::SO_SNDBUF),
+            (theirs.as_raw_fd(), libc::SO_RCVBUF),
+        ] {
+            // SAFETY: a valid socket and an int-sized option value.
+            let r = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    opt,
+                    &size as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(r, 0);
+        }
+        let (in_r, in_w) = sys::pipe().unwrap();
+        let (_out_r, out_w) = sys::pipe().unwrap();
+        let feed = sent.clone();
+        let writer = std::thread::spawn(move || {
+            std::fs::File::from(in_w).write_all(&feed).unwrap();
+        });
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::with_capacity(TOTAL);
+            let mut b = [0u8; 16];
+            while got.len() < TOTAL {
+                match theirs.read(&mut b).unwrap() {
+                    0 => break,
+                    n => got.extend_from_slice(&b[..n]),
+                }
+            }
+            got
+        });
+        relay_fds(ours, Vec::new(), in_r.as_raw_fd(), out_w.as_raw_fd()).unwrap();
+        writer.join().unwrap();
+        let got = reader.join().unwrap();
+        assert!(got == sent, "every byte, once, in order");
     }
 
     /// Regression (acs-er6): when the master says its last words (EXIT) and
@@ -623,5 +755,69 @@ mod tests {
         let mut got = Vec::new();
         std::fs::File::from(out_r).read_to_end(&mut got).unwrap();
         assert_eq!(got, exit);
+    }
+
+    /// Regression (acs-mum0): a host whose sessions cannot be read used to
+    /// end `--list` with nothing but a line on stderr, and the client took
+    /// the silence for an empty host. It must say so in an ERROR frame.
+    #[test]
+    fn list_reports_an_unreadable_socket_dir_in_an_error_frame() {
+        use std::io::Read;
+        let tmp = crate::testutil::TempDir::new();
+        let dir = SocketDir::open_at(tmp.path().join("s")).unwrap();
+        std::fs::remove_dir(dir.path()).unwrap();
+        let out_path = tmp.path().join("out");
+        let out = std::fs::File::create(&out_path).unwrap();
+        assert_eq!(list(&dir, out.as_raw_fd()), ExitCode::from(1));
+        drop(out);
+        let mut got = Vec::new();
+        std::fs::File::open(&out_path)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        let ready = proto::ready_line();
+        assert!(got.starts_with(ready.as_bytes()), "{got:?}");
+        let mut dec = Decoder::new();
+        dec.push(&got[ready.len()..]);
+        match dec.next_msg() {
+            Ok(Some(Msg::Error { code, message })) => {
+                assert_eq!(code, err::INTERNAL);
+                assert!(message.starts_with("cannot list sessions: "), "{message}");
+            }
+            other => panic!("expected an ERROR, got {other:?}"),
+        }
+        assert!(matches!(dec.next_msg(), Ok(None)));
+    }
+
+    /// Regression (acs-5jrq): the pick's list returned the error without a
+    /// frame, so the client saw the connection close with no LIST_END. It
+    /// must send an ERROR, and no LIST_END that would pass for an empty
+    /// host.
+    #[test]
+    fn send_list_reports_an_unreadable_socket_dir_in_an_error_frame() {
+        use std::io::Read;
+        let tmp = crate::testutil::TempDir::new();
+        let dir = SocketDir::open_at(tmp.path().join("s")).unwrap();
+        std::fs::remove_dir(dir.path()).unwrap();
+        let out_path = tmp.path().join("out");
+        let out = std::fs::File::create(&out_path).unwrap();
+        let failed = send_list(&dir, None, out.as_raw_fd()).unwrap_err();
+        assert!(failed.starts_with("cannot list sessions: "), "{failed}");
+        drop(out);
+        let mut got = Vec::new();
+        std::fs::File::open(&out_path)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        let mut dec = Decoder::new();
+        dec.push(&got);
+        match dec.next_msg() {
+            Ok(Some(Msg::Error { code, message })) => {
+                assert_eq!(code, err::INTERNAL);
+                assert_eq!(message, failed);
+            }
+            other => panic!("expected an ERROR, got {other:?}"),
+        }
+        assert!(matches!(dec.next_msg(), Ok(None)));
     }
 }

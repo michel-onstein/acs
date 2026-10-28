@@ -6,30 +6,49 @@
 
 mod common;
 
+use acs::timing::{told, Phase};
 use common::*;
 
 const ALIAS: &str = "aliases:\n  devbox:\n    - host: devbox.lan\n";
 
-const TICKER: &str = "i=0; while true; do i=$((i+1)); printf '#%d#\\n' $i; sleep 0.01; done";
-
 /// The phases `connection` told, in the order they were told.
-fn phases(text: &str, connection: &str) -> Vec<String> {
-    let tag = format!("acs: timing: {connection}: ");
-    text.split(tag.as_str())
-        .skip(1)
-        .map(|rest| {
-            let end = rest.find(" +").expect("a timing line has its step");
-            let tail = &rest[end..];
-            assert!(
-                tail.split(['\r', '\n'])
-                    .next()
-                    .unwrap()
-                    .ends_with(" ms total)"),
-                "{tail:?}"
-            );
-            rest[..end].to_string()
-        })
+fn phases<'a>(text: &'a str, connection: &str) -> Vec<&'a str> {
+    let all = told(text);
+    let lines = text.matches("acs: timing: ").count();
+    assert_eq!(
+        all.len(),
+        lines,
+        "a timing line that does not parse: {text:?}"
+    );
+    all.into_iter()
+        .filter(|t| t.what == connection)
+        .map(|t| t.phase)
         .collect()
+}
+
+/// DESIGN §7's list of phases, in its order: the `` - `<phase>` `` items
+/// under the bullet that names `timing::Phase`.
+fn design_phases(design: &str) -> Vec<String> {
+    let mut lines = design
+        .lines()
+        .skip_while(|l| !l.contains("`timing::Phase`"));
+    assert!(lines.next().is_some(), "DESIGN §7 names `timing::Phase`");
+    lines
+        .skip_while(|l| !l.starts_with("  - `"))
+        .take_while(|l| !l.is_empty() && l.starts_with("  "))
+        .filter_map(|l| l.strip_prefix("  - `"))
+        .map(|l| l.split('`').next().unwrap().to_string())
+        .collect()
+}
+
+/// acs-fb7r: the phases `-v` can tell are the ones DESIGN lists, in the
+/// same order — a phase added to `Phase` without the doc fails here.
+#[test]
+fn designs_list_of_phases_is_timing_phase() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let design = std::fs::read_to_string(root.join("docs/DESIGN.md")).unwrap();
+    let names: Vec<_> = Phase::ALL.iter().map(|p| p.name()).collect();
+    assert_eq!(design_phases(&design), names);
 }
 
 #[test]
@@ -37,14 +56,7 @@ fn the_first_connection_and_a_redial_tell_each_phase_in_order() {
     let remote = Remote::installed();
     let net = Net::new(&["devbox.lan"]);
     let mut env = net.env(ALIAS);
-    env.extend(
-        [
-            ("ACS_BACKOFF_MS", "100"),
-            ("ACS_PING_MS", "200"),
-            ("ACS_DEAD_MS", "800"),
-        ]
-        .map(|(k, v)| (k.to_string(), v.to_string())),
-    );
+    env.extend(FAST.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     let mut c = Client::start_env(
         &remote,
         &["-v", "devbox", "t", "--", "/bin/sh", "-c", TICKER],
@@ -83,11 +95,10 @@ fn the_first_connection_and_a_redial_tell_each_phase_in_order() {
     assert_eq!(phases(&c.text(), "first connection").len(), 6);
 }
 
-/// The menu's connection owes its whole greeting to `serve`: the proxy
-/// read the list's frames from it first (DESIGN 4.4), so nothing went
-/// ahead with the dial. `HELLO sent` is told where the greeting actually
-/// goes -- after the list, not between `ssh spawned` and `ACS-READY seen`
-/// as it is on a connection that greeted with its dial (acs-ftn).
+/// With a session detached, the HELLO that went ahead with the menu's dial
+/// (acs-xvg) is moot: the connection owes the greeting of the session the
+/// user picks to `serve`, and `HELLO sent` is told again where that goes
+/// -- after the list (acs-ftn).
 #[test]
 fn the_menus_connection_tells_the_session_list() {
     let remote = Remote::installed();
@@ -114,6 +125,7 @@ fn the_menus_connection_tells_the_session_list() {
         phases(&c.text(), "first connection"),
         [
             "ssh spawned",
+            "HELLO sent",
             "ACS-READY seen",
             "session list received",
             "HELLO sent",
@@ -123,6 +135,36 @@ fn the_menus_connection_tells_the_session_list() {
         "{:?}",
         c.text()
     );
+}
+
+/// acs-xvg: with nothing detached, plain `acs <host>` costs no round trip
+/// for the attach -- the HELLO went ahead with the dial, the proxy attached
+/// it on finding nothing detached, and the WELCOME follows the list with
+/// no second HELLO in between.
+#[test]
+fn with_nothing_detached_the_welcome_follows_the_list_without_a_second_hello() {
+    let remote = Remote::installed();
+    let mut c = Client::start(
+        &remote,
+        &["-v", "devbox", "--", "/bin/sh", "-c", "echo up; sleep 30"],
+    );
+    c.wait_for("timing: first connection: first output byte", T);
+    assert_eq!(
+        phases(&c.text(), "first connection"),
+        [
+            "ssh spawned",
+            "HELLO sent",
+            "ACS-READY seen",
+            "session list received",
+            "WELCOME received",
+            "first output byte",
+        ],
+        "{:?}",
+        c.text()
+    );
+    let text = c.text();
+    assert!(text.contains("new session 'main' on devbox"), "{text:?}");
+    assert!(text.contains("_proxy --pick --eager"), "{text:?}");
 }
 
 #[test]

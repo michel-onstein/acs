@@ -5,12 +5,11 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use acs::proto::{err, Marker, Mode, Msg, PROTO_VERSION};
-use acs::testutil::{hello, FrameConn, TempDir};
+use acs::proto::{err, Mode, Msg, PROTO_VERSION};
+use acs::testutil::{hello, hello_running, wait_idle, FrameConn, TempDir};
 
-/// As `common::T`, which this file cannot reach: generous, because the
-/// suite runs its targets in parallel (acs-kip).
-const T: Duration = Duration::from_secs(30);
+mod common;
+use common::{exe, T};
 
 struct Proxy {
     conn: FrameConn,
@@ -25,7 +24,16 @@ impl Drop for Proxy {
 }
 
 fn proxy(dir: &Path, args: &[&str]) -> Proxy {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_acs"))
+    proxy_in(dir, None, args)
+}
+
+/// [`proxy`] run from `cwd`, against which a relative `dir` resolves.
+fn proxy_in(dir: &Path, cwd: Option<&Path>, args: &[&str]) -> Proxy {
+    let mut cmd = Command::new(exe());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let mut child = cmd
         .arg("_proxy")
         .args(args)
         .env("ACS_SOCKET_DIR", dir)
@@ -34,11 +42,7 @@ fn proxy(dir: &Path, args: &[&str]) -> Proxy {
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
-    let mut conn = FrameConn::from_io(child.stdout.take().unwrap(), child.stdin.take().unwrap());
-    match conn.expect_marker(T) {
-        Some(Marker::Ready { proto, .. }) => assert_eq!(proto, PROTO_VERSION),
-        other => panic!("expected ACS-READY, got {other:?}"),
-    }
+    let conn = FrameConn::ready_over(&mut child);
     Proxy { conn, child }
 }
 
@@ -47,16 +51,7 @@ fn session(dir: &Path, name: &str) -> Proxy {
 }
 
 fn hello_cmd(name: &str, identity: &str, cmd: &str) -> Msg {
-    let mut h = hello(name, Mode::AttachOrCreate, identity);
-    h.command = vec!["/bin/sh".into(), "-c".into(), cmd.into()];
-    Msg::Hello(h)
-}
-
-fn welcome(p: &mut Proxy) -> acs::proto::Welcome {
-    match p.conn.recv_control(T) {
-        Some(Msg::Welcome(w)) => w,
-        other => panic!("expected WELCOME, got {other:?}"),
-    }
+    Msg::Hello(hello_running(name, identity, &["/bin/sh", "-c", cmd]))
 }
 
 /// Regression (acs-wza): after the client's side closes while its input is
@@ -70,7 +65,7 @@ fn a_closed_client_with_input_backed_up_does_not_spin_the_proxy() {
     // discards input past a full line instead of pushing back.
     p.conn
         .send(&hello_cmd("bp", "me", "stty raw -echo; sleep 30"));
-    let w = welcome(&mut p);
+    let w = p.conn.expect_welcome();
     std::thread::sleep(Duration::from_millis(200));
     let chunk = vec![b'x'; acs::proto::MAX_CHUNK];
     let mut seq = w.input_seq;
@@ -85,7 +80,10 @@ fn a_closed_client_with_input_backed_up_does_not_spin_the_proxy() {
     }
     std::thread::sleep(Duration::from_millis(300));
     p.conn.close_write();
-    std::thread::sleep(Duration::from_millis(200));
+    wait_idle(p.child.id(), "proxy");
+    // Once idle, it stays idle. An upper bound on CPU time, unlike one on
+    // wall time, is one load cannot push up: a starved process only gets
+    // less of the CPU. Load can only hide a spin, never invent one.
     let burnt = acs::testutil::cpu_over(p.child.id(), Duration::from_secs(1));
     assert!(
         burnt < Duration::from_millis(300),
@@ -119,20 +117,36 @@ fn creates_a_session_and_relays_both_ways() {
     let mut p = session(t.path(), "s");
     p.conn
         .send(&hello_cmd("s", "me", "read l; echo got:$l; exit 4"));
-    let w = welcome(&mut p);
+    let w = p.conn.expect_welcome();
     assert!(w.created);
     p.conn.send(&Msg::Input {
         seq: w.input_seq,
         bytes: b"hi\r".to_vec(),
     });
     p.conn.wait_output("got:hi", T);
-    match p.conn.recv_control(T) {
-        Some(Msg::Exit { status }) => assert_eq!(acs::sys::exit_code(status), 4),
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(acs::sys::exit_code(p.conn.expect_exit(T)), 4);
     // The master closed: the proxy follows.
     assert!(p.conn.closed(T));
     assert!(p.child.wait().unwrap().success());
+}
+
+/// Regression (acs-7nan): a relative `ACS_SOCKET_DIR` names one directory,
+/// taken from the proxy's working directory. The master runs from `/`, and
+/// used to be handed the relative path as it was, so it looked for `/rel`
+/// and the session could not start.
+#[test]
+fn a_relative_socket_dir_is_one_directory_for_proxy_and_master() {
+    let t = TempDir::new();
+    let mut p = proxy_in(
+        Path::new("rel"),
+        Some(t.path()),
+        &["--session", "r", "--mode", "attach-or-create"],
+    );
+    p.conn.send(&hello_cmd("r", "me", "echo up; exit 3"));
+    assert!(p.conn.expect_welcome().created);
+    p.conn.wait_output("up", T);
+    assert_eq!(acs::sys::exit_code(p.conn.expect_exit(T)), 3);
+    assert!(t.path().join("rel").is_dir());
 }
 
 /// Regression (acs-4w8): a frame that had only half arrived when the HELLO
@@ -151,16 +165,13 @@ fn a_frame_split_across_the_hello_hand_off_survives() {
     let cut = input.len() - 2;
     first.extend_from_slice(&input[..cut]);
     p.conn.send_raw(&first);
-    let w = welcome(&mut p);
+    let w = p.conn.expect_welcome();
     assert!(w.created);
     assert_eq!(w.input_seq, 0);
     // The rest of the frame, after the proxy handed over to the relay.
     p.conn.send_raw(&input[cut..]);
     p.conn.wait_output("got:hi", T);
-    match p.conn.recv_control(T) {
-        Some(Msg::Exit { status }) => assert_eq!(acs::sys::exit_code(status), 4),
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(acs::sys::exit_code(p.conn.expect_exit(T)), 4);
 }
 
 #[test]
@@ -171,7 +182,7 @@ fn stale_socket_is_replaced() {
     assert!(path.exists(), "a socket file with nobody listening");
     let mut p = session(t.path(), "st");
     p.conn.send(&hello_cmd("st", "me", "echo alive; sleep 30"));
-    assert!(welcome(&mut p).created);
+    assert!(p.conn.expect_welcome().created);
     p.conn.wait_output("alive", T);
 }
 
@@ -193,7 +204,7 @@ fn racing_proxies_converge_on_one_master() {
                         let mut h = hello("race", Mode::AttachOrCreate, &format!("me{i}"));
                         h.force = true;
                         p.conn.send(&Msg::Hello(h));
-                        welcome(&mut p)
+                        p.conn.expect_welcome()
                     }
                     other => panic!("{other:?}"),
                 };
@@ -247,7 +258,7 @@ fn new_sessions_get_increasing_numbers() {
         let mut h = hello("", Mode::Create, "me");
         h.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
         p.conn.send(&Msg::Hello(h));
-        let w = welcome(&mut p);
+        let w = p.conn.expect_welcome();
         assert!(w.created);
         names.push(w.session.clone());
         keep.push(p);
@@ -261,7 +272,7 @@ fn a_dropped_client_leaves_the_session_detached() {
     let mut p = session(t.path(), "dd");
     p.conn
         .send(&hello_cmd("dd", "alice@one", "echo up; sleep 30"));
-    welcome(&mut p);
+    p.conn.expect_welcome();
     p.conn.wait_output("up", T);
     // The ssh connection ends: the proxy's stdin closes.
     p.conn.close_write();
@@ -270,7 +281,7 @@ fn a_dropped_client_leaves_the_session_detached() {
     let mut q = session(t.path(), "dd");
     q.conn
         .send(&Msg::Hello(hello("dd", Mode::Attach, "bob@two")));
-    let w = welcome(&mut q);
+    let w = q.conn.expect_welcome();
     assert!(!w.created);
 }
 
@@ -303,11 +314,11 @@ fn pick_lists_ends_on_request_and_attaches_what_the_hello_names() {
     let t = TempDir::new();
     let mut a = session(t.path(), "a");
     a.conn.send(&hello_cmd("a", "me", "sleep 30"));
-    welcome(&mut a);
+    a.conn.expect_welcome();
     let mut b = session(t.path(), "b");
     b.conn
         .send(&hello_cmd("b", "me", "read l; echo got:$l; sleep 30"));
-    welcome(&mut b);
+    b.conn.expect_welcome();
     b.conn.close_write();
     assert!(b.conn.closed(T));
 
@@ -321,7 +332,7 @@ fn pick_lists_ends_on_request_and_attaches_what_the_hello_names() {
         force: false,
     });
     assert_eq!(names(&pick_list(&mut p)), ["b"]);
-    assert!(matches!(a.conn.recv_control(T), Some(Msg::Exit { .. })));
+    a.conn.expect_exit(T);
     assert!(!t.path().join("a.sock").exists());
     // Ending one that is not there says so, and lists again.
     p.conn.send(&Msg::EndSession {
@@ -338,7 +349,7 @@ fn pick_lists_ends_on_request_and_attaches_what_the_hello_names() {
 
     p.conn
         .send(&Msg::Hello(hello("b", Mode::AttachOrCreate, "me")));
-    let w = welcome(&mut p);
+    let w = p.conn.expect_welcome();
     assert_eq!(w.session, "b");
     assert!(!w.created);
     p.conn.send(&Msg::Input {
@@ -348,13 +359,49 @@ fn pick_lists_ends_on_request_and_attaches_what_the_hello_names() {
     p.conn.wait_output("got:hi", T);
 }
 
+/// Regression (acs-wwy0): ending a session another identity is attached
+/// to, without forcing it, answers at once with who holds it. The master
+/// answers BUSY and keeps the connection open for a forced retry, so the
+/// proxy used to wait out its 10 s KILL_WAIT and report a timeout.
+///
+/// "At once" is the answer's content, not a stopwatch (acs-ci9u): the BUSY
+/// with its holder's name comes only from the master's BUSY, and waiting
+/// out KILL_WAIT ends in a timeout error instead, so a 5 s bound — which a
+/// starved host can reach without the bug — said nothing the match below
+/// does not.
+#[test]
+fn ending_a_session_someone_else_holds_names_them_at_once() {
+    let t = TempDir::new();
+    let mut a = session(t.path(), "a");
+    a.conn.send(&hello_cmd("a", "alice@laptop", "sleep 30"));
+    a.conn.expect_welcome();
+
+    let mut p = proxy(t.path(), &["--pick"]);
+    assert_eq!(names(&pick_list(&mut p)), ["a"]);
+    p.conn.send(&Msg::EndSession {
+        name: "a".into(),
+        identity: "bob@desk".into(),
+        force: false,
+    });
+    let answer = pick_list(&mut p);
+    assert!(
+        matches!(&answer[..], [Msg::Error { code, message }, Msg::StatusReply(s)]
+            if *code == err::BUSY
+                && message == "session 'a' is attached from alice@laptop, so it was not ended"
+                && s.name == "a" && s.attached),
+        "{answer:?}"
+    );
+    // Alice was not told anything: no EXIT, no TAKEOVER.
+    assert!(a.conn.recv_control(Duration::from_millis(300)).is_none());
+}
+
 #[test]
 fn pick_creates_a_session_by_name_or_a_new_numbered_one() {
     let t = TempDir::new();
     let mut p = proxy(t.path(), &["--pick"]);
     assert!(pick_list(&mut p).is_empty());
     p.conn.send(&hello_cmd("main", "me", "sleep 30"));
-    let w = welcome(&mut p);
+    let w = p.conn.expect_welcome();
     assert_eq!((w.session.as_str(), w.created), ("main", true));
 
     // An empty name with Create: the lowest free number, as --new.
@@ -363,7 +410,7 @@ fn pick_creates_a_session_by_name_or_a_new_numbered_one() {
     let mut h = hello("", Mode::Create, "me");
     h.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
     q.conn.send(&Msg::Hello(h));
-    let w = welcome(&mut q);
+    let w = q.conn.expect_welcome();
     assert_eq!((w.session.as_str(), w.created), ("1", true));
 }
 
@@ -410,4 +457,130 @@ fn leaving_the_pick_closes_the_connection_and_starts_nothing() {
         .filter(|e| e.path().extension().is_some_and(|x| x == "sock"))
         .collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// `--pick --eager` (acs-xvg): the client's HELLO goes ahead with the dial
+/// and, with nothing detached, the proxy attaches it at once — the WELCOME
+/// follows the list with no second request from the client.
+#[test]
+fn an_eager_pick_with_nothing_detached_attaches_the_hello_sent_ahead() {
+    let t = TempDir::new();
+    let mut p = proxy(t.path(), &["--pick", "--eager"]);
+    p.conn
+        .send(&hello_cmd("main", "me", "read l; echo got:$l; sleep 30"));
+    assert!(pick_list(&mut p).is_empty());
+    let w = p.conn.expect_welcome();
+    assert_eq!((w.session.as_str(), w.created), ("main", true));
+    p.conn.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"hi\r".to_vec(),
+    });
+    p.conn.wait_output("got:hi", T);
+
+    // `main` is attached, so nothing is detached and the name is taken: a
+    // new numbered session, as the client names it from the same list.
+    let mut q = proxy(t.path(), &["--pick", "--eager"]);
+    q.conn.send(&hello_cmd("main", "me", "sleep 30"));
+    let listed = pick_list(&mut q);
+    assert!(
+        matches!(&listed[..], [Msg::StatusReply(s)] if s.name == "main" && s.attached),
+        "{listed:?}"
+    );
+    let w = q.conn.expect_welcome();
+    assert_eq!((w.session.as_str(), w.created), ("1", true));
+}
+
+/// `--pick --eager` with a session detached: the HELLO sent ahead is moot,
+/// and the menu goes on as without `--eager` — nothing attached until the
+/// HELLO of the session the user picks.
+#[test]
+fn an_eager_pick_with_a_session_detached_waits_for_the_menu() {
+    let t = TempDir::new();
+    let mut a = session(t.path(), "a");
+    a.conn
+        .send(&hello_cmd("a", "me", "read l; echo got:$l; sleep 30"));
+    a.conn.expect_welcome();
+    a.conn.close_write();
+    assert!(a.conn.closed(T));
+
+    let mut p = proxy(t.path(), &["--pick", "--eager"]);
+    p.conn.send(&hello_cmd("main", "me", "sleep 30"));
+    assert_eq!(names(&pick_list(&mut p)), ["a"]);
+    assert!(
+        p.conn.recv(Duration::from_millis(300)).is_none(),
+        "nothing attached before the user picks"
+    );
+    assert!(!t.path().join("main.sock").exists());
+    p.conn
+        .send(&Msg::Hello(hello("a", Mode::AttachOrCreate, "me")));
+    let w = p.conn.expect_welcome();
+    assert_eq!((w.session.as_str(), w.created), ("a", false));
+    p.conn.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"hi\r".to_vec(),
+    });
+    p.conn.wait_output("got:hi", T);
+}
+
+#[test]
+fn an_eager_pick_wants_the_hello_first() {
+    let t = TempDir::new();
+    let mut p = proxy(t.path(), &["--pick", "--eager"]);
+    p.conn.send(&Msg::EndSession {
+        name: "a".into(),
+        identity: "me".into(),
+        force: false,
+    });
+    assert!(pick_list(&mut p).is_empty());
+    match p.conn.recv_control(T) {
+        Some(Msg::Error { code, message }) => {
+            assert_eq!(code, err::BAD_REQUEST, "{message}");
+            assert!(message.contains("expected the HELLO first"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(p.conn.closed(T));
+}
+
+/// Regression (acs-1cco): a frame other than HELLO was named in the ERROR
+/// by its `Debug` form, so an INPUT of a whole frame's worth of bytes made
+/// an ERROR of several MiB — too large for the client to decode, which
+/// reported a bad frame instead of the reason. The ERROR names the frame
+/// type, on every path that wants a HELLO first.
+#[test]
+fn a_full_size_frame_before_the_hello_is_refused_by_name() {
+    let big = Msg::Input {
+        seq: 0,
+        bytes: vec![0; acs::proto::MAX_FRAME - 8],
+    };
+    for (args, why) in [
+        (
+            &["--session", "a", "--mode", "attach-or-create"][..],
+            "expected HELLO, got INPUT",
+        ),
+        (&["--pick"][..], "expected HELLO or END_SESSION, got INPUT"),
+        (
+            &["--pick", "--eager"][..],
+            "expected the HELLO first, got INPUT",
+        ),
+    ] {
+        let t = TempDir::new();
+        let mut p = proxy(t.path(), args);
+        p.conn.send(&big);
+        // The menu's list goes out first; what follows it is the answer.
+        let answer = loop {
+            match p.conn.recv_control(T) {
+                Some(Msg::StatusReply(_) | Msg::ListEnd) => continue,
+                other => break other,
+            }
+        };
+        match answer {
+            Some(Msg::Error { code, message }) => {
+                assert_eq!(code, err::BAD_REQUEST, "{args:?}: {message}");
+                assert_eq!(message, why, "{args:?}");
+            }
+            other => panic!("{args:?}: {:?}", other.map(|m| m.kind())),
+        }
+        assert!(p.conn.closed(T), "{args:?}");
+    }
 }

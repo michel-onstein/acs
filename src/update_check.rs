@@ -120,9 +120,7 @@ pub fn state_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|h| !h.is_empty())
-                .map(|h| PathBuf::from(h).join(".local/state"))
+            crate::sys::env_nonempty("HOME").map(|h| PathBuf::from(h).join(".local/state"))
         })?;
     Some(base.join("acs/update-check"))
 }
@@ -139,13 +137,8 @@ fn write(path: &Path, s: &State) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    // Unpredictable, and created by us or not at all (acs-721).
-    let tmp = dir.join(format!(".update-check.{}", crate::sys::random_token()));
-    let written = crate::sys::create_new(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, s.format().as_bytes()));
-    if written.is_ok() && std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    // Ours alone to read, whatever the umask (acs-g4uc).
+    let _ = crate::sys::write_atomic(path, 0o600, s.format().as_bytes());
 }
 
 /// Whether checking is turned off.
@@ -207,11 +200,12 @@ pub fn check_main() -> ExitCode {
     let Some(path) = state_path() else {
         return ExitCode::from(1);
     };
-    let tmp = std::env::temp_dir().join(format!("acs-update-check.{}", crate::sys::random_token()));
-    if std::fs::create_dir(&tmp).is_err() {
+    // Private, as `acs upgrade`'s is: SHA256SUMS is verified and then
+    // re-read by path (acs-3sae).
+    let Ok(tmp) = crate::upgrade::scratch_dir("acs-update-check") else {
         return ExitCode::from(1);
-    }
-    let target = release::archive_target(crate::payload::OWN_TARGET);
+    };
+    let target = release::own_archive_target();
     // This check only reads SHA256SUMS to compare version numbers: it
     // downloads nothing and runs nothing, so the scheme is not load-bearing
     // here and a plain mirror is allowed (acs-95w). `acs upgrade`, which

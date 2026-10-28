@@ -1,6 +1,8 @@
 //! End-to-end over real ssh against a container host (acs-5v9.24). Run by
-//! `scripts/e2e_ssh.sh`, which starts the host and sets `ACS_E2E_*`;
-//! skipped otherwise.
+//! `scripts/e2e_ssh.sh`, which starts the host, sets `ACS_E2E_*` and passes
+//! `--include-ignored`. Every test is `#[ignore]`, so a plain `cargo test`
+//! counts them as ignored rather than passing them unrun (acs-hdj4), and one
+//! asked for without the host fails instead of returning early.
 //!
 //! The tests run one at a time in name order, and `e2e_01` must be first
 //! (it checks the first-contact install), so numbers are zero-padded:
@@ -20,14 +22,20 @@ struct Host {
     container: String,
 }
 
-fn host() -> Option<Host> {
-    let v = |k: &str| std::env::var(k).ok();
-    Some(Host {
-        client: v("ACS_E2E_CLIENT")?,
-        key: v("ACS_E2E_KEY")?,
-        port: v("ACS_E2E_PORT")?,
-        container: v("ACS_E2E_CONTAINER")?,
-    })
+/// The host `scripts/e2e_ssh.sh` started. A test only gets here when it was
+/// asked for by name or with `--include-ignored`, so a missing variable is a
+/// failure, not a reason to pass without running.
+fn host() -> Host {
+    let v = |k: &str| {
+        std::env::var(k)
+            .unwrap_or_else(|_| panic!("{k} is not set: this test runs under scripts/e2e_ssh.sh"))
+    };
+    Host {
+        client: v("ACS_E2E_CLIENT"),
+        key: v("ACS_E2E_KEY"),
+        port: v("ACS_E2E_PORT"),
+        container: v("ACS_E2E_CONTAINER"),
+    }
 }
 
 impl Host {
@@ -55,8 +63,12 @@ impl Host {
     }
 
     fn client(&self, session: &str, cmd: &str, env: &[(&str, &str)]) -> Client {
+        self.client_as("dev", session, cmd, env)
+    }
+
+    fn client_as(&self, user: &str, session: &str, cmd: &str, env: &[(&str, &str)]) -> Client {
         let mut args = self.ssh_args();
-        args.push("dev@127.0.0.1".into());
+        args.push(format!("{user}@127.0.0.1"));
         args.push(session.into());
         if !cmd.is_empty() {
             args.extend(["--", "/bin/sh", "-c", cmd].map(String::from));
@@ -68,6 +80,20 @@ impl Host {
     fn docker(&self, args: &[&str]) {
         let st = Command::new("docker").args(args).status().unwrap();
         assert!(st.success(), "docker {args:?}");
+    }
+
+    /// `sh -c script` in the container, as root; its stdout.
+    fn root_sh(&self, script: &str) -> String {
+        let out = Command::new("docker")
+            .args(["exec", &self.container, "sh", "-c", script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "in the container: {script}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 }
 
@@ -102,22 +128,17 @@ fn greeting(port: u16) -> Option<String> {
 
 /// [`greeting`], waiting for the forward to be bound and carrying bytes.
 fn wait_greeting(port: u16, timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(g) = greeting(port) {
-            return g;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "nothing answered on 127.0.0.1:{port} within {timeout:?}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    poll(
+        timeout,
+        || greeting(port),
+        || format!("nothing answered on 127.0.0.1:{port} within {timeout:?}"),
+    )
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_01_first_contact_installs_and_attaches() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client("first", "echo up-and-running; sleep 60", &[]);
     c.wait_for("installing acs", T);
     c.wait_for("(Linux aarch64)", T);
@@ -130,8 +151,9 @@ fn e2e_01_first_contact_installs_and_attaches() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_02_identity_file_is_required() {
-    let Some(h) = host() else { return };
+    let h = host();
     // Same options but no -i: this host only accepts the generated key.
     let args = [
         "-F",
@@ -155,8 +177,9 @@ fn e2e_02_identity_file_is_required() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_03_vim_uses_the_alternate_screen_and_exits_cleanly() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client("vim", "vim -u NONE -N", &[]);
     c.wait_for("\x1b[?1049h", T);
     std::thread::sleep(Duration::from_millis(500));
@@ -168,8 +191,9 @@ fn e2e_03_vim_uses_the_alternate_screen_and_exits_cleanly() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_04_osc52_and_hyperlinks_pass_through_verbatim() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client(
         "osc",
         "printf '\\033]52;c;aGVsbG8=\\007\\033]8;;https://x.test\\033\\\\link\\033]8;;\\033\\\\'; echo; echo done; sleep 30",
@@ -186,8 +210,9 @@ fn e2e_04_osc52_and_hyperlinks_pass_through_verbatim() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_05_kitty_keyboard_protocol_command_key() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client("kitty", "printf '\\033[>1u'; echo kitty-on; sleep 60", &[]);
     c.wait_for("kitty-on", T);
     c.send(b"\x1b[93;5u\x1b[93;5ud");
@@ -197,8 +222,9 @@ fn e2e_05_kitty_keyboard_protocol_command_key() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_06_mouse_reports_reach_the_program() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client(
         "mouse",
         "stty raw -echo; printf '\\033[?1000h'; echo mouse-on; od -An -tx1 -N 6",
@@ -221,8 +247,9 @@ fn e2e_06_mouse_reports_reach_the_program() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_07_killed_connection_resumes_without_loss() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client("drop", TICKER, &[("ACS_BACKOFF_MS", "300")]);
     c.wait_for("#30#", T);
     // Kill the sshd process serving the session (not the listener).
@@ -244,8 +271,9 @@ fn e2e_07_killed_connection_resumes_without_loss() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_08_frozen_host_is_detected_and_resumed() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut c = h.client(
         "freeze",
         TICKER,
@@ -271,8 +299,9 @@ fn e2e_08_frozen_host_is_detected_and_resumed() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_09_list_shows_the_sessions() {
-    let Some(h) = host() else { return };
+    let h = host();
     let mut args = vec!["list".to_string()];
     args.extend(h.ssh_args());
     args.push("dev@127.0.0.1".into());
@@ -292,8 +321,9 @@ fn e2e_09_list_shows_the_sessions() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_09b_list_without_a_host_asks_every_alias() {
-    let Some(h) = host() else { return };
+    let h = host();
     // `box` is the container; `gone` is a documentation address no ping
     // reaches.
     let dir = acs::testutil::TempDir::new();
@@ -328,8 +358,9 @@ fn e2e_09b_list_without_a_host_asks_every_alias() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_10_user_at_alias_logs_in_as_that_user() {
-    let Some(h) = host() else { return };
+    let h = host();
     // The entry's own user has no key on the host: only the override works.
     let cfg = acs::testutil::TempDir::new();
     let env = config_env(
@@ -350,8 +381,9 @@ fn e2e_10_user_at_alias_logs_in_as_that_user() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_11_identity_file_from_the_configuration() {
-    let Some(h) = host() else { return };
+    let h = host();
     // The key only under a HOME of our own, reached as ~/.ssh/id_box: acs
     // expands the ~. `keyed` names it on its host entry, over a missing
     // alias key; `plain` names it for the whole alias. No -i is given.
@@ -413,12 +445,10 @@ fn e2e_11_identity_file_from_the_configuration() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_12_ctrl_l_after_a_reattach_and_a_resume() {
-    let Some(h) = host() else { return };
-    // Every byte the program receives, as `in:xx`.
-    let reporter = "stty raw -echo; echo ready; \
-        while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1); printf 'in:%s\\n' $b; done";
-    let mut c = h.client("redraw", reporter, &[]);
+    let h = host();
+    let mut c = h.client("redraw", REPORTER, &[]);
     c.wait_for("ready", T);
     c.send(b"z");
     c.wait_for("in:7a", T);
@@ -444,9 +474,9 @@ fn e2e_12_ctrl_l_after_a_reattach_and_a_resume() {
 }
 
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
-    let Some(h) = host() else { return };
-    let echo = |name: &str| format!("echo ready-{name}; while read l; do echo got-{name}:$l; done");
+    let h = host();
     for name in ["menu-a", "menu-b"] {
         let mut c = h.client(name, &echo(name), &[]);
         c.wait_for(&format!("ready-{name}"), T);
@@ -461,26 +491,15 @@ fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
     c.wait_for("\x1b[?1049h", T);
     c.wait_for("acs: detached sessions on dev@127.0.0.1", T);
     c.wait_for("menu-b ", T);
-    // The number of a session's row, from the last screen drawn.
-    let row = |c: &Client, name: &str| -> usize {
-        let text = c.text();
-        let screen = &text[text.rfind("\x1b[Hacs: ").unwrap()..];
-        let line = screen
-            .split("\r\n")
-            .find(|l| l.contains(&format!(" {name} ")))
-            .unwrap_or_else(|| panic!("no {name} in {screen:?}"));
-        let line = line.trim_start_matches("\x1b[7m");
-        line[2..3].parse().unwrap()
-    };
     // End menu-b: the cursor down to it, x, y.
-    let b = row(&c, "menu-b");
+    let b = menu_row(&c, "menu-b");
     c.send(&vec![b'j'; b - 1]);
     c.send(b"x");
     c.wait_for("end session 'menu-b'?", T);
     c.send(b"y");
     c.wait_for("session 'menu-b' ended", T);
     // Attach menu-a by its number.
-    let a = row(&c, "menu-a");
+    let a = menu_row(&c, "menu-a");
     c.send(a.to_string().as_bytes());
     c.wait_for("\x1b[?1049l", T);
     c.wait_for("\x1b[H\x1b[J", T);
@@ -507,8 +526,9 @@ fn e2e_13_plain_host_picks_a_detached_session_from_the_menu() {
 /// it. The container's sshd is set to `AllowTcpForwarding yes` for it
 /// (scripts/e2e/Dockerfile) — Alpine ships `no`.
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_14_a_local_forward_is_the_session_connections_alone() {
-    let Some(h) = host() else { return };
+    let h = host();
     let port = free_port();
     // Back to the container's own sshd, so what comes out of the forward is
     // the host's real banner rather than something the test planted.
@@ -593,11 +613,12 @@ fn one_socket(dir: &std::path::Path) -> std::path::PathBuf {
     found.pop().unwrap()
 }
 
-/// `acs: timing: <what>: <phase> … (N ms total)` out of a client's output.
-fn total_ms(text: &str, what: &str, phase: &str) -> Option<u64> {
-    let head = format!("timing: {what}: {phase} ");
-    let line = text.lines().find(|l| l.contains(&head))?;
-    line.split('(').nth(1)?.split(' ').next()?.parse().ok()
+/// The total of `what`'s first `phase` timing line in a client's output.
+fn total_ms(text: &str, what: &str, phase: acs::timing::Phase) -> Option<u64> {
+    acs::timing::told(text)
+        .into_iter()
+        .find(|t| t.what == what && t.phase == phase.name())
+        .map(|t| t.total_ms)
 }
 
 /// acs-9n3, over real ssh — the one thing a fake transport cannot test.
@@ -608,9 +629,10 @@ fn total_ms(text: &str, what: &str, phase: &str) -> Option<u64> {
 /// link takes the master down with it, because the master's own connection
 /// is the one that failed.
 #[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
 fn e2e_15_a_shared_master_carries_the_second_connection_and_dies_with_the_link() {
     use std::os::unix::fs::PermissionsExt;
-    let Some(h) = host() else { return };
+    let h = host();
     let dir = acs::testutil::TempDir::new();
     let mux = dir.path().join("mux");
     let dir_s = mux.to_str().unwrap().to_string();
@@ -679,8 +701,8 @@ fn e2e_15_a_shared_master_carries_the_second_connection_and_dies_with_the_link()
         "a second master was started instead of the first being used"
     );
 
-    let cold = total_ms(&first, "first connection", "ACS-READY seen");
-    let warm = total_ms(&second, "first connection", "ACS-READY seen");
+    let cold = total_ms(&first, "first connection", acs::timing::Phase::ReadySeen);
+    let warm = total_ms(&second, "first connection", acs::timing::Phase::ReadySeen);
     eprintln!("MEASURED handshake to ACS-READY: cold {cold:?} ms, on the master {warm:?} ms");
     assert!(cold.is_some() && warm.is_some(), "{first}\n---\n{second}");
 
@@ -711,5 +733,180 @@ fn e2e_15_a_shared_master_carries_the_second_connection_and_dies_with_the_link()
     eprintln!(
         "VERIFIED shared ssh master over ssh: {pid} carried the reattach, \
          socket 0600 in a 0700 directory, ended with the lost link"
+    );
+}
+
+/// The system-wide install alone (acs-1gy): `solo` has nothing under its
+/// `$HOME`, and root has put this version at `/usr/local/lib/acs/<v>/acs`,
+/// as an administrator following DESIGN §8 would. The dial must attach on
+/// root's copy with no first-contact install and leave no second copy
+/// behind. The binary is the Linux build from this same `dist/`, so the test
+/// does not lean on `e2e_01` having installed one for `dev`.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn e2e_16_the_system_wide_install_alone_attaches_without_installing() {
+    let h = host();
+    let v = acs::VERSION;
+    let arch = h.root_sh("uname -m").trim().to_string();
+    let linux = std::path::Path::new(&h.client)
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .join(format!("{arch}-unknown-linux-musl/acs"));
+    assert!(linux.is_file(), "no Linux build for the host at {linux:?}");
+    let system = format!("/usr/local/lib/acs/{v}");
+    h.root_sh(&format!("mkdir -p {system}"));
+    h.docker(&[
+        "cp",
+        linux.to_str().unwrap(),
+        &format!("{}:{system}/acs", h.container),
+    ]);
+    // Root's, and writable by nobody else: what the prelude accepts.
+    h.root_sh(&format!(
+        "chown -R root:root /usr/local/lib/acs \
+         && chmod 755 /usr/local/lib/acs {system} {system}/acs"
+    ));
+    let own = "ls -A /home/solo/.local/share/acs /home/solo/.local/bin 2>/dev/null; true";
+    assert_eq!(
+        h.root_sh(own).trim(),
+        "",
+        "solo starts with an acs of its own"
+    );
+
+    let mut c = h.client_as("solo", "sys", "echo \"up-as-$(id -un)\"; sleep 60", &[]);
+    c.wait_for("up-as-solo", T);
+    // The prelude `exec`s the binary it picked as the proxy, so the path it
+    // picked is in solo's process list.
+    let ps = h.root_sh("ps -o user,args");
+    assert!(
+        ps.lines()
+            .any(|l| l.trim_start().starts_with("solo")
+                && l.contains(&format!("{system}/acs _proxy"))),
+        "no process of solo's runs {system}/acs:\n{ps}"
+    );
+    c.send(&command(b'x'));
+    c.wait(T);
+    let text = c.text();
+    assert!(!text.contains("installing acs"), "{text}");
+    assert!(!text.contains("installed acs"), "{text}");
+    // No second copy and no `~/.local/bin` link; and the proxy's version
+    // housekeeping, which only ever touches the user's own versions
+    // directory, made none either.
+    assert_eq!(h.root_sh(own).trim(), "", "solo got an acs of its own");
+    eprintln!("VERIFIED the system-wide install alone attaches over ssh, installing nothing");
+}
+
+/// acs-hmv, over real ssh: `acs list` over every alias joins the master a
+/// session has up — `ControlMaster=no` on acs's socket — and starts none;
+/// the session on that master keeps streaming through the listings; and
+/// the time a listing takes is measured on the master and off it.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn e2e_17_a_listing_over_every_alias_joins_the_master_a_session_has_up() {
+    let h = host();
+    let dir = acs::testutil::TempDir::new();
+    let mux = dir.path().join("mux");
+    let mux_s = mux.to_str().unwrap().to_string();
+    let mut env = config_env(
+        dir.path(),
+        "aliases:\n  box:\n    - host: 127.0.0.1\n      user: dev\n",
+    );
+    env.extend([
+        ("ACS_CONTROL_DIR".to_string(), mux_s.clone()),
+        ("ACS_CONTROL_PERSIST".to_string(), "300".to_string()),
+        ("ACS_NO_UPDATE_CHECK".to_string(), "1".to_string()),
+        (
+            "ACS_GLOBAL_CONFIG".to_string(),
+            format!("{NO_CONFIG}/global.yaml"),
+        ),
+    ]);
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let check = |sock: &std::path::Path| -> Option<String> {
+        let mut args = vec!["-o".to_string(), format!("ControlPath={}", sock.display())];
+        args.extend(h.ssh_args());
+        args.extend(["-O", "check", "--", "dev@127.0.0.1"].map(String::from));
+        let out = Command::new("ssh").args(&args).output().unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stderr).trim().to_string())
+    };
+    // One listing; how long it took, and what it said under -v.
+    let list = |persist: &str| -> (u128, String, String) {
+        let mut args = vec!["list".to_string(), "-v".into()];
+        args.extend(h.ssh_args());
+        let start = Instant::now();
+        let out = Command::new(&h.client)
+            .args(&args)
+            .envs(env_refs.iter().copied())
+            .env("ACS_CONTROL_PERSIST", persist)
+            .output()
+            .unwrap();
+        let ms = start.elapsed().as_millis();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{text}{err}");
+        (ms, text, err)
+    };
+
+    // No master yet: the listing starts none.
+    let (_, _, err) = list("300");
+    assert!(!err.contains("ControlPath="), "{err}");
+    assert!(
+        std::fs::read_dir(&mux).map_or(0, |d| d.count()) == 0,
+        "a listing left a socket"
+    );
+
+    // A session, attached and streaming, which starts the master.
+    let mut c = h.client("hmv", TICKER, &env_refs);
+    c.wait_for("#10#", T);
+    let sock = one_socket(&mux);
+    let pid = check(&sock).expect("no master under the session");
+
+    let mut on = Vec::new();
+    let mut off = Vec::new();
+    for _ in 0..5 {
+        let (ms, text, err) = list("300");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("box ") && l.contains(" hmv ")),
+            "{text}{err}"
+        );
+        assert!(err.contains("ControlMaster=no"), "{err}");
+        assert!(
+            err.contains(&format!("ControlPath={}", sock.display())),
+            "{err}"
+        );
+        assert!(!err.contains("ControlMaster=auto"), "{err}");
+        assert!(!err.contains("did not answer"), "{err}");
+        on.push(ms);
+        // The same listing on a connection of its own.
+        let (ms, _, err) = list("0");
+        assert!(!err.contains(&sock.display().to_string()), "{err}");
+        off.push(ms);
+    }
+    on.sort();
+    off.sort();
+    eprintln!(
+        "MEASURED acs list over every alias: on the master {on:?} ms, own connection {off:?} ms (median {} vs {})",
+        on[2], off[2]
+    );
+
+    // The master is the one the session started, and still the only one;
+    // the session streamed straight through every listing.
+    assert_eq!(check(&sock).as_deref(), Some(&pid[..]));
+    assert_eq!(one_socket(&mux), sock);
+    let last = *numbers(&c.text()).last().unwrap();
+    c.wait_for(&format!("#{}#", last + 20), T);
+    assert_consecutive(&c.text());
+    assert!(!c.text().contains("connection lost"), "{}", c.text());
+
+    c.send(&command(b'x'));
+    c.wait(T);
+    let mut args = vec!["-o".to_string(), format!("ControlPath={}", sock.display())];
+    args.extend(h.ssh_args());
+    args.extend(["-O", "exit", "--", "dev@127.0.0.1"].map(String::from));
+    let _ = Command::new("ssh").args(&args).output();
+    eprintln!(
+        "VERIFIED acs list over every alias joins the session's master ({pid}) and starts none"
     );
 }

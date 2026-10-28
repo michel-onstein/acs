@@ -17,7 +17,7 @@ use crate::yaml::{self, Node, Value};
 
 /// Where a value came from: a file and line, for `acs config show` and error
 /// messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Origin {
     pub file: PathBuf,
     pub line: usize,
@@ -25,7 +25,22 @@ pub struct Origin {
 
 impl std::fmt::Display for Origin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.file.display(), self.line)
+        write!(f, "{}", self.file.display())?;
+        // Line 0 is a value an edit added, not yet in the file (acs-5mmu).
+        if self.line > 0 {
+            write!(f, ":{}", self.line)?;
+        }
+        Ok(())
+    }
+}
+
+/// ` (line N)` after a message about a node, or nothing for one an edit
+/// added (acs-5mmu).
+fn on_line(line: usize) -> String {
+    if line == 0 {
+        String::new()
+    } else {
+        format!(" (line {line})")
     }
 }
 
@@ -79,8 +94,8 @@ impl HostEntry {
 }
 
 /// An alias (DESIGN §7.3): its entries in the order they are tried, and
-/// what they share.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// what they share. Its own settings are rows of [`SETTINGS`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Alias {
     pub name: String,
     pub entries: Vec<HostEntry>,
@@ -92,6 +107,9 @@ pub struct Alias {
     /// How long to wait for the hosts' pings; `None` leaves it to the
     /// global setting.
     pub reachability_timeout: Option<Setting<Duration>>,
+    /// Check the hosts by connecting to their ssh port rather than pinging
+    /// them (acs-fbes); `None` leaves it to the global setting.
+    pub reachability_tcp: Option<Setting<bool>>,
     /// Keep waiting for a lost host; `None` leaves it to the global
     /// setting.
     pub persist: Option<Setting<bool>>,
@@ -123,6 +141,9 @@ pub struct Config {
     /// How long an alias's hosts have to answer a ping (default 0.5 s;
     /// DESIGN §7.3).
     pub reachability_timeout: Setting<Duration>,
+    /// Check an alias's hosts by connecting to their ssh port rather than
+    /// pinging them (default false; acs-fbes, DESIGN §7.3).
+    pub reachability_tcp: Setting<bool>,
     /// Keep waiting for a lost host, dialling once it answers a ping
     /// (default false; DESIGN §5.3).
     pub persist: Setting<bool>,
@@ -148,6 +169,7 @@ impl Default for Config {
             command_bell: Setting::default(true),
             redraw_on_reconnect: Setting::default(true),
             reachability_timeout: Setting::default(DEFAULT_REACHABILITY_TIMEOUT),
+            reachability_tcp: Setting::default(false),
             persist: Setting::default(false),
             prefer_local_network: Setting::default(false),
             reachability_interval: Setting::default(DEFAULT_REACHABILITY_INTERVAL),
@@ -158,29 +180,230 @@ impl Default for Config {
     }
 }
 
-/// Every top-level setting, for error messages and `acs config`.
-pub const KEYS: &[&str] = &[
-    "install_on_remote",
-    "update_check",
-    "command_bell",
-    "redraw_on_reconnect",
-    "reachability_timeout",
-    "persist",
-    "reachability_interval",
-    "prefer_local_network",
-    "local_forwards",
-    "aliases",
+/// What a setting holds, and so how a file, `acs config set` and `acs
+/// config show` spell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `true` or `false`.
+    Bool,
+    /// A duration within these bounds: see [`parse_duration`].
+    Duration { min: Duration, max: Duration },
+    /// `-L` forwards: see [`parse_forwards`].
+    Forwards,
+    /// A file path, kept as written.
+    Path,
+}
+
+/// A setting's value, of whichever [`Kind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Val {
+    Bool(bool),
+    Duration(Duration),
+    Forwards(Vec<String>),
+    Path(String),
+}
+
+/// A type a setting is stored as.
+pub trait Kinded: Sized {
+    fn val(&self) -> Val;
+    /// `v` as this type; the table gives each field the kind of its type.
+    fn of(v: Val) -> Self;
+}
+
+macro_rules! kinded {
+    ($t:ty, $v:ident, $own:expr) => {
+        impl Kinded for $t {
+            fn val(&self) -> Val {
+                Val::$v($own(self))
+            }
+            fn of(v: Val) -> $t {
+                match v {
+                    Val::$v(x) => x,
+                    _ => unreachable!("a setting of another kind"),
+                }
+            }
+        }
+    };
+}
+kinded!(bool, Bool, |b: &bool| *b);
+kinded!(Duration, Duration, |d: &Duration| *d);
+kinded!(Vec<String>, Forwards, Vec::clone);
+kinded!(String, Path, String::clone);
+
+/// Where a setting is kept: always set (a top-level one, defaulted) or
+/// maybe (an alias's own).
+pub trait Slot {
+    /// The value and where it is from; `None` when not set.
+    fn get(&self) -> Option<(Val, Option<Origin>)>;
+    fn set(&mut self, value: Val, origin: Option<Origin>);
+}
+
+impl<T: Kinded> Slot for Setting<T> {
+    fn get(&self) -> Option<(Val, Option<Origin>)> {
+        Some((self.value.val(), self.origin.clone()))
+    }
+    fn set(&mut self, value: Val, origin: Option<Origin>) {
+        *self = Setting {
+            value: T::of(value),
+            origin,
+        }
+    }
+}
+
+impl<T: Kinded> Slot for Option<Setting<T>> {
+    fn get(&self) -> Option<(Val, Option<Origin>)> {
+        self.as_ref()?.get()
+    }
+    fn set(&mut self, value: Val, origin: Option<Origin>) {
+        *self = Some(Setting {
+            value: T::of(value),
+            origin,
+        })
+    }
+}
+
+/// A setting's field in a [`Config`] or an [`Alias`].
+pub struct Field<T> {
+    pub get: fn(&T) -> &dyn Slot,
+    pub get_mut: fn(&mut T) -> &mut dyn Slot,
+}
+
+/// One row of [`SETTINGS`].
+pub struct Def {
+    pub key: &'static str,
+    pub kind: Kind,
+    /// The top-level setting, if it is one.
+    pub global: Option<Field<Config>>,
+    /// The alias's own setting (over the top-level one), if an alias has
+    /// one.
+    pub alias: Option<Field<Alias>>,
+}
+
+macro_rules! field {
+    ($f:ident) => {
+        Some(Field {
+            get: |s| &s.$f,
+            get_mut: |s| &mut s.$f,
+        })
+    };
+}
+
+/// Every setting of the file but the aliases' hosts, in the order messages
+/// list them: what reads a file, `acs config get|set|unset|show` and `acs
+/// config host set|unset` all go by this table (DESIGN §7.2, §7.4). A new
+/// setting is a row here, its field in [`Config`] and/or [`Alias`] (with
+/// its default in `Config::default`), and its line in `config_cmd::USAGE`.
+pub const SETTINGS: &[Def] = &[
+    Def {
+        key: "identity_file",
+        kind: Kind::Path,
+        global: None,
+        alias: field!(identity_file),
+    },
+    Def {
+        key: "install_on_remote",
+        kind: Kind::Bool,
+        global: field!(install_on_remote),
+        alias: None,
+    },
+    Def {
+        key: "update_check",
+        kind: Kind::Bool,
+        global: field!(update_check),
+        alias: None,
+    },
+    Def {
+        key: "command_bell",
+        kind: Kind::Bool,
+        global: field!(command_bell),
+        alias: None,
+    },
+    Def {
+        key: "redraw_on_reconnect",
+        kind: Kind::Bool,
+        global: field!(redraw_on_reconnect),
+        alias: field!(redraw_on_reconnect),
+    },
+    Def {
+        key: "reachability_timeout",
+        kind: Kind::Duration {
+            min: MIN_REACHABILITY_TIMEOUT,
+            max: MAX_REACHABILITY_TIMEOUT,
+        },
+        global: field!(reachability_timeout),
+        alias: field!(reachability_timeout),
+    },
+    Def {
+        key: "reachability_tcp",
+        kind: Kind::Bool,
+        global: field!(reachability_tcp),
+        alias: field!(reachability_tcp),
+    },
+    Def {
+        key: "persist",
+        kind: Kind::Bool,
+        global: field!(persist),
+        alias: field!(persist),
+    },
+    Def {
+        key: "reachability_interval",
+        kind: Kind::Duration {
+            min: MIN_REACHABILITY_INTERVAL,
+            max: MAX_REACHABILITY_INTERVAL,
+        },
+        global: field!(reachability_interval),
+        alias: field!(reachability_interval),
+    },
+    Def {
+        key: "prefer_local_network",
+        kind: Kind::Bool,
+        global: field!(prefer_local_network),
+        alias: field!(prefer_local_network),
+    },
+    // Checked when the file is read, once, rather than by ssh on every
+    // dial (acs-odd, DESIGN §7.1): a bad spec is a configuration error
+    // naming its line, not ssh stderr mid-reconnect.
+    Def {
+        key: "local_forwards",
+        kind: Kind::Forwards,
+        global: field!(local_forwards),
+        alias: field!(local_forwards),
+    },
 ];
 
-/// The settings that are true or false.
-pub const BOOLS: &[&str] = &[
-    "install_on_remote",
-    "update_check",
-    "command_bell",
-    "redraw_on_reconnect",
-    "persist",
-    "prefer_local_network",
-];
+/// The row of setting `key`.
+pub fn setting(key: &str) -> Option<&'static Def> {
+    SETTINGS.iter().find(|d| d.key == key)
+}
+
+/// The top-level settings, in order.
+pub fn globals() -> impl Iterator<Item = &'static Def> {
+    SETTINGS.iter().filter(|d| d.global.is_some())
+}
+
+/// The settings an alias has of its own, in order.
+pub fn alias_settings() -> impl Iterator<Item = &'static Def> {
+    SETTINGS.iter().filter(|d| d.alias.is_some())
+}
+
+/// `defs`' keys then `last`, joined for a message.
+pub fn key_list(defs: impl Iterator<Item = &'static Def>, last: &str) -> String {
+    let mut keys: Vec<&str> = defs.map(|d| d.key).collect();
+    keys.extend(Some(last).filter(|l| !l.is_empty()));
+    keys.join(", ")
+}
+
+impl Def {
+    /// This setting's value in a file.
+    pub fn read(&self, n: &Node) -> Result<Val, String> {
+        match self.kind {
+            Kind::Bool => bool_value(n).map(Val::Bool),
+            Kind::Duration { min, max } => duration_value(n, min, max).map(Val::Duration),
+            Kind::Forwards => forwards_value(n).map(Val::Forwards),
+            Kind::Path => path_value(n).map(Val::Path),
+        }
+    }
+}
 
 /// Every key of a host entry.
 pub const HOST_KEYS: &[&str] = &[
@@ -193,29 +416,6 @@ pub const HOST_KEYS: &[&str] = &[
     "local_networks",
 ];
 
-/// Every key of an alias written as a mapping (`devbox: {identity_file: …,
-/// hosts: […]}`) rather than as its list of hosts.
-pub const ALIAS_KEYS: &[&str] = &[
-    "identity_file",
-    "redraw_on_reconnect",
-    "reachability_timeout",
-    "persist",
-    "reachability_interval",
-    "prefer_local_network",
-    "local_forwards",
-    "hosts",
-];
-
-/// The alias settings that are true or false.
-pub const ALIAS_BOOLS: &[&str] = &["redraw_on_reconnect", "persist", "prefer_local_network"];
-
-/// The settings, global or an alias's, that are a duration.
-pub const DURATIONS: &[&str] = &["reachability_timeout", "reachability_interval"];
-
-/// The settings, global or an alias's, that are a list of `-L` forwards
-/// (acs-odd).
-pub const FORWARDS: &[&str] = &["local_forwards"];
-
 /// The value that spells "no forward at all" wherever a `local_forwards` is
 /// taken — in a file, in `acs config set`, and as `-L none` on the command
 /// line. A forward spec can never be this word, so nothing is shadowed.
@@ -223,6 +423,9 @@ pub const NO_FORWARDS: &str = "none";
 
 /// `reachability_timeout` when nothing sets it.
 pub const DEFAULT_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The shortest `reachability_timeout`.
+pub const MIN_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// The longest `reachability_timeout`: a minute is already far past any
 /// ping worth waiting for.
@@ -239,24 +442,33 @@ pub const MAX_REACHABILITY_INTERVAL: Duration = Duration::from_secs(3600);
 /// The global file: `/etc/acs/config.yaml` (`ACS_GLOBAL_CONFIG` overrides it,
 /// for packagers and tests).
 pub fn global_path() -> PathBuf {
-    std::env::var_os("ACS_GLOBAL_CONFIG")
-        .filter(|v| !v.is_empty())
+    crate::sys::env_nonempty("ACS_GLOBAL_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/etc/acs/config.yaml"))
 }
 
 /// The local file: `$XDG_CONFIG_HOME/acs/config.yaml`, or
 /// `~/.config/acs/config.yaml` when that is unset or relative (as the XDG
-/// Base Directory spec says).
+/// Base Directory spec says). `None` when neither gives an absolute
+/// directory (no `XDG_CONFIG_HOME` and `HOME` unset, empty or relative):
+/// a path joined onto nothing would name a different file in every working
+/// directory (acs-36l0).
+pub fn local_file() -> Option<PathBuf> {
+    let absolute = |var| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    absolute("XDG_CONFIG_HOME")
+        .or_else(|| absolute("HOME").map(|h| h.join(".config")))
+        .map(|base| base.join("acs/config.yaml"))
+}
+
+/// The local file as a message names it: [`local_file`], or
+/// `~/.config/acs/config.yaml` when there is no home to put it in. For
+/// messages only — never read or written.
 pub fn local_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".config")
-        });
-    base.join("acs/config.yaml")
+    local_file().unwrap_or_else(|| PathBuf::from("~/.config/acs/config.yaml"))
 }
 
 /// Read a file into a document; `Ok(None)` if it does not exist.
@@ -274,14 +486,27 @@ pub fn read_doc(path: &Path) -> Result<Option<yaml::Document>, String> {
 impl Config {
     /// The global then the local file.
     pub fn load() -> Result<Config, String> {
-        Config::load_files(&[global_path(), local_path()])
+        // With no home there is no local file to read: just the global one.
+        let files: Vec<PathBuf> = std::iter::once(global_path()).chain(local_file()).collect();
+        Config::load_files(&files)
     }
 
     /// Read `files` in order; later ones override earlier ones.
     pub fn load_files(files: &[PathBuf]) -> Result<Config, String> {
+        let docs: Vec<_> = files.iter().map(|f| read_doc(f)).collect();
+        Config::merge(files, &docs)
+    }
+
+    /// [`Config::load_files`] over files already read with [`read_doc`],
+    /// so an edit that needs the merge parses neither again (acs-siqo).
+    /// The first error in file order wins.
+    pub fn merge(
+        files: &[PathBuf],
+        docs: &[Result<Option<yaml::Document>, String>],
+    ) -> Result<Config, String> {
         let mut c = Config::default();
-        for f in files {
-            if let Some(doc) = read_doc(f)? {
+        for (f, d) in files.iter().zip(docs) {
+            if let Some(doc) = d.as_ref().map_err(Clone::clone)? {
                 c.apply(f, &doc.root)?;
                 c.files.push(f.clone());
             }
@@ -324,33 +549,14 @@ impl Config {
             if node.value == Value::Null {
                 continue;
             }
+            if let Some((d, f)) = setting(key).and_then(|d| Some((d, d.global.as_ref()?))) {
+                let value = d
+                    .read(node)
+                    .map_err(|e| fail(node, format!("{key}: {e}")))?;
+                (f.get_mut)(self).set(value, Some(at(node)));
+                continue;
+            }
             match key.as_str() {
-                k if BOOLS.contains(&k) => {
-                    let value = bool_value(node).map_err(|e| fail(node, format!("{key}: {e}")))?;
-                    *self.bool_mut(k).expect("a bool setting") = Setting {
-                        value,
-                        origin: Some(at(node)),
-                    }
-                }
-                k if DURATIONS.contains(&k) => {
-                    let value =
-                        duration_value(k, node).map_err(|e| fail(node, format!("{key}: {e}")))?;
-                    *self.duration_mut(k).expect("a duration setting") = Setting {
-                        value,
-                        origin: Some(at(node)),
-                    }
-                }
-                // Checked here, once, rather than by ssh on every dial
-                // (acs-odd, DESIGN §7.1): a bad spec is a configuration
-                // error naming its line, not ssh stderr mid-reconnect.
-                k if FORWARDS.contains(&k) => {
-                    let value =
-                        forwards_value(node).map_err(|e| fail(node, format!("{key}: {e}")))?;
-                    self.local_forwards = Setting {
-                        value,
-                        origin: Some(at(node)),
-                    }
-                }
                 "aliases" => {
                     let aliases = node.value.map().ok_or_else(|| {
                         fail(
@@ -363,28 +569,11 @@ impl Config {
                     })?;
                     for (name, n) in aliases {
                         validate_alias(name).map_err(|e| fail(n, e))?;
-                        let (entries, settings) = alias_parts(name, n, &at)?;
-                        let i = match self.hosts.iter().position(|a| a.name == *name) {
-                            Some(i) => i,
-                            None => {
-                                self.hosts.push(Alias {
-                                    name: name.clone(),
-                                    entries: Vec::new(),
-                                    identity_file: None,
-                                    redraw_on_reconnect: None,
-                                    reachability_timeout: None,
-                                    persist: None,
-                                    prefer_local_network: None,
-                                    reachability_interval: None,
-                                    local_forwards: None,
-                                    origin: at(n),
-                                });
-                                self.hosts.len() - 1
-                            }
-                        };
-                        let alias = &mut self.hosts[i];
-                        alias.entries.extend(entries);
-                        settings.merge_into(alias);
+                        let new = alias_parts(name, n, &at)?;
+                        match self.hosts.iter_mut().find(|a| a.name == *name) {
+                            Some(alias) => alias.merge(new),
+                            None => self.hosts.push(new),
+                        }
                     }
                 }
                 // Renamed (acs-msy): say so rather than call it unknown.
@@ -397,54 +586,15 @@ impl Config {
                 other => {
                     return Err(fail(
                         node,
-                        format!("unknown setting '{other}' (known: {})", KEYS.join(", ")),
+                        format!(
+                            "unknown setting '{other}' (known: {})",
+                            key_list(globals(), "aliases")
+                        ),
                     ))
                 }
             }
         }
         Ok(())
-    }
-
-    /// A true-or-false setting by name.
-    pub fn bool_setting(&self, key: &str) -> Option<&Setting<bool>> {
-        match key {
-            "install_on_remote" => Some(&self.install_on_remote),
-            "update_check" => Some(&self.update_check),
-            "command_bell" => Some(&self.command_bell),
-            "redraw_on_reconnect" => Some(&self.redraw_on_reconnect),
-            "persist" => Some(&self.persist),
-            "prefer_local_network" => Some(&self.prefer_local_network),
-            _ => None,
-        }
-    }
-
-    fn bool_mut(&mut self, key: &str) -> Option<&mut Setting<bool>> {
-        match key {
-            "install_on_remote" => Some(&mut self.install_on_remote),
-            "update_check" => Some(&mut self.update_check),
-            "command_bell" => Some(&mut self.command_bell),
-            "redraw_on_reconnect" => Some(&mut self.redraw_on_reconnect),
-            "persist" => Some(&mut self.persist),
-            "prefer_local_network" => Some(&mut self.prefer_local_network),
-            _ => None,
-        }
-    }
-
-    /// A duration setting by name.
-    pub fn duration_setting(&self, key: &str) -> Option<&Setting<Duration>> {
-        match key {
-            "reachability_timeout" => Some(&self.reachability_timeout),
-            "reachability_interval" => Some(&self.reachability_interval),
-            _ => None,
-        }
-    }
-
-    fn duration_mut(&mut self, key: &str) -> Option<&mut Setting<Duration>> {
-        match key {
-            "reachability_timeout" => Some(&mut self.reachability_timeout),
-            "reachability_interval" => Some(&mut self.reachability_interval),
-            _ => None,
-        }
     }
 
     /// The alias called `name`, if there is one.
@@ -496,6 +646,15 @@ impl Config {
             .unwrap_or(&self.persist)
     }
 
+    /// `reachability_tcp` for `alias`: its own setting, else the global
+    /// one.
+    pub fn reachability_tcp_for<'a>(&'a self, alias: &'a Alias) -> &'a Setting<bool> {
+        alias
+            .reachability_tcp
+            .as_ref()
+            .unwrap_or(&self.reachability_tcp)
+    }
+
     /// `prefer_local_network` for `alias`: its own setting, else the global
     /// one.
     pub fn prefer_local_network_for<'a>(&'a self, alias: &'a Alias) -> &'a Setting<bool> {
@@ -516,13 +675,19 @@ impl Config {
     }
 }
 
+/// Whether `name` can go where ssh takes a host or a login name: not
+/// empty, and no `@`, space or control character. The one rule for an
+/// alias, a host and a user (a host and an alias may not start with `-`
+/// either).
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('@')
+        && !name.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// An alias is used where a host name goes: no `@`, spaces or leading `-`.
 pub fn validate_alias(alias: &str) -> Result<(), String> {
-    if alias.is_empty()
-        || alias.starts_with('-')
-        || alias.contains('@')
-        || alias.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
+    if !plain_name(alias) || alias.starts_with('-') {
         return Err(format!(
             "bad alias name '{alias}' (no '@', spaces or leading '-')"
         ));
@@ -530,15 +695,21 @@ pub fn validate_alias(alias: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `true` or `false` (YAML 1.2, any case).
+/// `true` or `false`, in any case (YAML 1.2), as a file and `acs config
+/// set` both take it.
+pub fn parse_bool(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// A true-or-false node: see [`parse_bool`].
 pub fn bool_value(n: &Node) -> Result<bool, String> {
     match &n.value {
         Value::Scalar(s) if s.style == yaml::Style::Plain => {
-            match s.text.to_ascii_lowercase().as_str() {
-                "true" => Ok(true),
-                "false" => Ok(false),
-                _ => Err(format!("expected true or false, found '{}'", s.text)),
-            }
+            parse_bool(&s.text).ok_or_else(|| format!("expected true or false, found '{}'", s.text))
         }
         Value::Scalar(s) => Err(format!(
             "expected true or false, found the string \"{}\"",
@@ -549,9 +720,9 @@ pub fn bool_value(n: &Node) -> Result<bool, String> {
 }
 
 /// A duration setting's node: see [`parse_duration`].
-fn duration_value(key: &str, n: &Node) -> Result<Duration, String> {
+fn duration_value(n: &Node, min: Duration, max: Duration) -> Result<Duration, String> {
     match &n.value {
-        Value::Scalar(s) => parse_duration(key, &s.text),
+        Value::Scalar(s) => parse_duration(&s.text, min, max),
         other => Err(format!(
             "expected a duration such as 500ms or 2s, found {}",
             other.kind()
@@ -561,23 +732,14 @@ fn duration_value(key: &str, n: &Node) -> Result<Duration, String> {
 
 /// A `reachability_timeout`: see [`parse_duration`].
 pub fn parse_timeout(text: &str) -> Result<Duration, String> {
-    parse_duration("reachability_timeout", text)
+    parse_duration(text, MIN_REACHABILITY_TIMEOUT, MAX_REACHABILITY_TIMEOUT)
 }
 
-/// The least and the most each duration setting takes.
-fn duration_bounds(key: &str) -> (Duration, Duration) {
-    match key {
-        "reachability_interval" => (MIN_REACHABILITY_INTERVAL, MAX_REACHABILITY_INTERVAL),
-        _ => (Duration::from_millis(1), MAX_REACHABILITY_TIMEOUT),
-    }
-}
-
-/// Duration setting `key` as `500ms`, `0.5s`, `2s`, or a bare number of
-/// seconds (`0.5`); to the millisecond, within the setting's bounds
-/// (`reachability_timeout`: 1 ms to a minute; `reachability_interval`:
-/// 100 ms to an hour).
-pub fn parse_duration(key: &str, text: &str) -> Result<Duration, String> {
-    let (min, max) = duration_bounds(key);
+/// A duration as `500ms`, `0.5s`, `2s`, or a bare number of seconds
+/// (`0.5`); to the millisecond, within the setting's bounds from
+/// [`SETTINGS`] (`reachability_timeout`: 1 ms to a minute;
+/// `reachability_interval`: 100 ms to an hour).
+pub fn parse_duration(text: &str, min: Duration, max: Duration) -> Result<Duration, String> {
     let bad = || format!("expected a duration such as 500ms or 2s, found '{text}'");
     let t = text.trim();
     let (number, scale) = match t.strip_suffix("ms") {
@@ -666,11 +828,11 @@ fn forwards_value(n: &Node) -> Result<Vec<String>, String> {
             .map(|i| match &i.value {
                 Value::Scalar(s) => crate::ssh::check_local_forward(&s.text)
                     .map(|()| s.text.clone())
-                    .map_err(|e| format!("{e} (line {})", i.line)),
+                    .map_err(|e| format!("{e}{}", on_line(i.line))),
                 other => Err(format!(
-                    "expected a forward such as 8080:localhost:80, found {} (line {})",
+                    "expected a forward such as 8080:localhost:80, found {}{}",
                     other.kind(),
-                    i.line
+                    on_line(i.line)
                 )),
             })
             .collect(),
@@ -707,132 +869,84 @@ fn string_value(n: &Node) -> Result<String, String> {
 /// `~` or `~/…` with `$HOME`, as the shell expands a `-i` typed on the
 /// command line; anything else (`~user/…` too) as is, for ssh to expand.
 pub fn expand_home(path: &str) -> String {
-    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
+    let home = crate::sys::env_nonempty("HOME").and_then(|h| h.into_string().ok());
     match (home, path.strip_prefix('~')) {
         (Some(h), Some(rest)) if rest.is_empty() || rest.starts_with('/') => format!("{h}{rest}"),
         _ => path.to_string(),
     }
 }
 
-/// An `identity_file` value: a path, kept as written (`~` is expanded where
-/// it is used); `None` for an empty value.
-fn identity_file(
-    n: &Node,
-    at: &dyn Fn(&Node) -> Origin,
-) -> Result<Option<Setting<String>>, String> {
+/// A path, kept as written (`~` is expanded where it is used).
+fn path_value(n: &Node) -> Result<String, String> {
     match &n.value {
-        Value::Null => Ok(None),
         Value::Scalar(s) if !s.text.is_empty() && !s.text.chars().any(char::is_control) => {
-            Ok(Some(Setting {
-                value: s.text.clone(),
-                origin: Some(at(n)),
-            }))
+            Ok(s.text.clone())
         }
         Value::Scalar(_) => Err("expected a file path, found an empty string".into()),
         other => Err(format!("expected a file path, found {}", other.kind())),
     }
 }
 
-/// The settings one file gives an alias of its own (DESIGN §7.2); `None`
-/// where it gives none.
-#[derive(Default)]
-struct AliasSettings {
-    identity_file: Option<Setting<String>>,
-    redraw_on_reconnect: Option<Setting<bool>>,
-    reachability_timeout: Option<Setting<Duration>>,
-    persist: Option<Setting<bool>>,
-    reachability_interval: Option<Setting<Duration>>,
-    prefer_local_network: Option<Setting<bool>>,
-    local_forwards: Option<Setting<Vec<String>>>,
+/// A host entry's `identity_file`: see [`path_value`]; `None` for an empty
+/// value.
+fn identity_file(
+    n: &Node,
+    at: &dyn Fn(&Node) -> Origin,
+) -> Result<Option<Setting<String>>, String> {
+    if n.value == Value::Null {
+        return Ok(None);
+    }
+    path_value(n).map(|value| {
+        Some(Setting {
+            value,
+            origin: Some(at(n)),
+        })
+    })
 }
 
-impl AliasSettings {
-    fn bool_mut(&mut self, key: &str) -> &mut Option<Setting<bool>> {
-        match key {
-            "redraw_on_reconnect" => &mut self.redraw_on_reconnect,
-            "persist" => &mut self.persist,
-            "prefer_local_network" => &mut self.prefer_local_network,
-            other => unreachable!("not an alias bool: {other}"),
-        }
-    }
-
-    fn duration_mut(&mut self, key: &str) -> &mut Option<Setting<Duration>> {
-        match key {
-            "reachability_timeout" => &mut self.reachability_timeout,
-            "reachability_interval" => &mut self.reachability_interval,
-            other => unreachable!("not a duration: {other}"),
-        }
-    }
-
-    /// Set on `alias` what this file sets; the rest stays as it was.
-    fn merge_into(self, alias: &mut Alias) {
-        fn over<T>(to: &mut Option<T>, from: Option<T>) {
-            if from.is_some() {
-                *to = from;
+impl Alias {
+    /// Merge another file's part of this alias over it: its hosts after
+    /// these, and the settings it sets over these (DESIGN §7.2).
+    fn merge(&mut self, mut from: Alias) {
+        self.entries.append(&mut from.entries);
+        for f in alias_settings().filter_map(|d| d.alias.as_ref()) {
+            if let Some((value, origin)) = (f.get)(&from).get() {
+                (f.get_mut)(self).set(value, origin);
             }
         }
-        over(&mut alias.identity_file, self.identity_file);
-        over(&mut alias.redraw_on_reconnect, self.redraw_on_reconnect);
-        over(&mut alias.reachability_timeout, self.reachability_timeout);
-        over(&mut alias.persist, self.persist);
-        over(&mut alias.prefer_local_network, self.prefer_local_network);
-        over(&mut alias.reachability_interval, self.reachability_interval);
-        over(&mut alias.local_forwards, self.local_forwards);
     }
 }
 
-/// One file's entries and settings for `hosts.<name>`: a list of entries,
-/// one entry without the list, or a mapping of the alias's settings and its
-/// `hosts` (which another file may supply instead).
-fn alias_parts(
-    name: &str,
-    node: &Node,
-    at: &dyn Fn(&Node) -> Origin,
-) -> Result<(Vec<HostEntry>, AliasSettings), String> {
+/// One file's part of `aliases.<name>`: a list of entries, one entry
+/// without the list, or a mapping of the alias's settings and its `hosts`
+/// (which another file may supply instead).
+fn alias_parts(name: &str, node: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<Alias, String> {
     let fail = |n: &Node, msg: String| format!("{}: aliases.{name}: {msg}", at(n));
-    let mut settings = AliasSettings::default();
+    let mut alias = Alias {
+        name: name.to_string(),
+        origin: at(node),
+        ..Alias::default()
+    };
     let list = match &node.value {
         Value::Map(m) if !m.iter().any(|(k, _)| k == "host") => {
             let mut list = None;
             for (k, v) in m {
-                match k.as_str() {
-                    "hosts" => list = Some(v).filter(|v| v.value != Value::Null),
-                    "identity_file" => {
-                        settings.identity_file = identity_file(v, at)
-                            .map_err(|e| fail(v, format!("identity_file: {e}")))?
+                if k == "hosts" {
+                    list = Some(v).filter(|v| v.value != Value::Null);
+                    continue;
+                }
+                match setting(k).and_then(|d| Some((d, d.alias.as_ref()?))) {
+                    Some(_) if v.value == Value::Null => {}
+                    Some((d, f)) => {
+                        let value = d.read(v).map_err(|e| fail(v, format!("{k}: {e}")))?;
+                        (f.get_mut)(&mut alias).set(value, Some(at(v)));
                     }
-                    k if (ALIAS_BOOLS.contains(&k)
-                        || DURATIONS.contains(&k)
-                        || FORWARDS.contains(&k))
-                        && v.value == Value::Null => {}
-                    k if ALIAS_BOOLS.contains(&k) => {
-                        let value = bool_value(v).map_err(|e| fail(v, format!("{k}: {e}")))?;
-                        *settings.bool_mut(k) = Some(Setting {
-                            value,
-                            origin: Some(at(v)),
-                        })
-                    }
-                    k if DURATIONS.contains(&k) => {
-                        let value =
-                            duration_value(k, v).map_err(|e| fail(v, format!("{k}: {e}")))?;
-                        *settings.duration_mut(k) = Some(Setting {
-                            value,
-                            origin: Some(at(v)),
-                        })
-                    }
-                    k if FORWARDS.contains(&k) => {
-                        let value = forwards_value(v).map_err(|e| fail(v, format!("{k}: {e}")))?;
-                        settings.local_forwards = Some(Setting {
-                            value,
-                            origin: Some(at(v)),
-                        })
-                    }
-                    other => {
+                    None => {
                         return Err(fail(
                             v,
                             format!(
-                                "unknown key '{other}' (an alias takes {}; a single host entry needs 'host: <name>')",
-                                ALIAS_KEYS.join(", ")
+                                "unknown key '{k}' (an alias takes {}; a single host entry needs 'host: <name>')",
+                                key_list(alias_settings(), "hosts")
                             ),
                         ))
                     }
@@ -840,7 +954,7 @@ fn alias_parts(
             }
             match list {
                 Some(l) => l,
-                None => return Ok((Vec::new(), settings)),
+                None => return Ok(alias),
             }
         }
         _ => node,
@@ -858,19 +972,20 @@ fn alias_parts(
             ))
         }
     };
-    let mut entries = Vec::new();
     for item in items {
-        entries.push(host_entry(item, at).map_err(|e| fail(item, e))?);
+        alias
+            .entries
+            .push(host_entry(item, at).map_err(|e| fail(item, e))?);
     }
-    if entries.is_empty() {
+    if alias.entries.is_empty() {
         return Err(fail(list, "no hosts listed".into()));
     }
-    Ok((entries, settings))
+    Ok(alias)
 }
 
 /// Name the field (and its line) in an error about its value.
 fn field<T>(key: &str, n: &Node, r: Result<T, String>) -> Result<T, String> {
-    r.map_err(|e| format!("{key}: {e} (line {})", n.line))
+    r.map_err(|e| format!("{key}: {e}{}", on_line(n.line)))
 }
 
 fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, String> {
@@ -891,7 +1006,7 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
         match k.as_str() {
             "host" => {
                 let h = field(k, v, string_value(v))?;
-                if h.starts_with('-') || h.contains('@') || h.chars().any(char::is_whitespace) {
+                if h.starts_with('-') || !plain_name(&h) {
                     return Err(format!(
                         "host: bad host name '{h}' (put a login name in 'user')"
                     ));
@@ -901,7 +1016,7 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
             "user" => {
                 if v.value != Value::Null {
                     let u = field(k, v, string_value(v))?;
-                    if u.contains('@') || u.chars().any(char::is_whitespace) {
+                    if !plain_name(&u) {
                         return Err(format!("user: bad login name '{u}'"));
                     }
                     user = Some(u);
@@ -1044,7 +1159,7 @@ mod tests {
             ),
             (
                 "x: 1\n",
-                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards, aliases)",
+                ":1: unknown setting 'x' (known: install_on_remote, update_check, command_bell, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, aliases)",
             ),
             ("aliases: [a]\n", ":1: aliases: expected a mapping"),
             // acs-9yv: a bad network on a host entry, and the setting's
@@ -1110,6 +1225,35 @@ mod tests {
             let e = load("", src).unwrap_err();
             assert!(e.contains("local.yaml") && e.contains(want), "{src:?}: {e}");
         }
+    }
+
+    /// acs-gydj: an alias, a host and a login name share one rule; a host
+    /// or a user with a control character in it was let through to ssh,
+    /// where an alias with one was refused.
+    #[test]
+    fn alias_host_and_user_names_share_one_rule() {
+        for (src, want) in [
+            (
+                "aliases:\n  d:\n    - host: \"a\\u0001b\"\n",
+                "host: bad host name",
+            ),
+            (
+                "aliases:\n  d:\n    - host: a\n      user: \"m\\u0001e\"\n",
+                "user: bad login name",
+            ),
+            (
+                "aliases:\n  \"d\\u0001\":\n    - host: a\n",
+                "bad alias name",
+            ),
+            ("aliases:\n  d:\n    - host: -a\n", "host: bad host name"),
+            ("aliases:\n  -d:\n    - host: a\n", "bad alias name"),
+        ] {
+            let e = load("", src).unwrap_err();
+            assert!(e.contains(want), "{src:?}: {e}");
+        }
+        // A login name may start with '-', as it always could.
+        let c = load("", "aliases:\n  d:\n    - host: a\n      user: -me\n").unwrap();
+        assert_eq!(c.alias("d").unwrap().entries[0].destination(), "-me@a");
     }
 
     fn identity(s: &Option<Setting<String>>) -> Option<String> {
@@ -1223,7 +1367,7 @@ aliases:
             ),
             (
                 "aliases:\n  d:\n    user: me\n",
-                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, persist, reachability_interval, prefer_local_network, local_forwards, hosts; a single host entry needs 'host: <name>')",
+                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, hosts; a single host entry needs 'host: <name>')",
             ),
             (
                 "aliases:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
@@ -1360,7 +1504,7 @@ aliases:
             assert!(e.contains(why), "{text:?}: {e}");
         }
         assert_eq!(
-            parse_duration("reachability_interval", "0.1"),
+            parse_duration("0.1", MIN_REACHABILITY_INTERVAL, MAX_REACHABILITY_INTERVAL),
             Ok(Duration::from_millis(100))
         );
     }
@@ -1510,8 +1654,7 @@ aliases:
         }
         // The setting has no global or per-alias form any more (acs-9yv):
         // it names one entry, so it lives on that entry.
-        assert!(!KEYS.contains(&"local_networks"));
-        assert!(!ALIAS_KEYS.contains(&"local_networks"));
+        assert!(setting("local_networks").is_none());
         assert!(HOST_KEYS.contains(&"local_networks"));
     }
 
@@ -1599,10 +1742,10 @@ aliases:
 
         // It is a setting of its own at both levels, and never a host
         // entry's: a forward belongs to the session, not to one address.
-        assert!(KEYS.contains(&"local_forwards"));
-        assert!(ALIAS_KEYS.contains(&"local_forwards"));
+        let d = setting("local_forwards").unwrap();
+        assert!(d.global.is_some() && d.alias.is_some());
+        assert_eq!(d.kind, Kind::Forwards);
         assert!(!HOST_KEYS.contains(&"local_forwards"));
-        assert!(FORWARDS.contains(&"local_forwards"));
     }
 
     /// acs-odd: a bad spec is refused **when the file is read**, by the very
@@ -1659,6 +1802,9 @@ aliases:
         // here, since tests run in parallel.
         let p = local_path();
         assert!(p.ends_with("acs/config.yaml"), "{}", p.display());
+        if let Some(p) = local_file() {
+            assert!(p.is_absolute(), "{}", p.display());
+        }
         assert!(global_path().ends_with("config.yaml"));
     }
 }

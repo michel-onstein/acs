@@ -63,9 +63,7 @@ const fn default_releases_url(built_in: Option<&'static str>) -> &'static str {
 ///   not an environment variable: whoever can set the URL could set that
 ///   too, and the check would be worth nothing.
 pub fn releases_url(allow_insecure: bool) -> Result<String, String> {
-    let set = std::env::var("ACS_RELEASES_URL")
-        .ok()
-        .filter(|v| !v.is_empty());
+    let set = crate::sys::env_nonempty("ACS_RELEASES_URL").and_then(|v| v.into_string().ok());
     let (url, warning) = choose_releases_url(
         set.as_deref(),
         crate::sys::privileges_dropped(),
@@ -136,6 +134,11 @@ pub fn archive_target(own: &str) -> String {
     }
 }
 
+/// The release archive target of this very build.
+pub fn own_archive_target() -> String {
+    archive_target(crate::payload::OWN_TARGET)
+}
+
 /// Our archive in a release, from its `SHA256SUMS`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
@@ -144,21 +147,42 @@ pub struct Asset {
     pub sha256: String,
 }
 
+/// One line of a `SHA256SUMS`: its hash and its file name.
+///
+/// The format `sha256sum` writes and `cargo xtask package` writes: 64
+/// lowercase hex digits, one space, then the name — after a second space
+/// (text mode) or a `*` (binary mode); any run of those is taken. Nothing
+/// else separates the two, not a tab and not a leading space.
+///
+/// This is the only reader of the format in Rust — the upgrade, the weekly
+/// update check and the Homebrew formula all go through it — and
+/// `scripts/install.sh`, which cannot share it, greps with the same rule:
+/// `tests/scripts.rs` runs its pattern against this function line by line.
+pub fn sums_line(line: &str) -> Option<(&str, &str)> {
+    let (hash, file) = line.split_once(' ')?;
+    let file = file.trim_start_matches([' ', '*']);
+    let hex = hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (hex && !file.is_empty()).then_some((hash, file))
+}
+
 /// Find the archive for `target` in a `SHA256SUMS` text.
 pub fn find_asset(sums: &str, target: &str) -> Option<Asset> {
     let suffix = format!("-{target}.tar.gz");
     sums.lines().find_map(|l| {
-        let (hash, file) = l.split_once(' ')?;
-        let file = file.trim_start_matches([' ', '*']);
+        let (hash, file) = sums_line(l)?;
         let version = file.strip_prefix("acs-")?.strip_suffix(&suffix)?;
-        let hex = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
-        // Releases are X.Y.Z; a `-` in the middle would be part of another
-        // target's name, not a pre-release.
-        let plain = parse_version(version).is_some_and(|(_, pre)| pre.is_none());
-        (hex && plain).then(|| Asset {
+        // Releases are X.Y.Z, with no `v` (the tag has one, the archive
+        // does not); a `-` in the middle would be part of another target's
+        // name, not a pre-release.
+        let plain = !version.starts_with('v')
+            && parse_version(version).is_some_and(|(_, pre)| pre.is_none());
+        plain.then(|| Asset {
             version: version.to_string(),
             file: file.to_string(),
-            sha256: hash.to_ascii_lowercase(),
+            sha256: hash.to_string(),
         })
     })
 }
@@ -287,13 +311,31 @@ pub fn asset_url(base: &str, a: &Asset) -> String {
     format!("{base}/download/v{}/{}", a.version, a.file)
 }
 
+/// curl's options before `-o <dest> <url>`: one attempt, capped at `t`
+/// seconds in all. curl does not retry by default, but a `~/.curlrc` can
+/// say `--retry`, and each retry gets a fresh `--max-time`; `--retry 0`
+/// on the command line overrides it.
+fn curl_args(t: &str) -> [&str; 5] {
+    ["-fsSL", "--max-time", t, "--retry", "0"]
+}
+
+/// wget's options before `-O <dest> <url>`: one attempt (`-t 1`), each of
+/// its DNS, connect and read phases capped at `t` seconds. wget's default
+/// is 20 tries, so without `-t 1` a refused or stalling server holds the
+/// "3 s" update check for a minute and an upgrade for far longer.
+/// BusyBox wget (Alpine) accepts `-t` and ignores it: it tries once anyway.
+fn wget_args(t: &str) -> [&str; 5] {
+    ["-q", "-T", t, "-t", "1"]
+}
+
 /// Download `url` into `dest` with curl (or wget), giving up after
 /// `timeout_secs`. The error says what failed, not how.
 pub fn fetch(url: &str, dest: &Path, timeout_secs: u32) -> Result<(), String> {
     let t = timeout_secs.to_string();
     let curl = || {
         Command::new("curl")
-            .args(["-fsSL", "--max-time", &t, "-o"])
+            .args(curl_args(&t))
+            .arg("-o")
             .arg(dest)
             .arg(url)
             .stdin(Stdio::null())
@@ -302,7 +344,8 @@ pub fn fetch(url: &str, dest: &Path, timeout_secs: u32) -> Result<(), String> {
     };
     let wget = || {
         Command::new("wget")
-            .args(["-q", "-T", &t, "-O"])
+            .args(wget_args(&t))
+            .arg("-O")
             .arg(dest)
             .arg(url)
             .stdin(Stdio::null())
@@ -372,6 +415,21 @@ pub fn lookup(
 mod tests {
     use super::*;
 
+    /// acs-q6ey: both download clients try once, so the 3 s update check
+    /// and an upgrade's timeout are the whole wait. wget defaults to 20
+    /// tries; curl to none, but a `~/.curlrc` can ask for retries.
+    #[test]
+    fn fetch_tries_once_within_its_timeout() {
+        let has =
+            |args: &[&str], flag: &str, value: &str| args.windows(2).any(|w| w == [flag, value]);
+        let curl = curl_args("3");
+        assert!(has(&curl, "--max-time", "3"), "{curl:?}");
+        assert!(has(&curl, "--retry", "0"), "{curl:?}");
+        let wget = wget_args("3");
+        assert!(has(&wget, "-T", "3"), "{wget:?}");
+        assert!(has(&wget, "-t", "1"), "{wget:?}");
+    }
+
     /// acs-5em: a fork builds with `ACS_DEFAULT_RELEASES_URL` set and its
     /// binaries update from the fork; unset — every upstream build — the
     /// default is acs's own releases, unchanged.
@@ -396,6 +454,16 @@ mod tests {
             default_releases_url(option_env!("ACS_DEFAULT_RELEASES_URL"))
         );
         assert!(!DEFAULT_RELEASES_URL.is_empty());
+    }
+
+    /// The URL this build actually carries is one `build.rs` would accept,
+    /// so the check and the value it guards cannot drift apart (acs-d7x).
+    #[test]
+    fn the_built_in_releases_url_passes_the_build_time_check() {
+        use crate::build_channel::check_releases_url;
+        for url in [UPSTREAM_RELEASES_URL, DEFAULT_RELEASES_URL] {
+            assert_eq!(check_releases_url(Some(url)), Ok(Some(url)));
+        }
     }
 
     /// acs-95w: what `ACS_RELEASES_URL` names is downloaded, checked only
@@ -484,6 +552,48 @@ nothexnothexnothexnothexnothexnothexnothexnothexnothexnothexnoth  acs-0.2.0-x86_
         assert_eq!(find_asset(SUMS, "riscv64gc-unknown-linux-musl"), None);
         // Not confused by a target that ends like another.
         assert_eq!(find_asset(SUMS, "apple-darwin"), None);
+    }
+
+    /// acs-sseq: one reader of the format, the one `sha256sum` writes —
+    /// the installer, the upgrade and the Homebrew formula used to differ
+    /// on tabs, on runs of separators and on the case of the hash.
+    #[test]
+    fn a_sha256sums_line_is_read_one_way() {
+        let h = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            sums_line(&format!("{h}  a.tar.gz")),
+            Some((h.as_str(), "a.tar.gz"))
+        );
+        assert_eq!(
+            sums_line(&format!("{h} *a.tar.gz")),
+            Some((h.as_str(), "a.tar.gz"))
+        );
+        assert_eq!(
+            sums_line(&format!("{h} ** a.tar.gz")),
+            Some((h.as_str(), "a.tar.gz"))
+        );
+        for bad in [
+            format!("{h}\ta.tar.gz"),
+            format!("{h}  "),
+            format!("{h}a.tar.gz"),
+            format!(" {h}  a.tar.gz"),
+            format!("{}  a.tar.gz", h.to_ascii_uppercase()),
+            format!("{}  a.tar.gz", &h[2..]),
+            String::new(),
+        ] {
+            assert_eq!(sums_line(&bad), None, "{bad:?}");
+        }
+        // The archive's version has no `v`: the tag does, the file not.
+        let sums = format!("{h}  acs-v0.2.0-aarch64-apple-darwin.tar.gz\n");
+        assert_eq!(find_asset(&sums, "aarch64-apple-darwin"), None);
+    }
+
+    #[test]
+    fn this_build_has_an_archive_target() {
+        assert_eq!(
+            own_archive_target(),
+            archive_target(crate::payload::OWN_TARGET)
+        );
     }
 
     #[test]

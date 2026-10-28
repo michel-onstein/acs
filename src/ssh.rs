@@ -53,8 +53,9 @@ pub enum Call {
     /// `acs list <host>`, the remote install, ending a session from the
     /// menu: one host, and the master is reused.
     Side,
-    /// `acs list` over every alias (DESIGN §7.3): many hosts at once, and
-    /// no master is started or joined.
+    /// `acs list` over every alias (DESIGN §7.3): many hosts at once. It
+    /// joins a master acs already has up for the host (`ControlMaster=no`)
+    /// and never starts one (acs-hmv).
     Batch,
 }
 
@@ -93,12 +94,16 @@ pub struct Transport {
     pub mux: Option<crate::mux::Mux>,
 }
 
+/// The ssh program when the command line names none: `ACS_SSH`, else
+/// `ssh`.
+pub fn program() -> OsString {
+    crate::sys::env_nonempty("ACS_SSH").unwrap_or_else(|| "ssh".into())
+}
+
 impl Transport {
     pub fn new(destination: impl Into<String>) -> Self {
         Transport {
-            ssh: std::env::var_os("ACS_SSH")
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "ssh".into()),
+            ssh: program(),
             user_opts: Vec::new(),
             destination: destination.into(),
             identity_file: None,
@@ -173,14 +178,12 @@ impl Transport {
             .filter(|_| !self.user_identity())
     }
 
-    /// Whether a call of this kind uses acs's own master (`mux.rs`). Only
-    /// the first connection and the side calls do: a redial must have its
-    /// own connection, and `acs list` over every alias would otherwise
-    /// leave a master on every host it asked.
+    /// Whether a call of this kind uses acs's own master (`mux.rs`). Every
+    /// call but a redial may, which must have its own connection; a batch
+    /// call only ever joins one (see [`Transport::control_opts`]), and is
+    /// given a master only where one is up (`mux::join`).
     pub fn multiplexes(&self, call: Call) -> bool {
-        self.mux.is_some()
-            && matches!(call, Call::Session | Call::Side)
-            && self.control_path().is_some()
+        self.mux.is_some() && call != Call::Redial && self.control_path().is_some()
     }
 
     /// Where acs's master for this destination listens, if it has one.
@@ -194,8 +197,19 @@ impl Transport {
     /// The control-socket options for this call: acs's master, or the
     /// opt-out §3 has always used, or — for a side or batch call with no
     /// master — nothing, leaving the user's own multiplexing alone.
+    ///
+    /// A batch call joins and never starts (acs-hmv): `ControlMaster=no`
+    /// with the path set uses the master that is there, and ssh dials on
+    /// its own where none is — no dozen masters behind one listing, and no
+    /// race between calls that would each decide to be the master.
     fn control_opts(&self, call: Call) -> Vec<OsString> {
         match (self.multiplexes(call), call) {
+            (true, Call::Batch) => {
+                let mut v = Vec::new();
+                v.extend(crate::mux::opt("ControlMaster", "no"));
+                v.extend(crate::mux::opt("ControlPath", self.control_path().unwrap()));
+                v
+            }
             (true, _) => {
                 let (m, path) = (self.mux.as_ref().unwrap(), self.control_path().unwrap());
                 let mut v = Vec::new();
@@ -310,7 +324,8 @@ pub fn check_local_forward(spec: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Quote a string for POSIX `sh`.
+/// Quote a string for POSIX `sh`: as it is when every byte is one the
+/// shell takes literally, otherwise [`sh_single_quote`]d.
 pub fn sh_quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes()
@@ -318,7 +333,39 @@ pub fn sh_quote(s: &str) -> String {
     {
         return s.to_string();
     }
+    sh_single_quote(s)
+}
+
+/// `s` as one POSIX shell word, always in single quotes, with an embedded
+/// quote written the only way a single-quoted string can hold one.
+///
+/// Inside single quotes `sh` expands nothing at all — no `$`, no backtick,
+/// no `\`, and a newline is a newline rather than the end of a command — so
+/// this is total: whatever `s` is becomes exactly that string. For a value
+/// whose shape a reader relies on (`cargo xtask package` writes
+/// `name='…'` lines that are read back), where [`sh_quote`] would leave a
+/// plain word bare.
+#[inline(always)] // out of line, a wrapper costs the slim build an unwind entry
+pub fn sh_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    /// acs-sseq: `cargo xtask package` writes `name='…'` and reads it
+    /// back, so it needs the quotes even on a plain word that [`sh_quote`]
+    /// would leave bare; both escape a quote the same way.
+    #[test]
+    fn single_quoting_always_quotes() {
+        let url = "https://github.com/michel-onstein/acs/releases";
+        assert_eq!(sh_quote(url), url);
+        assert_eq!(sh_single_quote(url), format!("'{url}'"));
+        assert_eq!(sh_single_quote(""), "''");
+        assert_eq!(sh_single_quote("it's"), "'it'\\''s'");
+        assert_eq!(sh_quote("it's"), sh_single_quote("it's"));
+    }
 }
 
 /// Where the remote side looks for the binary of exactly `version`.
@@ -335,14 +382,55 @@ pub fn remote_candidates(version: &str) -> [String; 2] {
         // `$HOME` is quoted on its own so a home with a space still works,
         // and the rest is already shell-safe, so the caller must not wrap
         // these in quotes again — that would make the quoting literal.
-        format!("\"$HOME\"/.local/share/acs/{v}/acs"),
-        format!("/usr/local/lib/acs/{v}/acs"),
+        format!(
+            concat!("\"$HOME\"/", crate::layout::user_root_str!(), "/{}/acs"),
+            v
+        ),
+        format!(concat!(crate::layout::system_root_str!(), "/{}/acs"), v),
     ]
 }
 
 /// The POSIX sh script run on the remote: exec our own version of acs with
 /// `args`, or report what is missing with an `ACS-NEED` line.
 pub fn prelude(version: &str, args: &[&str]) -> String {
+    prelude_with(version, args, None)
+}
+
+/// [`prelude`] that, after `ACS-NEED`, waits on the same connection for the
+/// client to install acs (acs-6k2, DESIGN §8.1): first contact is then one
+/// ssh handshake rather than four.
+///
+/// It reads stdin a line at a time — the `read` builtin takes one byte at a
+/// time from a pipe, so nothing past the line is consumed — and passes over
+/// everything until the line `ACS-INSTALL <sync>`. That skips the HELLO the
+/// client sent ahead with the dial (acs-trw), which was meant for a proxy
+/// that turned out not to be there. `sync` is random per dial, so no HELLO
+/// can hold it by chance. The line after it is the install script
+/// ([`crate::install`]), which reads exactly the bytes it was told to from
+/// the same stdin, checks them **before** anything is made executable, and
+/// installs. Then the candidates are tried again with every check above —
+/// owner, mode, every directory on the way — and the new binary is exec'd
+/// on the stdin that is left, which starts with the client's next HELLO.
+///
+/// The script arrives on stdin rather than in this command line because it
+/// carries digests and lengths the client only knows once `ACS-NEED` has
+/// said which target to send. It is no more trusted than the command line:
+/// both come from the client, over the one authenticated channel.
+///
+/// The exit statuses: the script's own (3 no gzip, 4 nothing to hash with,
+/// 5 a checksum mismatch, anything else a failed step), or
+/// [`INSTALLED_BUT_REFUSED`] when the install went through and the prelude
+/// still would not run what it put there. End of input before the sync
+/// line — the client chose not to install — exits quietly.
+pub fn prelude_installing(version: &str, args: &[&str], sync: &str) -> String {
+    prelude_with(version, args, Some(sync))
+}
+
+/// The prelude's exit status when it installed acs and then refused to run
+/// it (a directory on the way that someone else can write, say).
+pub const INSTALLED_BUT_REFUSED: i32 = 6;
+
+fn prelude_with(version: &str, args: &[&str], sync: Option<&str>) -> String {
     let args: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
     let [home, system] = remote_candidates(version);
     // Before exec'ing anything, check it is ours or root's and that nobody
@@ -446,14 +534,37 @@ pub fn prelude(version: &str, args: &[&str]) -> String {
          case \"$acs_t\" in /*) acs_p=$acs_t;; *) acs_p=$(dirname \"$acs_p\")/$acs_t;; esac; \
          done; \
          acs_ok \"$acs_p\" && acs_ok \"$(dirname \"$acs_p\")\"; }}; \
+         acs_run() {{ \
          for acs_b in {home} {system}; do \
          if [ -f \"$acs_b\" ] && [ -x \"$acs_b\" ]; then \
          if acs_safe \"$acs_b\"; then exec \"$acs_b\" {args}; fi; \
          printf 'acs: refusing to run %s: %s\\n' \"$acs_b\" \"$acs_w\" >&2; \
          fi; \
-         done; \
-         printf '\\nACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"",
-        args = args.join(" ")
+         done; }}; \
+         acs_run; \
+         printf '\\nACS-NEED %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"{tail}",
+        args = args.join(" "),
+        tail = sync.map(install_tail).unwrap_or_default(),
+    )
+}
+
+/// What [`prelude_installing`] adds after `ACS-NEED`. `(eval …); s=$?`
+/// rather than `(eval …) || exit`: on the left of `||`, `set -e` inside the
+/// script would be ignored, and it is what stops the script at the first
+/// failed step.
+fn install_tail(sync: &str) -> String {
+    format!(
+        "; while IFS= read -r acs_l; do \
+         case $acs_l in *{line}) \
+         IFS= read -r acs_l || exit 1; \
+         (eval \"$acs_l\"); acs_s=$?; \
+         [ \"$acs_s\" = 0 ] || exit \"$acs_s\"; \
+         acs_run; \
+         echo 'acs: the new install cannot be run' >&2; \
+         exit {refused};; \
+         esac; done",
+        line = sh_quote(&format!("{} {sync}", crate::proto::INSTALL_MARKER)),
+        refused = INSTALLED_BUT_REFUSED,
     )
 }
 
@@ -466,6 +577,11 @@ pub fn remote_command(script: &str) -> String {
 /// Convenience: the full remote command to run `acs <args>` of `version`.
 pub fn remote_acs(version: &str, args: &[&str]) -> String {
     remote_command(&prelude(version, args))
+}
+
+/// [`remote_acs`] with [`prelude_installing`].
+pub fn remote_acs_installing(version: &str, args: &[&str], sync: &str) -> String {
+    remote_command(&prelude_installing(version, args, sync))
 }
 
 /// Render argv for `-v` diagnostics.
@@ -609,16 +725,44 @@ mod tests {
     /// `acs list` asks every alias at once (DESIGN §7.3): starting a master
     /// on each would leave a dozen authenticated connections behind a
     /// listing, and several `ControlMaster=auto` racing for one host wedge
-    /// each other.
+    /// each other. Joining one has neither problem (acs-hmv): the batch
+    /// names acs's socket with `ControlMaster=no`, ahead of the user's
+    /// options, and nothing that would start or keep a master.
     #[test]
-    fn a_batch_call_starts_no_master() {
-        let v = strs(muxed().argv(Call::Batch, "R"));
-        assert!(!v.iter().any(|a| a.starts_with("ControlPath=")), "{v:?}");
+    fn a_batch_call_joins_the_master_and_never_starts_one() {
+        let tr = muxed();
+        let path = tr.control_path().unwrap();
+        let v = strs(tr.argv(Call::Batch, "R"));
+        assert_eq!(
+            v[..12],
+            [
+                "ssh",
+                "-T",
+                "-e",
+                "none",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                &format!("ControlPath={}", path.to_str().unwrap()),
+            ],
+            "{v:?}"
+        );
         assert!(!v.iter().any(|a| a.starts_with("ControlPersist")), "{v:?}");
-        // The user's own multiplexing is still theirs to keep.
-        assert_eq!(v, strs(t().argv(Call::Batch, "R")));
-        assert!(!muxed().multiplexes(Call::Batch));
-        assert!(!muxed().multiplexes(Call::Redial));
+        // The user's own `-o ControlMaster=auto` comes after, so it loses.
+        assert_eq!(v.iter().filter(|a| *a == "ControlMaster=auto").count(), 1);
+        assert!(v.iter().position(|a| a == "ControlMaster=auto").unwrap() > 12);
+        // The same socket the session and side calls use.
+        assert!(strs(tr.argv(Call::Side, "R")).contains(&v[11]));
+        assert!(tr.multiplexes(Call::Batch));
+        assert!(!tr.multiplexes(Call::Redial));
+        // With no master, the user's own multiplexing is still theirs.
+        let v = strs(t().argv(Call::Batch, "R"));
+        assert!(!v.iter().any(|a| a.starts_with("ControlPath=")), "{v:?}");
+        assert!(!v.iter().any(|a| a == "ControlMaster=no"), "{v:?}");
     }
 
     /// `ssh -O check` / `-O exit` must reach the socket a dial would, with

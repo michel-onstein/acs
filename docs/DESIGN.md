@@ -94,7 +94,7 @@ flowchart LR
    protocols, and terminal queries/replies all work as if you had run `ssh -t`.
 2. **One binary** for both sides and for both client platforms (macOS and
    Linux), statically linked on Linux, that can install itself on a remote
-   (§8). Slim build < 1 MB; with the embedded Linux payloads < 2 MB.
+   (§8). Slim build < 1.1 MB; with the embedded Linux payloads < 2.1 MB.
 3. **Survive network interruption** with no lost output, and detect a dead link
    in seconds rather than a minute.
 4. **Command mode** on a double-tap of Ctrl-] (§6): `d` detach, `x` exit.
@@ -138,7 +138,7 @@ lives in the master and the client.
 - `-e none`: ssh's `~.` escape is off (it is already off without a tty; this
   makes it explicit).
 - **The control options depend on which call it is** (`Call` in `ssh.rs`).
-  The first connection and a side call (`acs list <host>`, install) reuse an
+  The first connection and a side call (`acs list <host>`) reuse an
   ssh master **acs owns** — `ControlMaster=auto` on acs's own
   `ControlPath`, with `ControlPersist` — so a detach-and-reattach, or an
   `acs list <host>` followed by an attach, costs one round trip instead of a
@@ -149,7 +149,8 @@ lives in the master and the client.
   `ssh -O exit` on it first (§7.1, acs-n1m: not where only the channel on
   it broke, which would drop every other acs session sharing that master).
   `acs list` over every alias (`BatchMode=yes`,
-  `ConnectTimeout=10`, §7.3) neither starts nor joins one. The whole
+  `ConnectTimeout=10`, §7.3) joins one that is up and never starts one
+  (acs-hmv). The whole
   arrangement, its failure modes and how to turn it off are in §7.1 under
   **The ssh master acs owns**, and the decision is §12 decision 10.
 - `ServerAliveInterval=0`: liveness is ours (§5.3), much faster than ssh's.
@@ -208,10 +209,24 @@ shells).
   `KillUserProcesses=yes` the master itself is killed too — as dtach is today;
   the fix there is `loginctl enable-linger`, which `acs` should mention in its
   error when it detects a master died that way.)
-- `systemd-tmpfiles` may age files out of `/tmp`; the master re-checks its
-  socket every minute and re-binds it if the path is gone — recreating the
-  directory, with the same checks, if that went too (tmux's `SIGUSR1`
-  recovery, made automatic).
+- `systemd-tmpfiles` may age files out of `/tmp`. The master refreshes the
+  times on its socket and `.master` file (§4.2) hourly so an age-based
+  cleaner leaves them be, and re-checks both every 5 s, re-binding the
+  socket if the path is gone — recreating the directory, with the same
+  checks, if that went too (tmux's `SIGUSR1` recovery, made automatic). The
+  re-bind takes the create lock and connect-probes whatever is at the path
+  first, as a starting master does (acs-lbba).
+- **A reconnect does not wait for that check.** A proxy that finds the
+  socket gone starts a master, which finds the old master's `.master` lock
+  held, sends it `SIGUSR1` — re-bind now — and steps aside with "already
+  has a master", so the proxy retries the connect and reaches the same
+  shell. Before this the old master learned of the deletion only at its
+  next check, a minute later, and a client reconnecting inside that minute
+  got a second master with a second shell, while the first ran on with no
+  socket, reachable only by pid. A directory watch (inotify, kqueue) would
+  close the same window with two platform back-ends; the prod closes it on
+  demand, and the 5 s check is left only for a cleaner that took the
+  `.master` file too — a whole-directory wipe.
 
 ### 4.2 Master
 
@@ -220,7 +235,10 @@ shells).
   the socket **before** forking the shell, then report readiness to the proxy
   over a pipe so the proxy never races the bind (dtach's `statusfd`).
   Creation holds `flock(<dir>/<session>.lock)` so two simultaneous attaches do
-  not start two masters.
+  not start two masters. For its whole life the master also holds
+  `flock(<dir>/<session>.master)`, with its pid inside, so a master starting
+  under the same name while the socket is gone finds it, prods it to re-bind
+  and steps aside (§4.1). It lets go at child exit, with the socket.
 - Child: `$SHELL -l` in `$HOME` by default (`dsh` hardcodes `zsh -l`),
   overridable with `acs <host> [session] -- <command…>`. Environment gets
   `TERM` and `COLORTERM` from the client's HELLO (ssh `-T` no longer sends
@@ -257,6 +275,12 @@ shells).
   `-r winch`.
 - **Child exit**: the master reaps it, sends `EXIT{status}` to the client,
   unlinks the socket, and exits.
+- **Nobody came**: a master that has no child 30 s after it started, and no
+  connection open, unlinks its socket and exits. A new connection has 10 s
+  to send its first message (`HELLO`, `STATUS` or `KILL`) or it is dropped,
+  so one that never speaks cannot keep a childless master — and its line in
+  `acs list` — alive (acs-3anc). Once it has spoken it may wait: a client
+  answered `BUSY` stays connected while its user decides.
 - **Kill** (`x`, §6): `SIGHUP` to the child's process group, then `SIGKILL`
   after 3 s if it is still alive; then as child exit.
 - **Instance id**: a random `u64` minted at creation and sent in `WELCOME`, so
@@ -279,17 +303,23 @@ they are, so the master's decoder never sees a frame without its head. `acs _pro
 attached/detached, the client identity attached (or last attached), created-at,
 idle time, child command, and size. Sockets that
 refuse connections are reported stale and removed — no `ps` parsing.
+If the directory cannot be read, an `ERROR` ends the list, and `acs list`
+reports that host as failed rather than as having no sessions.
 `acs _proxy --pick` serves the session menu (§4.4) on the session's own
 connection. After `ACS-READY` it sends the list as `--list` does, one
 `STATUS_REPLY` per session, closed by `LIST_END`, since the connection
-stays open. It then reads the client's frames:
+stays open. If the directory cannot be read, an `ERROR` takes the place of
+`LIST_END` and the proxy ends, and the menu shows that error (acs-5jrq).
+It then reads the client's frames:
 
 - `END_SESSION <name, identity, force>` (the menu's `x`): it sends that
   master `KILL`, as `x` inside the session does, **carrying the identity
   and `force` the frame brought** (acs-fbo). Ending a session is as large a
   step as taking it over, so it goes through the same gate: a session
   another identity is attached to answers `BUSY`, which becomes an `ERROR`
-  naming them rather than a dead session. Before that, a five-byte frame
+  (code 6, `BUSY`) naming them rather than a dead session — at once, since
+  the master keeps that connection open for a forced retry and no EOF
+  follows (acs-wwy0). Before that, a five-byte frame
   from any process of this uid ended any session, and a connection that had
   just been refused with `BUSY` could destroy the very session it was
   denied. It does **not** attach on the way — that would send the attached
@@ -308,6 +338,22 @@ stays open. It then reads the client's frames:
   second marker.
 - End of input (the user left the menu): it exits, starting nothing.
   Anything else is an `ERROR` (bad request).
+
+`acs _proxy --pick --eager` (acs-xvg), which plain `acs <host>` dials, takes
+the client's first frame as a `HELLO` sent ahead of the marker, as a
+session call's is (§3): the one for the session the client would make with
+nothing detached — `main` (or `$ACS_DEFAULT_SESSION`), attach-or-create.
+The proxy reads it after the first list. If that list has **nothing
+detached**, it attaches that `HELLO` at once — under the name it carries,
+or, when a session already has that name, a new numbered one, exactly as
+the client names it from the same list (§4.4) — so the `WELCOME` follows
+`LIST_END` and the attach costs no round trip of its own. Otherwise the
+`HELLO` is moot and the menu goes on as above; any first frame but a
+`HELLO` is an `ERROR` (bad request). `acs list <host>` and the menu over
+every host dial plain `--pick`, since they show the menu whatever is
+detached. The client and the proxy are always the same version — the
+remote command runs exactly the client's own (§8) — so a client never
+meets a proxy that would take the early `HELLO` for the user's choice.
 
 ### 4.4 Session names and getting back in
 
@@ -345,6 +391,9 @@ the session, where a separate `_proxy --list` side call used to cost a second
 - **No session detached** (none at all, or all attached elsewhere): a new
   session, without a menu — named `main` (or `$ACS_DEFAULT_SESSION`) if no
   session has that name, otherwise the lowest free number, as `--new`.
+  It costs no round trip after the list (acs-xvg): the `HELLO` for it went
+  ahead with the dial, and `_proxy --pick --eager` attached it on finding
+  nothing detached (§4.3), so the list and the `WELCOME` arrive together.
   A host without acs has no sessions; the attach installs it (§8).
 - **Some detached**: a menu (`menu.rs`, a pure state machine from keys to
   choices; `pick.rs` drives it), drawn on the **alternate screen** so that
@@ -598,11 +647,17 @@ sequenceDiagram
   seconds later is how accidents happen. (Command-mode keys still work — §6
   — which is why what ends the wait early matters: only a change to this
   machine's own network does, §5.3.)
-  That includes the redial itself, where the terminal is back in cooked mode
-  for ssh's prompts: what was typed then is discarded when raw mode resumes
-  on `WELCOME` (`TCSAFLUSH`), and the takeover question discards it before
-  asking. A Ctrl-C there ends the client with the status line blanked and
-  the title popped, as any fatal signal does.
+  That includes the redial itself. Until ssh asks for the terminal, acs
+  reads the keys of a redial itself — command keys honoured, the rest
+  dropped, §5.3 has how — and once ssh has asked, the terminal is back in
+  cooked mode for ssh's prompt and stdin is ssh's (acs-8ax). Either way,
+  what reached the terminal and was not read is discarded when raw mode
+  resumes on `WELCOME` (`TCSAFLUSH`), and the takeover question discards it
+  before asking; a passphrase typed at ssh's prompt is read by ssh alone,
+  never by acs, and never echoed. A Ctrl-C there ends the client with the
+  status line blanked and the title popped, as any fatal signal does — read
+  by acs as the cooked terminal's interrupt key before ssh has asked, and
+  delivered to ssh, whose death by it ends acs, once ssh has the terminal.
 - **Fresh attach** (new client, e.g. after an explicit detach or from another
   machine) does **not** replay the ring: the local terminal's state is unknown,
   and replaying mode-changing sequences into it is unsafe. It behaves like
@@ -652,7 +707,9 @@ sequenceDiagram
   turned a stalled terminal into a lost link, with `PONG`s waiting in the pipe.
   The one exception is the deadline a network change brings forward, which
   only its own `PONG` clears (acs-br2, below): there the bytes in the pipe may
-  be older than the question.
+  be older than the question. A stalled terminal is kept from turning into a
+  lost link there another way — the time spent blocked writing to it is not
+  counted against that deadline (acs-spd, below).
 - The master does the same for its attached client, which answers `PING`
   with `PONG`: a client silent for 10 s is dropped, freeing the pty from
   its backpressure (§4.2). Without it a client that vanished without closing
@@ -664,18 +721,21 @@ sequenceDiagram
   `DETACH` acknowledged, `TAKEOVER`) from a drop, so there is nothing to guess.
   `--no-reconnect` restores `dsh`'s default behaviour.
 - **The first redial goes at once** (acs-iyq). Only the attempts after it
-  wait: backoff 1 s → 30 s, reset after a connection that lasted 30 s (as in
-  `dsh`), plus an immediate retry when this machine's own network changes
+  wait: backoff 1 s → 30 s, reset after a connection that served 30 s (as in
+  `dsh`; counted from its `WELCOME`, so a redial that spends its own 30 s
+  timeout on a host that accepts and then says nothing never resets it —
+  acs-omt2), plus an immediate retry when this machine's own network changes
   (Wi-Fi switch, laptop wake) where the platform exposes that cheaply — that
   retry *is* the immediate attempt, so the backoff resumes at its base rather
   than handing out a second dial with nothing in between. A drop has already
   cost 10 s of silence before it is a drop at all (§5.3), and most of them
   are momentary, so a wait before looking once put a second on every resume
   to buy nothing; a host that is really gone refuses the attempt (or times
-  out, below) and the backoff starts from there. What it costs: the offline
-  wait is where typed command keys are honoured (§5.4), so the second
-  between a drop and the first dial is no longer one in which `d` detaches
-  — it is a dial like any other, and keys typed into a dial are dropped.
+  out, below) and the backoff starts from there. It cost something for a
+  while: the offline wait was the only place the command keys were
+  honoured (§5.4), so the second between a drop and the first dial stopped
+  being one in which `d` detaches. A redial honours them too now (acs-8ax,
+  below), so it costs nothing.
 - **What counts as a network change** (acs-6p8). The watcher
   (`netwatch.rs`) has two halves, and the socket is only the first: a
   `PF_ROUTE` (macOS) or `NETLINK_ROUTE` (Linux) message says the kernel
@@ -705,7 +765,8 @@ sequenceDiagram
     (acs-0n8). `changed()` hands out a `Change`; the set it was judged
     against is replaced by `Change::acted` and nowhere else. The two
     callers that cannot always act — the offline wait inside its rate
-    limit, and the serving loop before the `WELCOME` — drop it instead,
+    limit, and a handshake on a change it lets pass (acs-xo1, below) —
+    drop it instead,
     and the next hint about the same move names the same change rather
     than being answered "not a change" against a set that has already
     moved. Before this the hint was spent either way: the change was not
@@ -724,7 +785,10 @@ sequenceDiagram
     `ACS_NETWATCH_FIFO` is the hint (one per write) and `ACS_NETWATCH_NETS`
     a file of the machine's networks, one CIDR per line. The harness points
     every other client at a watcher path that does not exist, so no test
-    but the watcher's own is exposed to the host's network.
+    but the watcher's own is exposed to the host's network. Both are read
+    once, by `NetWatch::new`, and held on the watcher (acs-r1k); the unit
+    tests hand the watcher their paths directly, so no test in that binary
+    sets the environment and none can race another over it.
   - **The platform half is the kernel's, and on Linux the kernel does it**
     (acs-4i2). Everything above tests the *decision*; what neither stand-in
     can say is that a real roam emits a message the socket is subscribed to
@@ -783,6 +847,22 @@ sequenceDiagram
     earlier `PING` is refused on the same ground: it came back over the
     path that has gone. The nonce is the `PING`'s own timestamp, so the
     match is a comparison and costs nothing.
+  - **Time blocked on the terminal is not the host's** (acs-spd). The rule
+    above took away what used to cover a terminal that stalls *while the
+    question is outstanding*: the `PONG` sits unread in the pipe behind
+    output the client cannot write, and stale bytes no longer answer for
+    it. So the deadline moves out by every millisecond the client spends
+    in a write to the terminal once the `PING` has gone — the link was not
+    slow, the terminal was — and a stall like that costs no redial, as
+    acs-7k7 settled for `ACS_DEAD_MS`. It is the honest measure rather than
+    decoding ahead of the tick: what the deadline asks is how long the
+    host took, and only the time the client could have been reading
+    counts. Two things it leaves alone. A terminal already stalled when
+    the network moves is acs-br2's case — the client is blocked and sees
+    the change only afterwards, so the question is asked after the stall
+    and the bytes then read still answer nothing. And the dead interval
+    stays the outer bound: a write that never returns is acs-7k7's, not
+    this.
   - **Why not redial on the change itself.** Keys typed into a redial are
     discarded (§5.2), so a redial the link did not need is directly
     user-visible: the session blinks, the screen repaints and what was
@@ -804,10 +884,128 @@ sequenceDiagram
     on wake the 10 s window starts from zero however long the sleep was.
     The address that moved is the only evidence available at that moment,
     and it is what this uses.
+- **A network change during the handshake abandons it and dials again at
+  once** (acs-xo1). So a change means something in each of the three
+  phases a client can be in: **offline**, it cuts the wait short and
+  redials (acs-6p8, above); **connected**, it asks the host and shortens
+  the dead-link timeout (acs-ft1, above); and **handshaking** — from the
+  dial until the `WELCOME` — it ends a dial that is very probably doomed,
+  instead of leaving it to run out its timeout, 30 s on a redial
+  (`ACS_REDIAL_TIMEOUT_MS`) and 120 s on the first connection
+  (`ACS_DIAL_TIMEOUT_MS`). The laptop opened on another network
+  while acs was mid-connect is the case: the connection ssh was making
+  went with the old address the moment the lid opened.
+  - **Both halves of the handshake, every dial that has a session behind
+    it.** The dial watches the network while it waits for the marker —
+    ssh's own handshake, authentication, the remote startup files, the
+    prelude — and the serving loop while it waits for the `WELCOME`. That
+    is the redial, the first connection of a named session, and the
+    session menu's dial that plain `acs <host>` makes (§4.4): the first
+    connection is the 120 s case and the one a user feels most, so it is
+    treated the same. The fresh dial gets a whole timeout of its own; a
+    joined master is ended with the dial, since its connection was made
+    from the network that went. Side calls (`acs list`, the menu's ending
+    of a session) do not watch: they are short and nobody is waiting on a
+    session.
+  - **Abandon, not shorten.** acs-ft1 brings a deadline forward because a
+    connected link has a question it can ask — a `PING` costs one frame
+    and answers in a round trip. A handshake has none: before the marker
+    nothing is listening, and the dial's own remaining work (key exchange,
+    authentication, startup files, an install) legitimately takes longer
+    than any short deadline would allow, so shortening it would kill good
+    dials and still wait on bad ones. Abandoning costs only the time the
+    dial had already spent — nothing typed is lost, keys typed into a
+    redial being dropped anyway (§5.2) — and the fresh dial is made from
+    whatever network the machine is on now.
+  - **What counts: a change that took a network away.** A dial was made
+    from one of the networks the watcher holds; which one is ssh's
+    business (a `ProxyCommand` or `ProxyJump` hides it entirely), so acs
+    cannot ask whether *its* address went — but it can ask, for free,
+    whether *any* did (`Change::removed`, the held set against the new
+    one). A change that only added a network — a second interface, a
+    phone tethering, a VPN coming up — left every address a dial could
+    have been made from in place, and is let pass: dropped, not spent
+    (acs-0n8), so the next hint offers it again, and once the `WELCOME`
+    is in it is acs-ft1's question like any other. A change that removed
+    one is acted on, even where the dial might have been on another
+    interface that survived; that mistake costs one dial, the other one
+    up to two minutes.
+  - **Not while ssh is asking the user something.** Killing ssh at its
+    password prompt would throw away what is being typed there, so a dial
+    that holds the terminal for a prompt is left to finish, the change
+    dropped rather than spent. On a redial with the command keys
+    (acs-8ax, below) that is exact: from the hand-off on, the dial is
+    ssh's to the end, as its stdin is. A dial that shares acs's cooked
+    terminal — the first connection, a redial without a terminal to hand
+    over — cannot see a hand-off, and judges by the terminal's echo, which
+    ssh's password, passphrase and PIN prompts turn off while they read; a
+    terminal acs cannot read the modes of counts as asking. The one prompt
+    that keeps its echo, the host-key question on a first meeting, can be
+    lost to a change on a dial that shares the terminal; the fresh dial
+    asks it again. Past the marker ssh asks nothing, so the serving loop
+    abandons without looking.
+  - **The greeting goes with the dial** (acs-trw), and nothing of it is
+    left behind: the `HELLO` written ahead of the marker went into the
+    pipe of an ssh that is killed, and the fresh dial writes its own into
+    a new one. The remote install (`ACS-NEED`) runs between two dials, so
+    a change during it is read by the dial after the install — which then
+    starts again, at worst, and finds acs installed; a change during the
+    dial that asked for it restarts that dial, which asks again.
+  - **No storm.** Each restart acts on the change, so the networks held
+    move with it and the next hint about the same move is not a change;
+    an interface that keeps coming and going costs one dial per time it
+    goes. Under `-v` a restart says so: `the network moved under the dial
+    — dialing again`, or `under the handshake` past the marker, and the
+    timing lines show the phase as `network moved — dialing again`.
 - Authentication prompts on reconnect (password, hardware key touch) are
   passed through, because ssh gets the controlling tty for prompts even with
-  `-T`; the client restores cooked mode while ssh is authenticating. With
-  keys in an agent, reconnect is silent.
+  `-T`. With keys in an agent, reconnect is silent.
+- **The command keys during a redial** (acs-8ax). A dial against a dead
+  network can take its whole `ConnectTimeout`, and `Ctrl-] Ctrl-] d` used
+  to do nothing until it gave up: the terminal was cooked for ssh, so the
+  keys sat in its line buffer. They conflict with ssh's prompts — stdin is
+  one terminal, and whoever reads first gets the bytes — so the redial is
+  arbitrated by **job control** rather than by guessing whether ssh will
+  ask for anything:
+  - ssh is spawned in a **process group of its own**, in the background of
+    the terminal, and the terminal is put in a mode that is cooked but for
+    line buffering and signals (`ICANON`, `ISIG` and `IEXTEN` off), so acs
+    reads each key as it arrives and feeds the command detector: `d`
+    detaches at once, `x` says it needs the link as in the offline wait,
+    the interrupt key ends the client as Ctrl-C did, and everything else
+    is dropped. Keys echo, as they did in the cooked dial.
+  - A background process that sets the terminal's modes or reads it is
+    **stopped by the kernel** (`SIGTTOU`, `SIGTTIN`), and the signal goes
+    to its whole process group — so a ProxyCommand's or ProxyJump's own
+    ssh stops the transport too, which leaves those signals at their
+    default. ssh's `readpassphrase` sets the modes
+    (echo off, `TCSAFLUSH`) before it writes the prompt, for a password, a
+    key passphrase, a PIN and the host-key question alike, and it is made
+    to start over after the stop. acs looks for the stop every 50 ms
+    (`waitid(WSTOPPED)`) and then **hands the terminal over**: the cooked
+    settings back, ssh's group made the foreground (`tcsetpgrp`), the group
+    continued. From then on stdin is ssh's and acs does not read it — the
+    keys are not live for the rest of that dial, as no dial's were before.
+    The prompt cannot have been seen before the hand-off, so nothing the
+    user types at it can reach acs.
+  - When the dial ends, however it ends, the terminal is taken back for
+    acs's group and left cooked until the `WELCOME`, as a cooked dial
+    leaves it (§5.2).
+  - **Which dials:** a redial (the first connection has no session to
+    detach from, and keeps the cooked dial with ssh in acs's group) while
+    acs has the terminal — in raw mode and the foreground of the terminal
+    on its stdin. A client run in the background of its shell, or on a
+    terminal that is not its controlling one, has no terminal to hand over
+    and dials cooked, as before. A non-interactive key — agent, hardware
+    touch, `SSH_ASKPASS` — never touches the terminal, so its redial is
+    live from end to end; that is the common case the change is for.
+  - **The hand-off is also what keeps a network change out** (acs-xo1,
+    above): a redial that has handed ssh the terminal is not abandoned
+    when the network moves, so a password half-typed is not thrown away.
+  - What it does not need: no change to ssh's options. Interactive
+    authentication on a redial still works exactly as it did, which is why
+    this is not `BatchMode` on redials — that would have made a password
+    host unable to reconnect at all.
 - **The greeting goes out with the dial** (acs-trw): the `HELLO` is written
   into ssh's stdin as it is spawned, before the marker is awaited (§3), so a
   redial costs the ssh handshake and one trip for the `WELCOME` rather than
@@ -820,11 +1018,19 @@ sequenceDiagram
 - **Before the first WELCOME there is a deadline too**: liveness only starts
   with WELCOME, and `ConnectTimeout` only covers the TCP connect, so a host
   that accepts and then says nothing would otherwise hold the client forever.
-  A connection has 30 s on a redial — then it is dropped and the client goes
-  back to its backoff wait, where the command keys work — and 120 s on the
-  first connection (time for a password), then the client exits 255, for the
-  marker and again for the handshake (`ACS_DIAL_TIMEOUT_MS` sets both). A
-  takeover question restarts the handshake's clock.
+  A connection has 30 s on a redial (`ACS_REDIAL_TIMEOUT_MS`) — then it is
+  dropped and the client goes back to its backoff wait, where the command
+  keys work even when ssh had the terminal — and 120 s on the first
+  connection (`ACS_DIAL_TIMEOUT_MS`: time for a password or a key touch),
+  then the client exits 255, each for the marker and again for the
+  handshake. They are two knobs (acs-p46) because they are two things: one
+  knob set both, so shortening the redial's to stop a hung redial holding
+  the backoff up also shortened the window a first connection has for a
+  human to answer it, and a 4:1 ratio kept between them would still have
+  done so, only less. A
+  takeover question restarts the handshake's clock, and a network change
+  that took an address away ends the handshake at once and starts a fresh
+  one with a whole timeout (acs-xo1, above).
 
 **Persisting.** By default the client gives up where there is no session to
 keep: no host of an alias answers at the start, the first connection fails,
@@ -833,9 +1039,15 @@ or the link is lost before the first `WELCOME` — each exits 255. With
 up on; it is waited for with pings (`alias.rs`, the ping of §7.3) instead
 of ssh dials:
 
-- **The ping gate**: while the host is lost it is pinged every
-  `reachability_interval` (default 5 s, §7.2), and dialled only once it
-  answers — at once, too, after a network change (netwatch). An alias is
+- **The ping gate**: while the host is lost it is pinged every second for
+  the first 30 s, then every `reachability_interval` (default 5 s, §7.2),
+  and dialled only once it answers — at once, too, after a network change
+  (netwatch), which also starts the fast pings over (acs-vxg). Most hosts
+  that go away come back within seconds — a reboot, a VPN reconnecting — so
+  the fast pings put the dial within a second of the host's return rather
+  than up to a whole interval after it; a ping is one packet, and an outage
+  that outlasts the 30 s costs no more of them than before. An interval
+  below a second is used throughout. An alias is
   resolved again each time, so the first of its hosts to answer is the one
   dialled (§7.3); a plain host is pinged itself. A host that answers but
   whose ssh is not up yet gets a dial that fails and the gate again.
@@ -854,13 +1066,51 @@ of ssh dials:
   alias's decides. `--persist` and `--no-reconnect` contradict each other
   and together are a usage error.
 
+**The timer knobs** (acs-r1k). Every deadline above, and the few elsewhere
+that tests need to shorten, is an environment variable in milliseconds
+(seconds where the name says so). They are internal — for tests, not in the
+README's environment table — bar the ones marked README, which are listed
+here only for how they interact with the rest. Each knob is read by the
+process that keeps the deadline: the master's, set for the remote side, are
+the remote environment's. `tests/knobs.rs` fails when a `*_MS` or `*_SECS`
+name appears in `src/` and in neither this table nor the README's, so the
+set stays visible; the cost of adding one is a row here.
+
+| Knob | Default | What it bounds | Interactions |
+| --- | --- | --- | --- |
+| `ACS_PING_MS` | 3000 | silence before a `PING`, client and master alike | must stay well under `ACS_DEAD_MS`, or a quiet link is dead before it is asked |
+| `ACS_DEAD_MS` | 10000 | silence before the link is dead (client redials; master drops its client) | ceiling for `ACS_NETCHECK_MS`, which only brings it forward |
+| `ACS_NETCHECK_MS` | 2000 | time the host has to answer the `PING` a network change sends while up | only its own `PONG` clears it (acs-br2); time blocked writing to the terminal is not counted (acs-spd) |
+| `ACS_BACKOFF_MS` | 1000 | the first wait of the redial backoff, after the free attempt | doubles to 30 s, or to itself if larger |
+| `ACS_BACKOFF_RESET_MS` | 30000 | how long a link must serve, `WELCOME` to loss, for the backoff to start over | equal to `ACS_REDIAL_TIMEOUT_MS` by default; a redial spending that timeout never resets it (acs-omt2) |
+| `ACS_PERSIST_FAST_MS` | 1000 | the ping gate's first pings after a loss, 30 of them, before it backs off to `reachability_interval` (acs-vxg) | never above `reachability_interval`; a network change starts the 30 over |
+| `ACS_EARLY_MS` | 2000 | at most one network-change redial per interval in the offline wait | separate from `ACS_NETCHECK_MS`: this one guards a redial, that one a ping |
+| `ACS_DIAL_TIMEOUT_MS` (README) | 120000 first connection, 30000 each host of `acs list` and the menu | a fresh connection's time to the marker, then to the `WELCOME` | not the redial's, which is its own knob (acs-p46); a network change that removed an address ends the dial at once and dials again with a fresh one, unless ssh is asking the user something (acs-xo1) |
+| `ACS_REDIAL_TIMEOUT_MS` (README) | 30000 | a redial's time to the marker, then to the `WELCOME`, before it goes back to the backoff wait | shortening it leaves the first connection's `ACS_DIAL_TIMEOUT_MS` alone (acs-p46); the same network-change rule (acs-xo1) |
+| `ACS_NOTE_HOLD_MS` | 500 | how long a diagnostic line waits for the output it would interrupt to reach a boundary, before it is written anyway | — |
+| `ACS_MASTER_REBIND_MS` | 5000 | how often the master checks its socket path is still there (§4.2) | the backstop: a new master for the name prods the old one at once (acs-lbba) |
+| `ACS_MASTER_HELLO_MS` | 10000 | time a new connection to the master has for its first whole message (acs-3anc) | the client's `HELLO` goes with the dial, so this is never a round trip short |
+| `ACS_MASTER_ORPHAN_MS` | 30000 | how long a new master waits for a client to create its session | — |
+| `ACS_PRUNE_AFTER_SECS` | 2592000 (30 days) | how long an unused installed version is kept (§8) | — |
+| `ACS_PRUNE_EVERY_SECS` | 86400 (1 day) | least time between prune runs | — |
+
+Two more of the same shape are plain constants with no knob: `PENDING_MS`
+(100, `keys.rs`), how long an incomplete escape sequence from the local
+terminal is held before it is sent as typed — local stdin only, so no link
+latency reaches it — and the master's `KILL_GRACE` (3 s), between `SIGHUP`
+and `SIGKILL` on a kill. The README's user-facing timers
+(`ACS_ESCAPE_TIMEOUT_MS`, `ACS_CONTROL_FALLBACK_MS`) are documented there.
+
 ### 5.4 Status while disconnected
 
 Anything the client prints corrupts the screen the remote program drew, and a
 lossless resume will not repaint it. So:
 
 1. While the link is merely quiet (< 10 s, or < 2 s when this machine's
-   network has just changed under it, §5.3), print nothing.
+   network has just changed under it, §5.3), print nothing. A terminal that
+   is not reading is not a quiet link in either case: bytes read count
+   against the 10 s, and time blocked writing to the terminal does not
+   count towards the 2 s (§5.3, acs-7k7, acs-spd).
 2. Once declared dead, write one status line on the bottom row using
    save-cursor / restore-cursor, and set the window title with the xterm title
    stack (push `CSI 22;0 t`, pop `CSI 23;0 t`) so the remote's title comes
@@ -868,16 +1118,30 @@ lossless resume will not repaint it. So:
    sequence the last frame opened, so the line is written **over** that
    sequence and not into it: ended with an `ST` before it and written again
    after it (§7, acs-p4u). The cursor, the title and the stream all come
-   back.
+   back. Each backoff step and each ping shows its status, but a line
+   already up is drawn again only when what it would write differs — text,
+   row or the sequence it steps over — or a note has been written since
+   (acs-ysx).
 3. After a successful resume that followed a printed status line, force one
    redraw to clean up the line: the client sends two RESIZE frames (one row
    fewer, then the real size), since an unchanged size raises no `SIGWINCH`.
    Full-screen programs repaint; a plain shell prompt may leave the line in
    scrollback, which is acceptable. The Ctrl-L every resume sends (§5.2,
    unless turned off) makes a shell clear and repaint too.
+   Straight after the pop the title is also set again explicitly (acs-r3m):
+   to the last `OSC 0` or `OSC 2` title the program set, which the mode
+   observer (§6.4) remembers, or to a neutral `acs: <host>` if it never set
+   one — after a fresh attach, the new program's, so none yet. Terminals
+   that ignore the title stack (macOS Terminal.app among them) would
+   otherwise keep the "connection lost" title for good; one that honours it
+   is handed the same title it just popped. This happens on every WELCOME
+   that follows a status line — resume, gap, or fresh attach.
 4. Whatever ends the client — resume, detach, or the session ending while
    the link was down — pops the title and blanks the status row on the way
-   out, so the terminal is left as it was. While offline, the command key
+   out, so the terminal is left as it was. Leaving, the pop is not followed
+   by an explicit title: the program's belongs to a session the terminal is
+   leaving, and a neutral one would overwrite what a stack-aware terminal
+   just restored. While offline, the command key
    uses the same key and window (`ACS_ESCAPE_TIMEOUT_MS`) as online — it is
    the same detector, which outlives both the wait and the link (§6.1), so a
    press held when a backoff expires into a redial is still held when the
@@ -892,7 +1156,7 @@ lossless resume will not repaint it. So:
 | Ctrl-] | Held for up to **400 ms**. If nothing else arrives, it is sent to the remote. |
 | Ctrl-] then any other key within 400 ms | Both keys sent to the remote, in order, immediately. |
 | Ctrl-] Ctrl-] within 400 ms | Enter command mode: the next key is a command. The terminal bell rings. |
-| … then `d` | **Detach.** `DETACH` to the master, restore the local terminal, exit 0. The session keeps running. Works even while the link is down (it is purely local then). |
+| … then `d` | **Detach.** `DETACH` to the master, restore the local terminal, exit 0. The session keeps running. Works even while the link is down (it is purely local then), in a redial too unless ssh is prompting (below). |
 | … then `x` | **Exit.** `KILL` to the master, wait for `EXIT`, restore the terminal, exit with the child's status. Needs the link; if it is down the client says so and stays in the session. |
 | … then any other key, or nothing for **2 s** (longer if the escape window is, below) | All the held keys are sent to the remote as typed. |
 
@@ -957,6 +1221,22 @@ to be a command. What §5.2 drops is input the user aimed at a program that
 could not receive it; what this forwards is one escape press, no older than
 the escape window, released into a live link exactly as the online path
 would have released it.
+
+"Came back" means the `WELCOME`, not the dial. A press whose window runs out
+while a redial is still in its handshake was typed into that dial, and is
+dropped like any key typed into one (§5.2) — it is not sent as `INPUT`
+ahead of the `WELCOME` (acs-wnhd). Which side of the `WELCOME` the window
+ends on is a matter of milliseconds, so either outcome is acceptable; what
+is not is a byte reaching the program from a link that was not yet up.
+
+**When the keys are live.** Always while a link is up, always in the wait
+between redials (§5.4), and during a redial until ssh asks for the
+terminal (acs-8ax, §5.3): once it has, the keys are ssh's — a password
+must reach ssh and nothing else — until that dial ends, and the next wait
+honours them again. The first connection's dial, which has no session to
+detach from, and a client that is not in the foreground of its terminal
+dial with the keys off. The detector carries through all of these, a
+redial included: a press held when the dial starts is still held in it.
 
 Command mode prints nothing on the screen — it only rings the bell (below):
 the local terminal shows only what the remote sent. The table is intended to
@@ -1121,8 +1401,17 @@ that cannot wait, which bytes end the open sequence and which write it again
   - **A quiet session cannot swallow one.** A program that stops
     mid-sequence, or a link that dies there, would hold a note for ever:
     the wait ends after `ACS_NOTE_HOLD_MS` (500 ms) or when the frame loop
-    does, whichever comes first, and the note is then written where it
-    stands. Late and ugly beats lost.
+    does, whichever comes first, and the note is then written *over* the
+    open sequence, as the status line is (next bullet). Late beats lost.
+  - **Outside the frame loop a note still knows the stream** (acs-ysx). The
+    terminal stays wherever the last frame left it, and the status line
+    puts it back inside the program's CSI on every step of an outage, so a
+    note raised by the dial, the offline wait or alias resolution may well
+    be written mid-sequence. Every note goes through one entry point that
+    knows where the stream stands — told after every frame and whenever the
+    observer is cleared or resynced — and steps over an open sequence the
+    way the status line does. A debug assertion in the status line's own
+    write checks that knowledge against the observer.
   - The status line (§5.4) and the other writes acs makes to fd 1 cannot
     wait for a boundary at all, and step out of the sequence and back in
     instead — next bullet.
@@ -1184,14 +1473,30 @@ that cannot wait, which bytes end the open sequence and which write it again
     nothing back.
 - **Connect timings** under `-v` (acs-pgn, `timing.rs`): one line per phase
   of a connection, `acs: timing: <connection>: <phase> +<step> ms (<total>
-  ms total)`, for the first connection and for every redial. The phases, in
-  order: `alias resolved` (an alias's pings and lookups), `ssh spawned`,
-  `HELLO sent`, `ACS-READY seen`, `session list received` (the menu's
-  `_proxy --pick`, §4.4), `WELCOME received`, `first output byte`; a phase a
+  ms total)`, for the first connection and for every redial. A phase a
   connection does not go through is not told, and nothing is told after the
   first output byte. They exist to show what dominates connect latency on a
   real host — the ssh handshake, remote startup files or the reachability
-  deadline — before any of it is optimised.
+  deadline — before any of it is optimised. The phases, in order — this
+  list is `timing::Phase`, and `tests/timing.rs` fails when the two differ
+  (acs-fb7r):
+  - `alias resolved` — an alias's pings and lookups.
+  - `network moved — dialing again` — a dial or handshake abandoned for a
+    network change (§7), told before the dial made again.
+  - `shared ssh master checked` — acs's own master may be joined
+    (acs-9n3, §7.1); not told where it may not.
+  - `ssh spawned`.
+  - `HELLO partly sent` — the transport's pipe took only part of the
+    greeting (below).
+  - `HELLO sent` — the whole greeting has gone (below).
+  - `ACS-READY seen` — the remote runs this acs.
+  - `ACS-NEED seen` — instead of `ACS-READY seen`: the remote has no acs,
+    or not this one.
+  - `acs installed` — after `ACS-NEED seen`, the install on the same
+    connection done (acs-6k2, §8.1).
+  - `session list received` — the menu's `_proxy --pick` answered (§4.4).
+  - `WELCOME received`.
+  - `first output byte`.
 - **`HELLO sent` is where the *whole* greeting has gone** (acs-ftn), so the
   order of the lines is what says whether the greeting overlapped the
   marker's leg (§5.3, acs-trw) or waited behind it — which is the one thing
@@ -1251,10 +1556,52 @@ never the user's `ControlPath`, and never on a connection acs did not open.
 
 - **Which calls use it.** The session's **first** connection (the menu's
   connection is that same one, §4.4) and **side** calls. A **redial** never
-  does, and `acs list` over every alias (a *batch* call) neither starts nor
-  joins one: it asks a dozen hosts at once, so a master per host would
+  does, and `acs list` over every alias (a *batch* call) **joins but never
+  starts** one: it asks a dozen hosts at once, so a master per host would
   leave a dozen authenticated connections behind a listing, and several
   `ControlMaster=auto` racing for one host wedge each other.
+- **A batch only joins** (acs-hmv, `mux::join`). Once an alias is
+  resolved, the batch call for it is given acs's socket only if a master
+  answers on it now — the socket file is there and `ssh -O check`
+  succeeds — and then asks with `ControlMaster=no` and that `ControlPath`,
+  no `ControlPersist`: it uses the master and can create none, so there is
+  no race. Every other host keeps the plain batch call, the user's own
+  multiplexing included. The questions this settles:
+  - *The cost where there is no master* — most hosts in a listing: a
+    `stat`; the check is not even run without a socket file. Where it does
+    run it is a local round trip to the master (a few ms), against a
+    handshake saved.
+  - *Why check at all*, rather than set the path and let ssh fall back:
+    with `ControlMaster=no`, OpenSSH dials on its own when the socket is
+    missing (silently) **and** when it is stale — but on a stale one, left
+    by a master that was killed, it first prints `Control socket
+    connect(…): Connection refused` on the terminal the table or the menu
+    is drawn on, and it does not unlink the file. The check keeps that line
+    off the screen, and keeps a host with no live master on exactly the
+    call it had before.
+  - *A half-dead master* — the socket answers, the connection under it is
+    gone: the batch is a dial that joins a master, so it gets
+    `ACS_CONTROL_FALLBACK_MS` like any other (next bullet); the master is
+    ended and the host asked again on a connection of its own, within the
+    same answer limit. One host's line waits 2 s; the others are not held.
+  - *The interactive session sharing the master.* One alias is one host,
+    so a listing opens **one** channel per master (two aliases naming the
+    same host, two) — what `acs list <host>` has done on the same master
+    since acs-9n3 — carrying a few kilobytes and closing. ssh multiplexes
+    channels with their own windows, so a session's stream is not queued
+    behind it. A listing never ends a master that answered: only the
+    fallback above does. Measured over real ssh (`e2e_17`, a container on
+    loopback) with a session streaming on the master through ten listings:
+    its stream stayed consecutive, the master's pid was unchanged, and a
+    listing took 33 ms (median of 5) on the master against 50 ms on its
+    own connection — on loopback, where a handshake costs almost no round
+    trips; on a real link each host saved is the handshake's round trips
+    and any key touch.
+  - *A per-host opt-out* is not needed: a batch only joins a master a
+    session or side call already started, so whatever keeps a host from
+    having one (a forward, `ACS_CONTROL_PERSIST=0`, a socket directory acs
+    cannot vouch for) keeps the listing off it too. `ACS_CONTROL_PERSIST=0`
+    on the listing itself joins nothing.
 - **Why the redial is the exception.** §3 opted out of multiplexing because
   a reconnect can hang on a dead multiplexer (§1.3). That hazard is the
   redial's, not a fresh start's: a redial happens *because* a connection
@@ -1272,7 +1619,8 @@ never the user's `ControlPath`, and never on a connection acs did not open.
 
   | How the link ended | The master |
   | --- | --- |
-  | The transport is gone — EOF on its pipes, a write to it that failed, the poll watching them failing, or a redial that could not be dialled at all | **Ended.** ssh exits when its connection does; `ServerAliveInterval=0` (§3) leaves that to the TCP stack, so an ssh that has gone is a connection that has gone |
+  | The transport is gone — EOF on its pipes and ssh exited 255, or had not exited 100 ms later; a write to it that failed; the poll watching them failing; or a redial that could not be dialled at all | **Ended.** ssh exits when its connection does; `ServerAliveInterval=0` (§3) leaves that to the TCP stack, so an ssh that has gone is a connection that has gone. 255 is ssh's own failure — its connection, or a master that went — and an ssh still running when the reap gives up is no evidence, which keeps this side's bias |
+  | EOF on its pipes, and ssh exited with any other status within 100 ms (acs-b4f) | **Kept.** OpenSSH exits with the remote command's status when the command ends and 255 when ssh itself fails, so this is our channel ending on a connection that said so. The reap waits only on a channel of the master — a redial, which never joins one, is dialled again at once (acs-iyq) — and a mux client exits a moment after its EOF, so the bound is never reached in practice. The install path never gets here: a prelude that exits during an install (§8.1) ends the attempt, not a link |
   | Nothing came back in time — `ACS_DEAD_MS` of silence, `ACS_NETCHECK_MS` after this machine's network moved (§5.3), or a handshake accepted and then quiet | **Ended.** Ambiguous, and deliberately on the blunt side: a master whose TCP died without noticing looks exactly like a network that stopped answering. A network change is the least ambiguous of the three — our own addresses moved, so a connection pinned to the old path is gone with them |
   | Bytes arrived and could not be read as a frame | **Kept.** The connection carried those bytes a moment ago, so it is up; the conversation on this one channel is what broke |
   | The far end said the session ended, that somebody took it over, or that we are refused | **Kept**, and not by this rule: none of those is a lost link. `acs` leaves on them (`Outcome::Exit`) without redialling, so nothing touches the master at all |
@@ -1418,6 +1766,7 @@ update_check: true             # look for a newer release once a week (§7.6)
 command_bell: true             # ring the bell when command mode arms (§6.1)
 redraw_on_reconnect: true      # send Ctrl-L after reconnecting (§5.2)
 reachability_timeout: 500ms    # how long hosts have to answer a ping (§7.3)
+reachability_tcp: false        # check the ssh port instead of pinging (§7.3)
 persist: false                 # wait for a lost host, pinging it (§5.3)
 reachability_interval: 5s      # how often a lost host is pinged (§5.3)
 local_forwards:                # ports every session forwards, as -L (§7.1)
@@ -1438,6 +1787,7 @@ aliases:                       # acs devbox tries its hosts in order
     identity_file: ~/.ssh/id_lab # the key of every host naming none
     redraw_on_reconnect: false # over the global setting, for this alias
     reachability_timeout: 2s   # so is this
+    reachability_tcp: true     # its hosts drop pings: try their ssh port
     persist: true              # and this, unless an entry says otherwise
     reachability_interval: 30s # and this
     prefer_local_network: true # hosts on this machine's networks first
@@ -1470,8 +1820,9 @@ aliases:                       # acs devbox tries its hosts in order
   written without the list. How an alias is resolved is §7.3.
 - **An alias's own settings**: an alias is a list of entries (or one entry,
   a mapping with `host`), or a mapping of its settings — `identity_file`,
-  `redraw_on_reconnect`, `reachability_timeout`, `persist`,
-  `reachability_interval`, `prefer_local_network` and `local_forwards` —
+  `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`,
+  `persist`, `reachability_interval`, `prefer_local_network` and
+  `local_forwards` —
   and its `hosts`, that list. The list form
   stays the usual one; the mapping is only needed for a setting shared by
   the entries. A file may give the mapping without
@@ -1504,16 +1855,20 @@ aliases:                       # acs devbox tries its hosts in order
 
 **Parser.** The files use a small subset of YAML — block mappings and lists,
 plain and quoted scalars, one-line `[…]`/`{…}`, comments — parsed by hand in
-`yaml.rs`, which refuses anchors, tags, block scalars and multi-line flow
-collections with the line they are on. A key may be separated from its
-value by a space or a tab, as YAML 1.2 says, and a leading byte-order mark
-is skipped; a tab for *indentation* is still refused, with that advice.
-The tree keeps every node's line and
-the comments around it, so a file rewritten by the client keeps its comments
-and order. Measured on the release profile, a minimal load-and-dump binary
-grows by about 100 KB with `yaml-rust2` and 150 KB with `serde_yaml`, and
-neither keeps comments; the hand-written parser adds 17 KB to `acs` (slim
-build 490 → 507 KB).
+`yaml.rs`, which refuses anchors, tags, directives, block scalars, multi-line
+flow collections and a second document with the line they are on. A key may
+be separated from its value, and a comment from what precedes it, by a space
+or a tab, as YAML 1.2 says, and a leading byte-order mark is skipped; a tab
+for *indentation* is still refused, with that advice.
+The tree keeps every node's line and the comments and `---`/`...` markers
+around it, so a file rewritten by the client keeps its comments and order.
+A space or a tab ends a marker; anything but a comment after one is refused
+with its line, since it could only be a top-level scalar or flow node, never
+the mapping a configuration is.
+Measured on the release profile, a minimal load-and-dump binary grows by
+about 100 KB with `yaml-rust2` and 150 KB with `serde_yaml`, and neither
+keeps comments; the hand-written parser adds 17 KB to `acs` (slim build
+490 → 507 KB).
 
 ### 7.3 Host aliases
 
@@ -1639,6 +1994,107 @@ one of the alias's entries instead of `<name>`:
   deadline passes kills and reaps it. Once a host is chosen the others'
   pings are not waited for; they end at the deadline. `ACS_PING` names
   another program, which is how the tests avoid ICMP.
+- **The entry used last here** (acs-zpj): a higher-ranked host that is
+  down where you are — `devbox.lan` away from home — costs the whole
+  deadline on every connection, the choice waiting for its ping. So acs
+  remembers which entry it chose, per alias and **set of local networks**,
+  and on those networks takes that entry **as soon as its own ping
+  answers**, not waiting for the ones ranked before it
+  (`alias_memory.rs`, `alias::resolve_remembering`).
+  - *The place* is this machine's usable networks (`getifaddrs`, as for
+    `prefer_local_network`, or `ACS_NETWATCH_NETS` as the watcher reads
+    them), each in network form, sorted: a new lease on the same subnet is
+    the same place; a network more or less — a VPN up, a second interface
+    — is another. On no usable network nothing is remembered or recalled.
+    `user@<alias>` shares the alias's memory.
+  - *What is remembered* is the chosen entry's `host`, and only when it was
+    **not first in the rank**; a choice of the first-ranked entry forgets
+    the memory instead, since there was no wait to save. A choice made
+    without answers (none reachable) leaves it as it was.
+  - *It is still pinged*, not dialled blind: ssh to a host that is down
+    takes its `ConnectTimeout`, far longer than the wait saved. An entry
+    with `reachability_check: false` is taken at once. Every other entry is
+    still pinged, as before, by the same deadline.
+  - *The entry used last is down*: its ping fails or the deadline passes,
+    and the walk goes on as without the memory, from the same pings — so
+    it costs nothing beyond the one deadline the walk has anyway. What was
+    chosen instead is remembered.
+  - *A higher-ranked host back up*: the connection stays on the remembered
+    entry (the entries are ways to reach one machine), and the usual
+    choice is still made from the same pings, by the same deadline, on a
+    thread the connection does not wait for, and remembered — here the
+    higher-ranked host, so the next connection waits for it again. A
+    process that ends before the deadline (a short `acs list`) leaves the
+    memory as it was; the next longer one corrects it.
+  - *The configuration changed*: a remembered host that is no longer an
+    entry of the alias, or is ranked behind an unchecked one so that it
+    could not be chosen, is ignored, and the choice made replaces it.
+    Several entries with the same `host` are taken by the first of them.
+    With `prefer_local_network`, the rank waits for the names to resolve;
+    the remembered entry does not.
+  - *The file* is `$XDG_STATE_HOME/acs/aliases` (default
+    `~/.local/state/acs/aliases`): a line per memory, `alias`, `host` and
+    the networks separated by tabs, newest first, at most 64. It is a
+    hint: a line that does not parse is dropped, an unreadable file is
+    empty, and a whole new file replaces it on each change (written beside
+    it and renamed). A file that cannot be written leaves the memory as it
+    was, and `-v` says why (`cannot remember the choice in …`). Since only
+    a configured entry can be taken through it, an edited file can choose
+    among the alias's hosts and nothing else. Threads of one process
+    (`acs list` over every alias) take turns; between processes the last
+    write wins, losing at most a hint.
+  - `-v` says it: `devbox.example.com was used last on these networks`,
+    then the "using" line, then for every other entry `<host> not waited
+    for: <host> was used last on these networks` (acs-qis's one line per
+    entry). On the walk without it, the lines are the usual ones.
+  - With `reachability_tcp` (below) the entry used last is checked on
+    its ssh port like every other entry, and taken as soon as it
+    connects; the memory itself is the same.
+- **The ssh port instead of a ping** (`reachability_tcp: true`, global or
+  per alias, default off; acs-fbes): a checked entry is checked by a TCP
+  connect to the port ssh would dial, instead of a ping. It is the truer
+  signal — it is what the dial needs, and a host whose sshd is down
+  answers pings — and it works where ICMP does not: a host that drops
+  pings needs no `reachability_check: false`, and a network that filters
+  ICMP no longer reports a reachable sshd as down.
+  - *The port* is `ssh -G <destination>`'s `hostname` and `port`, so
+    `~/.ssh/config` decides it as it decides the dial (`Host`, `Match`,
+    `HostName`, `Port`). The destination is the entry's, `user@host` when
+    it has a user, since a `Match user` may change either. `--ssh`, else
+    `ACS_SSH`, names the program, and the command line's own ssh options
+    (`-p`, `-F`, `-J`, `-o`, `-i`) go before the destination, as in the
+    dial (acs-nhrq): `acs -p 2222 devbox` probes port 2222, and a `-J` or
+    `-o ProxyJump=…` there makes the entry pinged, as below. All five are
+    passed: `-G` only prints the configuration they make, and an option
+    ssh rejects there (a bad `-o`) would fail the dial as well, so the entry
+    is reported down either way.
+  - *The deadline* is the ping's: `ssh -G` (killed at it, as a ping is),
+    the name's lookup (the system resolver, given up on at it) and the
+    connect all share one `reachability_timeout`, from a thread per entry
+    as the pings have. Every address of the name is tried at once and the
+    first to connect answers; the connection is closed straight away,
+    which sshd logs as a connection closed before authentication. An
+    `ssh -G` costs a process per entry, as a ping does, and it runs in
+    the same thread, so choosing still takes at most one deadline.
+  - *Through a proxy*: an entry whose `ssh -G` names a `ProxyJump` or a
+    `ProxyCommand` (other than `none`) has no port acs could connect to —
+    the dial goes to the jump host, not to it — so it is **pinged**, by
+    its `host`, as without the setting, in what is left of the same
+    deadline. That keeps the setting from changing anything for those
+    entries; one the ping cannot reach either is the job of
+    `reachability_check: false`, as it was. `-v` says so: `jumped answers
+    ping (ssh reaches it through a proxy), using jumped`.
+  - *Off by default*: it runs ssh once more per entry, and every
+    existing alias keeps its behaviour. A setting rather than per entry,
+    since the entries of an alias are usually on similar paths; an entry
+    that needs neither stays `reachability_check: false`.
+  - `-v` names the port: `devbox.lan does not answer on port 22 within
+    500ms`, `devbox.example.com answers on port 2222, using …`; an
+    `ssh -G` that fails or does not answer in time reads `does not answer
+    on its ssh port (ssh -G named none)`. `acs config host list` shows
+    `tcp` in the CHECK column for those entries.
+  - It is for an alias's entries only. A plain host waited for with
+    `persist` (§5.3) is still pinged.
 - The chosen entry becomes the ssh destination: `user@host` if it has a
   `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
 - **`user@<alias>`** goes through the alias the same way — same order, same
@@ -1661,8 +2117,10 @@ one of the alias's entries instead of `<name>`:
   it, as `<alias>` or `user@<alias>`; `ACS_REDRAW_ON_RECONNECT` still wins.
 - **None answers**: the client names every host it tried and exits with the
   unreachable code (255) without calling ssh — or, persisting (§5.3),
-  pings them every `reachability_interval` until one answers.
-- It applies to every ssh call — the session, `acs list`, install — since they
+  pings them every second for the first 30 pings, then every
+  `reachability_interval`, until one answers (§5.3).
+- It applies to every ssh call — the session (and the install it carries),
+  `acs list` — since they
   share one destination and key. `-v` says which entry was chosen and why.
 - **Redial**: a reconnect (§5.3) resolves the alias again, so after a network
   change the client reaches the host through whichever address answers now.
@@ -1699,7 +2157,9 @@ acs: lab: no host for 'lab' is reachable (tried lab.lan)
   holds up only its own line; each has the redial's answer limit (§5.3:
   30 s, `ACS_DIAL_TIMEOUT_MS`) for the whole exchange, not only for the
   marker. (`acs list <host>` bounds its whole exchange the same way, with
-  the first connection's 120 s.)
+  the first connection's 120 s.) A host acs already has a master up for
+  is asked on it, without a handshake; no master is ever started for a
+  listing (§7.1, acs-hmv).
 - **No prompts**: several ssh cannot share the terminal for a password or a
   host key, so these calls put `-o BatchMode=yes -o ConnectTimeout=10`
   before the user's options (`ssh::BATCH_OPTS`). A host that needs a
@@ -1772,11 +2232,11 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`); `set` checks the type |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`); `set` checks the type |
 | `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
 | `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check] [--prefer] [--persist] [--local-networks N,N]` | append an entry, so repeated adds give an alias its fallback hosts in order. `--local-networks` is checked as the file form is (§7.3) and written back masked |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
-| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false`, `local_forwards <spec>,<spec>\|none` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
+| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `reachability_tcp true\|false`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false`, `local_forwards <spec>,<spec>\|none` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
 | `path` | the two files and whether they exist |
 
 - A setting that is a **list** — `local_forwards` (§7.1) — is given to `set`
@@ -1847,10 +2307,17 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
     releases (VERSIONING.md, "Forking"); whichever it is, it is the key the
     packaged `install.sh` carries. Unset it is acs's own key — the one the
     checked-in `install.sh` carries — an empty value counts as unset, and a value
-    that is not an ssh public key line fails the build. What the variable
-    means lives in `src/release_key.rs`, which `build.rs` includes as
-    source: a build script is not a test target, so the rule sits where the
-    tests can reach it and only the wiring is left in `build.rs`. Like the
+    that is not an ssh public key line fails the build. That check decodes
+    the body (acs-d7x): base64 whose blob's embedded type string is the one
+    the line declares and, for a plain key, nothing but whole
+    length-prefixed fields — so a truncated or mismatched paste fails the
+    build rather than every user's upgrade. It stops there: a well-formed
+    key that is the wrong one cannot be told from the right one at build
+    time, and fails closed. What the variable means lives in
+    `src/build_channel.rs`, beside the releases URL's rule, which `build.rs`
+    includes as source and xtask compiles for the channel `dist` stamps: a
+    build script is not a test target, so the rule sits where the tests can
+    reach it and only the wiring is left in `build.rs`. Like the
     URL, that is the builder's decision rather than the environment's, so
     it carries none of the limits the runtime overrides below do.
   - **What it does not cover**: the first fetch of `install.sh` itself is
@@ -1879,10 +2346,15 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   "Forking") — and the release tasks follow it, into the packaged
   `install.sh`, the Homebrew formula and the notes (acs-x57). That one is
   the builder's decision rather than the environment's, so it carries none
-  of these limits.
+  of these limits — but a value that is not one https URL with a host (no
+  scheme, `http://`, an empty or malformed host or port, whitespace, a query
+  or fragment, credentials) fails the build, as a malformed key does, rather
+  than shipping a silently unreachable update channel (acs-d7x).
 - **Downloads use `curl`** (or `wget` when there is no curl, as on Alpine):
   an HTTP and TLS client of our own would cost more than the whole binary
-  (§9).
+  (§9). Either tries once (`--retry 0`, `-t 1`), so its timeout is the whole
+  wait: wget's default of 20 tries would hold the 3 s update check for a
+  minute against a refused connection (acs-q6ey).
 - **Decisions**: a newer release installs; the same version does nothing; a
   client newer than the latest release does nothing unless `--version` asks
   for that release, which is how to downgrade. `--check` only reports.
@@ -1950,7 +2422,14 @@ acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
 The one-line installer (`scripts/install.sh`, published with every release;
 README "Install") uses the same layout — `~/.local/share/acs/<version>/acs`,
 or `/usr/local/lib/acs/<version>/acs` as root — so a host set up with it
-serves clients of that version without an upload. It is also what the client
+serves clients of that version without an upload. It moves `~/.local/bin/acs`
+(`/usr/local/bin/acs` as root) by the rule below for the remote's link
+(acs-feee): made where nothing is, moved only when it is a link into the
+versioned directory to an older or removed version. So `ACS_VERSION=<older>`
+installs that version beside a newer one and leaves the link on the newer,
+and a file or link it did not make is left alone — which matters for a script
+run as `curl … | sh`, often as root. It says which it did, and where the
+version it installed is. It is also what the client
 suggests when `install_on_remote` is off (§7.2). Homebrew
 (`brew install michel-onstein/acs/acs`, docs/VERSIONING.md) installs the same
 complete release binary into its own keg, which the prelude below does not
@@ -1969,12 +2448,16 @@ for b in "$HOME/.local/share/acs/$v/acs" "/usr/local/lib/acs/$v/acs"; do
   [ -f "$b" ] && [ -x "$b" ] && exec "$b" _proxy main --create
 done
 printf '\nACS-NEED %s %s\n' "$(uname -s)" "$(uname -m)"
+# the session's prelude, where install_on_remote is on: wait for the install
+while IFS= read -r l; do case $l in *"ACS-INSTALL <sync>")
+  IFS= read -r l; (eval "$l"); s=$?; [ $s = 0 ] || exit $s
+  <the loop above again>; exit 6;; esac
+done
 ```
 
-The marker — `ACS-NEED` here, `ACS-READY` from the proxy, and the
-finisher's `ok` — is printed after a newline of its own, so a startup file
-that printed without one (`printf foo`) cannot put it mid-line, where it
-would not be recognised.
+The marker — `ACS-NEED` here, `ACS-READY` from the proxy — is printed after
+a newline of its own, so a startup file that printed without one
+(`printf foo`) cannot put it mid-line, where it would not be recognised.
 
 - `/usr/local/lib/acs/<version>/` is an optional system-wide location an
   administrator can populate once for all users; `acs` never writes there.
@@ -1989,16 +2472,36 @@ would not be recognised.
   or link the user put there is left alone, and an older client never moves
   the link back from a newer version. Nothing in the protocol depends on
   that link, so failing to make it (`HOME` unset in the ssh environment,
-  `~/.local/bin` a regular file or unwritable) is a warning printed after
-  the finisher's `ok`, not a failed install: the binary under
+  `~/.local/bin` a regular file or unwritable) is a warning from the
+  finisher, not a failed install: the binary under
   `~/.local/share/acs/<version>/` is complete and every connection works.
 - `acs _proxy` touches its version directory on start; versions untouched for
   30 days whose sessions have all ended are removed by the next proxy start —
   only under the user's own `~/.local/share/acs`, never in the system-wide
   `/usr/local/lib/acs`, which holds other users' versions.
+- **Old versions in `/usr/local/lib/acs` are the administrator's to remove**
+  (acs-1gy). acs never deletes there — a user cannot remove root's files,
+  and it is not ours to decide which version another user's client still
+  needs — and it does not touch those directories either, so their times
+  say when they were installed, not when they were last used. A directory
+  populated once per release therefore grows by one version each time until
+  its owner trims it: `rm -rf /usr/local/lib/acs/<version>` as root, for any
+  version no client should be on any more. Removing one is always safe. A
+  session already running keeps its binary (Linux keeps a running file
+  until its last process exits), and a client of that version still works:
+  its prelude finds nothing at either path, prints `ACS-NEED`, and the
+  client installs the version under that user's `$HOME` as on first
+  contact. `ps -eo user,args | grep /usr/local/lib/acs/` shows which
+  versions are attached at the moment, since the proxy is exec'd under the
+  path it was found at. There is no `acs prune` command to say any of this
+  at run time: pruning happens silently at a proxy start, and a message
+  there would reach every user on every connection about a directory none
+  of them can change.
 
-When the client reads `ACS-NEED`, it maps the `uname` pair to a target,
-installs a binary for it (below), and redials. Protocol versions are checked in
+When the client reads `ACS-NEED`, it maps the `uname` pair to a target and
+installs a binary for it **on the same connection** (below, acs-6k2): the
+prelude installs it, runs the candidates again, and execs the proxy, so first
+contact is one ssh handshake. Protocol versions are checked in
 `HELLO`; a new proxy that finds an older master tells the user to finish or
 kill the session rather than guess across versions.
 
@@ -2039,22 +2542,75 @@ Installing on a remote whose target is `r`:
    install by hand. macOS as a remote is rare, and carrying Mach-O payloads
    would add ~0.4 MB to every binary.
 
-On the wire, with no decompressor needed inside `acs` (gzip is on every
-Linux, busybox included), in two ssh calls that may use the user's
-multiplexed connection:
+On the wire there is no decompressor inside `acs` (gzip is on every Linux,
+busybox included), and **no second connection** (acs-6k2). The session's
+prelude ([§8](#8-installing-the-remote-binary)) says `ACS-NEED` and then
+reads its stdin a line at a time — the `read` builtin takes a pipe one byte
+at a time, so it consumes nothing past the line — passing over everything
+until `ACS-INSTALL <sync>`. That skips the HELLO the client sent ahead with
+the dial (§5.3, acs-trw), meant for a proxy that turned out not to be there;
+`<sync>` is random per dial, so no HELLO holds it by chance. The next line is
+a one-line script, which the prelude `eval`s in a subshell. It is no more
+trusted than the command line — both are the client's, over the one
+authenticated channel — and it travels on stdin only because its lengths and
+digests depend on the target `ACS-NEED` named. The client writes:
+
+```text
+\nACS-INSTALL <sync>\n<script>\n<bytes the script takes><HELLO>
+```
+
+and the script, for case 2 (case 1 takes the file straight into
+`acs.new.<token>` and has no `P` step):
 
 ```sh
-# 1: unpack the slim binary; stdin is gz(slim_r) from P. The shell checks
-#    the SHA-256 the client computed BEFORE the file is made executable.
+acs_take() { …exactly $1 bytes of stdin into $2… }; trap <rm the temp files> EXIT; set -e
 umask 022; d=~/.local/share/acs/0.3.1; mkdir -p $d; chmod 755 ~/.local/share/acs $d
-gzip -dc > $d/acs.new.<token>
+acs_take <n> $d/acs.gz.<token>; gzip -dc < $d/acs.gz.<token> > $d/acs.new.<token>
 got=$({ sha256sum $d/acs.new.<token> || shasum -a 256 … || openssl dgst … ; } | …)
-[ "$got" = <digest> ] || { rm -f $d/acs.new.<token>; exit 5; }
+[ "$got" = <digest> ] || { rm -f $d/acs.new.<token>; exit 5; }   # BEFORE chmod
 chmod 755 $d/acs.new.<token>
-# 2: stdin is P; check P against its own digest, append it as a trailer,
-#    then rename over $d/acs and repoint ~/.local/bin/acs
-$d/acs.new.<token> _install --finish --slim-sha256 <digest> --blob-sha256 <digest>
+acs_take <m> $d/acs.blob.<token>; <the same check of P against its digest>
+# check P again, append it as a trailer, rename over $d/acs, repoint ~/.local/bin/acs
+$d/acs.new.<token> _install --finish --slim-sha256 <digest> --blob-sha256 <digest> \
+  --payloads < $d/acs.blob.<token> >/dev/null
 ```
+
+The prelude then runs its candidate loop again — every check it makes on any
+connection, so an install it would not trust is refused (exit 6, and the
+client says the install went through but cannot be run) — and execs the
+proxy on what is left of stdin, which starts with the client's next HELLO.
+The client reads `ACS-READY` on the same pipe and the session starts. A
+failed step ends the connection with its status (3 no gzip, 4 nothing to
+hash with, 5 a mismatch), which the client reports beside the remote's own
+message; temporary files are removed on the way out.
+
+**`acs_take` takes exactly the bytes it is told to**, because what follows
+belongs to the next step and finally to the session. `head -c` is not POSIX,
+and the BSD one reads through stdio, a buffer past the count. A `read(2)`
+never returns more than it is asked for, and `dd bs=<still owed> count=1` is
+one read — it does not fill a block on a short read unless told to — so the
+loop takes what the pipe holds, up to what is owed, and `wc -c` says how far
+it got. A pass that gets nothing is the end of input, and fails the install.
+A pipe holds a few dozen kilobytes, so on its own that is a `dd` and a `wc`
+per few dozen kilobytes — measured at 0.5–1 s for the 1.9 MB complete build
+in the container, slower than the handshakes it replaced. Where `dd` knows
+`iflag=fullblock` (GNU, busybox, current macOS) a probe that reads nothing
+finds out, and `dd` then fills the block with reads of what is still owed,
+so the first pass takes the lot; elsewhere the probe fails without reading
+and the loop does the same work a read at a time.
+
+**First contact is one handshake.** It used to be the dial that got
+`ACS-NEED`, one install call for case 1 or two for case 2, and a redial:
+four ssh invocations for a payload install, each a full handshake without a
+master — measured over ssh to a local container (`tests/e2e_ssh.rs`'s host)
+with the macOS complete build installing Linux aarch64, 0.22 s before and
+0.13 s after with `ACS_CONTROL_PERSIST=0`. With acs's own master (§3, the
+default) the three later calls were already channels on one connection, so
+the saving there is three channel round trips and three ssh processes —
+nothing measurable against a local container (0.13 s either way), a round
+trip each on a real link. A new release ships after
+every merge (docs/VERSIONING.md), so every host pays first contact once per
+release. The upload itself still dominates on a slow link.
 
 **The directories acs makes carry a mode of their own** (acs-iws), not
 whatever the remote's umask leaves. The prelude refuses to exec a binary
@@ -2136,10 +2692,11 @@ or `openssl` refuses the install rather than running something unchecked.
 The payload trailer is checked against its own digest too: parsing it only
 says it is well formed, not that it is ours.
 
-Step 2 is skipped in case 1 (the file sent is already complete, and step 1
-then uses `cat` rather than `gzip -dc`). `<token>` is random per install, so
-two clients installing the same version at once write separate files and the
-final atomic rename puts identical content in place either way. A version's
+Case 1 has no `P` step: the file sent is already complete, and the script
+takes it straight into `acs.new.<token>`. `<token>` is random per install,
+so two clients installing the same version at once — each on its own
+connection — write separate files, and the final atomic rename puts
+identical content in place either way. A version's
 binary is never replaced by different content, so running masters are never
 affected by someone else's install.
 
@@ -2147,12 +2704,14 @@ affected by someone else's install.
 
 | Target | Slim | Complete |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 602 KB | 1.21 MB |
-| `aarch64-unknown-linux-musl` | 553 KB | 1.16 MB |
-| `aarch64-apple-darwin` | 473 KB | 1.10 MB |
-| `x86_64-apple-darwin` | 494 KB | 1.13 MB |
+| `x86_64-unknown-linux-musl` | 1024 KB | 2.05 MB |
+| `aarch64-unknown-linux-musl` | 911 KB | 1.94 MB |
+| `aarch64-apple-darwin` | 774 KB | 1.79 MB |
+| `x86_64-apple-darwin` | 836 KB | 1.88 MB |
 
-The payload set (both Linux builds, gzip'd) is 609 KB.
+The payload set (both Linux builds, gzip'd) is 1030 KB. Measured 2026-10-27;
+the budget `cargo xtask dist` enforces is slim ≤ 1.1 MB and complete ≤ 2.1 MB
+(goal 2), raised from 1 MB / 2 MB when x86_64 Linux passed them.
 
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
@@ -2171,13 +2730,23 @@ written into the directory the run wipes and refills, last, so it cannot
 outlive the binaries it describes; `--allow-stale-dist` overrides it, and is
 a usage error without `--no-build`, where it would do nothing.
 
+Beside it goes `dist/channel.stamp`: the releases URL and release key the
+binaries were built for. `cargo xtask package` refuses a `dist/` whose
+channel is not its own, so a fork's binaries cannot be packaged beside acs's
+installer and notes or the other way round (acs-u3qn, docs/VERSIONING.md
+"Forking"). It is a file of its own because it says nothing about which
+tree the binaries are from.
+
 The refusal is about *reusing* binaries whose provenance is wrong, so it does
 not cover a checkout with no `dist/` at all — a fresh worktree, which is where
 nearly all work here happens. There `--no-build` builds once and says so
 (acs-0pr). What the stamp cannot see is *which* targets were built: a `dist/`
 built with `--targets` that leaves this host out is this tree's, and the run
 therefore checks the client binary it is about to drive exists, naming it
-rather than failing later inside the harness.
+rather than failing later inside the harness. `--targets` itself takes only
+the four targets acs releases, each once, and refuses anything else before a
+build starts, so a mistyped triple cannot leave a `dist/` silently a platform
+short (acs-u3qn).
 
 ## 9. Implementation
 
@@ -2188,6 +2757,16 @@ rather than failing later inside the harness.
   install digest; a hand-written parser for the YAML subset of the
   configuration file (§7.2). **No async runtime**: the single-threaded poll
   loops do not need tokio.
+- **Build-time checks cost the binary nothing**: what `ACS_DEFAULT_RELEASES_URL`
+  and `ACS_DEFAULT_RELEASE_KEY` may be (§7.5) is `src/build_channel.rs`, run
+  by `build.rs` and xtask and compiled into the crate only for its tests. Its
+  URL check is not a URL parser — scheme, host, port, nothing a URL cannot
+  hold — and its key check decodes as far as the blob's fields and embedded
+  type and no further (acs-d7x): proving a key is a valid curve point or
+  modulus would need the crypto acs leaves to `ssh-keygen`, and a key that is
+  well-formed but wrong fails closed anyway. The base64 decoder is
+  hand-written rather than a crate, the build script sharing no
+  dependencies.
 - **Profile**: `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
   `panic = "abort"`, `strip = true`.
 - **Targets**: `aarch64-apple-darwin` (local, installed), `x86_64-apple-darwin`,
@@ -2227,9 +2806,12 @@ src/
                 addresses, for locality (§7.3)
   yaml.rs       the YAML subset those files use, parsed and written back
   install.rs    remote self-install and _install --finish
+  layout.rs     where acs is installed: the version and link directories
   payload.rs    payload set format, ELF trailer, Mach-O embed
   prune.rs      pruning of unused remote versions
-  sha256.rs     SHA-256 for install checks
+  sha256.rs     SHA-256, of a buffer or streamed from a file
+  build_channel.rs  what a build's releases URL and release key may be
+                (build.rs and xtask; tests only in the crate)
   signature.rs  the release key, and ssh-keygen -Y over a release's SHA256SUMS
   sys.rs        libc wrappers
 xtask/          cargo xtask dist
@@ -2245,8 +2827,8 @@ scripts/        verify.sh, test_linux.sh, e2e_ssh.sh, source_stamp.sh
   encodings, split reads, key release events and bracketed paste; the mode
   observer on sequences split at every byte boundary; the ssh argv builder
   (session calls put the transport options first; the user's
-  `-i`/`-p`/`-J`/`-F`/`-o` follow in order and are identical for session,
-  `acs list` and install calls).
+  `-i`/`-p`/`-J`/`-F`/`-o` follow in order and are identical for session
+  and `acs list` calls).
 - **Integration** (no ssh): `--transport-cmd` makes the client exec
   `acs _proxy …` locally instead of `ssh host acs _proxy …`. Tests start a
   session running a deterministic producer, kill the transport mid-stream,
@@ -2325,4 +2907,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 7 | What plain `acs <host>` attaches | Revisited at the user's request (2026-09-18). It used to mean `main` always, created if absent, so that the default "never depends on what else happens to exist". In use that meant a detached session under another name (`--new`'s `2`, a named one) was only found by `acs list` and retyping its name, and `acs <host>` with `main` attached elsewhere took it over (or asked to) instead of giving a fresh shell. Now it lists the sessions first: with none detached it creates one (`main` if free, else numbered), otherwise it shows a menu of the detached ones (§4.4). The list costs no second connection since decision 8. The predictable form stays: `acs <host> <name>`, and without a terminal plain `acs <host>` is still `main` |
 | 8 | One connection for the session menu and the attach | Revisited at the user's request (2026-09-19). The menu first listed with a `_proxy --list` side call and the attach dialed its own connection, since "reusing one connection for both is not worth a second proxy mode". In use the second full ssh handshake (TCP, key exchange, auth) cost a few hundred ms before every plain `acs <host>`, more through a jump host, and a hardware key needed two touches. The session call cannot share a multiplexed connection (it opts out on purpose, §3), so the fix is the proxy mode after all: `_proxy --pick` lists, ends sessions and then relays the session the client's HELLO names, on one connection (§4.3, §4.4) |
 | 9 | Listing: an option or a command | Revisited at the user's request (2026-09-19). Listing was `dsh`'s `-l`/`--list` option, and without a host it listed every alias — an option doing a whole-program action, as a command would. Now it is the command `acs list [<host>]`, beside `acs config` and `acs upgrade`: one host with a host, every alias without. The per-host form moved too rather than staying `acs <host> --list`, so that listing has one spelling. `list` is reserved as a first argument (a host of that name: `user@list`, an option first, or `acs list list`), and `-l`/`--list` are removed outright, with a usage error pointing to `acs list` — acs has no compatibility contract to keep yet (§7, §7.4) |
-| 10 | Reusing an ssh master (acs-9n3) | Revisited 2026-09-23, with the per-phase timings of acs-pgn in hand. §3 set `ControlMaster=no` outright because a reconnect can hang on a dead multiplexer — but that hazard is the redial's, and the price was a full handshake (and a second hardware-key touch) on every first connection, `acs list <host>` and reattach. acs now keeps **its own** master — its own `ControlPath` under `/tmp/acs-mux-<uid>`, its own `ControlPersist`, never the user's — for the first connection and side calls; a redial still opts out, and ends the master the lost link ran on when what ended that link says the connection failed rather than only the channel on it (acs-n1m, §7.1 — a protocol error is bytes arriving, so the connection is up and every sibling session on the master keeps it); a dial that joins a master must produce its marker within 2 s or the master is ended and the dial made again on its own connection; a session with a `-L` has no master, because a forward asked of a client is opened by the master and would outlive the session. Measured over ssh to a container on loopback, where a handshake costs almost no round trips: 51 ms to `ACS-READY` cold against 13 ms on the master. Every reason acs cannot vouch for the socket's directory costs the speed-up and nothing else; `ACS_CONTROL_PERSIST=0` restores the old dial exactly (§3, §7.1) |
+| 10 | Reusing an ssh master (acs-9n3) | Revisited 2026-09-23, with the per-phase timings of acs-pgn in hand. §3 set `ControlMaster=no` outright because a reconnect can hang on a dead multiplexer — but that hazard is the redial's, and the price was a full handshake (and a second hardware-key touch) on every first connection, `acs list <host>` and reattach. acs now keeps **its own** master — its own `ControlPath` under `/tmp/acs-mux-<uid>`, its own `ControlPersist`, never the user's — for the first connection and side calls, and `acs list` over every alias joins one that is up but never starts one (acs-hmv: 33 ms against 50 ms per listing on loopback); a redial still opts out, and ends the master the lost link ran on when what ended that link says the connection failed rather than only the channel on it (acs-n1m, §7.1 — a protocol error is bytes arriving, so the connection is up and every sibling session on the master keeps it; so is an ssh that exits with the remote command's status rather than its own 255, acs-b4f); a dial that joins a master must produce its marker within 2 s or the master is ended and the dial made again on its own connection; a session with a `-L` has no master, because a forward asked of a client is opened by the master and would outlive the session. Measured over ssh to a container on loopback, where a handshake costs almost no round trips: 51 ms to `ACS-READY` cold against 13 ms on the master. Every reason acs cannot vouch for the socket's directory costs the speed-up and nothing else; `ACS_CONTROL_PERSIST=0` restores the old dial exactly (§3, §7.1) |

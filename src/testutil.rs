@@ -39,6 +39,32 @@ impl Drop for TempDir {
     }
 }
 
+/// A child process killed and reaped when dropped, so a test that panics
+/// part way does not leave it running (acs-88a8). Derefs to the `Child`.
+pub struct KillOnDrop(pub std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // Both are no-ops on a child already waited for: std remembers the
+        // status and signals nothing, so a recycled pid is never hit.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// SIGTERM the master of every session socket at most two levels below
 /// `root`; a master ends its session on SIGTERM (SIGHUP, then SIGKILL).
 pub fn end_sessions_under(root: &Path) {
@@ -122,7 +148,7 @@ pub fn cpu_over(pid: u32, span: std::time::Duration) -> std::time::Duration {
     after.saturating_sub(before)
 }
 
-use crate::proto::{Decoder, Hello, Mode, Msg, WinSize, PROTO_VERSION};
+use crate::proto::{Decoder, Hello, Mode, Msg, Welcome, WinSize, PROTO_VERSION};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -356,5 +382,212 @@ impl Drop for FrameConn {
         if let Some(s) = &self.socket {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
+    }
+}
+
+impl FrameConn {
+    /// A connection over a spawned `acs _proxy`'s pipes, read past its
+    /// ACS-READY, which must name this protocol. Takes the child's stdin and
+    /// stdout, so both must have been piped.
+    pub fn ready_over(child: &mut std::process::Child) -> FrameConn {
+        let out = child.stdout.take().expect("the child's stdout, piped");
+        let inp = child.stdin.take().expect("the child's stdin, piped");
+        let mut c = FrameConn::from_io(out, inp);
+        match c.expect_marker(T) {
+            Some(crate::proto::Marker::Ready { proto, .. }) => assert_eq!(proto, PROTO_VERSION),
+            other => panic!("expected ACS-READY, got {other:?}"),
+        }
+        c
+    }
+
+    /// The next control message, which must be WELCOME.
+    pub fn expect_welcome(&mut self) -> Welcome {
+        match self.recv_control(T) {
+            Some(Msg::Welcome(w)) => w,
+            other => panic!("expected WELCOME, got {other:?}"),
+        }
+    }
+
+    /// Send `h` and expect WELCOME for it.
+    pub fn greet(&mut self, h: Hello) -> Welcome {
+        self.send(&Msg::Hello(h));
+        self.expect_welcome()
+    }
+
+    /// The next control message within `timeout`, which must be EXIT; its
+    /// raw wait status.
+    pub fn expect_exit(&mut self, timeout: Duration) -> i32 {
+        match self.recv_control(timeout) {
+            Some(Msg::Exit { status }) => status,
+            other => panic!("expected EXIT, got {other:?}"),
+        }
+    }
+}
+
+/// A HELLO that attaches to `session` or creates it running `command`.
+pub fn hello_running(session: &str, identity: &str, command: &[&str]) -> Hello {
+    let mut h = hello(session, Mode::AttachOrCreate, identity);
+    h.command = command.iter().map(|s| s.to_string()).collect();
+    h
+}
+
+/// Start a master for `name` in `dir` from the acs at `exe`, with `env`,
+/// and create the session running `command` as `identity`: the connection
+/// that created it and its WELCOME.
+pub fn start_master(
+    exe: &Path,
+    dir: &Path,
+    name: &str,
+    command: &[&str],
+    identity: &str,
+    env: &[(&str, &str)],
+) -> (FrameConn, Welcome) {
+    crate::master::spawn_with_env(exe, dir, name, env).expect("spawn master");
+    let mut c = FrameConn::connect(&dir.join(format!("{name}.sock"))).expect("connect to master");
+    let w = c.greet(hello_running(name, identity, command));
+    (c, w)
+}
+
+/// The deadline test helpers wait to. Generous on purpose (acs-kip): the
+/// whole suite runs its targets in parallel, so a laptop building and
+/// running two dozen binaries at once takes many times longer over any one
+/// step than an idle machine does. A test that truly hangs still fails,
+/// only later; one that merely lost the CPU for a second does not, and a
+/// gate that cries wolf teaches people to re-run rather than to read.
+pub const T: Duration = Duration::from_secs(30);
+
+/// How long [`poll`] sleeps between looks.
+pub const POLL_EVERY: Duration = Duration::from_millis(20);
+
+/// Call `f` until it returns `Some`, and return what it held; fail once
+/// `timeout` has passed, with `what()` saying what never happened. `what`
+/// is called only then, so it can describe the state at the deadline.
+#[track_caller]
+pub fn poll<R, M: std::fmt::Display>(
+    timeout: Duration,
+    mut f: impl FnMut() -> Option<R>,
+    what: impl FnOnce() -> M,
+) -> R {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(r) = f() {
+            return r;
+        }
+        if Instant::now() >= deadline {
+            panic!("after {timeout:?}: {}", what());
+        }
+        std::thread::sleep(POLL_EVERY);
+    }
+}
+
+/// Wait until `ready` holds, failing after `timeout` as [`poll`] does. For
+/// the moments a test needs a state to have been *reached* rather than to
+/// have been given time to (acs-kip).
+#[track_caller]
+pub fn wait_until<M: std::fmt::Display>(
+    timeout: Duration,
+    mut ready: impl FnMut() -> bool,
+    what: impl FnOnce() -> M,
+) {
+    poll(timeout, || ready().then_some(()), what)
+}
+
+/// Wait, up to [`T`], for `pid` to spend under a tenth of a half-second
+/// window on the CPU (acs-ci9u). It replaces a fixed settle after the event
+/// under test, a deadline for the process's legitimate work that a starved
+/// host could miss, so that the work spilled into the window the test then
+/// measures. A process that spins never gets here at all.
+#[track_caller]
+pub fn wait_idle(pid: u32, what: &str) {
+    let burnt = std::cell::Cell::new(Duration::ZERO);
+    wait_until(
+        T,
+        || {
+            burnt.set(cpu_over(pid, Duration::from_millis(500)));
+            burnt.get() < Duration::from_millis(50)
+        },
+        || {
+            format!(
+                "{what} never went idle: {:?} of CPU in its last 500 ms",
+                burnt.get()
+            )
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KillOnDrop;
+
+    fn alive(pid: u32) -> bool {
+        crate::sys::kill(pid as i32, 0).is_ok()
+    }
+
+    /// acs-88a8: a test that panics while holding a child must not leave
+    /// it running.
+    #[test]
+    fn a_guarded_child_is_killed_when_the_test_panics() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("100")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let r = std::panic::catch_unwind(move || {
+            let _g = KillOnDrop(child);
+            assert!(alive(pid));
+            panic!("deliberate");
+        });
+        assert!(r.is_err());
+        // Reaped as well as killed, so not even a zombie is left.
+        assert!(!alive(pid), "child {pid} still running");
+    }
+
+    /// `poll` hands back what `f` found, on the try that found it.
+    #[test]
+    fn poll_returns_what_it_waited_for() {
+        let mut tries = 0;
+        let got = super::poll(
+            super::T,
+            || {
+                tries += 1;
+                (tries == 3).then_some("three")
+            },
+            || "never",
+        );
+        assert_eq!((got, tries), ("three", 3));
+    }
+
+    /// A wait that never comes true fails, saying what it waited for and
+    /// with the state `what` reads at the deadline, not before.
+    #[test]
+    fn wait_until_fails_at_the_deadline_with_its_message() {
+        let looks = std::cell::Cell::new(0);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::wait_until(
+                std::time::Duration::from_millis(100),
+                || {
+                    looks.set(looks.get() + 1);
+                    false
+                },
+                || format!("the moon, after {} looks", looks.get()),
+            )
+        }));
+        let msg = *r.unwrap_err().downcast::<String>().unwrap();
+        assert!(msg.starts_with("after 100ms: the moon, after "), "{msg}");
+        assert!(looks.get() > 1, "looked {} times", looks.get());
+        assert!(msg.ends_with(&format!("{} looks", looks.get())), "{msg}");
+    }
+
+    /// A child the test already waited for is left alone by the guard.
+    #[test]
+    fn a_waited_child_is_not_signalled_again() {
+        let mut g = KillOnDrop(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(g.wait().unwrap().success());
+        drop(g);
     }
 }

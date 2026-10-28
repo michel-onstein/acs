@@ -11,11 +11,18 @@
 #   as root   /usr/local/lib/acs/<version>/acs, linked from /usr/local/bin/acs
 #
 # so a client of the same version finds it there and has nothing to upload.
-# Running it again upgrades in place.
+# Running it again upgrades in place. The link follows the rule acs keeps
+# for ~/.local/bin/acs on a remote (DESIGN §8): it is made where nothing
+# is, and moved only when it is a link of ours (into the versioned
+# directory) to an older or removed version. So ACS_VERSION=<older>
+# installs that version beside a newer one without taking the link back,
+# and a file or link the user put there is left alone; either way the
+# installer says so, and where the version it installed is.
 #
 # Environment:
 #   ACS_VERSION=X.Y.Z     install that release instead of the latest
-#   ACS_INSTALL_DIR=DIR   put the binary itself in DIR (no versioned layout)
+#   ACS_INSTALL_DIR=DIR   put the binary itself in DIR (no versioned layout
+#                         and no link: DIR/acs is replaced)
 #   ACS_RELEASES_URL=URL  where releases are (default: the GitHub releases).
 #                         Must be https unless ACS_ALLOW_INSECURE_URL=1, and
 #                         it is ignored when running through sudo (acs-95w).
@@ -133,12 +140,13 @@ ssh-keygen -Y verify -f "$tmp/allowed_signers" -I releases@acs -n acs-release \
 # [^ ]+ for the whole name, which allows / and .., so a SHA256SUMS from a
 # channel under someone else's control could name a version that walks out
 # of $tmp and out of $lib -- and $lib is written as root in the root
-# branch. The Rust side has always been this strict; the two now agree.
-line=$(grep -E "^[0-9a-f]{64} [ *]?acs-[0-9]+\\.[0-9]+\\.[0-9]+-$target\\.tar\\.gz\$" "$tmp/SHA256SUMS" | head -n 1 || true)
+# branch. The Rust side has always been this strict; the two now agree,
+# on the separator too: one space, then any run of spaces and `*`s
+# (release::sums_line; tests/scripts.rs holds them together).
+line=$(grep -E "^[0-9a-f]{64} [ *]*acs-[0-9]+\\.[0-9]+\\.[0-9]+-$target\\.tar\\.gz\$" "$tmp/SHA256SUMS" | head -n 1 || true)
 [ -n "$line" ] || die "the release has no build for $target"
 sum=${line%% *}
-file=${line##* }
-file=${file#\*}
+file=${line##*[ *]}
 version=${file#acs-}
 version=${version%-"$target".tar.gz}
 # Belt and braces: whatever the grep let through, this is a version.
@@ -164,6 +172,12 @@ new="$tmp/acs-$version-$target/acs"
 chmod 755 "$new"
 
 # ---- where it goes -------------------------------------------------------------
+
+# Under umask 002 (Ubuntu's default with user-private groups) what is made
+# below would be group-writable, and acs on a remote refuses to run from a
+# directory others can write (acs-91q2): installed by this script, it was
+# refused and uploaded again on the first connection.
+umask 022
 
 # Copy to a temporary name next to the destination, then rename over it,
 # so the path is never missing or half-written.
@@ -199,6 +213,57 @@ link() { # link <target> <link>
     mv -f "$2.new.$tag" "$2"
 }
 
+# The physical path of directory $1, or a failure when it is not one.
+phys() { (cd "$1" 2>/dev/null && pwd -P); }
+
+# Whether $1, what $bin/acs points at, is $lib/<version>/<file>: by name,
+# or through a symlinked parent ($HOME itself is often one).
+ours() {
+    case "$1" in "$lib"/*) return 0 ;; esac
+    d=$(phys "$(dirname "$(dirname "$1")")") || return 1
+    [ "$d" = "$(phys "$lib")" ]
+}
+
+# Whether version $1 (X.Y.Z) is at least $2, field by field as numbers, as
+# release::compare orders them: a pre-release $2 is below its release, and
+# a $2 that is not a version at all does not hold the link (should_link).
+at_least() {
+    case "$2" in [0-9]*.[0-9]*.[0-9]*) ;; *) return 0 ;; esac
+    a=$1. b=${2%%-*}.
+    while [ -n "$a" ] && [ -n "$b" ]; do
+        x=${a%%.*} y=${b%%.*}
+        case "$x$y" in *[!0-9]*) return 0 ;; esac
+        [ "$x" -gt "$y" ] && return 0
+        [ "$x" -lt "$y" ] && return 1
+        a=${a#*.} b=${b#*.}
+    done
+    return 0
+}
+
+# Point $2 ($bin/acs) at $1 ($lib/$version/acs) by acs's own rule for that
+# link (install::should_link, DESIGN §8), so this script -- run as
+# `curl | sh`, often as root -- never replaces what it did not make: link
+# when nothing is there, or when it is a link of ours to an older or
+# removed version; keep a link of ours to a newer one; leave anything else
+# alone (acs-feee). Sets $linked to linked, newer (with $have) or theirs.
+link_bin() { # link_bin <target> <link>
+    linked=theirs
+    if [ -L "$2" ]; then
+        cur=$(readlink "$2") || return 0
+        case "$cur" in /*) ;; *) cur="$(dirname "$2")/$cur" ;; esac
+        ours "$cur" || return 0
+        have=$(basename "$(dirname "$cur")")
+        if [ -e "$cur" ] && ! at_least "$version" "$have"; then
+            linked=newer
+            return 0
+        fi
+    elif [ -e "$2" ]; then
+        return 0
+    fi
+    link "$1" "$2"
+    linked=linked
+}
+
 if [ -n "${ACS_INSTALL_DIR:-}" ]; then
     bin=$ACS_INSTALL_DIR
     mkdir -p "$bin" || die "cannot create $bin"
@@ -215,12 +280,26 @@ else
         bin="$HOME/.local/bin"
     fi
     mkdir -p "$lib/$version" "$bin" || die "cannot create $lib/$version or $bin"
+    # As the remote install does: a client refuses to run a binary whose
+    # directory others can write, and would upload this version again.
+    chmod 755 "$lib" "$lib/$version" || die "cannot set the mode of $lib/$version"
     place "$new" "$lib/$version/acs"
-    link "$lib/$version/acs" "$bin/acs"
     installed="$lib/$version/acs"
+    link_bin "$installed" "$bin/acs"
 fi
 
-say "installed acs $version: $bin/acs"
+case "${linked:-placed}" in
+    placed) say "installed acs $version: $installed" ;;
+    linked) say "installed acs $version: $bin/acs -> $installed" ;;
+    newer)
+        say "installed acs $version: $installed"
+        say "left $bin/acs on acs $have, which is newer: an older version never takes the link back"
+        ;;
+    *)
+        say "installed acs $version: $installed"
+        say "left $bin/acs alone: it is not a link this installer made (remove it and run again to link it)"
+        ;;
+esac
 
 # ---- after -------------------------------------------------------------------
 

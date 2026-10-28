@@ -3,8 +3,9 @@
 # first-contact install from the macOS complete build, TUI escape sequences,
 # the kitty keyboard protocol, mouse reports, OSC 52, key selection by -i and
 # by identity_file, drops (a killed connection, a frozen host), the Ctrl-L
-# sent after a re-attach and a resume, and a -L forward (the session's ssh
-# alone binds the port).
+# sent after a re-attach and a resume, a -L forward (the session's ssh
+# alone binds the port), and a user whose only acs is the system-wide
+# install under /usr/local/lib/acs.
 #
 #   scripts/e2e_ssh.sh [--no-build [--allow-stale-dist]]
 #
@@ -112,4 +113,5 @@ export ACS_E2E_CLIENT="$root/$client"
 export ACS_E2E_KEY="$work/key"
 export ACS_E2E_PORT="$port"
 export ACS_E2E_CONTAINER="$name"
-cargo test -p acs --test e2e_ssh -- --test-threads=1 --nocapture
+# Every e2e test is #[ignore] so a plain cargo test counts it (acs-hdj4).
+cargo test -p acs --test e2e_ssh -- --include-ignored --test-threads=1 --nocapture

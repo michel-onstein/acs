@@ -2,7 +2,8 @@
 //! session's STATUS and print a table. `acs list` asks every alias in the
 //! configuration at once (DESIGN §7.3).
 
-use std::os::fd::AsRawFd;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -34,7 +35,8 @@ pub(crate) fn push_session(sessions: &mut Vec<StatusInfo>, s: StatusInfo) -> Res
 pub(crate) enum Failure {
     /// No connection, or no answer in time.
     Unreachable(String),
-    /// The proxy answered with something that is not a STATUS reply.
+    /// The proxy answered with something that is not a STATUS reply, or
+    /// with an ERROR saying why it could not list.
     BadReply(String),
 }
 
@@ -131,7 +133,9 @@ pub(crate) fn no_aliases(config: &crate::config::Config) -> String {
     format!("{what}: list one host with acs list <host>, or add an alias with acs config host add <alias> <host>")
 }
 
-/// Resolve `alias` and ask the host it stands for now, in BatchMode.
+/// Resolve `alias` and ask the host it stands for now, in BatchMode — on
+/// the master acs already has up for that host, if it has one (acs-hmv):
+/// a host with a session open answers without another handshake.
 pub(crate) fn ask(
     base: &ClientArgs,
     alias: &str,
@@ -139,6 +143,9 @@ pub(crate) fn ask(
 ) -> Result<Option<Vec<StatusInfo>>, Failure> {
     let mut args = base.clone();
     client::resolve_alias(&mut args, alias).map_err(Failure::Unreachable)?;
+    // After the alias is resolved: the socket is named for the host it
+    // stands for now, as the session's was.
+    crate::mux::join(&mut args.transport);
     query(&args, Call::Batch, timeout)
 }
 
@@ -179,56 +186,105 @@ pub(crate) fn query(
     };
     let mut dec = Decoder::new();
     dec.push(&rest);
-    let mut sessions = Vec::new();
+    let late = format!(
+        "no answer from {} within {} s",
+        args.transport.destination,
+        timeout.as_secs_f32()
+    );
+    let listed = read_listing(
+        &mut dec,
+        link.from_fd().as_raw_fd(),
+        deadline,
+        Until::Eof,
+        &late,
+        &mut sys::wait_readable,
+    );
+    link.close();
+    listed.map(|l| Some(l.sessions))
+}
+
+/// Where a listing ends: the one way the two connections that carry one
+/// differ (acs-bsar).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Until {
+    /// The connection closing: `_proxy --list`, which ends after its list.
+    /// An ERROR is the answer at once — the host could not list (acs-mum0)
+    /// — frames of no listing's are passed over, and a failed read is
+    /// taken for the close.
+    Eof,
+    /// LIST_END: `_proxy --pick`, whose connection stays open. An ERROR
+    /// ahead of the list is kept with it (a session that would not end);
+    /// one and then the close is the failure to report (acs-5jrq). Any
+    /// other frame is a bad reply, and closing before the end a failure.
+    End,
+}
+
+/// One list from the proxy: every session's STATUS, and the message of an
+/// ERROR sent along (only with [`Until::End`]).
+pub(crate) struct Listing {
+    pub(crate) sessions: Vec<StatusInfo>,
+    pub(crate) error: Option<String>,
+}
+
+/// Read one list of sessions from `from` (what `dec` holds already first)
+/// up to `until`, by `deadline`: `wait` says whether `from` turned
+/// readable in time, and `late` is what to report when it did not.
+pub(crate) fn read_listing(
+    dec: &mut Decoder,
+    from: RawFd,
+    deadline: Instant,
+    until: Until,
+    late: &str,
+    wait: &mut dyn FnMut(RawFd, Instant) -> io::Result<bool>,
+) -> Result<Listing, Failure> {
+    let mut answer = Listing {
+        sessions: Vec::new(),
+        error: None,
+    };
     let mut buf = [0u8; 16 * 1024];
-    let from = link.from_fd().as_raw_fd();
     loop {
         match dec.next_msg() {
+            // Bounded (acs-rip).
             Ok(Some(Msg::StatusReply(s))) => {
-                if let Err(f) = push_session(&mut sessions, s) {
-                    link.close();
-                    return Err(f);
-                }
+                push_session(&mut answer.sessions, s)?;
                 continue;
             }
-            Ok(Some(_)) => continue,
-            Ok(None) => {}
-            Err(e) => {
-                link.close();
-                return Err(Failure::BadReply(e.to_string()));
+            Ok(Some(Msg::Error { message, .. })) if until == Until::Eof => {
+                return Err(Failure::BadReply(message))
             }
+            Ok(Some(Msg::Error { message, .. })) => {
+                answer.error = Some(message);
+                continue;
+            }
+            Ok(Some(Msg::ListEnd)) if until == Until::End => return Ok(answer),
+            Ok(Some(_)) if until == Until::Eof => continue,
+            Ok(Some(other)) => return Err(Failure::BadReply(format!("unexpected {other:?}"))),
+            Ok(None) => {}
+            Err(e) => return Err(Failure::BadReply(e.to_string())),
         }
         // A host that goes quiet after its marker must not hold us forever.
-        let left = deadline.saturating_duration_since(Instant::now());
-        let mut p = [sys::pollfd(from, libc::POLLIN)];
-        let ready = if left.is_zero() {
-            Ok(0)
-        } else {
-            sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32)
-        };
-        match ready {
-            Ok(0) if Instant::now() < deadline => continue, // a signal cut the wait short
-            Ok(0) => {
-                link.close();
-                return Err(Failure::Unreachable(format!(
-                    "no answer from {} within {} s",
-                    args.transport.destination,
-                    timeout.as_secs_f32()
-                )));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                link.close();
-                return Err(Failure::Unreachable(e.to_string()));
-            }
+        match wait(from, deadline) {
+            Ok(true) => {}
+            Ok(false) => return Err(Failure::Unreachable(late.to_string())),
+            Err(e) => return Err(Failure::Unreachable(e.to_string())),
         }
         match sys::read(from, &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => dec.push(&buf[..n]),
+            Ok(n) if n > 0 => dec.push(&buf[..n]),
+            Err(e) if until == Until::End => return Err(Failure::Unreachable(e.to_string())),
+            // Closed.
+            _ => {
+                return match until {
+                    Until::Eof => Ok(answer),
+                    Until::End => Err(match answer.error {
+                        Some(e) => Failure::BadReply(e),
+                        None => Failure::Unreachable(
+                            "the connection closed before the session list".into(),
+                        ),
+                    }),
+                }
+            }
         }
     }
-    link.close();
-    Ok(Some(sessions))
 }
 
 /// Compact durations in one unit: `42s`, `7m`, `3h`, `12d`.
@@ -274,20 +330,25 @@ fn table(head: &[&str], rows: &[Vec<String>]) -> String {
 
 /// The lines of [`table`], each ending in `\n`: the heading, then a line
 /// per row.
+///
+/// Columns are measured in terminal columns ([`crate::menu::width`]), not
+/// characters: a wide character in a cell (an identity in CJK, an emoji)
+/// would otherwise push every column after it out of line (acs-75de).
 fn table_lines(head: &[&str], rows: &[Vec<String>]) -> Vec<String> {
-    let mut width: Vec<usize> = head.iter().map(|h| h.len()).collect();
+    use crate::menu::width as cols;
+    let mut width: Vec<usize> = head.iter().map(|h| cols(h)).collect();
     for r in rows {
         for (w, c) in width.iter_mut().zip(r.iter()) {
-            *w = (*w).max(c.chars().count());
+            *w = (*w).max(cols(c));
         }
     }
     let line = |cells: &[&str]| -> String {
         let mut s = String::new();
         for (i, c) in cells.iter().enumerate() {
-            if i == cells.len() - 1 {
-                s.push_str(c);
-            } else {
-                s.push_str(&format!("{c:<w$}  ", w = width[i]));
+            s.push_str(c);
+            if i < cells.len() - 1 {
+                let pad = width[i] - cols(c) + 2;
+                s.extend(std::iter::repeat(' ').take(pad));
             }
         }
         s.trim_end().to_string() + "\n"
@@ -303,7 +364,12 @@ fn table_lines(head: &[&str], rows: &[Vec<String>]) -> Vec<String> {
 /// heading first (the session menu, DESIGN §4.4).
 pub(crate) fn lines(sessions: &[StatusInfo], now: u64) -> Vec<String> {
     let rows: Vec<Vec<String>> = sessions.iter().map(|s| cells(s, now)).collect();
-    table_lines(&HEAD, &rows)
+    unterminated(table_lines(&HEAD, &rows))
+}
+
+/// `lines` without their `\n`, for the menu.
+fn unterminated(lines: Vec<String>) -> Vec<String> {
+    lines
         .into_iter()
         .map(|mut l| {
             l.pop();
@@ -312,29 +378,33 @@ pub(crate) fn lines(sessions: &[StatusInfo], now: u64) -> Vec<String> {
         .collect()
 }
 
-/// The `acs list` table of every host's sessions under a HOST column, as
-/// lines without their `\n`: the heading, then each host's sessions in
-/// order (the session menu on every host, DESIGN §7.3).
-pub(crate) fn host_lines(hosts: &[(&str, &[StatusInfo])], now: u64) -> Vec<String> {
-    let rows: Vec<Vec<String>> = hosts
+/// Every host's sessions as rows under a HOST column, and that heading:
+/// what [`host_lines`] and [`render_all`] lay out.
+fn host_table<S: AsRef<[StatusInfo]>>(
+    hosts: &[(&str, S)],
+    now: u64,
+) -> ([&'static str; 7], Vec<Vec<String>>) {
+    let rows = hosts
         .iter()
         .flat_map(|(host, sessions)| {
-            sessions.iter().map(move |s| {
+            sessions.as_ref().iter().map(move |s| {
                 let mut row = vec![host.to_string()];
                 row.extend(cells(s, now));
                 row
             })
         })
         .collect();
-    let mut head = vec!["HOST"];
-    head.extend(HEAD);
-    table_lines(&head, &rows)
-        .into_iter()
-        .map(|mut l| {
-            l.pop();
-            l
-        })
-        .collect()
+    let mut head = ["HOST"; 7];
+    head[1..].copy_from_slice(&HEAD);
+    (head, rows)
+}
+
+/// The `acs list` table of every host's sessions under a HOST column, as
+/// lines without their `\n`: the heading, then each host's sessions in
+/// order (the session menu on every host, DESIGN §7.3).
+pub(crate) fn host_lines(hosts: &[(&str, &[StatusInfo])], now: u64) -> Vec<String> {
+    let (head, rows) = host_table(hosts, now);
+    unterminated(table_lines(&head, &rows))
 }
 
 /// The table `acs list <host>` prints.
@@ -349,21 +419,10 @@ pub fn render(host: &str, sessions: &[StatusInfo], now: u64) -> String {
 /// The table `acs list` prints: the sessions of every host that has any,
 /// under a HOST column; empty if none has.
 pub fn render_all(hosts: &[(&str, Vec<StatusInfo>)], now: u64) -> String {
-    let rows: Vec<Vec<String>> = hosts
-        .iter()
-        .flat_map(|(host, sessions)| {
-            sessions.iter().map(move |s| {
-                let mut row = vec![host.to_string()];
-                row.extend(cells(s, now));
-                row
-            })
-        })
-        .collect();
+    let (head, rows) = host_table(hosts, now);
     if rows.is_empty() {
         return String::new();
     }
-    let mut head = vec!["HOST"];
-    head.extend(HEAD);
     table(&head, &rows)
 }
 
@@ -389,6 +448,71 @@ mod tests {
         assert_eq!(sessions.len(), MAX_SESSIONS, "the refused one was kept");
         // And it is reported as a bad reply, not as an unreachable host.
         assert_eq!(e.code(), code::ERROR);
+    }
+
+    /// `frames` as the proxy would send them, then the close, read as a
+    /// listing up to `until` (acs-bsar).
+    fn read_back(frames: &[Msg], until: Until) -> Result<Listing, Failure> {
+        let (r, w) = sys::pipe().unwrap();
+        let mut bytes = Vec::new();
+        for f in frames {
+            f.encode(&mut bytes);
+        }
+        sys::write_all(w.as_raw_fd(), &bytes).unwrap();
+        drop(w);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        read_listing(
+            &mut Decoder::new(),
+            r.as_raw_fd(),
+            deadline,
+            until,
+            "late",
+            &mut sys::wait_readable,
+        )
+    }
+
+    fn error(message: &str) -> Msg {
+        Msg::Error {
+            code: 1,
+            message: message.into(),
+        }
+    }
+
+    /// One reader serves `--list` and `--pick` (acs-bsar); where they
+    /// differ is where the list ends and what an ERROR in it means.
+    #[test]
+    fn one_reader_ends_a_listing_where_its_connection_does() {
+        let one = || {
+            Msg::StatusReply(StatusInfo {
+                name: "main".into(),
+                ..Default::default()
+            })
+        };
+        // `--list`: the close ends it; LIST_END is passed over.
+        let l = read_back(&[one(), Msg::ListEnd, one()], Until::Eof).unwrap();
+        assert_eq!(l.sessions.len(), 2);
+        // `--pick`: LIST_END ends it, and what follows is left unread.
+        let l = read_back(&[one(), Msg::ListEnd, one()], Until::End).unwrap();
+        assert_eq!(l.sessions.len(), 1);
+        // ...and a close before it is a failure, not an empty host.
+        let e = read_back(&[one()], Until::End).err().unwrap();
+        assert!(matches!(e, Failure::Unreachable(_)), "{e:?}");
+        // Anything else is a bad reply to `--pick`, passed over by `--list`.
+        let e = read_back(&[Msg::Detach], Until::End).err().unwrap();
+        assert!(matches!(e, Failure::BadReply(_)), "{e:?}");
+        assert!(read_back(&[Msg::Detach], Until::Eof).is_ok());
+    }
+
+    /// An ERROR that is the whole answer is a bad reply on both paths; one
+    /// ahead of a `--pick` list goes with it (a session that would not end).
+    #[test]
+    fn an_error_is_the_answer_on_both_paths() {
+        let e = read_back(&[error("no")], Until::Eof).err().unwrap();
+        assert!(matches!(&e, Failure::BadReply(m) if m == "no"), "{e:?}");
+        let e = read_back(&[error("no")], Until::End).err().unwrap();
+        assert!(matches!(&e, Failure::BadReply(m) if m == "no"), "{e:?}");
+        let l = read_back(&[error("busy"), Msg::ListEnd], Until::End).unwrap();
+        assert_eq!(l.error.as_deref(), Some("busy"));
     }
 
     fn info(
@@ -442,6 +566,29 @@ mod tests {
              x     detached  -               0s    0s   sh\n"
         );
         assert_eq!(render("h", &[], now), "no sessions on h\n");
+    }
+
+    /// Regression (acs-75de): columns are padded by terminal columns, so a
+    /// wide identity — two columns a character — leaves IDLE and AGE in
+    /// line with the heading, where padding by characters pushed them left
+    /// by one column a wide character.
+    #[test]
+    fn a_wide_identity_keeps_the_columns_in_line() {
+        let now = 1_000_000;
+        let t = render(
+            "devbox",
+            &[
+                info("main", true, "米歇尔@mbp", 3, now - 7200, "zsh"),
+                info("2", false, "al@x", 900, now - 60, "htop"),
+            ],
+            now,
+        );
+        assert_eq!(
+            t,
+            "NAME  STATE     WHO         IDLE  AGE  COMMAND\n\
+             main  attached  米歇尔@mbp  3s    2h   zsh\n\
+             2     detached  (al@x)      15m   1m   htop\n"
+        );
     }
 
     #[test]

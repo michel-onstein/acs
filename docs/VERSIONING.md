@@ -7,8 +7,9 @@ are all built: a fork publishes a complete release — binaries, packaged
 installer, Homebrew formula and notes — without editing a tracked source
 file (acs-x57).
 
-acs follows semantic versioning, and the version moves **automatically** after
-every merge to `main`. The version lives in `Cargo.toml` (and so in
+acs follows semantic versioning, and the version moves after every merge to
+`main` — when whoever landed it runs the bump ("Who runs it"). The version
+lives in `Cargo.toml` (and so in
 `Cargo.lock`, in `acs --version`, and in the remote install path
 `~/.local/share/acs/<version>/`); each release is an annotated tag `vX.Y.Z` on
 a `chore(release): vX.Y.Z` commit.
@@ -67,9 +68,26 @@ scripts/version-bump.sh --major     # a new major version (manual only)
 - It never touches your checkout: it releases from a throwaway worktree of
   `origin/main` and pushes the commit and tag atomically. Afterwards update
   your `main` with `git pull --ff-only`.
-- The `ship` workflow runs it after every merge, then pulls again.
+- The `ship` skill runs it after every merge, then pulls again.
 - The first run on a repository without tags releases the current
   `Cargo.toml` version as it is.
+
+### Who runs it: there is no CI
+
+The repository has **no CI** — no `.github/`, no GitHub Actions, nothing
+that runs on a push, a merge or a schedule. `gh pr checks` saying "no checks
+reported" is the expected answer, not a broken pipeline.
+
+- **`scripts/verify.sh` is the gate.** It runs where the person landing the
+  change runs it, on their machine, before the merge; the container, ssh and
+  installer suites (`scripts/test_linux.sh`, `scripts/e2e_ssh.sh`,
+  `scripts/test_install.sh`) likewise run only when someone runs them.
+- **The version bump is a local step, not an automated one.** The `ship`
+  skill runs `scripts/version-bump.sh` at its version-bump step, after the
+  merge and on the lander's machine. If nobody runs `ship`, or it is told to
+  skip that step, nothing bumps: `main` simply sits ahead of its last tag,
+  with its changes unreleased, until someone runs the script. That is safe —
+  the next run releases everything since the tag ("Running it").
 
 ## Binaries
 
@@ -139,13 +157,26 @@ renders the formula from the release's `SHA256SUMS`
   from its published `SHA256SUMS` — the way to retry if the push failed
   after the release was published. `ACS_TAP_REPO` points it at another
   repository (the tests use a local one) and `ACS_RELEASES_URL` at another
-  release channel to read that `SHA256SUMS` from.
+  release channel to read that `SHA256SUMS` from; by default it is the
+  build's channel.
+- before rendering anything from a published `SHA256SUMS`, it checks
+  `SHA256SUMS.sig` with `ssh-keygen -Y verify`, as the installer does, and
+  refuses a release that is unsigned or not signed by the build's release
+  key (acs-oxl4). Homebrew users never see the signature — brew checks only
+  the sha256s the formula pins — so this is the check they get. The key is
+  the one `cargo xtask channel` reports, xtask's own `RELEASE_KEY`, which is
+  what the formula and the packaged installer carry: a fork that builds with
+  `ACS_DEFAULT_RELEASE_KEY` ("Forking") checks against its own key, and no
+  variable names another.
 
 The formula's homepage and download URLs are the build's
-`DEFAULT_RELEASES_URL` ("Forking"), so a fork's tap points at the fork. It
-reads a release back out of those URLs to decide whether the tap would move
-backwards, which wants the `…/releases/download/vX.Y.Z/…` shape GitHub and
-GitLab both publish under.
+`DEFAULT_RELEASES_URL` ("Forking"), so a fork's tap points at the fork. To
+decide whether the tap would move backwards, `scripts/update-tap.sh` reads the
+release from the `# acs-version: X.Y.Z` line the generator writes into the
+formula's header, not from those URLs — so a fork whose releases are not
+GitHub-shaped gets a formula the tap takes (acs-u3qn). A formula without that
+line is refused; one already on the tap without it (rendered before the line
+existed) counts as no version and is replaced.
 
 The formula is generated: change `xtask/src/formula.rs`, not the tap. A
 Homebrew install is brew's to replace — its real path is in a `Cellar` —
@@ -178,16 +209,26 @@ binaries — xtask links the `acs` library, so `build.rs` gives it the same
 installer, the formula and the notes follow a fork with no edit. A `dist`
 built with the variables and a `package` run without them would produce
 binaries that update from the fork beside an installer that installs
-upstream; `scripts/release-binaries.sh` runs every step in one environment,
-and `package` prints the URL and key it substituted.
+upstream, so that is refused: `dist` records the releases URL and key it
+built for in `dist/channel.stamp`, and `package` refuses a `dist/` whose
+stamp differs from its own — or that has none — before writing anything
+(acs-u3qn). `dist` likewise refuses to run when the environment would build
+for a different channel than the xtask it is (a cached xtask binary).
+`scripts/release-binaries.sh` runs every step in one environment, and
+`package` prints the URL and key it substituted.
 
 The build-time URL is what `acs upgrade` and the weekly update check look at
 when nothing overrides them, and the one-line installer named in the "acs is
 not installed on that host" message is derived from it, so a fork's users are
 not sent upstream to install. Unset — every build of acs itself — it is
 `https://github.com/michel-onstein/acs/releases`, and an empty value counts as
-unset. It is taken as given, with no https check: whoever builds the binary
-already chooses what it does. The runtime `ACS_RELEASES_URL` override is a
+unset. A value that is not one https URL with a host — `http://`, no scheme,
+an empty or malformed host or port, a space or line break, a query or
+fragment, credentials — **fails the build**, the same way a malformed key
+does, rather than shipping a binary whose update channel is silently
+unreachable (acs-d7x). Past that it is taken as given: whoever builds the
+binary already chooses what it does, and no build can tell whether the
+server answers. The runtime `ACS_RELEASES_URL` override is a
 different matter and keeps its guards — https only unless
 `--allow-insecure-url` is passed on the command line, and ignored outright
 when the real and effective user differ (DESIGN §7.5).
@@ -206,7 +247,10 @@ key as acs's tap is for acs's.
 Neither knob can leave a binary that verifies nothing. Unset — every build of
 acs itself — the key is acs's own, an empty value counts as unset, and a
 value that is not an ssh public key line **fails the build** rather than
-shipping a release that no one can install. A key that is merely the wrong
+shipping a release that no one can install. The body is decoded, not just
+looked at: it must be base64 whose blob names the key type the line declares
+and is made of whole fields, so a truncated paste or an `ssh-rsa` line with
+an ed25519 body is a build error too (acs-d7x). A key that is merely the wrong
 one fails closed: every release is refused, nothing is downloaded or run.
 Like the URL, it is the builder's decision rather than the environment's, so
 it carries none of the limits on the runtime `ACS_RELEASE_KEY` override —

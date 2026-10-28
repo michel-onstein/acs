@@ -18,6 +18,9 @@
 //!   what ended the link, so a channel that broke on a connection still
 //!   carrying bytes leaves every sibling session on the master alone
 //!   (acs-n1m).
+//! - **A batch only joins** ([`crate::ssh::Call::Batch`], [`join`]).
+//!   `acs list` over every alias asks a dozen hosts at once, so it never
+//!   starts a master — but it rides one that is already up (acs-hmv).
 //! - **A master must answer fast or not at all.** Joining one is supposed
 //!   to cost a round trip; if the marker does not arrive within
 //!   `ACS_CONTROL_FALLBACK_MS` the master is killed and the dial is made
@@ -72,33 +75,34 @@ pub struct Mux {
 /// remote's directory. Separate from `/tmp/acs-<uid>`: that one holds
 /// session sockets and is scanned as such.
 pub fn dir_path() -> PathBuf {
-    match std::env::var_os("ACS_CONTROL_DIR") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => PathBuf::from(format!("/tmp/acs-mux-{}", sys::getuid())),
+    match sys::env_nonempty("ACS_CONTROL_DIR") {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(format!("/tmp/acs-mux-{}", sys::getuid())),
     }
 }
 
 /// `ACS_CONTROL_PERSIST` in seconds; `0` turns multiplexing off entirely.
 pub fn persist_secs() -> u64 {
-    persist_from(std::env::var("ACS_CONTROL_PERSIST").ok().as_deref())
+    trimmed_or(
+        std::env::var("ACS_CONTROL_PERSIST").ok().as_deref(),
+        DEFAULT_PERSIST_SECS,
+    )
 }
 
-fn persist_from(env: Option<&str>) -> u64 {
-    match env {
-        Some(v) if !v.trim().is_empty() => v.trim().parse().unwrap_or(DEFAULT_PERSIST_SECS),
-        _ => DEFAULT_PERSIST_SECS,
-    }
+/// [`sys::parse_or`] on the trimmed value: unlike the other knobs, these two
+/// have always forgiven surrounding whitespace (` 90 ` is 90), so they keep
+/// doing so.
+fn trimmed_or<T: std::str::FromStr>(env: Option<&str>, default: T) -> T {
+    sys::parse_or(env.map(str::trim), default)
 }
 
 /// How long a joined master has to produce a marker before acs stops
 /// believing in it (`ACS_CONTROL_FALLBACK_MS`).
 pub fn fallback_window() -> Duration {
-    Duration::from_millis(
-        std::env::var("ACS_CONTROL_FALLBACK_MS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DEFAULT_FALLBACK_MS),
-    )
+    Duration::from_millis(trimmed_or(
+        std::env::var("ACS_CONTROL_FALLBACK_MS").ok().as_deref(),
+        DEFAULT_FALLBACK_MS,
+    ))
 }
 
 /// Why this transport gets no master, or `None` if nothing objects.
@@ -175,6 +179,31 @@ pub fn configure_at(tr: &mut Transport, dir: PathBuf, persist: u64) -> String {
             )
         }
     }
+}
+
+/// Give a batch call (`acs list` over every alias, DESIGN §7.3) acs's
+/// master for this host **only where one is up now** (acs-hmv); `true` if
+/// it was. The batch then joins it and never starts one
+/// ([`Call::Batch`]). Call it once the alias is resolved, so the socket is
+/// the one the session on that host would have opened.
+///
+/// The `ssh -O check` is what keeps this from costing anything where
+/// there is no master, which is most hosts in a listing: with no socket
+/// file it is not even run, and where it fails — a socket a killed master
+/// left behind — the transport keeps the user's own multiplexing and ssh
+/// is spared printing `Control socket connect(…): Connection refused`
+/// across the table or the menu before dialling anyway.
+pub fn join(tr: &mut Transport) -> bool {
+    join_at(tr, dir_path(), persist_secs())
+}
+
+/// [`join`], with the directory and persist window given.
+pub fn join_at(tr: &mut Transport, dir: PathBuf, persist: u64) -> bool {
+    configure_at(tr, dir, persist);
+    if !joinable(tr, Call::Batch) {
+        tr.mux = None;
+    }
+    tr.mux.is_some()
 }
 
 /// The socket's name: a hash of everything that decides *which connection*
@@ -408,6 +437,67 @@ mod tests {
         assert!(msg.contains("platform limit"), "{msg}");
     }
 
+    /// A fake ssh whose `-O check` answers `ok`, logging every call to
+    /// `calls` beside it.
+    fn checker(d: &TempDir, ok: bool) -> OsString {
+        use std::os::unix::fs::PermissionsExt;
+        let path = d.path().join("ssh");
+        let log = d.path().join("calls");
+        let st = if ok { 0 } else { 255 };
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit {st}\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.into()
+    }
+
+    /// acs-hmv: a batch joins the master that is up, and only that one.
+    /// Where there is none — no socket, or one a killed master left — it
+    /// is given no master at all, so its ssh call is the one it always was.
+    #[test]
+    fn a_batch_joins_only_a_master_that_answers() {
+        let d = TempDir::new();
+        let dir = d.path().join("mux");
+
+        // No socket: not even asked.
+        let mut t = tr();
+        t.ssh = checker(&d, true);
+        assert!(!join_at(&mut t, dir.clone(), 300));
+        assert!(t.mux.is_none());
+        assert!(!d.path().join("calls").exists(), "a check with no socket");
+        assert_eq!(t.argv(Call::Batch, "R"), {
+            let mut plain = t.clone();
+            plain.mux = None;
+            plain.argv(Call::Batch, "R")
+        });
+
+        // A socket whose master does not answer: a stale file.
+        let mut probe = t.clone();
+        configure_at(&mut probe, dir.clone(), 300);
+        std::fs::write(probe.control_path().unwrap(), b"").unwrap();
+        let mut t = tr();
+        t.ssh = checker(&d, false);
+        assert!(!join_at(&mut t, dir.clone(), 300));
+        assert!(t.mux.is_none());
+        let asked = std::fs::read_to_string(d.path().join("calls")).unwrap();
+        assert!(asked.contains("-O check"), "{asked}");
+
+        // One that does: joined.
+        let mut t = tr();
+        t.ssh = checker(&d, true);
+        assert!(join_at(&mut t, dir.clone(), 300));
+        let v = t.argv(Call::Batch, "R");
+        assert!(v.contains(&"ControlMaster=no".into()), "{v:?}");
+        assert!(!v.contains(&"ControlMaster=auto".into()), "{v:?}");
+
+        // And ACS_CONTROL_PERSIST=0 is no master to join either.
+        let mut t = tr();
+        t.ssh = checker(&d, true);
+        assert!(!join_at(&mut t, dir, 0));
+    }
+
     #[test]
     fn persist_zero_turns_it_off() {
         let d = TempDir::new();
@@ -415,11 +505,17 @@ mod tests {
         let msg = configure_at(&mut t, d.path().to_path_buf(), 0);
         assert!(t.mux.is_none(), "{msg}");
         assert!(msg.contains("ACS_CONTROL_PERSIST"), "{msg}");
-        assert_eq!(persist_from(Some("0")), 0);
-        assert_eq!(persist_from(Some(" 90 ")), 90);
-        assert_eq!(persist_from(None), DEFAULT_PERSIST_SECS);
-        assert_eq!(persist_from(Some("")), DEFAULT_PERSIST_SECS);
-        assert_eq!(persist_from(Some("soon")), DEFAULT_PERSIST_SECS);
+        assert_eq!(trimmed_or(Some("0"), DEFAULT_PERSIST_SECS), 0);
+        assert_eq!(trimmed_or(Some(" 90 "), DEFAULT_PERSIST_SECS), 90);
+        assert_eq!(trimmed_or(None, DEFAULT_PERSIST_SECS), DEFAULT_PERSIST_SECS);
+        assert_eq!(
+            trimmed_or(Some(""), DEFAULT_PERSIST_SECS),
+            DEFAULT_PERSIST_SECS
+        );
+        assert_eq!(
+            trimmed_or(Some("soon"), DEFAULT_PERSIST_SECS),
+            DEFAULT_PERSIST_SECS
+        );
     }
 
     #[test]

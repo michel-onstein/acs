@@ -2,60 +2,67 @@
 //!
 //! The client learns what is missing from the prelude's `ACS-NEED <os>
 //! <arch>` line and installs exactly its own version under
-//! `~/.local/share/acs/<version>/acs`:
+//! `~/.local/share/acs/<version>/acs`, **on the same connection** (acs-6k2):
+//! the prelude waits for a sync line and a one-line script on stdin
+//! ([`crate::ssh::prelude_installing`]), and the script reads the bytes it
+//! was told to from the same stdin:
 //!
-//! - **self-copy** — the remote has this binary's own target: stream our file
-//!   (complete if it carries payloads) in one call;
-//! - **payload** — another Linux target we carry: stream its gzip'd slim
-//!   build to the remote's `gzip -dc`, then run the new binary's
-//!   `_install --finish` with the payload set on stdin, which appends it.
+//! - **self-copy** — the remote has this binary's own target: our file
+//!   (complete if it carries payloads);
+//! - **payload** — another Linux target we carry: its gzip'd slim build,
+//!   unpacked by the remote's `gzip -dc`, then the payload set, which the
+//!   new binary's `_install --finish` appends.
 //!
 //! Either way the **remote shell** checks the SHA-256 the client computed
 //! before the upload is made executable (acs-4km), and `_install --finish`
 //! then renames the file into place atomically and repoints
-//! `~/.local/bin/acs`.
+//! `~/.local/bin/acs`. The prelude then runs the candidates again, with
+//! every check it makes on any connection, and execs the proxy on what is
+//! left of stdin.
 //! A running executable cannot be written to on Linux (ETXTBSY), so the
 //! finisher writes a new file instead of appending to itself.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use std::process::{ExitCode, Stdio};
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cli::ClientArgs;
 use crate::client::note;
 use crate::payload::{self, Payloads};
 use crate::sha256;
-use crate::ssh::{sh_quote, Call};
+use crate::ssh::sh_quote;
 
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 /// What to send for `target`, decided from what this binary carries.
+///
+/// It borrows from the payloads rather than copying them, and the self-copy
+/// carries nothing: our own file is read only once that is the plan, and
+/// the payloads only when it is not (acs-zgof).
 #[derive(Debug, PartialEq, Eq)]
-pub enum Plan {
+pub enum Plan<'a> {
     /// Our own file, streamed as is.
-    SelfCopy { data: Vec<u8> },
+    SelfCopy,
     /// A gzip'd slim build, then the payload blob appended remotely.
     Payload {
-        gz: Vec<u8>,
-        blob: Vec<u8>,
+        gz: &'a [u8],
+        blob: &'a [u8],
         digest: [u8; 32],
     },
 }
 
-/// Decide how to install acs for `target` given our own target, our file,
-/// and the payloads we carry.
-pub fn plan(
+/// Decide how to install acs for `target` given our own target and the
+/// payloads we carry.
+pub fn plan<'a>(
     target: &str,
     own_target: &str,
-    own_file: &[u8],
-    payloads: Option<&Payloads>,
-) -> Result<Plan, String> {
+    payloads: Option<&'a Payloads>,
+) -> Result<Plan<'a>, String> {
     if target == own_target {
-        return Ok(Plan::SelfCopy {
-            data: own_file.to_vec(),
-        });
+        return Ok(Plan::SelfCopy);
     }
     if payload::is_elf_target(target) {
         if let Some(p) = payloads {
@@ -63,19 +70,30 @@ pub fn plan(
                 // `digest` is the slim build's: the finisher checks what
                 // gzip unpacked before completing it with the blob.
                 return Ok(Plan::Payload {
-                    gz: gz.to_vec(),
-                    blob: p.blob().to_vec(),
+                    gz,
+                    blob: p.blob(),
                     digest: entry.sha256,
                 });
             }
         }
         return Err(format!(
-            "this acs build carries no binary for {target}; build a complete one with `cargo xtask dist`, or install ~/.local/share/acs/{}/acs on the host by hand",
+            concat!(
+                "this acs build carries no binary for {}; build a complete one with `cargo xtask dist`, or install ~/",
+                crate::layout::user_root_str!(),
+                "/{}/acs on the host by hand"
+            ),
+            target,
             crate::VERSION
         ));
     }
     Err(format!(
-        "cannot install acs for {target} from a {own_target} build; install ~/.local/share/acs/{}/acs on the host by hand",
+        concat!(
+            "cannot install acs for {} from a {} build; install ~/",
+            crate::layout::user_root_str!(),
+            "/{}/acs on the host by hand"
+        ),
+        target,
+        own_target,
         crate::VERSION
     ))
 }
@@ -106,8 +124,23 @@ pub fn not_installing(args: &ClientArgs, os: &str, arch: &str) -> String {
     )
 }
 
-/// The remote has no acs of our version for `os`/`arch`: install it.
-pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
+/// The remote has no acs of our version for `os`/`arch`: install it over
+/// `to`, the stdin of the connection whose prelude
+/// ([`crate::ssh::prelude_installing`] with `sync`) has just said
+/// `ACS-NEED`, then send `hello` for the proxy the prelude execs once the
+/// install is in place (acs-6k2).
+///
+/// `Err` is a plan that cannot be carried out, before anything is sent.
+/// A write that fails is not reported here: the remote stopped reading,
+/// and its exit status ([`failed`]) says why far better than `EPIPE`.
+pub fn install(
+    args: &ClientArgs,
+    os: &str,
+    arch: &str,
+    sync: &str,
+    to: RawFd,
+    hello: &[u8],
+) -> Result<(), String> {
     let host = &args.transport.destination;
     if ATTEMPTED.swap(true, Ordering::SeqCst) {
         return Err(format!(
@@ -116,48 +149,123 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
     }
     let target = payload::target_for_uname(os, arch)
         .ok_or_else(|| format!("{host} runs {os} {arch}, which acs does not support"))?;
-    let own = crate::sys::self_exe()
-        .and_then(std::fs::read)
-        .map_err(|e| format!("cannot read this acs binary: {e}"))?;
-    let carried = Payloads::from_self();
-    let plan = plan(target, payload::OWN_TARGET, &own, carried.as_ref())?;
+    // A self-copy sends our file and needs no payloads; anything else
+    // needs only the payloads, which are borrowed, not copied (acs-zgof).
+    let carried = if target == payload::OWN_TARGET {
+        None
+    } else {
+        Payloads::from_self()
+    };
+    let plan = plan(target, payload::OWN_TARGET, carried.as_ref())?;
+    let own;
+    let token = crate::sys::random_token();
+    let (script, parts): (String, [&[u8]; 2]) = match plan {
+        Plan::SelfCopy => {
+            own = crate::sys::self_exe()
+                .and_then(std::fs::read)
+                .map_err(|e| format!("cannot read this acs binary: {e}"))?;
+            let digest = sha256::hex(&sha256::digest(&own));
+            (self_copy_script(&token, own.len(), &digest), [&own, &[]])
+        }
+        Plan::Payload { gz, blob, digest } => {
+            let script = payload_script(
+                &token,
+                (gz.len(), &sha256::hex(&digest)),
+                (blob.len(), &sha256::hex(&sha256::digest(blob))),
+            );
+            (script, [gz, blob])
+        }
+    };
     note(&format!(
         "installing acs {} on {host} ({os} {arch})…",
         crate::VERSION
     ));
-    let token = format!("{:016x}", crate::sys::random_u64());
-    let v = crate::VERSION;
-    let acs_dir = "\"$HOME\"/.local/share/acs";
-    let dir = format!("{acs_dir}/{}", sh_quote(v));
-    let tmp = format!("{dir}/acs.new.{token}");
-    let make_dir = make_dir(acs_dir, &dir);
-    match plan {
-        Plan::SelfCopy { data } => {
-            let digest = sha256::hex(&sha256::digest(&data));
-            let check = check_upload(&tmp, &digest);
-            let script = format!(
-                "set -e; {make_dir} cat > {tmp}; {check} chmod 755 {tmp}; exec {tmp} _install --finish --token {token} --sha256 {digest}"
-            );
-            side_call(args, &script, &data, true)?;
-        }
-        Plan::Payload { gz, blob, digest } => {
-            let slim_digest = sha256::hex(&digest);
-            let blob_digest = sha256::hex(&sha256::digest(&blob));
-            let check = check_upload(&tmp, &slim_digest);
-            let script = format!(
-                "set -e; command -v gzip >/dev/null || {{ echo 'acs: the remote has no gzip' >&2; exit 3; }}; {make_dir} gzip -dc > {tmp}; {check} chmod 755 {tmp}"
-            );
-            side_call(args, &script, &gz, false)?;
-            let script = format!(
-                "exec {tmp} _install --finish --token {token} --slim-sha256 {slim_digest} --blob-sha256 {blob_digest} --payloads"
-            );
-            side_call(args, &script, &blob, true)?;
-        }
-    }
-    note(&format!("installed acs {v} on {host}"));
+    // In parts, where they lie, rather than one copy of a binary-sized
+    // buffer (acs-zgof). Nothing comes back on stdout while this blocks:
+    // the login noise came before ACS-NEED, and the script sends every
+    // step's output elsewhere.
+    let _ = [&header(sync, &script)[..], parts[0], parts[1], hello]
+        .iter()
+        .try_for_each(|p| crate::sys::write_all(to, p));
     Ok(())
 }
 
+/// What the client says when the connection it installed over ended
+/// before the new acs answered, given the remote's exit status.
+pub fn failed(host: &str, status: Option<i32>) -> String {
+    match status {
+        Some(crate::ssh::INSTALLED_BUT_REFUSED) => format!(
+            "acs {} was installed on {host}, but the remote refused to run it (see above)",
+            crate::VERSION
+        ),
+        Some(n) => format!("installing acs on {host} failed (exit status {n})"),
+        None => format!("installing acs on {host} failed (the connection was killed)"),
+    }
+}
+
+/// The two lines that start an install on a connection waiting in
+/// [`crate::ssh::prelude_installing`]: the sync line, after a newline of its
+/// own so that a HELLO cut short cannot run into it, and the script.
+pub fn header(sync: &str, script: &str) -> Vec<u8> {
+    debug_assert!(!script.contains('\n'), "the script must be one line");
+    format!("\n{} {sync}\n{script}\n", crate::proto::INSTALL_MARKER).into_bytes()
+}
+
+/// Where the install's files go: the version directory, and in it the
+/// temporary names for `token`. Random per install, so two clients
+/// installing one version at once never write the same file.
+struct Paths {
+    acs_dir: &'static str,
+    dir: String,
+    tmp: String,
+}
+
+fn paths(token: &str) -> Paths {
+    let acs_dir = concat!("\"$HOME\"/", crate::layout::user_root_str!());
+    let dir = format!("{acs_dir}/{}", sh_quote(crate::VERSION));
+    let tmp = format!("{dir}/acs.new.{token}");
+    Paths { acs_dir, dir, tmp }
+}
+
+/// The install script for a self-copy of `len` bytes whose SHA-256 is
+/// `digest`: take them, check them, and only then make them executable
+/// and run the finisher.
+pub fn self_copy_script(token: &str, len: usize, digest: &str) -> String {
+    let Paths { acs_dir, dir, tmp } = paths(token);
+    format!(
+        "{TAKE} acs_rm() {{ rm -f {tmp}; }}; trap acs_rm EXIT; set -e; {make_dir} \
+         acs_take {len} {tmp}; {check} chmod 755 {tmp}; \
+         {tmp} _install --finish --token {token} --sha256 {digest} </dev/null >/dev/null",
+        make_dir = make_dir(acs_dir, &dir),
+        check = check_upload(&tmp, digest),
+    )
+}
+
+/// The install script for a payload: `gz` is the gzip'd slim build's length
+/// and the slim build's digest, `blob` the payload set's. The slim build is
+/// checked before it is made executable, and the payload set before the
+/// finisher reads it.
+pub fn payload_script(token: &str, gz: (usize, &str), blob: (usize, &str)) -> String {
+    let Paths { acs_dir, dir, tmp } = paths(token);
+    let gz_file = format!("{dir}/acs.gz.{token}");
+    let blob_file = format!("{dir}/acs.blob.{token}");
+    format!(
+        "{TAKE} acs_rm() {{ rm -f {tmp} {gz_file} {blob_file}; }}; trap acs_rm EXIT; set -e; \
+         command -v gzip >/dev/null || {{ echo 'acs: the remote has no gzip' >&2; exit 3; }}; \
+         {make_dir} acs_take {gz_len} {gz_file}; gzip -dc < {gz_file} > {tmp}; \
+         {check_slim} chmod 755 {tmp}; \
+         acs_take {blob_len} {blob_file}; {check_blob} \
+         {tmp} _install --finish --token {token} --slim-sha256 {slim} --blob-sha256 {blob_digest} \
+         --payloads < {blob_file} >/dev/null",
+        make_dir = make_dir(acs_dir, &dir),
+        gz_len = gz.0,
+        blob_len = blob.0,
+        slim = gz.1,
+        blob_digest = blob.1,
+        check_slim = check_upload(&tmp, gz.1),
+        check_blob = check_upload(&blob_file, blob.1),
+    )
+}
 /// The fragment that makes the directory acs installs into, with a mode of
 /// its own rather than whatever the remote's umask leaves (acs-iws).
 ///
@@ -205,53 +313,34 @@ pub fn check_upload(file: &str, want: &str) -> String {
     )
 }
 
-/// How much of the remote's answer to an install call is read. The reply
-/// is one `ok` line under a login banner; anything past this is a host
-/// filling memory rather than answering (acs-rip).
-const MAX_REPLY: usize = 256 * 1024;
-
-/// Run `script` on the host with `input` on stdin. With `expect_ok` the
-/// finisher must print its `ok` line; without, the exit status alone
-/// decides — stdout may hold login-shell noise either way (DESIGN §3).
-fn side_call(args: &ClientArgs, script: &str, input: &[u8], expect_ok: bool) -> Result<(), String> {
-    let remote = crate::ssh::remote_command(script);
-    let mut cmd = args.transport.command(Call::Side, &remote);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let mut child = cmd.spawn().map_err(|e| format!("cannot run ssh: {e}"))?;
-    let mut stdin = child.stdin.take().unwrap();
-    let data = input.to_vec();
-    let writer = std::thread::spawn(move || {
-        let r = stdin.write_all(&data);
-        drop(stdin);
-        r
-    });
-    // Bytes, not a String: a login banner in Latin-1 or CP437 is not
-    // UTF-8, and read_to_string would throw the whole reply away (acs-vdl).
-    // Bounded: the finisher answers with one short line, so a host that
-    // streams instead is not answering, and reading it to the end would
-    // let it grow the client until the machine gives out (acs-rip).
-    let mut buf = Vec::new();
-    let mut stdout = child.stdout.take().unwrap();
-    let _ = std::io::copy(
-        &mut (&mut stdout).take(MAX_REPLY as u64),
-        &mut io::Cursor::new(&mut buf),
-    );
-    let out = String::from_utf8_lossy(&buf);
-    let status = child.wait().map_err(|e| e.to_string())?;
-    let _ = writer.join();
-    if !status.success() {
-        return Err(format!("installing acs failed ({status})"));
-    }
-    if expect_ok && !out.lines().any(|l| l.trim() == "ok") {
-        return Err(format!(
-            "unexpected reply while installing: {:?}",
-            out.trim()
-        ));
-    }
-    Ok(())
-}
+/// `acs_take <n> <file>`: exactly `n` bytes of stdin into `file`, and not
+/// one more — what follows is the next step's, and in the end the
+/// session's (acs-6k2).
+///
+/// `head -c` would be shorter, but it is not POSIX and the BSD one reads
+/// through stdio, which takes a buffer's worth past the count. A single
+/// `read(2)` never returns more than it is asked for, and `dd bs=<rest>
+/// count=1` is one read — it does not fill the block on a short one
+/// unless told to — so each pass takes what the pipe holds, up to what is
+/// still owed, and `wc -c` says how far that got. A pass that gets
+/// nothing is the end of input.
+///
+/// A pipe holds a few dozen kilobytes, so that is a `dd` and a `wc` per
+/// few dozen kilobytes — slower than the handshakes it replaces, over a
+/// fast link, on a host where a fork is dear. Where `dd` knows
+/// `iflag=fullblock` (GNU, busybox) it is told to fill the block, which
+/// it does with reads of what is still owed, so the first pass takes the
+/// lot; where it does not (the BSDs) the probe fails without reading, and
+/// the passes do the same work one read at a time.
+const TAKE: &str =
+    "acs_fb=; dd iflag=fullblock count=0 </dev/null >/dev/null 2>&1 && acs_fb=iflag=fullblock; \
+     acs_take() { : > \"$2\"; acs_h=0; \
+     while [ \"$acs_h\" -lt \"$1\" ]; do \
+     dd $acs_fb bs=$(($1 - acs_h)) count=1 2>/dev/null >> \"$2\" || return 1; \
+     acs_g=$(($(wc -c < \"$2\"))); \
+     [ \"$acs_g\" -gt \"$acs_h\" ] || \
+     { echo 'acs: the connection ended before the install was all there' >&2; return 1; }; \
+     acs_h=$acs_g; done; };";
 
 // ---- `acs _install --finish` (runs on the remote) ---------------------------
 
@@ -329,44 +418,34 @@ fn finish(f: &Finish) -> Result<(), String> {
         ));
     }
     let final_path = dir.join("acs");
+    // The remote shell has checked the upload already (acs-4km); these
+    // digests are belt and braces, so they stream the file through the
+    // hash rather than holding a second copy of it (acs-zgof).
     if f.payloads {
-        // Our own file is the slim build; complete it with the blob.
-        let slim = std::fs::read(&me).map_err(|e| e.to_string())?;
-        if let Some(want) = &f.slim_sha256 {
-            if &sha256::hex(&sha256::digest(&slim)) != want {
-                let _ = std::fs::remove_file(&me);
-                return Err("the uploaded binary is corrupt (checksum mismatch)".into());
-            }
-        }
-        let mut blob = Vec::new();
-        io::stdin()
-            .read_to_end(&mut blob)
-            .map_err(|e| e.to_string())?;
-        if let Some(want) = &f.blob_sha256 {
-            if &sha256::hex(&sha256::digest(&blob)) != want {
-                let _ = std::fs::remove_file(&me);
-                return Err("the payload set does not match its checksum".into());
-            }
-        }
-        if Payloads::parse(&blob).is_none() {
-            let _ = std::fs::remove_file(&me);
-            return Err("the payload set is corrupt".into());
-        }
+        // Our own file is the slim build; complete it with the blob. What
+        // is hashed is what is copied, so nothing can change in between.
         let full = dir.join(format!("acs.full.{}", f.token));
-        write_exe(&full, &[&slim, &blob])?;
-        rename(&full, &final_path)?;
+        // 0755 whatever the remote's umask (077 would leave 0700, acs-28b).
+        let mut out = crate::sys::create_new_mode(&full, 0o755)
+            .map_err(|e| format!("{}: {e}", full.display()))?;
+        let done = complete(f, &me, &mut out);
+        drop(out);
+        if let Err(e) = done.and_then(|()| rename(&full, &final_path)) {
+            let _ = std::fs::remove_file(&full);
+            return Err(e);
+        }
         let _ = std::fs::remove_file(&me);
     } else {
-        let data = std::fs::read(&me).map_err(|e| e.to_string())?;
+        let got = sha256::file(&me).map_err(|e| e.to_string())?;
         if let Some(want) = &f.sha256 {
-            if &sha256::hex(&sha256::digest(&data)) != want {
+            if &sha256::hex(&got) != want {
                 let _ = std::fs::remove_file(&me);
                 return Err("the uploaded binary is corrupt (checksum mismatch)".into());
             }
         }
         rename(&me, &final_path)?;
     }
-    if let Err(e) = link_bin(&final_path, &f.token) {
+    if let Err(e) = link_bin(&final_path) {
         // The link is a convenience: nothing in the protocol depends on it
         // (DESIGN §8), and the client finds the binary through the prelude.
         // So it is a warning after the ok, not a failed install (acs-iry).
@@ -378,22 +457,32 @@ fn finish(f: &Finish) -> Result<(), String> {
     Ok(())
 }
 
-fn write_exe(path: &Path, parts: &[&[u8]]) -> Result<(), String> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o755)
-        .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    for p in parts {
-        f.write_all(p).map_err(|e| e.to_string())?;
+/// Write the slim build `me` and then the payload set from stdin into
+/// `out`, checking each against its digest; a mismatch removes `me`.
+fn complete(f: &Finish, me: &Path, out: &mut std::fs::File) -> Result<(), String> {
+    let got = sha256::copy_file(me, out).map_err(|e| e.to_string())?;
+    if let Some(want) = &f.slim_sha256 {
+        if &sha256::hex(&got) != want {
+            let _ = std::fs::remove_file(me);
+            return Err("the uploaded binary is corrupt (checksum mismatch)".into());
+        }
     }
-    f.sync_all().map_err(|e| e.to_string())?;
-    // The mode above is masked by the remote's umask (077 leaves 0700), so
-    // set it for real, as the self-copy path does (acs-28b).
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("{}: {e}", path.display()))
+    let mut blob = Vec::new();
+    io::stdin()
+        .read_to_end(&mut blob)
+        .map_err(|e| e.to_string())?;
+    if let Some(want) = &f.blob_sha256 {
+        if &sha256::hex(&sha256::digest(&blob)) != want {
+            let _ = std::fs::remove_file(me);
+            return Err("the payload set does not match its checksum".into());
+        }
+    }
+    if !Payloads::is_well_formed(&blob) {
+        let _ = std::fs::remove_file(me);
+        return Err("the payload set is corrupt".into());
+    }
+    out.write_all(&blob).map_err(|e| e.to_string())?;
+    out.sync_all().map_err(|e| e.to_string())
 }
 
 fn rename(from: &Path, to: &Path) -> Result<(), String> {
@@ -402,18 +491,15 @@ fn rename(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Point `~/.local/bin/acs` at the newest install: a temporary symlink
 /// renamed over the old one, so it is never missing.
-fn link_bin(target: &Path, token: &str) -> Result<(), String> {
+fn link_bin(target: &Path) -> Result<(), String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
-    let bin = home.join(".local/bin");
+    let bin = crate::layout::user_bin(&home);
     let link = bin.join("acs");
-    if !should_link(&link, target, &home.join(".local/share/acs")) {
+    if !should_link(&link, target, &crate::layout::user_root(&home)) {
         return Ok(());
     }
     std::fs::create_dir_all(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
-    let tmp = bin.join(format!(".acs.{token}"));
-    let _ = std::fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(target, &tmp).map_err(|e| e.to_string())?;
-    rename(&tmp, &link)
+    crate::sys::symlink_atomic(target, &link).map_err(|e| format!("{}: {e}", link.display()))
 }
 
 /// Whether `~/.local/bin/acs` (`link`) should point at `target`, the
@@ -498,13 +584,16 @@ mod tests {
 
     #[test]
     fn same_target_is_a_self_copy() {
-        let p = plan("aarch64-apple-darwin", "aarch64-apple-darwin", b"me", None).unwrap();
-        assert_eq!(
-            p,
-            Plan::SelfCopy {
-                data: b"me".to_vec()
-            }
+        let p = plan("aarch64-apple-darwin", "aarch64-apple-darwin", None).unwrap();
+        assert_eq!(p, Plan::SelfCopy);
+        // Payloads or not: our own target is always our own file.
+        let carried = blob_for("aarch64-apple-darwin", b"slim");
+        let p = plan(
+            "aarch64-apple-darwin",
+            "aarch64-apple-darwin",
+            Some(&carried),
         );
+        assert_eq!(p.unwrap(), Plan::SelfCopy);
     }
 
     #[test]
@@ -513,7 +602,6 @@ mod tests {
         match plan(
             "aarch64-unknown-linux-musl",
             "x86_64-unknown-linux-musl",
-            b"me",
             Some(&carried),
         )
         .unwrap()
@@ -521,6 +609,9 @@ mod tests {
             Plan::Payload { gz, blob, digest } => {
                 assert_eq!(gz, b"GZ");
                 assert_eq!(blob, carried.blob());
+                // acs-zgof: borrowed from the payloads, not copies of them.
+                assert_eq!(blob.as_ptr(), carried.blob().as_ptr());
+                assert!(carried.blob().as_ptr_range().contains(&gz.as_ptr()));
                 assert_eq!(digest, sha256::digest(b"slim-arm"));
             }
             other => panic!("{other:?}"),
@@ -529,15 +620,9 @@ mod tests {
 
     #[test]
     fn missing_payload_explains_how_to_get_one() {
-        let e = plan(
-            "x86_64-unknown-linux-musl",
-            "aarch64-apple-darwin",
-            b"me",
-            None,
-        )
-        .unwrap_err();
+        let e = plan("x86_64-unknown-linux-musl", "aarch64-apple-darwin", None).unwrap_err();
         assert!(e.contains("cargo xtask dist"), "{e}");
-        let e = plan("x86_64-apple-darwin", "aarch64-apple-darwin", b"me", None).unwrap_err();
+        let e = plan("x86_64-apple-darwin", "aarch64-apple-darwin", None).unwrap_err();
         assert!(e.contains("by hand"), "{e}");
     }
 

@@ -9,19 +9,10 @@ use std::time::{Duration, Instant};
 
 use common::*;
 
-/// Fast timers so a test takes seconds, not minutes.
-const FAST: &[(&str, &str)] = &[
-    ("ACS_BACKOFF_MS", "100"),
-    ("ACS_PING_MS", "200"),
-    ("ACS_DEAD_MS", "800"),
-];
-
 /// The dead interval `frozen_link_is_declared_dead_and_replaced` runs with,
 /// in place of `FAST`'s: long enough that the bound it reads against has
 /// room, and the only test here that waits out a whole one.
 const DEAD: Duration = Duration::from_secs(4);
-
-const TICKER: &str = "i=0; while true; do i=$((i+1)); printf '#%d#\\n' $i; sleep 0.01; done";
 
 fn start(remote: &Remote, session: &str, cmd: &str, env: &[(&str, &str)]) -> Client {
     Client::start_env(
@@ -65,15 +56,16 @@ fn frames(ticks: &Path) -> u64 {
 /// into a four kilobyte ring, so the overwrite is a fact before the client
 /// is let back and a stalled host only makes the test slower.
 fn wait_frames(ticks: &Path, base: u64, more: u64) {
-    let deadline = Instant::now() + T;
-    while frames(ticks) < base + more {
-        assert!(
-            Instant::now() < deadline,
-            "{} frames, waiting for {more} more than the {base} there were",
-            frames(ticks),
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || frames(ticks) >= base + more,
+        || {
+            format!(
+                "{} frames, waiting for {more} more than the {base} there were",
+                frames(ticks),
+            )
+        },
+    );
 }
 
 /// Frames of 2001 bytes to overwrite `ACS_RING` at 4096 — ten kilobytes
@@ -240,58 +232,128 @@ fn no_reconnect_exits_on_a_drop() {
     assert!(remote.session_exists("nr"));
 }
 
+/// Regression (acs-rsn5): a first connection that passes the marker and
+/// then ends before any WELCOME has no session to keep running, and with
+/// `--new` no name to reattach to — it says so, and exits as a failed dial
+/// does (255).
+#[test]
+fn a_link_lost_before_the_welcome_claims_no_session() {
+    let remote = Remote::new();
+    let ready = remote.root.path().join("ready");
+    std::fs::write(&ready, acs::proto::ready_line()).unwrap();
+    let script = remote.root.path().join("ready-then-eof.sh");
+    write_executable(&script, format!("#!/bin/sh\ncat '{}'\n", ready.display()));
+    let script = script.display().to_string();
+    for session in [&["nw"][..], &["--new"]] {
+        let mut args = vec!["--transport-cmd", &script, "devbox"];
+        args.extend_from_slice(session);
+        args.extend_from_slice(&["--", "/bin/sh", "-c", "sleep 30"]);
+        let mut c = Client::spawn(&exe(), &args, FAST);
+        assert_eq!(c.wait(T), 255, "{session:?}: {}", c.text());
+        c.wait_for("connection to devbox lost before the session started", T);
+        assert!(!c.text().contains("keeps running"), "{}", c.text());
+        assert!(!c.text().contains("reattach"), "{}", c.text());
+    }
+}
+
 /// Regression (acs-7k7): a terminal that stops reading for longer than the
 /// dead interval is not a lost link. The client blocks writing to stdout
 /// meanwhile, and judged liveness by what it had decoded before the block
 /// rather than by the bytes waiting in the pipe.
 ///
-/// The 8 s pause is the stimulus and stays a sleep: it must *exceed*
-/// `ACS_DEAD_MS` (800 ms), and a starved host can only make it longer. What
-/// followed it was a 500 ms settle before a negative assertion, which a
-/// stalled host silently turns into no test at all (acs-7wu). The settle is
-/// now an event: the session prints `RESUMED` only once the flag file is
-/// there, and the flag is written after the terminal starts draining again,
-/// so those bytes cannot be among the ones buffered during the pause — they
-/// were produced afterwards and carried across the same link. Seeing them is
-/// the client saying it read the host after the write unblocked and lived,
-/// which is exactly the moment the bug fired: the first `tick` after the
-/// unblocking write, with the newly read bytes not yet decoded. Waiting for
-/// output alone would not do — on unpause the flood of buffered `y`s arrives
-/// whether the link was kept or dropped and redialled.
+/// **The stall is proven, not assumed** (acs-io8c). How much a terminal
+/// holds before a write blocks is the pty's business — about 1 KiB on a
+/// macOS raw pty, about 20 KiB on Linux — and the 2.4 s pause this test used
+/// to sleep blocked the client on the first and never on the second. So the
+/// pause is not a duration: it lasts until the client is seen to have been
+/// stuck for three dead intervals (`STUCK`). The probe is a resize. The
+/// client handles `SIGWINCH` in its poll loop and passes it on as a RESIZE,
+/// which the program reports with `stty size`; a client blocked in
+/// `write_output` does neither, since the write is retried across the
+/// signal. So while the terminal is paused the test resizes and watches: a
+/// size the program reports means the client is still keeping up — the
+/// trickle has not filled the terminal yet — and the next probe asks for a
+/// new one; a size still unreported `STUCK` after it was asked for is a
+/// client that sat in a write that long, whatever the pty holds. A starved
+/// host only makes the pause longer.
 ///
-/// The stimulus itself is untouched: the flag test is a shell builtin beside
-/// two forks already in the loop, and until the flag appears the frame is the
-/// same 101 bytes, so the trickle that fills the terminal's buffer mid-pause
-/// is the one acs-7k7 was reproduced with.
+/// The trickle is one write of 1000 bytes per loop and no newline, so a
+/// frame reaches the client as one DATA in one read, and the write that
+/// blocks leaves nothing behind it to decode — the shape acs-7k7 fired on:
+/// the first `tick` after the unblocking write, with the bytes read during
+/// the stall not yet decoded. At some 20 KiB/s it fills a Linux pty in about
+/// a second.
+///
+/// The settle is an event, not a sleep (acs-7wu): the session prints
+/// `RESUMED` only once the flag file is there, and the flag is written after
+/// the terminal drains again, so those bytes were produced after the stall
+/// and carried across the same link. Seeing them is the client saying it
+/// read the host after the write unblocked and lived. Waiting for output
+/// alone would not do — on unpause the buffered `y`s arrive whether the link
+/// was kept or dropped and redialled.
 #[test]
 fn a_stalled_terminal_is_not_a_dead_link() {
+    /// Three times `FAST`'s `ACS_DEAD_MS`.
+    const STUCK: Duration = Duration::from_millis(2400);
     let remote = Remote::installed();
     // The master keeps its client for a minute (it has its own liveness,
     // acs-ode); this is about the client's judgement of the master.
     remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
     let go = remote.root.path().join("go");
+    let size = remote.root.path().join("size");
     let mut c = start(
         &remote,
         "stall",
-        // A trickle: one small frame per read, and the terminal's buffer
-        // fills partway through the pause, blocking the client in a write
-        // with nothing left to decode.
+        // Renamed into place, so a read never sees half a size.
         &format!(
-            "echo up; while true; do head -c 100 /dev/zero | tr '\\0' y; \
-             [ -f '{}' ] && printf RESUMED; echo; sleep 0.05; done",
-            go.display()
+            "echo up; while true; do head -c 1000 /dev/zero | tr '\\0' y; \
+             stty size > '{size}.new' && mv '{size}.new' '{size}'; \
+             [ -f '{go}' ] && printf RESUMED; sleep 0.02; done",
+            size = size.display(),
+            go = go.display()
         ),
         FAST,
     );
     c.wait_for("up", T);
+    let reported = || std::fs::read_to_string(&size).unwrap_or_default();
+    c.wait_until(
+        "the program reports its size",
+        |_| reported() == "24 80\n",
+        T,
+    );
     // Counted from here, not from one: a remote that has to install acs
     // first spends a connection or two before the session (acs-cu8), and
     // what this test is about is whether the stall costs one *more*.
     let dialled = remote.connections();
-    // Nothing is read for well past ACS_DEAD_MS (800 ms).
     c.set_paused(true);
-    std::thread::sleep(Duration::from_secs(8));
+    let cols = std::cell::Cell::new(80);
+    let want = poll(
+        T,
+        || {
+            cols.set(cols.get() + 1);
+            let want = format!("24 {}\n", cols.get());
+            c.resize(cols.get(), 24);
+            let asked = Instant::now();
+            while reported() != want && asked.elapsed() < STUCK {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (reported() != want).then_some(want)
+        },
+        || {
+            format!(
+                "the client never blocked on the paused terminal: {} resizes got through",
+                cols.get() - 80
+            )
+        },
+    );
     c.set_paused(false);
+    // The resize the blocked client sat on goes through once its write
+    // does: it was stuck, not lost.
+    c.wait_until(
+        "the last resize reaches the program",
+        |_| reported() == want,
+        T,
+    );
     // Only now, so every RESUMED is output made after the stall.
     std::fs::write(&go, "").unwrap();
     c.wait_for("RESUMED", T);
@@ -395,6 +457,110 @@ fn ctrl_c_during_a_redial_clears_the_status_line() {
     assert!(c.echo_on());
 }
 
+/// acs-8ax: the command keys work while a redial is in flight, not only in
+/// the wait between dials. The redial is held for good — only the keys can
+/// end it — and `x` says it needs the link before `d` detaches.
+///
+/// The redial timeout is two minutes, longer than every deadline in the
+/// suite: a client that only read the keys once the dial gave up — which
+/// is what it did, the cooked terminal handing them over late — cannot
+/// pass inside `T`.
+#[test]
+fn detach_works_during_a_redial() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_REDIAL_TIMEOUT_MS", "120000"));
+    let mut c = start(&remote, "dr", "echo up; sleep 30", &env);
+    c.wait_for("up", T);
+    remote.hold_dial();
+    let dialled = remote.connections();
+    remote.cut_link();
+    remote.wait_more_connections(dialled, 1, T);
+    c.wait_until("the client has left raw mode to redial", |c| c.echo_on(), T);
+    c.send(&command(b'x'));
+    c.wait_for("ending the session needs the connection", T);
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/dr", T);
+    assert!(c.echo_on());
+    assert!(c.text().contains("\x1b[23;0t"));
+}
+
+/// acs-8ax: with the keys live during a redial, ssh still gets the
+/// terminal when it asks for a password — the answer reaches it, and
+/// neither the screen nor the program sees it (acs-qty).
+#[test]
+fn a_password_prompt_during_a_redial_gets_the_terminal() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "pw",
+        "echo ready; while read l; do echo got:$l; done",
+        FAST,
+    );
+    c.wait_for("ready", T);
+    let answer = remote.prompt_on_next_dial();
+    remote.cut_link();
+    c.wait_for("Password: ", T);
+    c.send(b"hunter2\r");
+    c.wait_for("\x1b[23;0t", T);
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
+    let text = c.text();
+    assert!(!text.contains("hunter2"), "{text:?}");
+}
+
+/// The text written after the last title pop, once the client has resumed.
+fn after_the_pop(c: &mut Client) -> String {
+    c.wait_for("\x1b[23;0t", T);
+    let text = c.text();
+    text[text.rfind("\x1b[23;0t").unwrap()..].to_string()
+}
+
+/// Regression (acs-r3m): a terminal without the xterm title stack ignores
+/// the pop, so after a reconnect the title the program last set is written
+/// again explicitly — straight after `CSI 23;0 t` — rather than leaving
+/// "connection lost" up for good.
+#[test]
+fn a_reconnect_gives_the_program_its_title_back() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "titled",
+        "printf '\\033]2;vim main.rs\\007'; echo ready; sleep 30",
+        FAST,
+    );
+    c.wait_for("ready", T);
+    remote.cut_link();
+    let tail = after_the_pop(&mut c);
+    assert!(
+        tail.starts_with("\x1b[23;0t\x1b]2;vim main.rs\x07"),
+        "title not restored: {tail:?}"
+    );
+    assert!(!tail.contains("connection lost"), "{tail:?}");
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+}
+
+/// acs-r3m: a program that never set a title gets a neutral one back, so
+/// the outage text is gone even where the pop does nothing.
+#[test]
+fn a_reconnect_without_a_program_title_sets_a_neutral_one() {
+    let remote = Remote::installed();
+    let mut c = start(&remote, "untitled", "echo ready; sleep 30", FAST);
+    c.wait_for("ready", T);
+    remote.cut_link();
+    let tail = after_the_pop(&mut c);
+    assert!(
+        tail.starts_with("\x1b[23;0t\x1b]2;acs: devbox\x07"),
+        "no neutral title: {tail:?}"
+    );
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0);
+}
+
 #[test]
 fn exit_needs_the_link() {
     let remote = Remote::installed();
@@ -445,15 +611,15 @@ fn output_lost_to_a_small_ring_is_a_gap_and_redraw() {
     remote.release_dial();
     // After reconnecting with an overwritten offset the client clears the
     // screen for the program's redraw.
-    let deadline = Instant::now() + T;
-    loop {
-        let out = c.output();
-        if out[before..].windows(6).any(|w| w == b"\x1b[H\x1b[J") {
-            break;
-        }
-        assert!(Instant::now() < deadline, "no clear after the gap");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || {
+            c.output()[before..]
+                .windows(6)
+                .any(|w| w == b"\x1b[H\x1b[J")
+        },
+        || "no clear after the gap",
+    );
 }
 
 /// Regression (acs-xk4): the modes a program turned on before a gap are
@@ -529,11 +695,11 @@ fn modes_of_a_restarted_session_are_reset() {
     remote.cut_link();
     a.wait_for("reconnecting in 120s", T);
     // The first program ends while the link is down; another takes its name.
-    let deadline = Instant::now() + T;
-    while remote.session_exists("restart") {
-        assert!(Instant::now() < deadline, "the first program did not end");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || !remote.session_exists("restart"),
+        || "the first program did not end",
+    );
     let mut b = start(&remote, "restart", "echo second; sleep 30", &[]);
     b.wait_for("second", T);
     b.send(&command(b'd'));
@@ -765,6 +931,84 @@ fn bytes_in_flight_when_the_network_moved_do_not_answer_the_netcheck() {
     assert_consecutive(&c.text());
 }
 
+/// acs-spd: a terminal that stalls **after** a network change was asked
+/// about does not cost a redial. The `PONG` that answers the question sits
+/// in the pipe behind output the client cannot write, and the time spent
+/// blocked on the terminal is not counted against `ACS_NETCHECK_MS` — the
+/// link was not slow, the terminal was. The mirror of acs-7k7 for the
+/// netcheck's deadline, and the case acs-br2's "only the `PONG` answers"
+/// left exposed.
+///
+/// The order is made, not waited for. The link is frozen first (the proxy
+/// `SIGSTOP`ped), so the `PING` the change sends cannot be answered yet;
+/// `-v`'s `network changed` line says the question is out; only then does
+/// the terminal stop reading and the link thaw, so the answer comes back
+/// behind a backlog of output into a client that is about to block. The
+/// 7 s pause is the stimulus: more than twice `ACS_NETCHECK_MS`, which is
+/// 3 s here rather than the 2 s default so the frozen spell before the
+/// stall — time the host *is* answerable for — has room on a loaded
+/// machine. `RESUMED` is printed only once the flag file exists, written
+/// after the terminal drains again, so seeing it is the client reading the
+/// host after the stall and having kept the link.
+#[test]
+fn a_terminal_stall_during_a_netcheck_is_not_a_dead_link() {
+    let remote = Remote::installed();
+    // The master keeps a client that is not reading (acs-ode); this is
+    // about the client's judgement of the host.
+    remote.remote_env(&[("ACS_DEAD_MS", "60000"), ("ACS_PING_MS", "20000")]);
+    let go = remote.root.path().join("go");
+    let ticks = remote.root.path().join("ticks");
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let mut env = vec![
+        ("ACS_BACKOFF_MS".to_string(), "100".to_string()),
+        ("ACS_PING_MS".to_string(), "20000".to_string()),
+        ("ACS_DEAD_MS".to_string(), "60000".to_string()),
+        ("ACS_NETCHECK_MS".to_string(), "3000".to_string()),
+    ];
+    env.extend(watch.env());
+    let cmd = format!(
+        "echo up; while true; do head -c 20000 /dev/zero | tr '\\0' y; \
+         [ -f '{go}' ] && printf RESUMED; echo; printf . >> '{ticks}'; sleep 0.02; done",
+        go = go.display(),
+        ticks = ticks.display(),
+    );
+    let mut c = Client::start_env(
+        &remote,
+        &["-v", "devbox", "spd", "--", "/bin/sh", "-c", &cmd],
+        &refs(&env),
+    );
+    c.wait_for("up", T);
+    let dialled = remote.connections();
+    let pid = *remote.transport_pids().last().unwrap();
+    // The link holds still, so the question cannot be answered yet.
+    acs::sys::kill(pid, libc::SIGSTOP).unwrap();
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    // The question is out. The program goes on printing into the frozen
+    // link until the master's queue for this client is full and the
+    // buffers between are too — 200 KB against the 64 KiB a read takes —
+    // so the answer, queued after all of it, cannot be read in the same
+    // pass as the output the client is about to block on.
+    let base = frames(&ticks);
+    wait_frames(&ticks, base, 10);
+    // Now the terminal stalls, and the answer comes back behind output the
+    // client cannot write.
+    c.set_paused(true);
+    acs::sys::kill(pid, libc::SIGCONT).unwrap();
+    std::thread::sleep(Duration::from_secs(7));
+    c.set_paused(false);
+    std::fs::write(&go, "").unwrap();
+    c.wait_for("RESUMED", T);
+    assert_eq!(
+        remote.connections(),
+        dialled,
+        "a terminal stall cost a redial: {}",
+        c.text()
+    );
+    assert!(!c.text().contains("reconnecting"), "{}", c.text());
+}
+
 /// acs-ft1, the other half: a network change under a link that is *still
 /// working* costs nothing — no redial, and so not a byte of what was typed
 /// (keys typed into a redial are discarded, DESIGN §5.2). Dropping a live
@@ -978,44 +1222,55 @@ fn a_change_the_rate_limit_suppressed_is_offered_again() {
     );
 }
 
+/// The client's arguments for a session `name` running a program that
+/// reads lines and says what it got, under `-v`, which the network tests
+/// read the watcher's decisions off.
+fn echoing(name: &str) -> Vec<&str> {
+    vec![
+        "-v",
+        "devbox",
+        name,
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo up; while read l; do echo got:$l; done",
+    ]
+}
+
+/// The environment of a handshake test: `watch`'s stand-ins, no offline
+/// wait to read a hint in its place (the free first redial goes at once,
+/// acs-iyq, and the one after it waits two minutes), and dial and redial
+/// timeouts of two minutes — four times `T`, so a client that waited one
+/// out cannot pass anything here.
+fn handshake_env(watch: &NetWatch) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
+        ("ACS_DIAL_TIMEOUT_MS".to_string(), "120000".to_string()),
+        ("ACS_REDIAL_TIMEOUT_MS".to_string(), "120000".to_string()),
+    ];
+    env.extend(watch.env());
+    env
+}
+
 /// Regression (acs-0n8), the other drop path: a change that arrives between
-/// the dial and the `WELCOME` is not spent either.
+/// the dial and the `WELCOME` is not spent either — when it is one the
+/// handshake lets pass (acs-xo1): a network that appeared beside the one
+/// the dial was made from leaves the dial's own address where it was.
 ///
 /// The host accepts the connection, prints its marker and then says nothing
 /// (as `a_silent_host_is_given_up_on` uses it), so the client sits in the
 /// handshake with a generous dial timeout — long enough that nothing here
-/// is racing it. There the netwatch descriptor is polled and the hint is
-/// read, and **that is all that happens**: acting on it is acs-xo1, which
-/// has the blocking dial to deal with and is still open. What this asserts
-/// is only that the hint is not thrown away, and the connection count says
-/// the dial was neither abandoned nor replaced.
+/// is racing it. The connection count says the dial was neither abandoned
+/// nor replaced.
 ///
 /// Same shape as the test above: two hints for one move, and the second one
 /// has to name the change again rather than answer "not a change".
 #[test]
-fn a_change_during_the_handshake_is_offered_again() {
+fn a_network_that_only_appeared_leaves_the_handshake_alone() {
     let remote = Remote::installed();
     let watch = NetWatch::new("192.168.1.5/24\n");
-    let mut env = vec![
-        // The free first redial goes at once (acs-iyq), so the hints below
-        // cannot be read by an offline wait: there is not one.
-        ("ACS_BACKOFF_MS".to_string(), "120000".to_string()),
-        ("ACS_DIAL_TIMEOUT_MS".to_string(), "60000".to_string()),
-    ];
-    env.extend(watch.env());
-    let mut c = Client::start_env(
-        &remote,
-        &[
-            "-v",
-            "devbox",
-            "hs",
-            "--",
-            "/bin/sh",
-            "-c",
-            "echo up; sleep 60",
-        ],
-        &refs(&env),
-    );
+    let env = handshake_env(&watch);
+    let mut c = Client::start_env(&remote, &echoing("hs"), &refs(&env));
     c.wait_session("hs");
     c.wait_for("up", T);
     // Every connection from here on goes quiet once accepted.
@@ -1029,23 +1284,157 @@ fn a_change_during_the_handshake_is_offered_again() {
     c.wait_for("timing: redial: ACS-READY seen", T);
     let handshaking = remote.connections();
 
-    // The machine's addresses move while that dial is still owed a WELCOME.
-    watch.set_networks("10.0.0.5/24\n");
+    // A second network appears while that dial is still owed a WELCOME.
+    watch.set_networks("192.168.1.5/24\n10.0.0.5/24\n");
     watch.hint();
-    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    let named = "acs: network changed: 192.168.1.5/24 → 10.0.0.5/24 192.168.1.5/24";
+    c.wait_for(named, T);
     c.wait_for("acs: network change not acted on", T);
 
     // The kernel's next word about the same move.
     watch.hint();
-    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    c.wait_for(named, T);
+    c.wait_for("acs: network change not acted on", T);
     assert_eq!(
         remote.connections(),
         handshaking,
-        "the handshake acted on the change (acs-xo1, not this): {}",
+        "a network appearing abandoned the handshake: {}",
         c.text()
     );
-    // The client is left in its handshake, which is where this bead ends;
-    // dropping it kills it.
+    // The client is left in its handshake; dropping it kills it.
+}
+
+/// acs-xo1: a network change that takes away the network a link past its
+/// marker was made on abandons the handshake and dials again at once,
+/// instead of waiting out the dial timeout for a `WELCOME` that went with
+/// the address.
+///
+/// The connection goes quiet after its marker, and the dial timeout is
+/// two minutes: only abandoning it brings the session back inside `T`.
+#[test]
+fn a_network_that_went_during_the_handshake_is_dialled_again_at_once() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let mut c = Client::start_env(&remote, &echoing("hg"), &refs(&env));
+    c.wait_session("hg");
+    c.wait_for("up", T);
+    remote.silence(Some(&acs::proto::ready_line()));
+    remote.cut_link();
+    c.wait_for("timing: redial: ACS-READY seen", T);
+    let handshaking = remote.connections();
+    // The next connection is a good one: what the client does with the
+    // change is all that decides whether it is ever made.
+    remote.silence(None);
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("the network moved under the handshake — dialing again", T);
+    c.wait_resumed();
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    assert_eq!(remote.connections(), handshaking + 1, "{}", c.text());
+}
+
+/// acs-xo1, before the marker: a redial still in ssh's handshake when the
+/// network it was made from goes is killed and made again at once. The
+/// dial is held short of the remote command for good, so without the
+/// change it would sit there for the whole two minutes.
+#[test]
+fn a_network_that_went_during_a_redial_is_dialled_again_at_once() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let mut c = Client::start_env(&remote, &echoing("dg"), &refs(&env));
+    c.wait_session("dg");
+    c.wait_for("up", T);
+    remote.hold_dial();
+    let dialled = remote.connections();
+    remote.cut_link();
+    remote.wait_more_connections(dialled, 1, T);
+    c.wait_until("the client has left raw mode to redial", |c| c.echo_on(), T);
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("the network moved under the dial — dialing again", T);
+    // The second dial is made while the first is still held.
+    remote.wait_more_connections(dialled, 2, T);
+    remote.release_dial();
+    c.wait_resumed();
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    assert_eq!(remote.connections(), dialled + 2, "{}", c.text());
+}
+
+/// acs-xo1: the first connection too — a named session's, and plain
+/// `acs <host>`'s, whose first dial is the session menu's (DESIGN §4.4).
+/// That is the two-minute case.
+#[test]
+fn a_network_that_went_during_the_first_dial_is_dialled_again_at_once() {
+    for args in [&["-v", "devbox", "fd"][..], &["-v", "devbox"][..]] {
+        let remote = Remote::installed();
+        let watch = NetWatch::new("192.168.1.5/24\n");
+        let env = handshake_env(&watch);
+        remote.hold_dial();
+        let base = remote.connections();
+        let mut c = Client::start_env(&remote, args, &refs(&env));
+        remote.wait_more_connections(base, 1, T);
+        watch.set_networks("10.0.0.5/24\n");
+        watch.hint();
+        c.wait_for("the network moved under the dial — dialing again", T);
+        remote.wait_more_connections(base, 2, T);
+        remote.release_dial();
+        c.wait_for("new session '", T);
+        assert_eq!(remote.connections(), base + 2, "{args:?}: {}", c.text());
+    }
+}
+
+/// acs-xo1 and acs-8ax: a redial whose ssh is asking for a password is not
+/// abandoned for a network change, because that would throw away what the
+/// user is typing at it. The change is dropped, not spent (acs-0n8), and
+/// the answer still reaches ssh.
+#[test]
+fn a_network_change_leaves_a_redial_asking_for_a_password_alone() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let mut c = Client::start_env(&remote, &echoing("pa"), &refs(&env));
+    c.wait_session("pa");
+    c.wait_for("up", T);
+    let answer = remote.prompt_on_next_dial();
+    let dialled = remote.connections();
+    remote.cut_link();
+    c.wait_for("Password: ", T);
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network change not acted on", T);
+    c.send(b"hunter2\r");
+    c.wait_resumed();
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
+    assert_eq!(remote.connections(), dialled + 1, "{}", c.text());
+}
+
+/// acs-xo1: the same on the first connection, whose dial shares acs's
+/// cooked terminal with ssh — there the prompt is seen by the echo it
+/// turns off.
+#[test]
+fn a_network_change_leaves_a_first_dial_asking_for_a_password_alone() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let answer = remote.prompt_on_next_dial();
+    let base = remote.connections();
+    let mut c = Client::start_env(&remote, &echoing("pf"), &refs(&env));
+    c.wait_for("Password: ", T);
+    watch.set_networks("10.0.0.5/24\n");
+    watch.hint();
+    c.wait_for("acs: network change not acted on", T);
+    c.send(b"hunter2\r");
+    c.wait_session("pf");
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
+    assert_eq!(remote.connections(), base + 1, "{}", c.text());
 }
 
 /// A flapping interface is still **one** redial (acs-6p8's storm, kept out
@@ -1151,19 +1540,22 @@ fn a_silent_host_is_given_up_on() {
 /// Regression (acs-znr): a redial into a host that has gone quiet times out
 /// and returns to the backoff wait — and reconnects once the host answers.
 ///
-/// The dial timeout **is** the subject here, so it stays a stretch of wall
-/// clock — but ten seconds of it rather than four (acs-ryz). It covers the
-/// first connection too, and four seconds was not enough for one: under
-/// parallel copies of the suite with `dd` and fork loops beside them,
-/// `no answer from devbox within 4 s` before the session had even started
-/// was the commonest failure this file had. Ten is the same statement with
-/// the slack acs-cu8 gave the frozen-link bound, and still leaves twenty
-/// seconds of `T` for the second attempt to be made.
+/// The redial timeout **is** the subject here, so it stays a stretch of
+/// wall clock: one second of it. It used to be `ACS_DIAL_TIMEOUT_MS`, which
+/// set the first connection's deadline too, and four seconds was not
+/// enough for that one under parallel copies of the suite with `dd` beside
+/// them — `no answer from devbox within 4 s` before the session had even
+/// started — so acs-ryz widened it to ten and the test took twenty. The
+/// redial has a knob of its own now (acs-p46), and the first connection
+/// keeps its two minutes, set here explicitly: a client that applied that
+/// to the redial would make no second attempt inside `T`. So this is also
+/// the test that the two deadlines are separate.
 #[test]
 fn a_redial_into_a_silent_host_returns_to_the_backoff() {
     let remote = Remote::installed();
     let mut env = FAST.to_vec();
-    env.push(("ACS_DIAL_TIMEOUT_MS", "10000"));
+    env.push(("ACS_DIAL_TIMEOUT_MS", "120000"));
+    env.push(("ACS_REDIAL_TIMEOUT_MS", "1000"));
     let mut c = start(&remote, "rs", "echo up; cat", &env);
     c.wait_for("up", T);
     let dialled = remote.connections();
@@ -1173,6 +1565,60 @@ fn a_redial_into_a_silent_host_returns_to_the_backoff() {
     remote.wait_more_connections(dialled, 2, T);
     remote.silence(None);
     // Resumed: the status line's title is popped, and keys go through.
+    c.wait_for("\x1b[23;0t", T);
+    c.send(b"hello\r");
+    c.wait_for("hello", T);
+}
+
+/// acs-p46: a short redial deadline does not shorten the first
+/// connection's. The first dial is held — as one waiting on a passphrase
+/// or a key touch is — for three times the redial timeout, and then let
+/// through: the session starts, and nothing gave up on it. Held rather
+/// than slowed, so a stalled host only makes the test slower (acs-o8h);
+/// the sleep is the stimulus, and a starved host can only lengthen it.
+#[test]
+fn a_short_redial_deadline_leaves_the_first_connection_its_own() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_REDIAL_TIMEOUT_MS", "300"));
+    let dialled = remote.connections();
+    remote.hold_dial();
+    let mut c = start(&remote, "fd", "echo up; cat", &env);
+    remote.wait_more_connections(dialled, 1, T);
+    std::thread::sleep(Duration::from_millis(900));
+    remote.release_dial();
+    c.wait_for("up", T);
+    assert!(!c.text().contains("no answer"), "{}", c.text());
+}
+
+/// Regression (acs-omt2): a redial that runs out its whole timeout against
+/// a silent host does not reset the backoff, however long it took. The
+/// reset is for a connection that *served* the threshold, WELCOME to loss;
+/// a redial's timeout is the threshold's 30 s too, so counting the dial
+/// handed out a free immediate attempt after every silent dial and the
+/// backoff never climbed.
+///
+/// Here the redial timeout equals the reset threshold, as the defaults do,
+/// and the waits still go 0 → 1 s → 2 s. Two seconds of each: the first
+/// connection is no longer held to the redial's deadline (acs-p46), so
+/// the ten that used to protect it are not needed.
+#[test]
+fn a_silent_redial_as_long_as_the_reset_threshold_keeps_the_backoff_climbing() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.retain(|(k, _)| *k != "ACS_BACKOFF_MS");
+    env.push(("ACS_BACKOFF_MS", "1000"));
+    env.push(("ACS_REDIAL_TIMEOUT_MS", "2000"));
+    env.push(("ACS_BACKOFF_RESET_MS", "2000"));
+    let mut c = start(&remote, "rb", "echo up; cat", &env);
+    c.wait_for("up", T);
+    remote.silence(Some(""));
+    remote.cut_link();
+    c.wait_for("reconnecting now", T);
+    // Each silent dial takes the full threshold and the wait still grows.
+    c.wait_for("reconnecting in 1s", T);
+    c.wait_for("reconnecting in 2s", T);
+    remote.silence(None);
     c.wait_for("\x1b[23;0t", T);
     c.send(b"hello\r");
     c.wait_for("hello", T);
@@ -1365,6 +1811,44 @@ fn a_held_command_key_survives_a_redial_attempt() {
     c.send(&[0x1d, b'd']);
     assert_eq!(c.wait(T), 0, "{}", c.text());
     c.wait_for("detached from devbox/hk", T);
+}
+
+/// Regression (acs-wnhd): a lone command key whose window runs out during
+/// a redial, before the WELCOME, is dropped like any key typed into a dial
+/// (DESIGN §5.2, §6.1). `serve()` released it as INPUT whether or not the
+/// link had been welcomed, so the same press reached the program or not
+/// depending on whether the window ended a few milliseconds before or
+/// after the host answered.
+///
+/// The press goes in online; the redial is held short of the remote
+/// command for longer than the window, so the window has certainly run
+/// out before the dial can be answered — the sleep is a floor, and a slow
+/// host only makes it longer. After the resume a marker line goes to `cat`,
+/// and the press must not be in front of it: neither the pty's `^]` echo
+/// nor the byte itself.
+#[test]
+fn a_command_key_expiring_in_a_redial_is_dropped() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_ESCAPE_TIMEOUT_MS", "1000"));
+    let mut c = start(&remote, "xd", "echo up; cat", &env);
+    c.wait_for("up", T);
+    c.send(&[0x1d]);
+    let dialled = remote.connections();
+    remote.hold_dial();
+    remote.cut_link();
+    remote.wait_more_connections(dialled, 1, T);
+    std::thread::sleep(Duration::from_millis(2500));
+    remote.release_dial();
+    c.wait_resumed();
+    c.send(b"mark\r");
+    c.wait_for("mark", T);
+    let text = c.text();
+    let after = &text[text.find("up").unwrap_or(0)..];
+    assert!(
+        !after.contains("^]") && !after.contains('\x1d'),
+        "the expired command key reached the program:\n{after:?}"
+    );
 }
 
 // ---- the status line over an unfinished sequence (acs-p4u) -----------------

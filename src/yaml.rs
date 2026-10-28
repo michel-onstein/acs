@@ -5,7 +5,7 @@
 //! Supported: block mappings and sequences (including `- key: value` items),
 //! plain, single- and double-quoted scalars, one-line flow collections
 //! (`[a, b]`, `{k: v}`), comments and blank lines. Anchors, aliases, tags,
-//! block scalars (`|`, `>`), multi-line flow collections and several
+//! directives, block scalars (`|`, `>`), multi-line flow collections and several
 //! documents are refused with the line they are on.
 //!
 //! The tree keeps each node's line, the comment and blank lines before it and
@@ -111,7 +111,7 @@ impl Node {
 
     /// A string scalar, quoted when plain would read as something else.
     pub fn string(s: &str) -> Node {
-        let style = if plain_ok(s) && !looks_typed(s) {
+        let style = if plain_ok(s, false) && !looks_typed(s) {
             Style::Plain
         } else {
             Style::Double
@@ -169,7 +169,19 @@ struct Line {
 
 impl Line {
     fn trivia(&self) -> bool {
-        self.text.is_empty() || self.text.starts_with('#')
+        self.text.is_empty() || self.text.starts_with('#') || self.marker()
+    }
+
+    /// A `---` or `...` document marker: kept as written, like a comment, so
+    /// an edit does not drop it (acs-5mmu). A space or a tab ends the marker
+    /// (acs-u20c).
+    fn marker(&self) -> bool {
+        self.indent == 0
+            && ["---", "..."].iter().any(|m| {
+                self.text
+                    .strip_prefix(m)
+                    .is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t']))
+            })
     }
 }
 
@@ -180,34 +192,61 @@ struct Parser {
     depth: usize,
 }
 
+/// The only characters YAML treats as whitespace within a line.
+const YAML_WS: [char; 3] = [' ', '\t', '\r'];
+
 /// Parse a configuration file.
 pub fn parse(src: &str) -> Result<Document> {
     // A BOM is not part of the first key: editors that write one produce a
     // file every other YAML reader accepts (acs-qjx).
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let mut lines = Vec::new();
+    let (mut content, mut ended) = (false, false);
     for (i, raw) in src.lines().enumerate() {
         let no = i + 1;
-        let raw = raw.trim_end();
+        // YAML whitespace is space and tab only: `str::trim_end` would also
+        // eat a trailing U+00A0 or U+3000 that belongs to the value (acs-m8ts).
+        let raw = raw.trim_end_matches(YAML_WS);
         let text = raw.trim_start_matches(' ');
         if text.starts_with('\t') {
             return err(no, "tabs are not allowed for indentation; use spaces");
         }
         let indent = raw.len() - text.len();
-        if indent == 0 && (text == "---" || text.starts_with("--- ")) {
-            if lines.iter().any(|l: &Line| !l.trivia()) {
-                return err(no, "only one YAML document is supported");
-            }
-            continue;
-        }
-        if indent == 0 && text == "..." {
-            continue;
-        }
-        lines.push(Line {
+        let line = Line {
             no,
             indent,
             text: text.to_string(),
-        });
+        };
+        if indent == 0 && text.starts_with('%') {
+            return err(no, "directives such as %YAML are not supported");
+        }
+        // A `---` after content, or content after a `...` that ended it, is
+        // a second document.
+        if line.marker() {
+            // Content on the marker line would be a top-level scalar or flow
+            // node, never the mapping a configuration is: refused, not
+            // silently kept as trivia (acs-u20c).
+            let rest = text[3..].trim_start_matches(YAML_WS);
+            if !rest.is_empty() && !rest.starts_with('#') {
+                return err(
+                    no,
+                    format!(
+                        "content after '{}' is not supported; start it on the next line",
+                        &text[..3]
+                    ),
+                );
+            }
+            if content && !text.starts_with("...") {
+                return err(no, "only one YAML document is supported");
+            }
+            ended = content;
+        } else if !line.trivia() {
+            if ended {
+                return err(no, "only one YAML document is supported");
+            }
+            content = true;
+        }
+        lines.push(line);
     }
     let mut p = Parser {
         lines,
@@ -418,8 +457,8 @@ fn split_key(text: &str, line: usize) -> Result<Option<(String, &str)>> {
         else {
             return Ok(None);
         };
-        let key = text[..colon].trim_end();
-        if key.is_empty() || key.contains(" #") {
+        let key = text[..colon].trim_end_matches(YAML_WS);
+        if key.is_empty() || key.contains(" #") || key.contains("\t#") {
             return Ok(None);
         }
         (key.to_string(), &text[colon..])
@@ -474,8 +513,13 @@ fn inline(text: &str, line: usize) -> Result<(Option<(Value, bool)>, Option<Stri
         b'&' | b'*' | b'!' => return err(line, "anchors, aliases and tags are not supported"),
         b'@' | b'`' => return err(line, "a value starting with @ or ` must be quoted"),
         _ => {
-            let end = t.find(" #").unwrap_or(t.len());
-            let s = t[..end].trim_end();
+            // A space or a tab separates a comment (acs-5mmu).
+            let end = t
+                .as_bytes()
+                .windows(2)
+                .position(|w| matches!(w, [b' ' | b'\t', b'#']))
+                .unwrap_or(t.len());
+            let s = t[..end].trim_end_matches(YAML_WS);
             if s.contains(": ") || s.ends_with(':') {
                 return err(line, format!("a value containing ': ' must be quoted: {s}"));
             }
@@ -486,10 +530,10 @@ fn inline(text: &str, line: usize) -> Result<(Option<(Value, bool)>, Option<Stri
             (v, end, false)
         }
     };
-    let rest = t[used..].trim_start_matches(' ');
+    let rest = t[used..].trim_start_matches([' ', '\t']);
     let comment = if rest.is_empty() {
         None
-    } else if rest.starts_with('#') && (used == t.len() || t.as_bytes()[used] == b' ') {
+    } else if rest.starts_with('#') && matches!(t.as_bytes()[used], b' ' | b'\t') {
         Some(rest.to_string())
     } else {
         return err(line, format!("unexpected text after the value: {rest}"));
@@ -674,7 +718,9 @@ impl Flow<'_> {
                     }
                     self.i += 1;
                 }
-                let text = self.text[start..self.i].trim_end().to_string();
+                let text = self.text[start..self.i]
+                    .trim_end_matches(YAML_WS)
+                    .to_string();
                 if text.is_empty() {
                     return err(self.line, "expected a value");
                 }
@@ -690,13 +736,18 @@ impl Flow<'_> {
 
 // ---- writing ---------------------------------------------------------------
 
-/// Whether `s` can be written without quotes and read back as the same text.
-fn plain_ok(s: &str) -> bool {
+/// Whether `s` can be written without quotes and read back as the same text
+/// — in block context, or inside a `[...]`/`{...}` when `flow` is set, where
+/// the reader also ends a plain scalar at any of `,]}#` (acs-tacx).
+fn plain_ok(s: &str, flow: bool) -> bool {
     let Some(first) = s.chars().next() else {
         return false;
     };
-    !(s.starts_with(' ')
-        || s.ends_with(' ')
+    !((flow && s.contains([',', '[', ']', '{', '}', '#']))
+        // Any Unicode whitespace at an end is quoted, so a reader that trims
+        // more than YAML's space and tab still gets it back (acs-m8ts).
+        || s.starts_with(char::is_whitespace)
+        || s.ends_with(char::is_whitespace)
         || s.ends_with(':')
         || "?:,[]{}#&*!|>'\"%@`".contains(first)
         || s == "-"
@@ -732,9 +783,9 @@ fn quote_double(s: &str) -> String {
     out
 }
 
-fn scalar_text(s: &Scalar) -> String {
+fn scalar_text(s: &Scalar, flow: bool) -> String {
     match s.style {
-        Style::Plain if plain_ok(&s.text) => s.text.clone(),
+        Style::Plain if plain_ok(&s.text, flow) => s.text.clone(),
         Style::Single if !s.text.chars().any(|c| c.is_control()) => {
             format!("'{}'", s.text.replace('\'', "''"))
         }
@@ -742,8 +793,8 @@ fn scalar_text(s: &Scalar) -> String {
     }
 }
 
-fn key_text(k: &str) -> String {
-    if plain_ok(k) {
+fn key_text(k: &str, flow: bool) -> String {
+    if plain_ok(k, flow) {
         k.to_string()
     } else {
         quote_double(k)
@@ -752,14 +803,19 @@ fn key_text(k: &str) -> String {
 
 /// A value written on one line (scalars, empty and flow collections).
 fn flow_text(v: &Value) -> String {
+    one_line_text(v, false)
+}
+
+/// `flow_text`, where `inside` says `v` sits within a flow collection.
+fn one_line_text(v: &Value, inside: bool) -> String {
     match v {
         Value::Null => String::new(),
-        Value::Scalar(s) => scalar_text(s),
+        Value::Scalar(s) => scalar_text(s, inside),
         Value::Seq(items) => format!(
             "[{}]",
             items
                 .iter()
-                .map(|n| flow_text(&n.value))
+                .map(|n| one_line_text(&n.value, true))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -768,8 +824,8 @@ fn flow_text(v: &Value) -> String {
             entries
                 .iter()
                 .map(|(k, n)| match &n.value {
-                    Value::Null => format!("{}:", key_text(k)),
-                    v => format!("{}: {}", key_text(k), flow_text(v)),
+                    Value::Null => format!("{}:", key_text(k, true)),
+                    v => format!("{}: {}", key_text(k, true), one_line_text(v, true)),
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -787,12 +843,19 @@ fn one_line(n: &Node) -> bool {
         }
 }
 
+/// `indent` spaces, written in place rather than built per line.
+fn pad(out: &mut String, indent: usize) {
+    for _ in 0..indent {
+        out.push(' ');
+    }
+}
+
 fn push_before(out: &mut String, before: &[String], indent: usize) {
     for b in before {
         if b.is_empty() {
             out.push('\n');
         } else {
-            out.push_str(&" ".repeat(indent));
+            pad(out, indent);
             out.push_str(b);
             out.push('\n');
         }
@@ -815,21 +878,24 @@ fn line_end(out: &mut String, n: &Node) {
     out.push('\n');
 }
 
-fn emit_block(out: &mut String, v: &Value, indent: usize) {
-    let pad = " ".repeat(indent);
-    match v {
-        Value::Map(entries) => {
-            for (k, n) in entries {
-                push_before(out, &n.before, indent);
-                out.push_str(&pad);
-                out.push_str(&key_text(k));
-                out.push(':');
-                line_end(out, n);
-                if !one_line(n) {
-                    emit_block(out, &n.value, indent + 2);
-                }
-            }
+/// A mapping's entries, one `key:` line each. A slice, so a `- key:` item
+/// hands on the keys after its first without copying them (acs-siqo).
+fn emit_map(out: &mut String, entries: &[(String, Node)], indent: usize) {
+    for (k, n) in entries {
+        push_before(out, &n.before, indent);
+        pad(out, indent);
+        out.push_str(&key_text(k, false));
+        out.push(':');
+        line_end(out, n);
+        if !one_line(n) {
+            emit_block(out, &n.value, indent + 2);
         }
+    }
+}
+
+fn emit_block(out: &mut String, v: &Value, indent: usize) {
+    match v {
+        Value::Map(entries) => emit_map(out, entries, indent),
         Value::Seq(items) => {
             for n in items {
                 match &n.value {
@@ -838,19 +904,19 @@ fn emit_block(out: &mut String, v: &Value, indent: usize) {
                         let (k0, n0) = &entries[0];
                         push_before(out, &n.before, indent);
                         push_before(out, &n0.before, indent);
-                        out.push_str(&pad);
+                        pad(out, indent);
                         out.push_str("- ");
-                        out.push_str(&key_text(k0));
+                        out.push_str(&key_text(k0, false));
                         out.push(':');
                         line_end(out, n0);
                         if !one_line(n0) {
                             emit_block(out, &n0.value, indent + 4);
                         }
-                        emit_block(out, &Value::Map(entries[1..].to_vec()), indent + 2);
+                        emit_map(out, &entries[1..], indent + 2);
                     }
                     _ => {
                         push_before(out, &n.before, indent);
-                        out.push_str(&pad);
+                        pad(out, indent);
                         out.push('-');
                         line_end(out, n);
                         if !one_line(n) {
@@ -861,7 +927,7 @@ fn emit_block(out: &mut String, v: &Value, indent: usize) {
             }
         }
         other => {
-            out.push_str(&pad);
+            pad(out, indent);
             out.push_str(&flow_text(other));
             out.push('\n');
         }
@@ -1079,6 +1145,93 @@ list: [a, \"b c\", 3]
         }
     }
 
+    /// acs-m8ts: YAML whitespace is space and tab only. A value or key
+    /// ending (or starting) in U+00A0, U+3000 or U+2028 is quoted when
+    /// written, and a hand-written plain one keeps the character when read —
+    /// `str::trim_end` used to eat it, so `k<nbsp>` read back as `k`.
+    #[test]
+    fn unicode_whitespace_at_an_end_survives_a_round_trip() {
+        for s in ["k\u{a0}", "k\u{3000}", "k\u{2028}", "\u{a0}k", "a\u{a0}b"] {
+            let mut d = parse("k: v\n").unwrap();
+            d.root.value.map_mut().unwrap()[0] = (s.to_string(), Node::string(s));
+            let out = emit(&d);
+            let back = parse(&out).unwrap();
+            let m = back.root.value.map().unwrap();
+            assert_eq!(m[0].0, s, "{out:?}");
+            assert_eq!(text(&m[0].1), s, "{out:?}");
+
+            // The same inside a flow mapping.
+            let mut d = parse("k: v\n").unwrap();
+            let mut map = Node::new(Value::Map(vec![(s.to_string(), Node::string(s))]));
+            map.flow = true;
+            d.root.value.map_mut().unwrap()[0].1 = map;
+            let out = emit(&d);
+            let back = parse(&out).unwrap();
+            let m = get(&back.root, "k").value.map().unwrap();
+            assert_eq!(m[0].0, s, "{out:?}");
+            assert_eq!(text(&m[0].1), s, "{out:?}");
+        }
+        // Only an inner one stays plain.
+        let mut d = parse("k: v\n").unwrap();
+        d.root.value.map_mut().unwrap()[0].1 = Node::string("a\u{a0}b");
+        assert_eq!(emit(&d), "k: a\u{a0}b\n");
+
+        // Written by hand, unquoted: the reader keeps it, in block and flow.
+        let d = parse("k\u{a0}: v\u{a0}  # c\nf: [x\u{a0} , {y\u{a0}: z\u{a0}}]\n").unwrap();
+        let m = d.root.value.map().unwrap();
+        assert_eq!(m[0].0, "k\u{a0}");
+        assert_eq!(text(&m[0].1), "v\u{a0}");
+        let f = items(get(&d.root, "f"));
+        assert_eq!(text(&f[0]), "x\u{a0}");
+        let inner = f[1].value.map().unwrap();
+        assert_eq!(inner[0].0, "y\u{a0}");
+        assert_eq!(text(&inner[0].1), "z\u{a0}");
+    }
+
+    /// acs-tacx: inside `[...]`/`{...}` the reader ends a plain scalar at
+    /// any of `,]}#`, so such a string is quoted there — an IPv6 `-L` spec
+    /// no longer breaks the re-parse, and `a,b` no longer becomes two
+    /// items. In block context the same strings stay plain.
+    #[test]
+    fn strings_in_a_flow_collection_are_quoted_when_flow_would_split_them() {
+        for (s, want) in [
+            ("8080:[::1]:80", "\"8080:[::1]:80\""),
+            ("a,b", "\"a,b\""),
+            ("a}b", "\"a}b\""),
+            ("a#b", "\"a#b\""),
+            ("a{b", "\"a{b\""),
+            ("8080:localhost:80", "8080:localhost:80"),
+        ] {
+            let mut d = parse("k: v\n").unwrap();
+            let mut seq = Node::new(Value::Seq(vec![Node::string(s), Node::string("x")]));
+            seq.flow = true;
+            d.root.value.map_mut().unwrap()[0].1 = seq;
+            let out = emit(&d);
+            assert_eq!(out, format!("k: [{want}, x]\n"), "{s:?}");
+            let back = parse(&out).unwrap();
+            let got = items(get(&back.root, "k"));
+            assert_eq!(got.len(), 2, "{s:?}: {out}");
+            assert_eq!(text(&got[0]), s);
+
+            // A flow mapping: keys and values alike.
+            let mut d = parse("k: v\n").unwrap();
+            let mut map = Node::new(Value::Map(vec![(s.to_string(), Node::string(s))]));
+            map.flow = true;
+            d.root.value.map_mut().unwrap()[0].1 = map;
+            let out = emit(&d);
+            let back = parse(&out).unwrap();
+            let m = get(&back.root, "k").value.map().unwrap();
+            assert_eq!(m.len(), 1, "{s:?}: {out}");
+            assert_eq!(m[0].0, s, "{out}");
+            assert_eq!(text(&m[0].1), s, "{out}");
+
+            // In block context the same string needs no quotes.
+            let mut d = parse("k: v\n").unwrap();
+            d.root.value.map_mut().unwrap()[0].1 = Node::string(s);
+            assert_eq!(emit(&d), format!("k: {s}\n"));
+        }
+    }
+
     #[test]
     fn empty_documents() {
         for src in ["", "\n", "# only a comment\n", "---\n"] {
@@ -1111,6 +1264,58 @@ list: [a, \"b c\", 3]
             assert_eq!(e.line, *line, "{src:?}: {e}");
             assert!(e.msg.contains(want), "{src:?}: {e}");
         }
+    }
+
+    /// acs-5mmu: a tab separates a comment as a space does, so the comment
+    /// did not become part of the value (and get quoted into it on save).
+    #[test]
+    fn a_tab_before_a_comment_starts_the_comment() {
+        let src = "a: x\t# c\nb: 'y'\t# d\n";
+        let d = parse(src).unwrap();
+        assert_eq!(text(get(&d.root, "a")), "x");
+        assert_eq!(get(&d.root, "a").comment.as_deref(), Some("# c"));
+        assert_eq!(text(get(&d.root, "b")), "y");
+        assert_eq!(emit(&d), "a: x # c\nb: 'y' # d\n");
+        // Not a key `x\t# k`: a scalar and a comment.
+        assert!(parse("x\t# k: v\n").unwrap().root.value.map().is_none());
+    }
+
+    /// acs-5mmu: the document markers survive a round trip; a `%YAML`
+    /// directive is refused by name rather than as a second document.
+    #[test]
+    fn document_markers_are_kept_and_directives_refused() {
+        for src in ["---\na: 1\n...\n", "# c\n--- # d\na: 1\n", "---\n"] {
+            assert_eq!(emit(&parse(src).unwrap()), src);
+        }
+        let e = parse("%YAML 1.2\n---\na: 1\n").unwrap_err();
+        assert_eq!((e.line, e.msg.contains("directive")), (1, true), "{e}");
+        let e = parse("a: 1\n...\nb: 2\n").unwrap_err();
+        assert_eq!(e.line, 3, "{e}");
+        assert!(e.msg.contains("one YAML document"), "{e}");
+    }
+
+    /// acs-u20c: a tab ends a marker as a space does, and content on the
+    /// marker line is refused with its line rather than silently ignored.
+    #[test]
+    fn a_tab_ends_a_marker_and_content_on_it_is_refused() {
+        for src in ["---\t# d\na: 1\n", "a: 1\n...\t# e\n", "--- \t# d\na: 1\n"] {
+            let d = parse(src).unwrap();
+            assert_eq!(text(get(&d.root, "a")), "1", "{src:?}");
+            assert_eq!(emit(&d), src);
+        }
+        let cases: &[(&str, usize, &str)] = &[
+            ("--- x\n", 1, "content after '---'"),
+            ("# c\n--- {a: 1}\n", 2, "content after '---'"),
+            ("---\ta: 1\n", 1, "content after '---'"),
+            ("a: 1\n...\tb\n", 2, "content after '...'"),
+        ];
+        for (src, line, want) in cases {
+            let e = parse(src).unwrap_err();
+            assert_eq!(e.line, *line, "{src:?}: {e}");
+            assert!(e.msg.contains(want), "{src:?}: {e}");
+        }
+        // Not markers: a plain scalar that starts with dashes or dots.
+        assert!(parse("---x: 1\n").unwrap().root.value.map().is_some());
     }
 
     #[test]

@@ -10,24 +10,23 @@ use crate::client::{self, code, note, LinkEnd, Outcome, State};
 use crate::keys::Action;
 use crate::proto::{AttachKind, Msg};
 use crate::sys;
-use crate::timing::Timing;
+use crate::timing::{Phase, Timing};
 use crate::tty::RawMode;
-
-pub(crate) fn env_ms(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
 
 /// Send a PING after this much silence (`ACS_PING_MS`).
 fn ping_after() -> u64 {
-    env_ms("ACS_PING_MS", 3000)
+    sys::env_or("ACS_PING_MS", 3000)
+}
+
+/// How long a link must have served, WELCOME to loss, for the backoff to
+/// start over at its free attempt (`ACS_BACKOFF_RESET_MS`, acs-omt2).
+fn backoff_reset_after() -> Duration {
+    sys::env_ms("ACS_BACKOFF_RESET_MS", 30_000)
 }
 
 /// Declare the link dead after this much silence (`ACS_DEAD_MS`).
 fn dead_after() -> u64 {
-    env_ms("ACS_DEAD_MS", 10_000)
+    sys::env_or("ACS_DEAD_MS", 10_000)
 }
 
 /// How long the host has to answer the PING a network change sends while
@@ -35,13 +34,13 @@ fn dead_after() -> u64 {
 /// is only "is this link still the one" and the answer is one round trip;
 /// the full `ACS_DEAD_MS` stands for every other kind of silence.
 fn netcheck_after() -> u64 {
-    env_ms("ACS_NETCHECK_MS", 2000)
+    sys::env_or("ACS_NETCHECK_MS", 2000)
 }
 
 /// Waits between redials (acs-iyq): **the first attempt after a drop goes
 /// at once**, and only then the exponential backoff 1 s → 30 s
 /// (`ACS_BACKOFF_MS` sets its first step), reset after a connection that
-/// lasted 30 s.
+/// served 30 s ([`Backoff::link_ended`]).
 ///
 /// Most drops are momentary — a Wi-Fi blip, a laptop waking, a NAT that
 /// forgot the flow — and the link is back by the time the drop is noticed
@@ -76,6 +75,19 @@ impl Backoff {
         self.next = Some(self.first);
     }
 
+    /// A link has ended; `served` is how long it was up from its WELCOME,
+    /// `None` when it never was. Only a link that served `reset_after`
+    /// gives the free attempt back (acs-omt2): the time a dial spent
+    /// waiting on a host that accepted and then said nothing is not a
+    /// connection that lasted — and a redial's timeout is 30 s too, so
+    /// counting it reset the backoff after every silent dial and the next
+    /// one went at once, never leaving a wait where the command keys work.
+    pub fn link_ended(&mut self, served: Option<Duration>, reset_after: Duration) {
+        if served.is_some_and(|d| d >= reset_after) {
+            self.reset();
+        }
+    }
+
     pub fn step(&mut self) -> Duration {
         let d = self.next.unwrap_or(0);
         self.next = Some(match self.next {
@@ -89,6 +101,7 @@ impl Backoff {
 /// Serve the session over as many links as it takes, the first one the
 /// session menu's when it opened one (`picked`, DESIGN §4.4). `timing` is
 /// the first connection's clock; every redial starts one of its own.
+/// `netwatch` is the client's network watcher, made before the first dial.
 pub fn run(
     args: &ClientArgs,
     state: &mut State,
@@ -96,9 +109,9 @@ pub fn run(
     signals: &OwnedFd,
     mut picked: Option<client::Picked>,
     mut timing: Timing,
+    netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> u8 {
-    let mut backoff = Backoff::new(env_ms("ACS_BACKOFF_MS", 1000));
-    let netwatch = crate::netwatch::NetWatch::new(args.verbose > 0);
+    let mut backoff = Backoff::new(sys::env_or("ACS_BACKOFF_MS", 1000));
     let mut last_early: Option<Instant> = None;
     let mut resuming = false;
     // A dial after a wait; `gated`: the host has just answered the ping
@@ -111,7 +124,8 @@ pub fn run(
     let mut ended: Option<LinkEnd> = None;
     let mut args = args.clone();
     loop {
-        let started = Instant::now();
+        // Served time starts at this link's WELCOME, not at the dial.
+        state.welcomed_at = None;
         if redial {
             timing = Timing::start(args.verbose > 0, "redial");
         }
@@ -119,7 +133,7 @@ pub fn run(
         // picked up after a network change (DESIGN §7.3).
         let reachable = !redial || gated || redial_alias(&mut args, state);
         if redial && reachable && !gated && args.alias.is_some() {
-            timing.mark("alias resolved");
+            timing.mark(Phase::AliasResolved);
         }
         gated = false;
         let first = picked.take();
@@ -134,7 +148,7 @@ pub fn run(
                 ended,
                 first,
                 &mut timing,
-                netwatch.as_ref(),
+                netwatch,
             )
         } else {
             // No host to dial: nothing new was learned about the link that
@@ -158,23 +172,24 @@ pub fn run(
         let persist = client::persist(&args);
         if !args.reconnect || (state.instance.is_none() && !persist) {
             client::leave(state, raw);
-            note(&format!(
-                "connection lost — the session keeps running; reattach with: acs {} {name}",
-                state.host
-            ));
+            // Lost before any WELCOME, there is no session known to keep
+            // running, and for `--new` no name to reattach to (acs-rsn5).
+            note(&match state.instance {
+                Some(_) => format!(
+                    "connection lost — the session keeps running; {}",
+                    client::reattach_hint(&state.host, &name)
+                ),
+                None => format!(
+                    "connection to {} lost before the session started",
+                    state.host
+                ),
+            });
             return code::UNREACHABLE;
         }
         redial = true;
         let detached = if persist && pingable(&args) {
             // The ping gate: wait for the host to answer, then dial.
-            match wait_for_answer(
-                &mut args,
-                state,
-                raw,
-                signals,
-                netwatch.as_ref(),
-                &mut last_early,
-            ) {
+            match wait_for_answer(&mut args, state, raw, signals, netwatch, &mut last_early) {
                 true => {
                     gated = true;
                     false
@@ -182,9 +197,8 @@ pub fn run(
                 false => true,
             }
         } else {
-            if started.elapsed() >= Duration::from_secs(30) {
-                backoff.reset();
-            }
+            let served = state.welcomed_at.map(|t| t.elapsed());
+            backoff.link_ended(served, backoff_reset_after());
             let wait = backoff.step();
             // The status line goes up even when nothing is waited for: the
             // dial itself takes as long as it takes, and it is what the
@@ -198,15 +212,7 @@ pub fn run(
                     wait.as_secs().max(1),
                 ),
             };
-            match offline(
-                state,
-                raw,
-                signals,
-                wait,
-                netwatch.as_ref(),
-                &mut last_early,
-                &msg,
-            ) {
+            match offline(state, raw, signals, wait, netwatch, &mut last_early, &msg) {
                 Offline::Retry => false,
                 Offline::NetworkChanged => {
                     // A new network is a fresh start — and the redial it
@@ -222,16 +228,12 @@ pub fn run(
         // A session to resume, or (persisting) still the first attach.
         resuming = state.instance.is_some();
         if detached {
-            clear_status(state);
             client::leave(state, raw);
             if state.instance.is_none() {
                 note(&format!("stopped waiting for {}", state.host));
                 return code::UNREACHABLE;
             }
-            note(&format!(
-                "detached from {}/{name} — reattach with: acs {} {name}",
-                state.host, state.host
-            ));
+            client::note_detached(state);
             return code::DETACHED;
         }
     }
@@ -258,8 +260,9 @@ fn pingable(args: &ClientArgs) -> bool {
         .map_or(true, |a| a.entries.iter().any(|e| e.reachability_check))
 }
 
-/// Persisting (DESIGN §5.3): ping the lost host every
-/// `reachability_interval` — at once on a network change — until it
+/// Persisting (DESIGN §5.3): ping the lost host as
+/// [`client::PingSteps`] says — every second at first, then every
+/// `reachability_interval`, and at once on a network change — until it
 /// answers (`true`: dial it now), showing the status line and honouring
 /// the command keys meanwhile (`false`: the user detached, or gave up).
 /// An alias is resolved again each time, so its first host to answer is
@@ -272,16 +275,20 @@ fn wait_for_answer(
     netwatch: Option<&crate::netwatch::NetWatch>,
     last_early: &mut Option<Instant>,
 ) -> bool {
-    let every = client::reachability_interval(args);
+    let mut steps = client::PingSteps::new(client::reachability_interval(args));
     let msg = format!(
-        "{} is not answering — pinging it every {} ({})",
+        "{} is not answering — pinging it {} ({})",
         state.host,
-        crate::config::format_timeout(every),
+        steps.describe(),
         give_up_keys(state)
     );
     loop {
-        match offline(state, raw, signals, every, netwatch, last_early, &msg) {
-            Offline::Retry | Offline::NetworkChanged => {
+        let wait = steps.next();
+        match offline(state, raw, signals, wait, netwatch, last_early, &msg) {
+            o @ (Offline::Retry | Offline::NetworkChanged) => {
+                if matches!(o, Offline::NetworkChanged) {
+                    steps.restart();
+                }
                 let answers = match args.alias.clone() {
                     Some(_) => redial_alias(args, state),
                     None => {
@@ -350,7 +357,7 @@ enum Offline {
 /// settling quietly: any later hint carries it, instead of the backoff
 /// (30 s at worst) having to cover for it.
 fn early_every() -> Duration {
-    Duration::from_millis(env_ms("ACS_EARLY_MS", 2000))
+    sys::env_ms("ACS_EARLY_MS", 2000)
 }
 
 /// Wait `wait` before the next redial with the link down: show `msg` as the
@@ -392,7 +399,7 @@ fn offline(
             sys::pollfd(signals.as_raw_fd(), libc::POLLIN),
             sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
         ];
-        let _ = sys::poll(&mut fds, timeout.as_millis() as i32);
+        let _ = sys::poll(&mut fds, sys::poll_timeout(timeout));
         if fds[1].revents != 0 {
             sys::signals::drain(signals.as_raw_fd());
         }
@@ -441,19 +448,35 @@ fn offline(
 /// sequence the last frame opened, and a line written into one is read as
 /// part of it. So it goes out through [`client::write_over_stream`], which
 /// ends that sequence first and re-opens it afterwards (acs-p4u, DESIGN §7).
-fn show_status(state: &mut State, msg: &str) {
-    let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
-    let mut out = Vec::new();
-    if !state.status_shown {
-        out.extend_from_slice(b"\x1b[22;0t");
-    }
-    out.extend_from_slice(format!("\x1b]2;acs: {} — {msg}\x07", state.host).as_bytes());
-    out.extend_from_slice(
+///
+/// A line already up is not drawn again for nothing (acs-ysx): every
+/// backoff step and every ping shows its status, and the text is mostly the
+/// same. It is drawn again when anything in what it would write differs —
+/// the text, the row, the sequence it steps over — or when a note has been
+/// written since, which may have scrolled it off its row.
+pub(crate) fn show_status(state: &mut State, msg: &str) {
+    let rows = status_row();
+    let mut line = format!("\x1b]2;acs: {} — {msg}\x07", state.host).into_bytes();
+    line.extend_from_slice(
         format!("\x1b7\x1b[{rows};1H\x1b[2K\x1b[7macs: {msg}\x1b[0m\x1b8").as_bytes(),
     );
-    client::write_over_stream(state, &out);
+    let drawn = (client::over_stream(state, &line), client::notes_written());
+    if state.status_shown && drawn == state.status_drawn {
+        return;
+    }
+    if !state.status_shown {
+        line.splice(0..0, *b"\x1b[22;0t");
+    }
+    client::write_over_stream(state, &line);
+    state.status_drawn = drawn;
     state.status_shown = true;
     crate::tty::set_status_shown(true);
+}
+
+/// The terminal's last row, where the status line goes: 24 when the size
+/// cannot be read.
+fn status_row() -> u16 {
+    sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1)
 }
 
 /// Take the title back (pop the stack) and blank the status row, if we
@@ -465,23 +488,56 @@ fn show_status(state: &mut State, msg: &str) {
 /// `client::leave` ends it instead, and a reattach that is not a resume ends
 /// it too — both after this.
 pub fn clear_status(state: &mut State) {
+    take_status_down(state, false);
+}
+
+/// [`clear_status`], and with `retitle` the title set again explicitly
+/// after the pop (acs-r3m): to the one the program last set, or else to a
+/// neutral `acs: <host>`. A terminal without the xterm title stack ignores
+/// the push and the pop alike and would keep the outage text for good; one
+/// with it has just popped the program's title, and is given the same title
+/// again.
+///
+/// Only a link that is back does this ([`on_welcome`]). On the way out the
+/// pop stands alone: the program's title belongs to a session the terminal
+/// is leaving, and the neutral one would overwrite the title a stack-aware
+/// terminal had before acs ran.
+fn take_status_down(state: &mut State, retitle: bool) {
     if state.status_shown {
-        let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
-        let out = format!("\x1b[23;0t\x1b7\x1b[{rows};1H\x1b[2K\x1b8");
-        client::write_over_stream(state, out.as_bytes());
+        let rows = status_row();
+        let mut out = b"\x1b[23;0t".to_vec();
+        if retitle {
+            out.extend_from_slice(&restored_title(state));
+        }
+        out.extend_from_slice(format!("\x1b7\x1b[{rows};1H\x1b[2K\x1b8").as_bytes());
+        client::write_over_stream(state, &out);
+        state.status_drawn = (Vec::new(), 0);
         state.status_shown = false;
         crate::tty::set_status_shown(false);
     }
 }
 
-/// A WELCOME arrived on a link. After a resume that followed a status line,
-/// ask the program to repaint: two size changes (rows-1, then rows), since
+/// The `OSC 2` that puts the window title back after an outage: the
+/// program's last ([`crate::modes::ModeObserver::title`]), or `acs: <host>`.
+fn restored_title(state: &State) -> Vec<u8> {
+    let mut out = b"\x1b]2;".to_vec();
+    match state.observer.title() {
+        Some(t) => out.extend_from_slice(t),
+        None => out.extend_from_slice(format!("acs: {}", state.host).as_bytes()),
+    }
+    out.push(0x07);
+    out
+}
+
+/// A WELCOME arrived on a link. The status line and the outage title go,
+/// the title set back explicitly (acs-r3m). After a resume that followed a
+/// status line, also ask the program to repaint: two size changes (rows-1, then rows), since
 /// an unchanged size sends no SIGWINCH.
 pub fn on_welcome(state: &mut State, kind: AttachKind, out: &mut Vec<u8>) {
     if !state.status_shown {
         return;
     }
-    clear_status(state);
+    take_status_down(state, true);
     if kind == AttachKind::Resumed {
         if let Ok(s) = sys::get_winsize(0) {
             if s.rows > 1 {
@@ -609,6 +665,22 @@ impl Liveness {
         }
     }
 
+    /// The client spent `ms` writing to the terminal (acs-spd). While a
+    /// netcheck is outstanding that time is not the host's: the `PONG` may
+    /// have been in the pipe all along, unread because the terminal was
+    /// not, so the question's deadline moves out by it. The link was not
+    /// slow; the terminal was.
+    ///
+    /// Only the netcheck's deadline moves. The dead interval stays the
+    /// outer bound, and the stale bytes acs-br2 refused still answer
+    /// nothing — a stall that began *before* the change was asked about is
+    /// not counted, since no question was outstanding yet.
+    pub fn wrote_for(&mut self, ms: u64) {
+        if let Some((_, until)) = self.probe.as_mut() {
+            *until += ms;
+        }
+    }
+
     fn netcheck_at(&mut self, now: u64, out: &mut Vec<u8>) {
         if self.probe.is_some() {
             return;
@@ -695,6 +767,28 @@ mod tests {
         // And it is the base that comes back, whatever the backoff had
         // climbed to while the network was down.
         b.spent();
+        assert_eq!(b.step(), Duration::from_millis(1000));
+    }
+
+    /// Regression (acs-omt2): only time served after the WELCOME resets the
+    /// backoff. A dial that ran out its whole timeout against a silent host
+    /// was never welcomed, so the backoff keeps climbing.
+    #[test]
+    fn only_a_link_that_served_long_enough_resets_the_backoff() {
+        let thirty = Duration::from_secs(30);
+        let mut b = Backoff::new(1000);
+        assert_eq!(b.step(), Duration::ZERO);
+        // Silent dials: never welcomed, however long they took.
+        b.link_ended(None, thirty);
+        assert_eq!(b.step(), Duration::from_millis(1000));
+        b.link_ended(None, thirty);
+        assert_eq!(b.step(), Duration::from_millis(2000));
+        // Welcomed but lost again quickly: still the same outage.
+        b.link_ended(Some(Duration::from_secs(5)), thirty);
+        assert_eq!(b.step(), Duration::from_millis(4000));
+        // A link that served the full threshold: a fresh drop.
+        b.link_ended(Some(thirty), thirty);
+        assert_eq!(b.step(), Duration::ZERO);
         assert_eq!(b.step(), Duration::from_millis(1000));
     }
 
@@ -791,6 +885,45 @@ mod tests {
         l.pong(4000);
         l.heard = 4100;
         assert_eq!(l.tick_at(4150, &mut out), Health::Dead);
+    }
+
+    /// acs-spd: time the client spent blocked writing to a terminal that
+    /// was not reading is not counted against an outstanding netcheck — the
+    /// `PONG` may have been waiting in the pipe all along. Time written
+    /// before the question was asked moves nothing, and the dead interval
+    /// stays the outer bound.
+    #[test]
+    fn time_blocked_on_the_terminal_does_not_count_against_a_netcheck() {
+        let mut l = liveness(1000, 3000, 10_000);
+        let mut out = Vec::new();
+        // A stall with no question outstanding: nothing to move.
+        l.wrote_for(5000);
+        l.netcheck_at(1100, &mut out);
+        assert_eq!(l.next_deadline_ms(), 1150);
+        // The terminal stalls for three seconds with the PONG unread.
+        l.wrote_for(3000);
+        assert_eq!(l.next_deadline_ms(), 1100 + 3000, "the ordinary ping");
+        assert_eq!(l.tick_at(3149, &mut out), Health::Ok);
+        l.heard = 4140;
+        assert_eq!(l.tick_at(4149, &mut out), Health::Ok);
+        // The PONG, read once the terminal drained, answers it.
+        l.pong(1100);
+        assert_eq!(l.probe, None);
+        assert_eq!(l.tick_at(4200, &mut out), Health::Ok);
+
+        // A link that is really gone is still given up on, once the time
+        // the terminal took is over.
+        let mut l = liveness(1000, 3000, 10_000);
+        l.netcheck_at(1100, &mut out);
+        l.wrote_for(3000);
+        l.heard = 4140;
+        assert_eq!(l.tick_at(4150, &mut out), Health::Dead);
+
+        // And the dead interval bounds it whatever the terminal did.
+        let mut l = liveness(1000, 3000, 300);
+        l.netcheck_at(1050, &mut out);
+        l.wrote_for(60_000);
+        assert_eq!(l.tick_at(1300, &mut out), Health::Dead);
     }
 
     /// The change's deadline never outlives the dead interval: a machine

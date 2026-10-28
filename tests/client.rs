@@ -22,6 +22,32 @@ fn start_env(remote: &Remote, session: &str, cmd: &str, env: &[(&str, &str)]) ->
     Client::start_env(remote, &args, env)
 }
 
+/// acs-e86g: a remote's install is never a copy this process wrote — such a
+/// copy is "busy" while any test thread's fork holds its write descriptor,
+/// and the remote's exec of it fails ETXTBSY. Every remote's acs is a link
+/// to one inode: the build's own binary, or the one staged copy of it where
+/// the build lives on another filesystem.
+#[test]
+fn every_remote_install_links_one_shared_binary() {
+    use std::os::unix::fs::MetadataExt;
+    let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+    let (a, b) = (Remote::installed(), Remote::installed());
+    let ia = ino(&a.installed_binary(acs::VERSION));
+    assert_eq!(ia, ino(&b.installed_binary(acs::VERSION)));
+    let shared = ino(&exe());
+    if ia != shared {
+        assert_eq!(ia, ino(staged_exe()), "a per-remote copy, not a link");
+    }
+    // Kept until the binary exits rather than dropped now: on macOS,
+    // unlinking a link of the binary while another test thread spawns it
+    // can kill that spawn, and this test ends while the others are still
+    // starting their clients.
+    for r in [a, b] {
+        remove_at_exit(r.root.path().to_path_buf());
+        std::mem::forget(r);
+    }
+}
+
 #[test]
 fn output_is_byte_exact_including_escape_sequences() {
     let remote = Remote::installed();
@@ -89,11 +115,11 @@ fn exit_command_ends_the_session() {
     // The shell dies of SIGHUP: 128 + 1.
     assert_eq!(c.wait(T), 129);
     assert!(c.echo_on());
-    let deadline = std::time::Instant::now() + T;
-    while remote.session_exists("gone") {
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until(
+        T,
+        || !remote.session_exists("gone"),
+        || "the session outlived its exit",
+    );
 }
 
 #[test]
@@ -177,16 +203,14 @@ fn resize_reaches_the_program() {
     );
     c.wait_for("ready", T);
     c.resize(101, 33);
-    let deadline = std::time::Instant::now() + T;
-    while !c.text().contains("33 101") {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the program never reported the new size:\n{}",
-            c.text()
-        );
-        c.send(b"\r");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    c.wait_until(
+        "the program reports the new size",
+        |c| {
+            c.send(b"\r");
+            c.text().contains("33 101")
+        },
+        T,
+    );
 }
 
 #[test]
@@ -241,17 +265,23 @@ fn failing_transport_is_unreachable() {
     c.wait_for("closed before acs started", T);
 }
 
-/// Ctrl-] Ctrl-] typed as a person does: two presses, apart.
+/// Ctrl-] Ctrl-] in one write, as tests/reconnect.rs sends it (acs-o8h,
+/// acs-ci9u). Two presses 50 ms apart inside the default 400 ms window
+/// was a gap a host that deschedules the test between them can stretch
+/// past the window, and nothing these tests are about needs it.
 fn double_tap(c: &Client) {
-    c.send(&[0x1d]);
-    std::thread::sleep(Duration::from_millis(50));
-    c.send(&[0x1d]);
+    c.send(&[0x1d, 0x1d]);
 }
+
+/// The window to choose the command key after a double tap, as wide as the
+/// rest of the suite's waits: `ACS_ESCAPE_TIMEOUT_MS` sets it (acs-mq0),
+/// so the `d` these tests send after a pause is not racing the default 2 s.
+const WIDE: (&str, &str) = ("ACS_ESCAPE_TIMEOUT_MS", "30000");
 
 #[test]
 fn arming_command_mode_rings_the_bell() {
     let remote = Remote::installed();
-    let mut c = start(&remote, "bell", "echo started; sleep 30");
+    let mut c = start_env(&remote, "bell", "echo started; sleep 30", &[WIDE]);
     c.wait_for("started", T);
     assert!(!c.output().contains(&0x07));
     double_tap(&c);
@@ -273,11 +303,20 @@ fn the_bell_setting_and_its_environment_override() {
         ([&off[..], &[("ACS_COMMAND_BELL", "1")]].concat(), true),
     ];
     for (env, bell) in cases {
+        let env = [&env[..], &[WIDE]].concat();
         let remote = Remote::installed();
         let mut c = start_env(&remote, "nb", "echo started; sleep 30", &env);
         c.wait_for("started", T);
         double_tap(&c);
-        std::thread::sleep(Duration::from_millis(300));
+        if bell {
+            // The bell is the client saying it armed: no clock to read.
+            c.wait_for("\x07", T);
+        } else {
+            // Nothing to wait for, so a floor: `d` goes in a write of its
+            // own, as a person types it. A host that delays the client
+            // only makes this longer, and the wide window takes any length.
+            std::thread::sleep(Duration::from_millis(300));
+        }
         c.send(b"d");
         assert_eq!(c.wait(T), 0);
         c.wait_for("detached from devbox/nb", T);
@@ -285,23 +324,34 @@ fn the_bell_setting_and_its_environment_override() {
     }
 }
 
+/// The program finishes its title when the test releases a fifo, not after
+/// a `sleep 1` (acs-ci9u): a starved test could take longer than that
+/// second to look for the BEL, find the title already over and the BEL
+/// rightly rung, and fail. Now the title stays open until the test has
+/// looked. The look is still after a pause, but that pause is a floor: the
+/// second the old `sleep 1` gave the client to read the double tap before
+/// the title ended, which a slow host now only lengthens. The wide window
+/// keeps command mode armed however long all that takes.
 #[test]
 fn the_bell_waits_for_the_programs_osc_to_end() {
     let remote = Remote::installed();
-    // A title the program takes a second to finish, ended by ST.
-    let mut c = start(
-        &remote,
-        "osc",
-        "printf 'A\\033]2;ti'; sleep 1; printf 'tle\\033\\\\B'; sleep 30",
+    let gate = remote.root.path().join("osc-gate");
+    make_fifo(&gate);
+    // A title the program finishes only when let past, ended by ST.
+    let cmd = format!(
+        "printf 'A\\033]2;ti'; read x < {}; printf 'tle\\033\\\\B'; sleep 30",
+        gate.display()
     );
+    let mut c = start_env(&remote, "osc", &cmd, &[WIDE]);
     c.wait_for("A\x1b]2;ti", T);
     double_tap(&c);
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(1000));
     assert!(
         !c.output().contains(&0x07),
         "a BEL now would end the title: {:?}",
         c.text()
     );
+    release_fifo(&gate);
     c.wait_for("B", T);
     // Rung as soon as the title ended, not inside it.
     assert!(
