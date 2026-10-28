@@ -815,3 +815,118 @@ fn e2e_16_the_system_wide_install_alone_attaches_without_installing() {
     assert_eq!(h.root_sh(own).trim(), "", "solo got an acs of its own");
     eprintln!("VERIFIED the system-wide install alone attaches over ssh, installing nothing");
 }
+
+/// acs-hmv, over real ssh: `acs list` over every alias joins the master a
+/// session has up — `ControlMaster=no` on acs's socket — and starts none;
+/// the session on that master keeps streaming through the listings; and
+/// the time a listing takes is measured on the master and off it.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn e2e_17_a_listing_over_every_alias_joins_the_master_a_session_has_up() {
+    let h = host();
+    let dir = acs::testutil::TempDir::new();
+    let mux = dir.path().join("mux");
+    let mux_s = mux.to_str().unwrap().to_string();
+    let mut env = config_env(
+        dir.path(),
+        "aliases:\n  box:\n    - host: 127.0.0.1\n      user: dev\n",
+    );
+    env.extend([
+        ("ACS_CONTROL_DIR".to_string(), mux_s.clone()),
+        ("ACS_CONTROL_PERSIST".to_string(), "300".to_string()),
+        ("ACS_NO_UPDATE_CHECK".to_string(), "1".to_string()),
+        (
+            "ACS_GLOBAL_CONFIG".to_string(),
+            format!("{NO_CONFIG}/global.yaml"),
+        ),
+    ]);
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let check = |sock: &std::path::Path| -> Option<String> {
+        let mut args = vec!["-o".to_string(), format!("ControlPath={}", sock.display())];
+        args.extend(h.ssh_args());
+        args.extend(["-O", "check", "--", "dev@127.0.0.1"].map(String::from));
+        let out = Command::new("ssh").args(&args).output().unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stderr).trim().to_string())
+    };
+    // One listing; how long it took, and what it said under -v.
+    let list = |persist: &str| -> (u128, String, String) {
+        let mut args = vec!["list".to_string(), "-v".into()];
+        args.extend(h.ssh_args());
+        let start = Instant::now();
+        let out = Command::new(&h.client)
+            .args(&args)
+            .envs(env_refs.iter().copied())
+            .env("ACS_CONTROL_PERSIST", persist)
+            .output()
+            .unwrap();
+        let ms = start.elapsed().as_millis();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{text}{err}");
+        (ms, text, err)
+    };
+
+    // No master yet: the listing starts none.
+    let (_, _, err) = list("300");
+    assert!(!err.contains("ControlPath="), "{err}");
+    assert!(
+        std::fs::read_dir(&mux).map_or(0, |d| d.count()) == 0,
+        "a listing left a socket"
+    );
+
+    // A session, attached and streaming, which starts the master.
+    let mut c = h.client("hmv", TICKER, &env_refs);
+    c.wait_for("#10#", T);
+    let sock = one_socket(&mux);
+    let pid = check(&sock).expect("no master under the session");
+
+    let mut on = Vec::new();
+    let mut off = Vec::new();
+    for _ in 0..5 {
+        let (ms, text, err) = list("300");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("box ") && l.contains(" hmv ")),
+            "{text}{err}"
+        );
+        assert!(err.contains("ControlMaster=no"), "{err}");
+        assert!(
+            err.contains(&format!("ControlPath={}", sock.display())),
+            "{err}"
+        );
+        assert!(!err.contains("ControlMaster=auto"), "{err}");
+        assert!(!err.contains("did not answer"), "{err}");
+        on.push(ms);
+        // The same listing on a connection of its own.
+        let (ms, _, err) = list("0");
+        assert!(!err.contains(&sock.display().to_string()), "{err}");
+        off.push(ms);
+    }
+    on.sort();
+    off.sort();
+    eprintln!(
+        "MEASURED acs list over every alias: on the master {on:?} ms, own connection {off:?} ms (median {} vs {})",
+        on[2], off[2]
+    );
+
+    // The master is the one the session started, and still the only one;
+    // the session streamed straight through every listing.
+    assert_eq!(check(&sock).as_deref(), Some(&pid[..]));
+    assert_eq!(one_socket(&mux), sock);
+    let last = *numbers(&c.text()).last().unwrap();
+    c.wait_for(&format!("#{}#", last + 20), T);
+    assert_consecutive(&c.text());
+    assert!(!c.text().contains("connection lost"), "{}", c.text());
+
+    c.send(&command(b'x'));
+    c.wait(T);
+    let mut args = vec!["-o".to_string(), format!("ControlPath={}", sock.display())];
+    args.extend(h.ssh_args());
+    args.extend(["-O", "exit", "--", "dev@127.0.0.1"].map(String::from));
+    let _ = Command::new("ssh").args(&args).output();
+    eprintln!(
+        "VERIFIED acs list over every alias joins the session's master ({pid}) and starts none"
+    );
+}
