@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use acs::sys;
+use acs::testutil::KillOnDrop;
 
 const CHILD_ENV: &str = "ACS_TTY_CHILD";
 
@@ -35,19 +36,15 @@ fn child_helper() {
     }
 }
 
-fn spawn_child(
-    mode: &str,
-) -> (
-    std::process::Child,
-    std::os::fd::OwnedFd,
-    std::os::fd::OwnedFd,
-) {
+fn spawn_child(mode: &str) -> (KillOnDrop, std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
     let (master, slave) = sys::openpty().unwrap();
     let dup = |fd: &std::os::fd::OwnedFd| {
         let n = unsafe { libc::dup(fd.as_raw_fd()) };
         assert!(n >= 0);
         unsafe { Stdio::from_raw_fd(n) }
     };
+    // Guarded: a failed assertion in the parent would otherwise leave the
+    // "signal" and "menu" children sleeping forever (acs-88a8).
     let child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "child_helper", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, mode)
@@ -56,7 +53,7 @@ fn spawn_child(
         .stderr(dup(&slave))
         .spawn()
         .unwrap();
-    (child, master, slave)
+    (KillOnDrop(child), master, slave)
 }
 
 fn wait_for_raw(master: &std::os::fd::OwnedFd) {
