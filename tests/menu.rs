@@ -171,6 +171,38 @@ fn x_ends_a_session_and_the_menu_shows_the_rest() {
     attached_to(&mut c, "two");
 }
 
+/// Regression (acs-5jrq): when the host could not read its sessions the
+/// pick's proxy sent no frame at all, and the menu said only that the
+/// connection closed. The ERROR it now sends is what the menu shows.
+#[test]
+fn a_host_that_cannot_read_its_sessions_says_so_in_the_menu() {
+    let remote = Remote::installed();
+    detached(&remote, "one");
+    let mut c = Client::start(&remote, &["devbox"]);
+    menu_up(&mut c);
+    // The socket directory vanishes under the menu: `x` fails to end the
+    // session, and the list that answers it cannot be read.
+    let moved = remote.home().join("sockets-moved");
+    std::fs::rename(remote.sockets(), &moved).unwrap();
+    c.send(b"x");
+    c.wait_for("end session 'one'? y (or x) ends it", T);
+    c.send(b"y");
+    c.wait_for("cannot list sessions: ", T);
+    let screen = last_screen(&c);
+    assert!(
+        screen.contains("bad reply from devbox: cannot list sessions: "),
+        "{screen:?}"
+    );
+    assert!(
+        !screen.contains("connection closed before the session list"),
+        "{screen:?}"
+    );
+    std::fs::rename(&moved, remote.sockets()).unwrap();
+    c.send(b"\x1b");
+    assert_eq!(c.wait(T), 0);
+    assert!(remote.session_exists("one"));
+}
+
 #[test]
 fn esc_exit_and_ctrl_c_leave_with_the_terminal_restored() {
     let remote = Remote::installed();

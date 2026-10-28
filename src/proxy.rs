@@ -230,7 +230,7 @@ fn reply_err(code: u16, message: String) -> Result<ExitCode, String> {
 /// and the menu goes on as without it.
 fn pick(dir: &SocketDir, eager: bool) -> Result<ExitCode, String> {
     sys::write_all(STDOUT, proto::ready_line().as_bytes()).map_err(|e| e.to_string())?;
-    let sessions = send_list(dir, None)?;
+    let sessions = send_list(dir, None, STDOUT)?;
     let mut dec = Decoder::new();
     if eager {
         let mut hello = match next_from_client(&mut dec)? {
@@ -260,7 +260,7 @@ fn pick(dir: &SocketDir, eager: bool) -> Result<ExitCode, String> {
                 identity,
                 force,
             }) => {
-                send_list(dir, Some((&name, &identity, force)))?;
+                send_list(dir, Some((&name, &identity, force)), STDOUT)?;
             }
             Some(Msg::Hello(h)) => break h,
             Some(other) => {
@@ -465,40 +465,51 @@ fn list(dir: &SocketDir, out: RawFd) -> ExitCode {
     if sys::write_all(out, proto::ready_line().as_bytes()).is_err() {
         return ExitCode::from(1);
     }
-    match write_statuses(dir, out) {
+    match listed(dir, out) {
         Ok(_) => ExitCode::SUCCESS,
-        Err(e) => {
-            let message = format!("cannot list sessions: {e}");
-            let _ = sys::write_all(
-                out,
-                &Msg::Error {
-                    code: err::INTERNAL,
-                    message: message.clone(),
-                }
-                .to_bytes(),
-            );
-            fail(message)
-        }
+        Err(message) => fail(message),
     }
+}
+
+/// [`write_statuses`], with an ERROR to `out` when the sessions cannot be
+/// read, so the client reports that rather than an empty or cut-short list
+/// (acs-mum0 for `--list`, acs-5jrq for `--pick`). The error is returned
+/// too, for the proxy to end on.
+fn listed(dir: &SocketDir, out: RawFd) -> Result<Vec<proto::StatusInfo>, String> {
+    write_statuses(dir, out).map_err(|e| {
+        let message = format!("cannot list sessions: {e}");
+        let _ = sys::write_all(
+            out,
+            &Msg::Error {
+                code: err::INTERNAL,
+                message: message.clone(),
+            }
+            .to_bytes(),
+        );
+        message
+    })
 }
 
 /// The list for `--pick`: as `--list` sends it, then LIST_END, since the
 /// connection stays open. With `kill` (END_SESSION, the menu's `x`) that
 /// session is ended first, and an ERROR goes ahead of the list if it could
-/// not be. Returns the sessions listed.
+/// not be. Returns the sessions listed. When the sessions cannot be read
+/// an ERROR goes out instead of LIST_END and the pick ends: the client
+/// reports it rather than taking the silence for an empty host (acs-5jrq).
 fn send_list(
     dir: &SocketDir,
     kill: Option<(&str, &str, bool)>,
+    out: RawFd,
 ) -> Result<Vec<proto::StatusInfo>, String> {
-    let mut out = Vec::new();
+    let mut first = Vec::new();
     if let Some(Err((code, message))) =
         kill.map(|(name, identity, force)| end_session(dir, name, identity, force))
     {
-        Msg::Error { code, message }.encode(&mut out);
+        Msg::Error { code, message }.encode(&mut first);
     }
-    sys::write_all(STDOUT, &out).map_err(|e| e.to_string())?;
-    let sessions = write_statuses(dir, STDOUT)?;
-    sys::write_all(STDOUT, &Msg::ListEnd.to_bytes()).map_err(|e| e.to_string())?;
+    sys::write_all(out, &first).map_err(|e| e.to_string())?;
+    let sessions = listed(dir, out)?;
+    sys::write_all(out, &Msg::ListEnd.to_bytes()).map_err(|e| e.to_string())?;
     Ok(sessions)
 }
 
@@ -741,6 +752,38 @@ mod tests {
             Ok(Some(Msg::Error { code, message })) => {
                 assert_eq!(code, err::INTERNAL);
                 assert!(message.starts_with("cannot list sessions: "), "{message}");
+            }
+            other => panic!("expected an ERROR, got {other:?}"),
+        }
+        assert!(matches!(dec.next_msg(), Ok(None)));
+    }
+
+    /// Regression (acs-5jrq): the pick's list returned the error without a
+    /// frame, so the client saw the connection close with no LIST_END. It
+    /// must send an ERROR, and no LIST_END that would pass for an empty
+    /// host.
+    #[test]
+    fn send_list_reports_an_unreadable_socket_dir_in_an_error_frame() {
+        use std::io::Read;
+        let tmp = crate::testutil::TempDir::new();
+        let dir = SocketDir::open_at(tmp.path().join("s")).unwrap();
+        std::fs::remove_dir(dir.path()).unwrap();
+        let out_path = tmp.path().join("out");
+        let out = std::fs::File::create(&out_path).unwrap();
+        let failed = send_list(&dir, None, out.as_raw_fd()).unwrap_err();
+        assert!(failed.starts_with("cannot list sessions: "), "{failed}");
+        drop(out);
+        let mut got = Vec::new();
+        std::fs::File::open(&out_path)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        let mut dec = Decoder::new();
+        dec.push(&got);
+        match dec.next_msg() {
+            Ok(Some(Msg::Error { code, message })) => {
+                assert_eq!(code, err::INTERNAL);
+                assert_eq!(message, failed);
             }
             other => panic!("expected an ERROR, got {other:?}"),
         }
