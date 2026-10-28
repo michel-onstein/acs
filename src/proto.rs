@@ -327,6 +327,21 @@ impl<'a> R<'a> {
     }
 }
 
+/// Append a DATA frame at `offset` whose payload is `parts` back to back,
+/// byte for byte what `Msg::Data` with them joined encodes to. The master
+/// hands it the ring's two slices as they are, so output is copied once,
+/// into the connection's buffer, rather than joined first (acs-m08z).
+pub fn encode_data(offset: u64, parts: &[&[u8]], out: &mut Vec<u8>) {
+    let len = 8 + parts.iter().map(|p| p.len()).sum::<usize>();
+    out.reserve(HEADER + len);
+    out.push(ty::DATA);
+    out.extend_from_slice(&(len as u32).to_be_bytes());
+    out.extend_from_slice(&offset.to_be_bytes());
+    for p in parts {
+        out.extend_from_slice(p);
+    }
+}
+
 impl Msg {
     /// Append this message as one frame to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
@@ -803,6 +818,35 @@ fn parse_marker(line: &[u8]) -> Option<Marker> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `encode_data` over split parts is the same frame as `Msg::Data`
+    /// over them joined, appended after what is already there (acs-m08z).
+    #[test]
+    fn encode_data_matches_msg_data_for_any_split() {
+        let payload: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        for cut in [0, 1, 500, 999, 1000] {
+            let (x, y) = payload.split_at(cut);
+            let mut want = b"queued".to_vec();
+            Msg::Data {
+                offset: 0x0102_0304_0506_0708,
+                bytes: payload.clone(),
+            }
+            .encode(&mut want);
+            let mut got = b"queued".to_vec();
+            encode_data(0x0102_0304_0506_0708, &[x, y], &mut got);
+            assert_eq!(got, want, "cut at {cut}");
+        }
+        let mut empty = Vec::new();
+        encode_data(7, &[], &mut empty);
+        assert_eq!(
+            empty,
+            Msg::Data {
+                offset: 7,
+                bytes: vec![]
+            }
+            .to_bytes()
+        );
+    }
 
     fn size() -> WinSize {
         WinSize {
