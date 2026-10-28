@@ -2324,7 +2324,14 @@ acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
 The one-line installer (`scripts/install.sh`, published with every release;
 README "Install") uses the same layout — `~/.local/share/acs/<version>/acs`,
 or `/usr/local/lib/acs/<version>/acs` as root — so a host set up with it
-serves clients of that version without an upload. It is also what the client
+serves clients of that version without an upload. It moves `~/.local/bin/acs`
+(`/usr/local/bin/acs` as root) by the rule below for the remote's link
+(acs-feee): made where nothing is, moved only when it is a link into the
+versioned directory to an older or removed version. So `ACS_VERSION=<older>`
+installs that version beside a newer one and leaves the link on the newer,
+and a file or link it did not make is left alone — which matters for a script
+run as `curl … | sh`, often as root. It says which it did, and where the
+version it installed is. It is also what the client
 suggests when `install_on_remote` is off (§7.2). Homebrew
 (`brew install michel-onstein/acs/acs`, docs/VERSIONING.md) installs the same
 complete release binary into its own keg, which the prelude below does not
@@ -2631,9 +2638,10 @@ src/
                 addresses, for locality (§7.3)
   yaml.rs       the YAML subset those files use, parsed and written back
   install.rs    remote self-install and _install --finish
+  layout.rs     where acs is installed: the version and link directories
   payload.rs    payload set format, ELF trailer, Mach-O embed
   prune.rs      pruning of unused remote versions
-  sha256.rs     SHA-256 for install checks
+  sha256.rs     SHA-256, of a buffer or streamed from a file
   signature.rs  the release key, and ssh-keygen -Y over a release's SHA256SUMS
   sys.rs        libc wrappers
 xtask/          cargo xtask dist

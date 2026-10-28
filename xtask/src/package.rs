@@ -91,22 +91,6 @@ pub fn notes_with(
     n
 }
 
-/// `value` as one POSIX shell word: single quotes, with an embedded quote
-/// written the only way a single-quoted string can hold one.
-///
-/// Inside single quotes `sh` expands nothing at all — no `$`, no backtick,
-/// no `\`, and a newline is a newline rather than the end of a command — so
-/// this is total: whatever the build was given becomes exactly that string
-/// and can be nothing else. That is the whole of the injection answer for
-/// [`install_script`], and it is why neither value needs to be validated
-/// *for safety* before it goes in. Whether a build-time releases URL is a
-/// sensible URL at all is a separate question, and a separate bead
-/// (acs-d7x); the key already has to be one ssh public key line
-/// (`src/release_key.rs`).
-fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 /// `scripts/install.sh` with this release's releases URL and release key
 /// substituted in, for the copy that ships as a release asset (acs-x57).
 ///
@@ -138,7 +122,15 @@ pub fn install_script(script: &str, releases: &str, key: &str) -> Result<String,
             .map(|(i, _)| i)
             .collect();
         match at[..] {
-            [i] => lines[i] = format!("{name}={}", sh_quote(value)),
+            // Always single-quoted, so it reads back as `name='…'`. Inside
+            // single quotes `sh` expands nothing at all, so this is total:
+            // whatever the build was given becomes exactly that string. That
+            // is the whole of the injection answer here, and why neither
+            // value needs validating *for safety*. Whether a build-time
+            // releases URL is a sensible URL is a separate bead (acs-d7x);
+            // the key already has to be one ssh public key line
+            // (`src/release_key.rs`).
+            [i] => lines[i] = format!("{name}={}", acs::ssh::sh_single_quote(value)),
             [] => {
                 return Err(format!(
                     "the installer has no `{name}=` line to put this build's value in \
@@ -261,11 +253,8 @@ pub fn package(
     let _ = std::fs::remove_dir_all(&stage);
     let mut sums = String::new();
     for (_, file) in &archives {
-        let data = std::fs::read(out.join(file)).map_err(|e| e.to_string())?;
-        sums.push_str(&format!(
-            "{}  {file}\n",
-            acs::sha256::hex(&acs::sha256::digest(&data))
-        ));
+        let digest = acs::sha256::file(&out.join(file)).map_err(|e| e.to_string())?;
+        sums.push_str(&format!("{}  {file}\n", acs::sha256::hex(&digest)));
     }
     std::fs::write(out.join("SHA256SUMS"), &sums).map_err(|e| e.to_string())?;
     written.push(out.join("SHA256SUMS"));

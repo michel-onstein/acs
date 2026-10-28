@@ -136,6 +136,11 @@ pub fn archive_target(own: &str) -> String {
     }
 }
 
+/// The release archive target of this very build.
+pub fn own_archive_target() -> String {
+    archive_target(crate::payload::OWN_TARGET)
+}
+
 /// Our archive in a release, from its `SHA256SUMS`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
@@ -144,21 +149,42 @@ pub struct Asset {
     pub sha256: String,
 }
 
+/// One line of a `SHA256SUMS`: its hash and its file name.
+///
+/// The format `sha256sum` writes and `cargo xtask package` writes: 64
+/// lowercase hex digits, one space, then the name — after a second space
+/// (text mode) or a `*` (binary mode); any run of those is taken. Nothing
+/// else separates the two, not a tab and not a leading space.
+///
+/// This is the only reader of the format in Rust — the upgrade, the weekly
+/// update check and the Homebrew formula all go through it — and
+/// `scripts/install.sh`, which cannot share it, greps with the same rule:
+/// `tests/scripts.rs` runs its pattern against this function line by line.
+pub fn sums_line(line: &str) -> Option<(&str, &str)> {
+    let (hash, file) = line.split_once(' ')?;
+    let file = file.trim_start_matches([' ', '*']);
+    let hex = hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (hex && !file.is_empty()).then_some((hash, file))
+}
+
 /// Find the archive for `target` in a `SHA256SUMS` text.
 pub fn find_asset(sums: &str, target: &str) -> Option<Asset> {
     let suffix = format!("-{target}.tar.gz");
     sums.lines().find_map(|l| {
-        let (hash, file) = l.split_once(' ')?;
-        let file = file.trim_start_matches([' ', '*']);
+        let (hash, file) = sums_line(l)?;
         let version = file.strip_prefix("acs-")?.strip_suffix(&suffix)?;
-        let hex = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
-        // Releases are X.Y.Z; a `-` in the middle would be part of another
-        // target's name, not a pre-release.
-        let plain = parse_version(version).is_some_and(|(_, pre)| pre.is_none());
-        (hex && plain).then(|| Asset {
+        // Releases are X.Y.Z, with no `v` (the tag has one, the archive
+        // does not); a `-` in the middle would be part of another target's
+        // name, not a pre-release.
+        let plain = !version.starts_with('v')
+            && parse_version(version).is_some_and(|(_, pre)| pre.is_none());
+        plain.then(|| Asset {
             version: version.to_string(),
             file: file.to_string(),
-            sha256: hash.to_ascii_lowercase(),
+            sha256: hash.to_string(),
         })
     })
 }
@@ -484,6 +510,48 @@ nothexnothexnothexnothexnothexnothexnothexnothexnothexnothexnoth  acs-0.2.0-x86_
         assert_eq!(find_asset(SUMS, "riscv64gc-unknown-linux-musl"), None);
         // Not confused by a target that ends like another.
         assert_eq!(find_asset(SUMS, "apple-darwin"), None);
+    }
+
+    /// acs-sseq: one reader of the format, the one `sha256sum` writes —
+    /// the installer, the upgrade and the Homebrew formula used to differ
+    /// on tabs, on runs of separators and on the case of the hash.
+    #[test]
+    fn a_sha256sums_line_is_read_one_way() {
+        let h = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            sums_line(&format!("{h}  a.tar.gz")),
+            Some((h.as_str(), "a.tar.gz"))
+        );
+        assert_eq!(
+            sums_line(&format!("{h} *a.tar.gz")),
+            Some((h.as_str(), "a.tar.gz"))
+        );
+        assert_eq!(
+            sums_line(&format!("{h} ** a.tar.gz")),
+            Some((h.as_str(), "a.tar.gz"))
+        );
+        for bad in [
+            format!("{h}\ta.tar.gz"),
+            format!("{h}  "),
+            format!("{h}a.tar.gz"),
+            format!(" {h}  a.tar.gz"),
+            format!("{}  a.tar.gz", h.to_ascii_uppercase()),
+            format!("{}  a.tar.gz", &h[2..]),
+            String::new(),
+        ] {
+            assert_eq!(sums_line(&bad), None, "{bad:?}");
+        }
+        // The archive's version has no `v`: the tag does, the file not.
+        let sums = format!("{h}  acs-v0.2.0-aarch64-apple-darwin.tar.gz\n");
+        assert_eq!(find_asset(&sums, "aarch64-apple-darwin"), None);
+    }
+
+    #[test]
+    fn this_build_has_an_archive_target() {
+        assert_eq!(
+            own_archive_target(),
+            archive_target(crate::payload::OWN_TARGET)
+        );
     }
 
     #[test]
