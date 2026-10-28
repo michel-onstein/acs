@@ -62,7 +62,12 @@ impl Fake {
              cp=\n\
              for a in \"$@\"; do case \"$a\" in ControlPath=/*) cp=${{a#ControlPath=}} ;; esac; done\n\
              case \" $* \" in\n\
-             *' -O check '*) exit 0 ;;\n\
+             *' -O check '*)\n\
+             # A socket a killed master left: nothing answers on it.\n\
+             if [ -n \"$cp\" ] && [ -f \"$cp.stale\" ]; then\n\
+             echo \"Control socket connect($cp): Connection refused\" >&2; exit 255\n\
+             fi\n\
+             exit 0 ;;\n\
              *' -O exit '*)\n\
              # A master takes its channels with it. Without that, a session\n\
              # here would survive an `-O exit` that a real one would have\n\
@@ -70,9 +75,19 @@ impl Fake {
              [ -n \"$cp\" ] && : > \"$cp.gone\"\n\
              rm -f '{wedge}'; exit 0 ;;\n\
              esac\n\
+             case \" $* \" in\n\
+             # ControlMaster=no only joins (acs-hmv): with no master on the\n\
+             # socket, ssh dials a connection of its own.\n\
+             *' ControlMaster=no '*)\n\
+             # A stale socket is said on stderr first, as ssh says it.\n\
+             if [ -n \"$cp\" ] && [ -f \"$cp.stale\" ]; then\n\
+             echo \"Control socket connect($cp): Connection refused\" >&2\n\
+             fi\n\
+             if [ ! -e \"$cp\" ] || [ -f \"$cp.gone\" ] || [ -f \"$cp.stale\" ]; then cp=; fi ;;\n\
              # Dialling with ControlMaster=auto on a socket whose master has\n\
              # gone starts a new one, so this call is the master again.\n\
-             [ -n \"$cp\" ] && rm -f \"$cp.gone\"\n\
+             *) [ -n \"$cp\" ] && rm -f \"$cp.gone\" ;;\n\
+             esac\n\
              # A master whose control socket answers while its connection is\n\
              # dead: the channel opens and nothing ever comes back.\n\
              if [ -f '{wedge}' ] && [ -n \"$cp\" ]; then exec sleep 300; fi\n\
@@ -562,4 +577,173 @@ fn a_listing_over_every_alias_starts_no_master() {
         assert!(call.contains("-o BatchMode=yes"), "{call:?}");
         assert!(Fake::control_path(&call).is_none(), "{call:?}");
     }
+}
+
+/// The aliases the listings below ask: two that stand for `devbox`, where
+/// a master may be up, and one for a host with none.
+const ALIASES: &str = "aliases:\n  one:\n    - host: devbox\n  two:\n    - host: devbox\n  other:\n    - host: other.lan\n";
+
+/// `acs list` over every alias with `env`, through `fake`.
+fn list_every_alias(fake: &Fake, env: &[(String, String)]) -> std::process::Output {
+    output_of(
+        acs_cmd()
+            .args(["list", "--ssh", fake.path().to_str().unwrap()])
+            .envs(env.iter().map(|(k, v)| (k, v))),
+    )
+}
+
+/// `acs list devbox`: a side call, which names the socket a master for
+/// devbox has (and, in the fake, leaves no file there).
+fn list_devbox(fake: &Fake, env: &[(String, String)]) -> String {
+    let out = output_of(
+        acs_cmd()
+            .args(["list", "--ssh", fake.path().to_str().unwrap(), "devbox"])
+            .envs(env.iter().map(|(k, v)| (k, v))),
+    );
+    assert!(out.status.success(), "{out:?}");
+    Fake::control_path(&fake.dials()[0]).unwrap()
+}
+
+/// The batch calls (`BatchMode=yes`) that dialled `dest`.
+fn batch_dials(fake: &Fake, dest: &str) -> Vec<String> {
+    fake.dials()
+        .into_iter()
+        .filter(|c| c.contains("-o BatchMode=yes") && SshCall::of(c).dest == dest)
+        .collect()
+}
+
+/// acs-hmv: a listing over every alias **joins** the master a session has
+/// up — `ControlMaster=no` on acs's own socket, nothing that would start or
+/// keep one — and leaves every host without a master exactly as it was.
+/// The session sharing that master is not disturbed: its connection is the
+/// one it was, and no `-O exit` was ever asked for.
+#[test]
+fn a_listing_over_every_alias_joins_a_master_that_is_up() {
+    let remote = Remote::installed();
+    let other = Remote::installed();
+    let fake = Fake::hosts(&[("devbox", &remote), ("other.lan", &other)]);
+    let net = Net::new(&["devbox", "other.lan"]);
+    let mut env = net.env(ALIASES);
+    env.extend(self::env(&fake));
+
+    // A session on devbox, which starts the master.
+    let ssh = fake.path();
+    let mut args = vec!["--ssh", ssh.to_str().unwrap(), "devbox", "open"];
+    args.extend(UP);
+    let mut session = Client::spawn(&exe(), &args, &refs(&env));
+    session.wait_for("MUX-UP", T);
+    let session_pid = *remote.transport_pids().last().unwrap();
+    let path = Fake::control_path(&fake.dials()[0]).unwrap();
+    fake.leave_a_socket(&path);
+
+    let out = list_every_alias(&fake, &env);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("one ") && l.contains(" open ")),
+        "{text}"
+    );
+
+    let joined = batch_dials(&fake, "devbox");
+    assert_eq!(joined.len(), 2, "{:?}", fake.calls());
+    for call in &joined {
+        assert_eq!(
+            Fake::control_path(call).as_deref(),
+            Some(&path[..]),
+            "{call:?}"
+        );
+        assert!(call.contains("-o ControlMaster=no"), "{call:?}");
+        assert!(!call.contains("ControlMaster=auto"), "{call:?}");
+        assert!(!call.contains("ControlPersist"), "{call:?}");
+    }
+    // A host with no master is asked as it always was: no socket named,
+    // so the user's own multiplexing stays theirs.
+    let alone = batch_dials(&fake, "other.lan");
+    assert_eq!(alone.len(), 1, "{:?}", fake.calls());
+    assert!(!alone[0].contains("ControlPath="), "{alone:?}");
+    assert!(!alone[0].contains("ControlMaster="), "{alone:?}");
+    // Only the host with a socket was even checked.
+    let checks: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.contains(" -O check "))
+        .collect();
+    assert!(!checks.is_empty(), "{:?}", fake.calls());
+    assert!(
+        checks.iter().all(|c| c.contains(&path)),
+        "a check without a socket: {checks:?}"
+    );
+
+    // The session on that master never noticed.
+    assert!(
+        !fake.calls().iter().any(|c| c.contains(" -O exit ")),
+        "the listing ended the master: {:?}",
+        fake.calls()
+    );
+    assert!(acs::sys::kill(session_pid, 0).is_ok());
+    let said = session.text();
+    assert!(!said.contains("connection lost"), "{said:?}");
+}
+
+/// acs-hmv: a socket a killed master left behind is not joined. Real ssh
+/// with `ControlMaster=no` would dial on its own anyway, but only after
+/// printing `Control socket connect(…): Connection refused` across the
+/// table — so the batch checks first and keeps its plain call.
+#[test]
+fn a_listing_passes_over_a_stale_socket_without_a_word() {
+    let remote = Remote::installed();
+    let other = Remote::installed();
+    let fake = Fake::hosts(&[("devbox", &remote), ("other.lan", &other)]);
+    let net = Net::new(&["devbox", "other.lan"]);
+    let mut env = net.env(ALIASES);
+    env.extend(self::env(&fake));
+
+    let path = list_devbox(&fake, &env);
+    fake.leave_a_socket(&path);
+    std::fs::write(format!("{path}.stale"), b"").unwrap();
+
+    let out = list_every_alias(&fake, &env);
+    assert!(out.status.success(), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("Control socket"), "{err}");
+    let asked = batch_dials(&fake, "devbox");
+    assert_eq!(asked.len(), 2, "{:?}", fake.calls());
+    for call in asked {
+        assert!(Fake::control_path(&call).is_none(), "{call:?}");
+    }
+}
+
+/// acs-hmv: a master whose socket answers while its connection is dead is
+/// caught in a listing as it is anywhere else (DESIGN §7.1): the batch
+/// gives it `ACS_CONTROL_FALLBACK_MS`, ends it, and asks again on a
+/// connection of its own — and the host is listed.
+#[test]
+fn a_listing_ends_a_wedged_master_and_asks_again() {
+    let remote = Remote::installed();
+    let fake = Fake::new("devbox", &remote);
+    let net = Net::new(&["devbox"]);
+    let mut env = net.env("aliases:\n  one:\n    - host: devbox\n");
+    env.extend(self::env(&fake));
+
+    let path = list_devbox(&fake, &env);
+    fake.leave_a_socket(&path);
+    fake.wedge_the_master();
+
+    let out = list_every_alias(&fake, &env);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text.contains("no sessions on one"), "{text}");
+    assert!(
+        !fake.wedged(),
+        "the wedged master was left up: {:?}",
+        fake.calls()
+    );
+    let asked = batch_dials(&fake, "devbox");
+    assert!(asked.len() >= 2, "{asked:?}");
+    assert!(asked[0].contains("-o ControlMaster=no"), "{asked:?}");
+    assert!(
+        Fake::control_path(&asked[0]).as_deref() == Some(&path[..]),
+        "{asked:?}"
+    );
 }

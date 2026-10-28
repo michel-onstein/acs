@@ -53,8 +53,9 @@ pub enum Call {
     /// `acs list <host>`, the remote install, ending a session from the
     /// menu: one host, and the master is reused.
     Side,
-    /// `acs list` over every alias (DESIGN §7.3): many hosts at once, and
-    /// no master is started or joined.
+    /// `acs list` over every alias (DESIGN §7.3): many hosts at once. It
+    /// joins a master acs already has up for the host (`ControlMaster=no`)
+    /// and never starts one (acs-hmv).
     Batch,
 }
 
@@ -179,14 +180,12 @@ impl Transport {
             .filter(|_| !self.user_identity())
     }
 
-    /// Whether a call of this kind uses acs's own master (`mux.rs`). Only
-    /// the first connection and the side calls do: a redial must have its
-    /// own connection, and `acs list` over every alias would otherwise
-    /// leave a master on every host it asked.
+    /// Whether a call of this kind uses acs's own master (`mux.rs`). Every
+    /// call but a redial may, which must have its own connection; a batch
+    /// call only ever joins one (see [`Transport::control_opts`]), and is
+    /// given a master only where one is up (`mux::join`).
     pub fn multiplexes(&self, call: Call) -> bool {
-        self.mux.is_some()
-            && matches!(call, Call::Session | Call::Side)
-            && self.control_path().is_some()
+        self.mux.is_some() && call != Call::Redial && self.control_path().is_some()
     }
 
     /// Where acs's master for this destination listens, if it has one.
@@ -200,8 +199,19 @@ impl Transport {
     /// The control-socket options for this call: acs's master, or the
     /// opt-out §3 has always used, or — for a side or batch call with no
     /// master — nothing, leaving the user's own multiplexing alone.
+    ///
+    /// A batch call joins and never starts (acs-hmv): `ControlMaster=no`
+    /// with the path set uses the master that is there, and ssh dials on
+    /// its own where none is — no dozen masters behind one listing, and no
+    /// race between calls that would each decide to be the master.
     fn control_opts(&self, call: Call) -> Vec<OsString> {
         match (self.multiplexes(call), call) {
+            (true, Call::Batch) => {
+                let mut v = Vec::new();
+                v.extend(crate::mux::opt("ControlMaster", "no"));
+                v.extend(crate::mux::opt("ControlPath", self.control_path().unwrap()));
+                v
+            }
             (true, _) => {
                 let (m, path) = (self.mux.as_ref().unwrap(), self.control_path().unwrap());
                 let mut v = Vec::new();
@@ -651,16 +661,44 @@ mod tests {
     /// `acs list` asks every alias at once (DESIGN §7.3): starting a master
     /// on each would leave a dozen authenticated connections behind a
     /// listing, and several `ControlMaster=auto` racing for one host wedge
-    /// each other.
+    /// each other. Joining one has neither problem (acs-hmv): the batch
+    /// names acs's socket with `ControlMaster=no`, ahead of the user's
+    /// options, and nothing that would start or keep a master.
     #[test]
-    fn a_batch_call_starts_no_master() {
-        let v = strs(muxed().argv(Call::Batch, "R"));
-        assert!(!v.iter().any(|a| a.starts_with("ControlPath=")), "{v:?}");
+    fn a_batch_call_joins_the_master_and_never_starts_one() {
+        let tr = muxed();
+        let path = tr.control_path().unwrap();
+        let v = strs(tr.argv(Call::Batch, "R"));
+        assert_eq!(
+            v[..12],
+            [
+                "ssh",
+                "-T",
+                "-e",
+                "none",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                &format!("ControlPath={}", path.to_str().unwrap()),
+            ],
+            "{v:?}"
+        );
         assert!(!v.iter().any(|a| a.starts_with("ControlPersist")), "{v:?}");
-        // The user's own multiplexing is still theirs to keep.
-        assert_eq!(v, strs(t().argv(Call::Batch, "R")));
-        assert!(!muxed().multiplexes(Call::Batch));
-        assert!(!muxed().multiplexes(Call::Redial));
+        // The user's own `-o ControlMaster=auto` comes after, so it loses.
+        assert_eq!(v.iter().filter(|a| *a == "ControlMaster=auto").count(), 1);
+        assert!(v.iter().position(|a| a == "ControlMaster=auto").unwrap() > 12);
+        // The same socket the session and side calls use.
+        assert!(strs(tr.argv(Call::Side, "R")).contains(&v[11]));
+        assert!(tr.multiplexes(Call::Batch));
+        assert!(!tr.multiplexes(Call::Redial));
+        // With no master, the user's own multiplexing is still theirs.
+        let v = strs(t().argv(Call::Batch, "R"));
+        assert!(!v.iter().any(|a| a.starts_with("ControlPath=")), "{v:?}");
+        assert!(!v.iter().any(|a| a == "ControlMaster=no"), "{v:?}");
     }
 
     /// `ssh -O check` / `-O exit` must reach the socket a dial would, with
