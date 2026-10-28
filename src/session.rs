@@ -188,7 +188,13 @@ impl SocketDir {
         Self::open_at(Self::default_path())
     }
 
+    /// A relative `path` is made absolute against the current directory
+    /// first, once, so the proxy and the master it starts (which runs from
+    /// `/`) name the same directory (acs-7nan). Lexically, not by
+    /// `canonicalize`: the directory need not exist yet, and resolving a
+    /// symlink here would hide it from the check below.
     pub fn open_at(path: PathBuf) -> Result<SocketDir, DirError> {
+        let path = std::path::absolute(&path).map_err(|e| DirError::Io(path, e.to_string()))?;
         let io_err = |e: io::Error| DirError::Io(path.clone(), e.to_string());
         match std::fs::DirBuilder::new().mode(0o700).create(&path) {
             Ok(()) => {}
