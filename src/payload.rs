@@ -14,6 +14,7 @@
 //! ignores it); Mach-O builds link it in with `include_bytes!` because
 //! code signing refuses appended data.
 
+use std::borrow::Cow;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -39,9 +40,12 @@ pub struct Entry {
 }
 
 /// A parsed payload blob.
+///
+/// The blob is borrowed when it is the one linked into this binary and
+/// owned when it was read from a file, so neither is copied (acs-zgof).
 #[derive(Debug, Clone)]
 pub struct Payloads {
-    blob: Vec<u8>,
+    blob: Cow<'static, [u8]>,
     pub entries: Vec<Entry>,
 }
 
@@ -83,51 +87,23 @@ fn be_u64(b: &[u8]) -> u64 {
 impl Payloads {
     /// Parse a blob. Anything malformed is `None`, never a panic.
     pub fn parse(blob: &[u8]) -> Option<Payloads> {
-        let (index_len, total) = footer(blob)?;
-        if total != blob.len() as u64 {
-            return None;
-        }
-        let index_end = blob.len() - FOOTER;
-        let index_start = index_end.checked_sub(index_len as usize)?;
-        let mut p = &blob[index_start..index_end];
-        let take = |p: &mut &[u8], n: usize| -> Option<Vec<u8>> {
-            if p.len() < n {
-                return None;
-            }
-            let (a, b) = p.split_at(n);
-            *p = b;
-            Some(a.to_vec())
-        };
-        let count = u32::from_be_bytes(take(&mut p, 4)?.try_into().ok()?);
-        let mut entries = Vec::new();
-        for _ in 0..count {
-            let tlen = u16::from_be_bytes(take(&mut p, 2)?.try_into().ok()?) as usize;
-            let target = String::from_utf8(take(&mut p, tlen)?).ok()?;
-            let offset = be_u64(&take(&mut p, 8)?);
-            let gz_len = be_u64(&take(&mut p, 8)?);
-            let raw_len = be_u64(&take(&mut p, 8)?);
-            let sha256: [u8; 32] = take(&mut p, 32)?.try_into().ok()?;
-            if offset.checked_add(gz_len)? > index_start as u64 {
-                return None;
-            }
-            entries.push(Entry {
-                target,
-                offset,
-                gz_len,
-                raw_len,
-                sha256,
-            });
-        }
-        Some(Payloads {
-            blob: blob.to_vec(),
-            entries,
-        })
+        Payloads::from_cow(Cow::Owned(blob.to_vec()))
+    }
+
+    /// Whether `blob` is a well-formed payload set, without keeping a copy.
+    pub fn is_well_formed(blob: &[u8]) -> bool {
+        index(blob).is_some()
+    }
+
+    fn from_cow(blob: Cow<'static, [u8]>) -> Option<Payloads> {
+        let entries = index(&blob)?;
+        Some(Payloads { blob, entries })
     }
 
     /// The payloads this binary carries (embedded or appended), if any.
     pub fn from_self() -> Option<Payloads> {
         if !EMBEDDED.is_empty() {
-            return Payloads::parse(EMBEDDED);
+            return Payloads::from_cow(Cow::Borrowed(EMBEDDED));
         }
         let exe = crate::sys::self_exe().ok()?;
         Payloads::from_file(&exe).ok().flatten().map(|(_, p)| p)
@@ -152,7 +128,7 @@ impl Payloads {
         f.seek(SeekFrom::Start(len - total))?;
         let mut blob = vec![0u8; total as usize];
         f.read_exact(&mut blob)?;
-        Ok(Payloads::parse(&blob).map(|p| (len - total, p)))
+        Ok(Payloads::from_cow(Cow::Owned(blob)).map(|p| (len - total, p)))
     }
 
     pub fn get(&self, target: &str) -> Option<(&Entry, &[u8])> {
@@ -169,6 +145,47 @@ impl Payloads {
     pub fn targets(&self) -> Vec<&str> {
         self.entries.iter().map(|e| e.target.as_str()).collect()
     }
+}
+
+/// The entries of a payload blob. Anything malformed is `None`, never a
+/// panic.
+fn index(blob: &[u8]) -> Option<Vec<Entry>> {
+    let (index_len, total) = footer(blob)?;
+    if total != blob.len() as u64 {
+        return None;
+    }
+    let index_end = blob.len() - FOOTER;
+    let index_start = index_end.checked_sub(index_len as usize)?;
+    let mut p = &blob[index_start..index_end];
+    let take = |p: &mut &[u8], n: usize| -> Option<Vec<u8>> {
+        if p.len() < n {
+            return None;
+        }
+        let (a, b) = p.split_at(n);
+        *p = b;
+        Some(a.to_vec())
+    };
+    let count = u32::from_be_bytes(take(&mut p, 4)?.try_into().ok()?);
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let tlen = u16::from_be_bytes(take(&mut p, 2)?.try_into().ok()?) as usize;
+        let target = String::from_utf8(take(&mut p, tlen)?).ok()?;
+        let offset = be_u64(&take(&mut p, 8)?);
+        let gz_len = be_u64(&take(&mut p, 8)?);
+        let raw_len = be_u64(&take(&mut p, 8)?);
+        let sha256: [u8; 32] = take(&mut p, 32)?.try_into().ok()?;
+        if offset.checked_add(gz_len)? > index_start as u64 {
+            return None;
+        }
+        entries.push(Entry {
+            target,
+            offset,
+            gz_len,
+            raw_len,
+            sha256,
+        });
+    }
+    Some(entries)
 }
 
 fn footer(b: &[u8]) -> Option<(u64, u64)> {
@@ -281,6 +298,35 @@ mod tests {
         let n = huge.len();
         huge[n - 24..n - 16].copy_from_slice(&u64::MAX.to_be_bytes());
         assert!(Payloads::parse(&huge).is_none());
+    }
+
+    /// acs-zgof: checking a blob keeps no copy of it, and agrees with
+    /// parsing it on every truncation.
+    #[test]
+    fn well_formed_agrees_with_parse() {
+        let s = sample();
+        assert!(Payloads::is_well_formed(&s));
+        for cut in 0..s.len() {
+            assert_eq!(
+                Payloads::is_well_formed(&s[..cut]),
+                Payloads::parse(&s[..cut]).is_some()
+            );
+            assert_eq!(
+                Payloads::is_well_formed(&s[cut..]),
+                Payloads::parse(&s[cut..]).is_some()
+            );
+        }
+    }
+
+    /// acs-zgof: a set linked into the binary is borrowed, not copied.
+    #[test]
+    fn a_linked_in_set_is_borrowed() {
+        static LINKED: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let linked: &'static [u8] = LINKED.get_or_init(sample);
+        let p = Payloads::from_cow(Cow::Borrowed(linked)).unwrap();
+        assert!(matches!(p.blob, Cow::Borrowed(_)));
+        assert_eq!(p.blob().as_ptr(), linked.as_ptr());
+        assert_eq!(p.targets().len(), 2);
     }
 
     #[test]
