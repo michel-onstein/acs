@@ -754,20 +754,31 @@ fn duplicate_input_after_a_resend_is_written_once() {
 /// poll after the exit was seen, not by the poll SIGCHLD cut short.
 #[test]
 fn the_last_output_before_exit_is_never_lost() {
-    // A burst right before the exit leaves the most in flight.
-    for i in 0..100 {
-        let t = TempDir::new();
-        let cmd = format!("head -c 30000 /dev/zero | tr '\\0' y; echo last-{i}");
-        let (mut c, _) = start(t.path(), "e", &["/bin/sh", "-c", &cmd], "me");
-        let status = wait_exit(&mut c);
-        assert_eq!(acs::sys::exit_code(status), 0);
-        let out = String::from_utf8_lossy(&c.output);
-        assert!(
-            out.contains(&format!("last-{i}")),
-            "run {i}: output ends {:?}",
-            &out[out.len().saturating_sub(40)..]
-        );
-    }
+    // A burst right before the exit leaves the most in flight. Still 100
+    // runs, but ten at a time (acs-dz3r): each is its own master in its own
+    // directory, so they share nothing, and the load they put on each other
+    // only widens the window between the last write and the exit.
+    const RUNS: usize = 100;
+    const LANES: usize = 10;
+    std::thread::scope(|s| {
+        for lane in 0..LANES {
+            s.spawn(move || {
+                for i in (lane..RUNS).step_by(LANES) {
+                    let t = TempDir::new();
+                    let cmd = format!("head -c 30000 /dev/zero | tr '\\0' y; echo last-{i}");
+                    let (mut c, _) = start(t.path(), "e", &["/bin/sh", "-c", &cmd], "me");
+                    let status = wait_exit(&mut c);
+                    assert_eq!(acs::sys::exit_code(status), 0, "run {i}");
+                    let out = String::from_utf8_lossy(&c.output);
+                    assert!(
+                        out.contains(&format!("last-{i}")),
+                        "run {i}: output ends {:?}",
+                        &out[out.len().saturating_sub(40)..]
+                    );
+                }
+            });
+        }
+    });
 }
 
 /// Wait, up to `T`, for `pid` to spend under a tenth of a half-second
