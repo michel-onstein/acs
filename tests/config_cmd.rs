@@ -562,6 +562,37 @@ fn redraw_on_reconnect_globally_and_for_an_alias() {
 }
 
 #[test]
+fn an_empty_value_means_the_same_globally_and_for_an_alias() {
+    // acs-cdal: `host set <alias> <key> ''` was refused as "bad arguments"
+    // whatever the setting, while `set <key> ''` was not.
+    let h = Home::new();
+    h.ok(&["config", "host", "add", "devbox", "devbox.lan"]);
+    h.ok(&["config", "set", "local_forwards", "8080:localhost:80"]);
+    assert_eq!(
+        h.ok(&["config", "host", "set", "devbox", "local_forwards", ""]),
+        "set local_forwards of devbox to none in ~/.config/acs/config.yaml\n"
+    );
+    assert_eq!(
+        h.ok(&["config", "set", "local_forwards", ""]),
+        "set local_forwards to none in ~/.config/acs/config.yaml\n"
+    );
+    // A setting an empty value means nothing to refuses it by name, the
+    // same way in both forms.
+    let want = "persist is true or false, not ''";
+    h.fails(&["config", "set", "persist", ""], 2, want);
+    h.fails(&["config", "host", "set", "devbox", "persist", ""], 2, want);
+    h.fails(
+        &["config", "host", "set", "devbox", "identity_file", ""],
+        2,
+        "identity_file needs a key file, not an empty value",
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.local()).unwrap(),
+        "aliases:\n  devbox:\n    local_forwards: none\n    hosts:\n      - host: devbox.lan\nlocal_forwards: none\n"
+    );
+}
+
+#[test]
 fn an_alias_with_a_key_but_no_hosts_is_an_error() {
     let h = Home::new();
     std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
