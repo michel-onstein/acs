@@ -85,8 +85,9 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     }
     // The master acs keeps for this host, if it may have one: decided once,
     // before anything dials, so every call this client makes agrees about
-    // it (acs-9n3). Never for `acs list` over every alias, which asks a
-    // dozen hosts at once and would leave a master on each.
+    // it (acs-9n3). Not decided here for `acs list` over every alias, which
+    // asks a dozen hosts at once: it joins a master that answers, in
+    // list.rs, and never starts one, which would leave a master on each.
     // The configured forwards join the command line's (acs-odd, DESIGN
     // §7.1) before the master is decided, so a forward that arrives from
     // the configuration hits the same carve-out a `-L` does: a session that
