@@ -786,13 +786,14 @@ fn the_installer_and_acs_read_sha256sums_alike() {
 /// together.
 #[test]
 fn the_installer_uses_the_layout_acs_looks_in() {
-    use acs::layout::{SYSTEM_BIN, SYSTEM_ROOT, USER_BIN, USER_ROOT};
+    use acs::layout::{COPY_NAME, SYSTEM_BIN, SYSTEM_ROOT, USER_BIN, USER_ROOT};
     let script = installer();
     for want in [
         format!("lib={SYSTEM_ROOT}\n"),
         format!("bin={SYSTEM_BIN}\n"),
         format!("lib=\"$HOME/{USER_ROOT}\"\n"),
         format!("bin=\"$HOME/{USER_BIN}\"\n"),
+        format!("\ncopy_name={COPY_NAME}\n"),
     ] {
         assert!(script.contains(&want), "install.sh has no {want:?}");
     }
@@ -803,6 +804,13 @@ fn the_installer_uses_the_layout_acs_looks_in() {
 /// The helpers are cut out of the script itself, from the first of them to
 /// where it picks the directories, so the test runs exactly what ships.
 fn installer_link(lib: &Path, bin: &Path, version: &str) -> String {
+    installer_links(lib, bin, version).0
+}
+
+/// [`installer_link`], then the installer's `link_copy` for `bin`, as the
+/// script runs them: what each did — `link_bin`'s `$linked`, and
+/// `link_copy`'s `$copied` (`linked`, `theirs`, `failed` or `skipped`).
+fn installer_links(lib: &Path, bin: &Path, version: &str) -> (String, String) {
     let script = installer();
     let helpers = script
         .lines()
@@ -811,16 +819,21 @@ fn installer_link(lib: &Path, bin: &Path, version: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        helpers.contains("link_bin() {"),
+        helpers.contains("link_bin() {") && helpers.contains("link_copy() {"),
         "the installer's link helpers moved:\n{helpers}"
     );
+    // The two calls exactly as the script makes them, in that order.
+    let calls = script
+        .find("    link_bin \"$installed\" \"$bin/acs\"\nfi\nlink_copy \"$bin\"\n")
+        .is_some();
+    assert!(calls, "install.sh no longer links acscp after link_bin");
     std::fs::create_dir_all(lib.join(version)).unwrap();
     std::fs::write(lib.join(version).join("acs"), "new\n").unwrap();
     std::fs::create_dir_all(bin).unwrap();
     let out = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "set -eu\n{helpers}\nlink_bin \"$lib/$version/acs\" \"$bin/acs\"\nprintf %s \"$linked\""
+            "set -eu\n{helpers}\nlink_bin \"$lib/$version/acs\" \"$bin/acs\"\nlink_copy \"$bin\"\nprintf '%s %s' \"$linked\" \"$copied\""
         ))
         .env("lib", lib)
         .env("bin", bin)
@@ -828,7 +841,67 @@ fn installer_link(lib: &Path, bin: &Path, version: &str) -> String {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    String::from_utf8(out.stdout).unwrap()
+    let out = String::from_utf8(out.stdout).unwrap();
+    let (linked, copied) = out.split_once(' ').unwrap();
+    (linked.to_string(), copied.to_string())
+}
+
+fn copy_link(bin: &Path) -> PathBuf {
+    bin.join(acs::layout::COPY_NAME)
+}
+
+/// acs-hofu.5: the installer puts `acscp -> acs`, relative, beside an
+/// `acs` it linked or kept, and a re-run keeps it (ACSCP_DESIGN §9).
+#[test]
+fn the_installer_links_acscp_beside_its_acs() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    let links = |v| installer_links(&lib, &bin, v);
+    assert_eq!(links("0.13.0"), ("linked".into(), "linked".into()));
+    assert_eq!(points_at(&copy_link(&bin)), Path::new("acs"));
+    // It follows acs forward with no change of its own.
+    assert_eq!(links("0.14.0"), ("linked".into(), "linked".into()));
+    assert_eq!(points_at(&copy_link(&bin)), Path::new("acs"));
+    assert_eq!(
+        std::fs::canonicalize(copy_link(&bin)).unwrap(),
+        std::fs::canonicalize(lib.join("0.14.0/acs")).unwrap()
+    );
+    // An older ACS_VERSION keeps the link of ours, and acscp beside it.
+    assert_eq!(links("0.12.0"), ("newer".into(), "linked".into()));
+    assert_eq!(points_at(&copy_link(&bin)), Path::new("acs"));
+}
+
+/// acs-hofu.5: a file or link at `acscp` the installer did not make is
+/// left alone, and an `acs` of the user's own gets no `acscp` at all.
+#[test]
+fn the_installer_leaves_a_users_acscp_alone() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(copy_link(&bin), "mine\n").unwrap();
+    assert_eq!(
+        installer_links(&lib, &bin, "0.13.0"),
+        ("linked".into(), "theirs".into())
+    );
+    assert_eq!(std::fs::read_to_string(copy_link(&bin)).unwrap(), "mine\n");
+    // A link of the user's to this very acs by full path is still theirs.
+    std::fs::remove_file(copy_link(&bin)).unwrap();
+    symlink(&bin.join("acs"), &copy_link(&bin));
+    assert_eq!(
+        installer_links(&lib, &bin, "0.13.0"),
+        ("linked".into(), "theirs".into())
+    );
+    assert_eq!(points_at(&copy_link(&bin)), bin.join("acs"));
+
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("acs"), "mine\n").unwrap();
+    assert_eq!(
+        installer_links(&lib, &bin, "0.13.0"),
+        ("theirs".into(), "skipped".into())
+    );
+    assert!(std::fs::symlink_metadata(copy_link(&bin)).is_err());
 }
 
 /// An installed version under `lib`, as an earlier run left it.

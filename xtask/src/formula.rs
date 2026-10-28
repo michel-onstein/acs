@@ -107,7 +107,12 @@ pub fn render_with(version: &str, sums: &str, releases: &str) -> Result<String, 
     }
     // The archive holds acs-<version>-<target>/{acs,README.md}; brew unpacks
     // into that directory. `acs upgrade` defers to brew for a Cellar path.
-    f.push_str("\n  def install\n    bin.install \"acs\"\n  end\n\n");
+    // `acscp` is the same binary by a second name (ACSCP_DESIGN §9): a
+    // relative link beside it, so the keg carries one file.
+    f.push_str(&format!(
+        "\n  def install\n    bin.install \"acs\"\n    bin.install_symlink \"acs\" => \"{}\"\n  end\n\n",
+        acs::layout::COPY_NAME
+    ));
     // `version` is the one brew reads from the URL. The complete build lists
     // both Linux targets among the remotes it can install (in its own order):
     // a brewed binary must still carry its payloads.
@@ -117,6 +122,10 @@ pub fn render_with(version: &str, sums: &str, releases: &str) -> Result<String, 
     f.push_str("    remotes = out[/^installs remotes: (.*)$/, 1].to_s.split(\", \")\n");
     f.push_str("    assert_includes remotes, \"x86_64-unknown-linux-musl\"\n");
     f.push_str("    assert_includes remotes, \"aarch64-unknown-linux-musl\"\n");
+    f.push_str(&format!(
+        "    assert_match \"acs #{{version}} \", shell_output(\"#{{bin}}/{} --version\")\n",
+        acs::layout::COPY_NAME
+    ));
     f.push_str("  end\nend\n");
     Ok(f)
 }
@@ -269,6 +278,17 @@ mod tests {
         // Installs the binary; the test checks the version and the payloads.
         assert!(f.contains("bin.install \"acs\""));
         assert!(f.contains("assert_match \"acs #{version} \""));
+        // acs-hofu.5: the keg links acscp to acs, and the test runs it.
+        assert!(
+            f.contains("    bin.install \"acs\"\n    bin.install_symlink \"acs\" => \"acscp\"\n"),
+            "{f}"
+        );
+        assert!(
+            f.contains(
+                "    assert_match \"acs #{version} \", shell_output(\"#{bin}/acscp --version\")\n"
+            ),
+            "{f}"
+        );
         // Both Linux payloads, in whatever order the build lists them (a
         // Linux build puts its own target first).
         assert!(f.contains("assert_includes remotes, \"x86_64-unknown-linux-musl\"\n"));

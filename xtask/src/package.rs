@@ -77,7 +77,8 @@ pub fn notes_with(
         .unwrap_or("acs.tar.gz");
     let dir = example.trim_end_matches(".tar.gz");
     n.push_str(&format!(
-        "\n```sh\ncurl -LO {releases}/download/v{version}/{example}\ntar xzf {example}\ninstall -m 755 {dir}/acs ~/.local/bin/acs\nacs --version\n```\n\n"
+        "\n```sh\ncurl -LO {releases}/download/v{version}/{example}\ntar xzf {example}\ninstall -m 755 {dir}/acs ~/.local/bin/acs\nln -s acs ~/.local/bin/{copy}    # acs run as acscp copies files, like scp\nacs --version\n```\n\n",
+        copy = acs::layout::COPY_NAME
     ));
     n.push_str("On macOS, a file downloaded with a browser is quarantined; clear it with `xattr -d com.apple.quarantine ~/.local/bin/acs` (curl does not set it).\n\n");
     n.push_str(
@@ -342,6 +343,8 @@ mod tests {
         assert!(n.contains("| Linux x86_64 (static) |"));
         assert!(n.contains("releases/download/v1.2.3/acs-1.2.3-aarch64-apple-darwin.tar.gz"));
         assert!(n.contains("install -m 755 acs-1.2.3-aarch64-apple-darwin/acs"));
+        // acs-hofu.5: the by-hand install makes the relative acscp link too.
+        assert!(n.contains("\nln -s acs ~/.local/bin/acscp "), "{n}");
         assert!(n.contains("## Changes\n\n- feat: something"));
         // The one-liner leads, with a way to pin this release.
         let install = n.find("releases/latest/download/install.sh | sh").unwrap();
