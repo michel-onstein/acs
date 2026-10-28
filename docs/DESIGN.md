@@ -1118,7 +1118,10 @@ lossless resume will not repaint it. So:
    sequence the last frame opened, so the line is written **over** that
    sequence and not into it: ended with an `ST` before it and written again
    after it (§7, acs-p4u). The cursor, the title and the stream all come
-   back.
+   back. Each backoff step and each ping shows its status, but a line
+   already up is drawn again only when what it would write differs — text,
+   row or the sequence it steps over — or a note has been written since
+   (acs-ysx).
 3. After a successful resume that followed a printed status line, force one
    redraw to clean up the line: the client sends two RESIZE frames (one row
    fewer, then the real size), since an unchanged size raises no `SIGWINCH`.
@@ -1398,8 +1401,17 @@ that cannot wait, which bytes end the open sequence and which write it again
   - **A quiet session cannot swallow one.** A program that stops
     mid-sequence, or a link that dies there, would hold a note for ever:
     the wait ends after `ACS_NOTE_HOLD_MS` (500 ms) or when the frame loop
-    does, whichever comes first, and the note is then written where it
-    stands. Late and ugly beats lost.
+    does, whichever comes first, and the note is then written *over* the
+    open sequence, as the status line is (next bullet). Late beats lost.
+  - **Outside the frame loop a note still knows the stream** (acs-ysx). The
+    terminal stays wherever the last frame left it, and the status line
+    puts it back inside the program's CSI on every step of an outage, so a
+    note raised by the dial, the offline wait or alias resolution may well
+    be written mid-sequence. Every note goes through one entry point that
+    knows where the stream stands — told after every frame and whenever the
+    observer is cleared or resynced — and steps over an open sequence the
+    way the status line does. A debug assertion in the status line's own
+    write checks that knowledge against the observer.
   - The status line (§5.4) and the other writes acs makes to fd 1 cannot
     wait for a boundary at all, and step out of the sequence and back in
     instead — next bullet.

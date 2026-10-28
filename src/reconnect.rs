@@ -459,17 +459,27 @@ fn offline(
 /// sequence the last frame opened, and a line written into one is read as
 /// part of it. So it goes out through [`client::write_over_stream`], which
 /// ends that sequence first and re-opens it afterwards (acs-p4u, DESIGN §7).
+///
+/// A line already up is not drawn again for nothing (acs-ysx): every
+/// backoff step and every ping shows its status, and the text is mostly the
+/// same. It is drawn again when anything in what it would write differs —
+/// the text, the row, the sequence it steps over — or when a note has been
+/// written since, which may have scrolled it off its row.
 pub(crate) fn show_status(state: &mut State, msg: &str) {
     let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
-    let mut out = Vec::new();
-    if !state.status_shown {
-        out.extend_from_slice(b"\x1b[22;0t");
-    }
-    out.extend_from_slice(format!("\x1b]2;acs: {} — {msg}\x07", state.host).as_bytes());
-    out.extend_from_slice(
+    let mut line = format!("\x1b]2;acs: {} — {msg}\x07", state.host).into_bytes();
+    line.extend_from_slice(
         format!("\x1b7\x1b[{rows};1H\x1b[2K\x1b[7macs: {msg}\x1b[0m\x1b8").as_bytes(),
     );
-    client::write_over_stream(state, &out);
+    let drawn = (client::over_stream(state, &line), client::notes_written());
+    if state.status_shown && drawn == state.status_drawn {
+        return;
+    }
+    if !state.status_shown {
+        line.splice(0..0, *b"\x1b[22;0t");
+    }
+    client::write_over_stream(state, &line);
+    state.status_drawn = drawn;
     state.status_shown = true;
     crate::tty::set_status_shown(true);
 }
@@ -506,6 +516,7 @@ fn take_status_down(state: &mut State, retitle: bool) {
         }
         out.extend_from_slice(format!("\x1b7\x1b[{rows};1H\x1b[2K\x1b8").as_bytes());
         client::write_over_stream(state, &out);
+        state.status_drawn = (Vec::new(), 0);
         state.status_shown = false;
         crate::tty::set_status_shown(false);
     }
