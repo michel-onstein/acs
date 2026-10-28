@@ -52,29 +52,26 @@ host settings: --local-networks lists the networks that make a host the local
                (172.16.0.0/16, fd00::/48; acs config host add)
 precedence of the ssh key: -i, then the host's identity_file, then the alias's";
 
-/// Settings `get`/`set`/`unset` know: every top-level key but `aliases`.
-fn scalars() -> impl Iterator<Item = &'static str> {
-    config::KEYS.iter().copied().filter(|k| *k != "aliases")
-}
-
-fn is_scalar(key: &str) -> bool {
-    scalars().any(|k| k == key)
+/// The top-level setting `key`, which `get`/`set`/`unset` know.
+fn global(key: &str) -> Option<&'static config::Def> {
+    config::setting(key).filter(|d| d.global.is_some())
 }
 
 /// A top-level setting's value as YAML, and where it is from.
 fn scalar(c: &Config, key: &str) -> Option<(Node, Option<config::Origin>)> {
-    if let Some(s) = c.bool_setting(key) {
-        return Some((Node::bool(s.value), s.origin.clone()));
+    let f = global(key)?.global.as_ref()?;
+    let (value, origin) = (f.get)(c).get()?;
+    Some((val_node(value), origin))
+}
+
+/// A setting's value as YAML, as `show` writes it and `set` stores it.
+fn val_node(v: config::Val) -> Node {
+    match v {
+        config::Val::Bool(b) => Node::bool(b),
+        config::Val::Duration(d) => Node::string(&config::format_timeout(d)),
+        config::Val::Forwards(specs) => forwards_node(&specs),
+        config::Val::Path(p) => Node::string(&p),
     }
-    if config::FORWARDS.contains(&key) {
-        let s = &c.local_forwards;
-        return Some((forwards_node(&s.value), s.origin.clone()));
-    }
-    let s = c.duration_setting(key)?;
-    Some((
-        Node::string(&config::format_timeout(s.value)),
-        s.origin.clone(),
-    ))
 }
 
 /// A list of networks as a one-line YAML list: `[172.16.0.0/16, fd00::/48]`
@@ -103,26 +100,30 @@ fn forwards_node(specs: &[String]) -> Node {
 }
 
 /// `value` as the node for setting `key`, global or an alias's, checked
-/// against its type.
+/// against its kind.
 fn typed(key: &str, value: &str) -> Result<Node, String> {
-    if config::BOOLS.contains(&key) || config::ALIAS_BOOLS.contains(&key) {
-        Ok(Node::bool(parse_bool(key, value)?))
-    } else if config::DURATIONS.contains(&key) {
-        let d = config::parse_duration(key, value).map_err(|e| format!("{key}: {e}"))?;
-        Ok(Node::string(&config::format_timeout(d)))
-    } else if config::FORWARDS.contains(&key) {
-        let specs = config::parse_forwards(value).map_err(|e| format!("{key}: {e}"))?;
-        Ok(forwards_node(&specs))
-    } else if value.is_empty() {
+    let d = config::setting(key).ok_or_else(|| unknown_key(key))?;
+    let v = match d.kind {
+        config::Kind::Bool => config::parse_bool(value)
+            .map(config::Val::Bool)
+            .ok_or_else(|| format!("{key} is true or false, not '{value}'"))?,
+        config::Kind::Duration { min, max } => config::parse_duration(value, min, max)
+            .map(config::Val::Duration)
+            .map_err(|e| format!("{key}: {e}"))?,
+        config::Kind::Forwards => config::parse_forwards(value)
+            .map(config::Val::Forwards)
+            .map_err(|e| format!("{key}: {e}"))?,
         // An empty `identity_file` names no key, and the file would not load
         // with one; what drops an alias's key is `host unset` (acs-cdal).
-        Err(format!(
-            "{key} needs a key file, not an empty value \
-             (acs config host unset <alias> {key} removes it)"
-        ))
-    } else {
-        Ok(Node::string(value))
-    }
+        config::Kind::Path if value.is_empty() => {
+            return Err(format!(
+                "{key} needs a key file, not an empty value \
+                 (acs config host unset <alias> {key} removes it)"
+            ))
+        }
+        config::Kind::Path => config::Val::Path(value.to_string()),
+    };
+    Ok(val_node(v))
 }
 
 /// The text of a scalar node.
@@ -141,12 +142,6 @@ fn value_text(n: &Node) -> String {
         Value::Seq(items) => items.iter().map(text).collect::<Vec<_>>().join(","),
         _ => text(n).to_string(),
     }
-}
-
-/// Settings of an alias that `host set`/`host unset` know: every key of the
-/// alias's mapping but its `hosts`.
-fn alias_settings() -> impl Iterator<Item = &'static str> {
-    config::ALIAS_KEYS.iter().copied().filter(|k| *k != "hosts")
 }
 
 /// What to do, parsed from the arguments after `config`.
@@ -239,10 +234,10 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
     };
     let w: Vec<&str> = words.iter().map(String::as_str).collect();
     if let ["host", "set" | "unset", _, key, ..] = w.as_slice() {
-        if !alias_settings().any(|k| k == *key) {
+        if !config::alias_settings().any(|d| d.key == *key) {
             return Err(format!(
                 "unknown alias setting '{key}' (settings: {})",
-                alias_settings().collect::<Vec<_>>().join(", ")
+                config::key_list(config::alias_settings(), "")
             ));
         }
     }
@@ -462,7 +457,7 @@ fn unknown_key(k: &str) -> String {
     };
     format!(
         "unknown setting '{k}' (settings: {}){hint}",
-        scalars().collect::<Vec<_>>().join(", ")
+        config::key_list(config::globals(), "")
     )
 }
 
@@ -499,10 +494,10 @@ fn from(origin: &Option<config::Origin>) -> String {
 /// The merged configuration as YAML, each value commented with its origin.
 pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
     let mut root = Vec::new();
-    for key in scalars() {
-        let (node, origin) = scalar(c, key).expect("a scalar setting");
+    for d in config::globals() {
+        let (node, origin) = scalar(c, d.key).expect("a top-level setting");
         root.push((
-            key.to_string(),
+            d.key.to_string(),
             Node {
                 comment: Some(from(&origin)),
                 ..node
@@ -525,60 +520,17 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
         let list = Node::new(Value::Seq(items));
         // An alias with a setting of its own is written as a mapping.
         let mut settings = Vec::new();
-        if let Some(key) = &a.identity_file {
-            settings.push((
-                "identity_file".to_string(),
-                Node {
-                    comment: Some(from(&key.origin)),
-                    ..Node::string(&key.value)
-                },
-            ));
-        }
-        if let Some(r) = &a.redraw_on_reconnect {
-            settings.push((
-                "redraw_on_reconnect".to_string(),
-                Node {
-                    comment: Some(from(&r.origin)),
-                    ..Node::bool(r.value)
-                },
-            ));
-        }
-        for (key, d) in [
-            ("reachability_timeout", &a.reachability_timeout),
-            ("reachability_interval", &a.reachability_interval),
-        ] {
-            if let Some(t) = d {
+        for d in config::alias_settings() {
+            let f = d.alias.as_ref().expect("an alias setting");
+            if let Some((value, origin)) = (f.get)(a).get() {
                 settings.push((
-                    key.to_string(),
+                    d.key.to_string(),
                     Node {
-                        comment: Some(from(&t.origin)),
-                        ..Node::string(&config::format_timeout(t.value))
+                        comment: Some(from(&origin)),
+                        ..val_node(value)
                     },
                 ));
             }
-        }
-        for (key, b) in [
-            ("persist", &a.persist),
-            ("prefer_local_network", &a.prefer_local_network),
-        ] {
-            if let Some(p) = b {
-                settings.push((
-                    key.to_string(),
-                    Node {
-                        comment: Some(from(&p.origin)),
-                        ..Node::bool(p.value)
-                    },
-                ));
-            }
-        }
-        if let Some(f) = &a.local_forwards {
-            settings.push((
-                "local_forwards".to_string(),
-                Node {
-                    comment: Some(from(&f.origin)),
-                    ..forwards_node(&f.value)
-                },
-            ));
         }
         let node = if settings.is_empty() {
             list
@@ -708,17 +660,12 @@ pub fn host_list(c: &Config) -> String {
 fn defined_in(other: &Path, cmd: &Cmd) -> Option<String> {
     let doc = config::read_doc(other).ok()??;
     let map = doc.root.value.map()?;
-    let find = |k: &str| map.iter().find(|(key, _)| key == k).map(|(_, n)| n);
     let alias = |name: &str| {
-        find("aliases")?
-            .value
-            .map()?
-            .iter()
-            .find(|(a, _)| a == name)
-            .map(|(_, n)| n)
+        let (hi, ai) = alias_at(map, name)?;
+        Some(&map[hi].1.value.map()?[ai].1)
     };
     let node = match cmd {
-        Cmd::Unset(key) => find(key)?,
+        Cmd::Unset(key) => &map.iter().find(|(k, _)| k == key)?.1,
         Cmd::HostRemove { alias: a, .. } => alias(a)?,
         Cmd::HostUnset { alias: a, key } => Some(alias(a)?)
             .filter(|n| is_alias_form(n))?
@@ -757,11 +704,26 @@ fn root_map(doc: &mut Document) -> Result<&mut Vec<(String, Node)>, String> {
         .ok_or_else(|| "the file does not hold 'key: value' settings; fix it by hand".into())
 }
 
-fn parse_bool(key: &str, v: &str) -> Result<bool, String> {
-    match v.to_ascii_lowercase().as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(format!("{key} is true or false, not '{v}'")),
+/// Where `alias` is in the root mapping `map`: the index of `aliases`, and
+/// of the alias in it.
+fn alias_at(map: &[(String, Node)], alias: &str) -> Option<(usize, usize)> {
+    let hi = map.iter().position(|(k, _)| k == "aliases")?;
+    let ai = map[hi]
+        .1
+        .value
+        .map()?
+        .iter()
+        .position(|(a, _)| a == alias)?;
+    Some((hi, ai))
+}
+
+/// Remove the alias at `ai` of the `aliases` at `hi`, and `aliases` with it
+/// when it was the last.
+fn remove_alias(map: &mut Vec<(String, Node)>, hi: usize, ai: usize) {
+    let aliases = map[hi].1.value.map_mut().expect("a mapping");
+    remove_entry(aliases, ai);
+    if aliases.is_empty() {
+        remove_entry(map, hi);
     }
 }
 
@@ -769,7 +731,7 @@ fn parse_bool(key: &str, v: &str) -> Result<bool, String> {
 pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
     match cmd {
         Cmd::Set(key, value) => {
-            if !is_scalar(key) {
+            if global(key).is_none() {
                 return Err(unknown_key(key));
             }
             let node = typed(key, value)?;
@@ -785,7 +747,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
             Ok(format!("set {key} to {shown}"))
         }
         Cmd::Unset(key) => {
-            if !is_scalar(key) {
+            if global(key).is_none() {
                 return Err(unknown_key(key));
             }
             let map = root_map(doc)?;
@@ -861,16 +823,8 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
         Cmd::HostUnset { alias, key } => {
             let missing = || format!("{key} of {alias} is not set in this file");
             let map = root_map(doc)?;
-            let hi = map
-                .iter()
-                .position(|(k, _)| k == "aliases")
-                .ok_or_else(missing)?;
-            let aliases = map[hi].1.value.map_mut().ok_or_else(missing)?;
-            let ai = aliases
-                .iter()
-                .position(|(a, _)| a == alias)
-                .ok_or_else(missing)?;
-            let node = &mut aliases[ai].1;
+            let (hi, ai) = alias_at(map, alias).ok_or_else(missing)?;
+            let node = &mut map[hi].1.value.map_mut().expect("a mapping")[ai].1;
             if !is_alias_form(node) {
                 return Err(missing());
             }
@@ -887,10 +841,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                 .collect();
             if left.is_empty() {
                 // Only the setting was here: the hosts are in the other file.
-                remove_entry(aliases, ai);
-                if aliases.is_empty() {
-                    remove_entry(map, hi);
-                }
+                remove_alias(map, hi, ai);
                 return Ok(format!(
                     "removed {key} of {alias}, and {alias}, which has no hosts in this file"
                 ));
@@ -915,24 +866,17 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
         }
         Cmd::HostRemove { alias, host } => {
             let map = root_map(doc)?;
-            let Some(hi) = map.iter().position(|(k, _)| k == "aliases") else {
+            let Some((hi, ai)) = alias_at(map, alias) else {
                 return Err(format!("no alias '{alias}' in this file"));
             };
-            let aliases = map[hi]
-                .1
-                .value
-                .map_mut()
-                .ok_or(format!("no alias '{alias}' in this file"))?;
-            let Some(ai) = aliases.iter().position(|(a, _)| a == alias) else {
-                return Err(format!("no alias '{alias}' in this file"));
-            };
-            let msg = match host {
+            match host {
                 None => {
-                    remove_entry(aliases, ai);
-                    format!("removed alias {alias}")
+                    remove_alias(map, hi, ai);
+                    Ok(format!("removed alias {alias}"))
                 }
                 Some(h) => {
-                    let (removed, empty) = match listed_hosts(&mut aliases[ai].1) {
+                    let node = &mut map[hi].1.value.map_mut().expect("a mapping")[ai].1;
+                    let (removed, empty) = match listed_hosts(node) {
                         None => (0, true),
                         Some(list) => {
                             let removed = match &mut list.value {
@@ -963,17 +907,15 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                         return Err(format!("{h} is not a host of {alias} in this file"));
                     }
                     if empty {
-                        remove_entry(aliases, ai);
-                        format!("removed {h}, the last host of {alias}, and the alias")
+                        remove_alias(map, hi, ai);
+                        Ok(format!(
+                            "removed {h}, the last host of {alias}, and the alias"
+                        ))
                     } else {
-                        format!("removed {h} from {alias}")
+                        Ok(format!("removed {h} from {alias}"))
                     }
                 }
-            };
-            if aliases.is_empty() {
-                remove_entry(map, hi);
             }
-            Ok(msg)
         }
         _ => unreachable!("not an edit"),
     }
@@ -1226,6 +1168,30 @@ mod tests {
         write(&path, &doc).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o640, "the file's own mode was not kept");
+    }
+
+    /// acs-gydj: the help names every setting of the table, at each level
+    /// it has one, so a new row cannot go undocumented.
+    #[test]
+    fn the_usage_names_every_setting() {
+        let (globals, aliases) = USAGE
+            .split_once("alias settings:")
+            .expect("an alias settings section");
+        let aliases = aliases.split_once("host settings:").unwrap().0;
+        for d in config::SETTINGS {
+            assert_eq!(
+                d.global.is_some(),
+                globals.contains(d.key),
+                "{} in the settings",
+                d.key
+            );
+            assert_eq!(
+                d.alias.is_some(),
+                aliases.contains(d.key),
+                "{} in the alias settings",
+                d.key
+            );
+        }
     }
 
     fn args(s: &str) -> Vec<OsString> {
