@@ -133,12 +133,13 @@ ssh-keygen -Y verify -f "$tmp/allowed_signers" -I releases@acs -n acs-release \
 # [^ ]+ for the whole name, which allows / and .., so a SHA256SUMS from a
 # channel under someone else's control could name a version that walks out
 # of $tmp and out of $lib -- and $lib is written as root in the root
-# branch. The Rust side has always been this strict; the two now agree.
-line=$(grep -E "^[0-9a-f]{64} [ *]?acs-[0-9]+\\.[0-9]+\\.[0-9]+-$target\\.tar\\.gz\$" "$tmp/SHA256SUMS" | head -n 1 || true)
+# branch. The Rust side has always been this strict; the two now agree,
+# on the separator too: one space, then any run of spaces and `*`s
+# (release::sums_line; tests/scripts.rs holds them together).
+line=$(grep -E "^[0-9a-f]{64} [ *]*acs-[0-9]+\\.[0-9]+\\.[0-9]+-$target\\.tar\\.gz\$" "$tmp/SHA256SUMS" | head -n 1 || true)
 [ -n "$line" ] || die "the release has no build for $target"
 sum=${line%% *}
-file=${line##* }
-file=${file#\*}
+file=${line##*[ *]}
 version=${file#acs-}
 version=${version%-"$target".tar.gz}
 # Belt and braces: whatever the grep let through, this is a version.

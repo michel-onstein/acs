@@ -419,6 +419,61 @@ fn ctrl_c_during_a_redial_clears_the_status_line() {
     assert!(c.echo_on());
 }
 
+/// acs-8ax: the command keys work while a redial is in flight, not only in
+/// the wait between dials. The redial is held for good — only the keys can
+/// end it — and `x` says it needs the link before `d` detaches.
+///
+/// The dial timeout is two minutes, longer than every deadline in the
+/// suite: a client that only read the keys once the dial gave up — which
+/// is what it did, the cooked terminal handing them over late — cannot
+/// pass inside `T`.
+#[test]
+fn detach_works_during_a_redial() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_DIAL_TIMEOUT_MS", "120000"));
+    let mut c = start(&remote, "dr", "echo up; sleep 30", &env);
+    c.wait_for("up", T);
+    remote.hold_dial();
+    let dialled = remote.connections();
+    remote.cut_link();
+    remote.wait_more_connections(dialled, 1, T);
+    c.wait_until("the client has left raw mode to redial", |c| c.echo_on(), T);
+    c.send(&command(b'x'));
+    c.wait_for("ending the session needs the connection", T);
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+    c.wait_for("detached from devbox/dr", T);
+    assert!(c.echo_on());
+    assert!(c.text().contains("\x1b[23;0t"));
+}
+
+/// acs-8ax: with the keys live during a redial, ssh still gets the
+/// terminal when it asks for a password — the answer reaches it, and
+/// neither the screen nor the program sees it (acs-qty).
+#[test]
+fn a_password_prompt_during_a_redial_gets_the_terminal() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "pw",
+        "echo ready; while read l; do echo got:$l; done",
+        FAST,
+    );
+    c.wait_for("ready", T);
+    let answer = remote.prompt_on_next_dial();
+    remote.cut_link();
+    c.wait_for("Password: ", T);
+    c.send(b"hunter2\r");
+    c.wait_for("\x1b[23;0t", T);
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
+    let text = c.text();
+    assert!(!text.contains("hunter2"), "{text:?}");
+}
+
 /// The text written after the last title pop, once the client has resumed.
 fn after_the_pop(c: &mut Client) -> String {
     c.wait_for("\x1b[23;0t", T);

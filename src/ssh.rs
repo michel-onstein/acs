@@ -316,7 +316,8 @@ pub fn check_local_forward(spec: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Quote a string for POSIX `sh`.
+/// Quote a string for POSIX `sh`: as it is when every byte is one the
+/// shell takes literally, otherwise [`sh_single_quote`]d.
 pub fn sh_quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes()
@@ -324,7 +325,39 @@ pub fn sh_quote(s: &str) -> String {
     {
         return s.to_string();
     }
+    sh_single_quote(s)
+}
+
+/// `s` as one POSIX shell word, always in single quotes, with an embedded
+/// quote written the only way a single-quoted string can hold one.
+///
+/// Inside single quotes `sh` expands nothing at all — no `$`, no backtick,
+/// no `\`, and a newline is a newline rather than the end of a command — so
+/// this is total: whatever `s` is becomes exactly that string. For a value
+/// whose shape a reader relies on (`cargo xtask package` writes
+/// `name='…'` lines that are read back), where [`sh_quote`] would leave a
+/// plain word bare.
+#[inline(always)] // out of line, a wrapper costs the slim build an unwind entry
+pub fn sh_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    /// acs-sseq: `cargo xtask package` writes `name='…'` and reads it
+    /// back, so it needs the quotes even on a plain word that [`sh_quote`]
+    /// would leave bare; both escape a quote the same way.
+    #[test]
+    fn single_quoting_always_quotes() {
+        let url = "https://github.com/michel-onstein/acs/releases";
+        assert_eq!(sh_quote(url), url);
+        assert_eq!(sh_single_quote(url), format!("'{url}'"));
+        assert_eq!(sh_single_quote(""), "''");
+        assert_eq!(sh_single_quote("it's"), "'it'\\''s'");
+        assert_eq!(sh_quote("it's"), sh_single_quote("it's"));
+    }
 }
 
 /// Where the remote side looks for the binary of exactly `version`.
@@ -341,8 +374,11 @@ pub fn remote_candidates(version: &str) -> [String; 2] {
         // `$HOME` is quoted on its own so a home with a space still works,
         // and the rest is already shell-safe, so the caller must not wrap
         // these in quotes again — that would make the quoting literal.
-        format!("\"$HOME\"/.local/share/acs/{v}/acs"),
-        format!("/usr/local/lib/acs/{v}/acs"),
+        format!(
+            concat!("\"$HOME\"/", crate::layout::user_root_str!(), "/{}/acs"),
+            v
+        ),
+        format!(concat!(crate::layout::system_root_str!(), "/{}/acs"), v),
     ]
 }
 
