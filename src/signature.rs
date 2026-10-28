@@ -244,15 +244,12 @@ mod tests {
     /// so the check and the key it guards cannot drift apart (acs-okz).
     #[test]
     fn the_built_in_key_passes_the_build_time_check() {
-        use crate::release_key::default_release_key;
+        use crate::build_channel::check_release_key;
         assert_eq!(
-            default_release_key(Some(UPSTREAM_RELEASE_KEY)),
+            check_release_key(Some(UPSTREAM_RELEASE_KEY)),
             Ok(Some(UPSTREAM_RELEASE_KEY))
         );
-        assert_eq!(
-            default_release_key(Some(RELEASE_KEY)),
-            Ok(Some(RELEASE_KEY))
-        );
+        assert_eq!(check_release_key(Some(RELEASE_KEY)), Ok(Some(RELEASE_KEY)));
     }
 
     #[test]
