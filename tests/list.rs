@@ -69,6 +69,11 @@ fn empty_and_not_installed() {
 
 /// Regression: a host that starts acs and then says nothing is given up on
 /// in time; listing used to wait for it forever.
+///
+/// "In time" is the deadline that fired, not a stopwatch (acs-ci9u): the
+/// message names the 0.5 s it gave the host, and the run cannot have ended
+/// before that half second was up. A 5 s ceiling around it was mostly
+/// process start, which is what a loaded host stretches.
 #[test]
 fn a_host_silent_after_its_marker_is_given_up_on() {
     let remote = Remote::installed();
@@ -79,7 +84,11 @@ fn a_host_silent_after_its_marker_is_given_up_on() {
         .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
         .output()
         .unwrap();
-    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() >= Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
     assert_eq!(out.status.code(), Some(255));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no answer from devbox within 0.5 s"), "{err}");
@@ -99,18 +108,21 @@ fn a_host_answering_error_is_a_failure_not_an_empty_list() {
         .to_bytes(),
     );
     remote.silence_bytes(&said);
-    let t0 = Instant::now();
     let out = acs_cmd()
         .env("ACS_DIAL_TIMEOUT_MS", "5000")
         .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
         .output()
         .unwrap();
-    // Answered on the ERROR, not on the host closing or the deadline.
-    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    // Answered on the ERROR, not on the host closing or the deadline — and
+    // the answer says which (acs-ci9u): the silenced host never closes, and
+    // the deadline exits 255 with "no answer", where the ERROR exits 1 with
+    // its own message. A 4 s bound against the 5 s deadline said the same
+    // with a second of room for a loaded host to eat.
     let stdout = String::from_utf8_lossy(&out.stdout);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stdout}{err}");
     assert!(!stdout.contains("no sessions"), "{stdout}");
+    assert!(!err.contains("no answer"), "{err}");
     assert!(
         err.contains("devbox: cannot list sessions: /run/acs: Permission denied"),
         "{err}"
