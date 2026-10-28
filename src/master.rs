@@ -26,7 +26,7 @@ const KILL_GRACE: Duration = Duration::from_secs(3);
 /// this is the backstop for a cleaner that took the `.master` file too.
 /// `ACS_MASTER_REBIND_MS` changes it for tests.
 fn rebind_every() -> Duration {
-    env_ms("ACS_MASTER_REBIND_MS").unwrap_or(Duration::from_secs(5))
+    sys::env_ms("ACS_MASTER_REBIND_MS", 5_000)
 }
 /// How often the socket and the `.master` file get their times refreshed,
 /// so an age-based cleaner never sees them as old (acs-lbba).
@@ -35,18 +35,12 @@ const TOUCH_EVERY: Duration = Duration::from_secs(3600);
 /// (HELLO, STATUS or KILL) before it is dropped (acs-3anc).
 /// `ACS_MASTER_HELLO_MS` shortens it for tests.
 fn hello_within() -> Duration {
-    env_ms("ACS_MASTER_HELLO_MS").unwrap_or(Duration::from_secs(10))
+    sys::env_ms("ACS_MASTER_HELLO_MS", 10_000)
 }
 /// How long a master waits for a client to create its session before it
 /// gives up. `ACS_MASTER_ORPHAN_MS` shortens it for tests.
 fn orphan_after() -> Duration {
-    env_ms("ACS_MASTER_ORPHAN_MS").unwrap_or(Duration::from_secs(30))
-}
-fn env_ms(var: &str) -> Option<Duration> {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_millis)
+    sys::env_ms("ACS_MASTER_ORPHAN_MS", 30_000)
 }
 /// Stop filling a client's buffer beyond this; the rest waits in the ring.
 const OUT_HIGH_WATER: usize = 64 * 1024;
@@ -152,10 +146,7 @@ fn parse_args(args: &[OsString]) -> Result<Args, String> {
     let mut session = None;
     let mut ready_fd = None;
     // Output history kept for resume (DESIGN §4.2); `ACS_RING` in bytes.
-    let mut ring = std::env::var("ACS_RING")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_RING);
+    let mut ring = sys::env_or("ACS_RING", DEFAULT_RING);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || {

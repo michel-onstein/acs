@@ -63,9 +63,7 @@ const fn default_releases_url(built_in: Option<&'static str>) -> &'static str {
 ///   not an environment variable: whoever can set the URL could set that
 ///   too, and the check would be worth nothing.
 pub fn releases_url(allow_insecure: bool) -> Result<String, String> {
-    let set = std::env::var("ACS_RELEASES_URL")
-        .ok()
-        .filter(|v| !v.is_empty());
+    let set = crate::sys::env_nonempty("ACS_RELEASES_URL").and_then(|v| v.into_string().ok());
     let (url, warning) = choose_releases_url(
         set.as_deref(),
         crate::sys::privileges_dropped(),

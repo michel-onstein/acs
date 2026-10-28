@@ -25,6 +25,37 @@ pub fn retry<F: FnMut() -> libc::c_int>(mut f: F) -> io::Result<libc::c_int> {
     }
 }
 
+// ---- environment knobs (acs-s57r) -------------------------------------------
+
+/// The environment variable `name`, or `None` when it is unset **or set to
+/// the empty string** — `ACS_SSH=` means "the default", as in a shell.
+pub fn env_nonempty(name: &str) -> Option<std::ffi::OsString> {
+    nonempty(std::env::var_os(name))
+}
+
+fn nonempty(v: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    v.filter(|v| !v.is_empty())
+}
+
+/// The environment variable `name` parsed as a `T`, else `default`: unset,
+/// empty, not UTF-8, unparsable and out of range for `T` all mean the
+/// default, silently. The value is not trimmed.
+pub fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    parse_or(std::env::var(name).ok().as_deref(), default)
+}
+
+/// A millisecond timer knob (`ACS_*_MS`): [`env_or`] as a [`Duration`].
+///
+/// [`Duration`]: std::time::Duration
+pub fn env_ms(name: &str, default_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(env_or(name, default_ms))
+}
+
+/// `v` parsed as a `T`, else `default` — [`env_or`] without the lookup.
+pub fn parse_or<T: std::str::FromStr>(v: Option<&str>, default: T) -> T {
+    v.and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 pub fn getuid() -> u32 {
     // SAFETY: getuid cannot fail.
     unsafe { libc::getuid() }
@@ -894,6 +925,38 @@ pub mod signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_knob_falls_back_on_anything_it_cannot_read() {
+        assert_eq!(parse_or(Some("250"), 7u64), 250);
+        assert_eq!(parse_or(None, 7u64), 7);
+        assert_eq!(parse_or(Some(""), 7u64), 7);
+        assert_eq!(parse_or(Some("soon"), 7u64), 7);
+        // Not trimmed: a padded value is not a number.
+        assert_eq!(parse_or(Some(" 250"), 7u64), 7);
+        // Out of range for the type, or of the wrong sign.
+        assert_eq!(parse_or(Some("18446744073709551616"), 7u64), 7);
+        assert_eq!(parse_or(Some("-5"), 7u64), 7);
+        assert_eq!(parse_or(Some("70000"), 7u16), 7);
+        assert_eq!(parse_or(Some("4096"), 1usize), 4096);
+    }
+
+    #[test]
+    fn an_unset_knob_is_its_default() {
+        const VAR: &str = "ACS_TEST_SYS_KNOB_NEVER_SET";
+        assert!(std::env::var_os(VAR).is_none());
+        assert_eq!(env_or(VAR, 42u64), 42);
+        assert_eq!(env_ms(VAR, 1500), std::time::Duration::from_millis(1500));
+        assert_eq!(env_nonempty(VAR), None);
+    }
+
+    #[test]
+    fn an_empty_variable_counts_as_unset() {
+        assert_eq!(nonempty(None), None);
+        assert_eq!(nonempty(Some("".into())), None);
+        assert_eq!(nonempty(Some(" ".into())), Some(" ".into()));
+        assert_eq!(nonempty(Some("ssh".into())), Some("ssh".into()));
+    }
 
     /// acs-721: a temporary name planted ahead of us must be an error, not
     /// a write through to whatever it points at. `acs upgrade` and the

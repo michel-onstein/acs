@@ -226,7 +226,7 @@ pub(crate) struct PingSteps {
 
 impl PingSteps {
     pub(crate) fn new(every: Duration) -> Self {
-        let fast = Duration::from_millis(crate::reconnect::env_ms("ACS_PERSIST_FAST_MS", 1000));
+        let fast = sys::env_ms("ACS_PERSIST_FAST_MS", 1000);
         PingSteps {
             fast: fast.min(every),
             every,
@@ -393,12 +393,7 @@ pub(crate) fn escape_config() -> keys::Config {
     {
         cfg.byte = k;
     }
-    if let Some(ms) = std::env::var("ACS_ESCAPE_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        cfg.window_ms = ms;
-    }
+    cfg.window_ms = sys::env_or("ACS_ESCAPE_TIMEOUT_MS", cfg.window_ms);
     cfg
 }
 
@@ -517,7 +512,7 @@ mod notes {
     /// a sequence a frame boundary cut in half to arrive over a slow link;
     /// short enough that a diagnostic is never lost for long.
     fn hold_ms() -> u64 {
-        crate::reconnect::env_ms("ACS_NOTE_HOLD_MS", 500)
+        sys::env_or("ACS_NOTE_HOLD_MS", 500)
     }
 
     thread_local! {
@@ -799,7 +794,7 @@ const REAP_BOUND: Duration = Duration::from_millis(100);
 /// two minutes alone (acs-p46).
 pub fn answer_timeout(batch: bool) -> Duration {
     let default = if batch { 30_000 } else { 120_000 };
-    Duration::from_millis(crate::reconnect::env_ms("ACS_DIAL_TIMEOUT_MS", default))
+    sys::env_ms("ACS_DIAL_TIMEOUT_MS", default)
 }
 
 /// How long a redial after a lost link may take to answer, marker and
@@ -807,7 +802,7 @@ pub fn answer_timeout(batch: bool) -> Duration {
 /// connection's, because a host that accepted the connection and then went
 /// quiet must hand back to the backoff wait, where the command keys work.
 pub fn redial_timeout() -> Duration {
-    Duration::from_millis(crate::reconnect::env_ms("ACS_REDIAL_TIMEOUT_MS", 30_000))
+    sys::env_ms("ACS_REDIAL_TIMEOUT_MS", 30_000)
 }
 
 /// The command keys through a redial (acs-8ax, DESIGN §5.2).

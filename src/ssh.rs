@@ -97,9 +97,7 @@ pub struct Transport {
 /// The ssh program when the command line names none: `ACS_SSH`, else
 /// `ssh`.
 pub fn program() -> OsString {
-    std::env::var_os("ACS_SSH")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "ssh".into())
+    crate::sys::env_nonempty("ACS_SSH").unwrap_or_else(|| "ssh".into())
 }
 
 impl Transport {

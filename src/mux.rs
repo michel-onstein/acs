@@ -75,33 +75,34 @@ pub struct Mux {
 /// remote's directory. Separate from `/tmp/acs-<uid>`: that one holds
 /// session sockets and is scanned as such.
 pub fn dir_path() -> PathBuf {
-    match std::env::var_os("ACS_CONTROL_DIR") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => PathBuf::from(format!("/tmp/acs-mux-{}", sys::getuid())),
+    match sys::env_nonempty("ACS_CONTROL_DIR") {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(format!("/tmp/acs-mux-{}", sys::getuid())),
     }
 }
 
 /// `ACS_CONTROL_PERSIST` in seconds; `0` turns multiplexing off entirely.
 pub fn persist_secs() -> u64 {
-    persist_from(std::env::var("ACS_CONTROL_PERSIST").ok().as_deref())
+    trimmed_or(
+        std::env::var("ACS_CONTROL_PERSIST").ok().as_deref(),
+        DEFAULT_PERSIST_SECS,
+    )
 }
 
-fn persist_from(env: Option<&str>) -> u64 {
-    match env {
-        Some(v) if !v.trim().is_empty() => v.trim().parse().unwrap_or(DEFAULT_PERSIST_SECS),
-        _ => DEFAULT_PERSIST_SECS,
-    }
+/// [`sys::parse_or`] on the trimmed value: unlike the other knobs, these two
+/// have always forgiven surrounding whitespace (` 90 ` is 90), so they keep
+/// doing so.
+fn trimmed_or<T: std::str::FromStr>(env: Option<&str>, default: T) -> T {
+    sys::parse_or(env.map(str::trim), default)
 }
 
 /// How long a joined master has to produce a marker before acs stops
 /// believing in it (`ACS_CONTROL_FALLBACK_MS`).
 pub fn fallback_window() -> Duration {
-    Duration::from_millis(
-        std::env::var("ACS_CONTROL_FALLBACK_MS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DEFAULT_FALLBACK_MS),
-    )
+    Duration::from_millis(trimmed_or(
+        std::env::var("ACS_CONTROL_FALLBACK_MS").ok().as_deref(),
+        DEFAULT_FALLBACK_MS,
+    ))
 }
 
 /// Why this transport gets no master, or `None` if nothing objects.
@@ -504,11 +505,17 @@ mod tests {
         let msg = configure_at(&mut t, d.path().to_path_buf(), 0);
         assert!(t.mux.is_none(), "{msg}");
         assert!(msg.contains("ACS_CONTROL_PERSIST"), "{msg}");
-        assert_eq!(persist_from(Some("0")), 0);
-        assert_eq!(persist_from(Some(" 90 ")), 90);
-        assert_eq!(persist_from(None), DEFAULT_PERSIST_SECS);
-        assert_eq!(persist_from(Some("")), DEFAULT_PERSIST_SECS);
-        assert_eq!(persist_from(Some("soon")), DEFAULT_PERSIST_SECS);
+        assert_eq!(trimmed_or(Some("0"), DEFAULT_PERSIST_SECS), 0);
+        assert_eq!(trimmed_or(Some(" 90 "), DEFAULT_PERSIST_SECS), 90);
+        assert_eq!(trimmed_or(None, DEFAULT_PERSIST_SECS), DEFAULT_PERSIST_SECS);
+        assert_eq!(
+            trimmed_or(Some(""), DEFAULT_PERSIST_SECS),
+            DEFAULT_PERSIST_SECS
+        );
+        assert_eq!(
+            trimmed_or(Some("soon"), DEFAULT_PERSIST_SECS),
+            DEFAULT_PERSIST_SECS
+        );
     }
 
     #[test]

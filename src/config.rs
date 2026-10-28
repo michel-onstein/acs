@@ -442,8 +442,7 @@ pub const MAX_REACHABILITY_INTERVAL: Duration = Duration::from_secs(3600);
 /// The global file: `/etc/acs/config.yaml` (`ACS_GLOBAL_CONFIG` overrides it,
 /// for packagers and tests).
 pub fn global_path() -> PathBuf {
-    std::env::var_os("ACS_GLOBAL_CONFIG")
-        .filter(|v| !v.is_empty())
+    crate::sys::env_nonempty("ACS_GLOBAL_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/etc/acs/config.yaml"))
 }
@@ -859,7 +858,7 @@ fn string_value(n: &Node) -> Result<String, String> {
 /// `~` or `~/…` with `$HOME`, as the shell expands a `-i` typed on the
 /// command line; anything else (`~user/…` too) as is, for ssh to expand.
 pub fn expand_home(path: &str) -> String {
-    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
+    let home = crate::sys::env_nonempty("HOME").and_then(|h| h.into_string().ok());
     match (home, path.strip_prefix('~')) {
         (Some(h), Some(rest)) if rest.is_empty() || rest.starts_with('/') => format!("{h}{rest}"),
         _ => path.to_string(),

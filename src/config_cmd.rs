@@ -465,7 +465,7 @@ fn unknown_key(k: &str) -> String {
 
 /// A path with the home directory shown as `~`.
 pub fn pretty(p: &Path) -> String {
-    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+    if let Some(home) = crate::sys::env_nonempty("HOME") {
         if let Ok(rest) = p.strip_prefix(&home) {
             return format!("~/{}", rest.display());
         }

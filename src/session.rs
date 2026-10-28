@@ -177,9 +177,9 @@ impl SocketDir {
     /// `$ACS_SOCKET_DIR`, else `/tmp/acs-<uid>` — keyed by the numeric uid,
     /// never `$USER` or `$TMPDIR` (DESIGN §4.1).
     pub fn default_path() -> PathBuf {
-        match std::env::var_os("ACS_SOCKET_DIR") {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => PathBuf::from(format!("/tmp/acs-{}", sys::getuid())),
+        match sys::env_nonempty("ACS_SOCKET_DIR") {
+            Some(p) => PathBuf::from(p),
+            None => PathBuf::from(format!("/tmp/acs-{}", sys::getuid())),
         }
     }
 

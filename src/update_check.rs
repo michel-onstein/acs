@@ -120,9 +120,7 @@ pub fn state_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|h| !h.is_empty())
-                .map(|h| PathBuf::from(h).join(".local/state"))
+            crate::sys::env_nonempty("HOME").map(|h| PathBuf::from(h).join(".local/state"))
         })?;
     Some(base.join("acs/update-check"))
 }
