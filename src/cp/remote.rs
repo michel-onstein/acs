@@ -5,7 +5,7 @@
 //! prints `ACS-READY` before it reads anything, so the client's `HELLO`
 //! may already be in the pipe; takes its paths from that `HELLO`, never
 //! from the command line (decision 4), resolving `~` and relative paths
-//! against `$HOME` itself; and runs the sender or the receiver — the code
+//! against `$HOME` and expanding wildcards ([`glob`]) itself; and runs the sender or the receiver — the code
 //! the local end runs — on its stdin and stdout. It touches its version
 //! directory and never prunes, and never looks at the session directory.
 
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::proto::{err, Hello, Msg, Role};
-use super::{drive, receiver, sender, walk, Endpoint, Options};
+use super::{drive, glob, receiver, sender, walk, Endpoint, Options};
 use crate::outq::OutQueue;
 use crate::proto::Decoder;
 use crate::sys;
@@ -89,9 +89,34 @@ fn endpoint(mut h: Hello, home: &Path, out: &mut OutQueue) -> Option<Box<dyn End
             let mut good = Vec::new();
             for p in h.paths {
                 let path = expand(home, &p);
-                match walk::check_source(&path, h.recursive) {
-                    Ok(name) => good.push((name, path)),
-                    Err(reason) => Msg::Skip { name: p, reason }.encode(out.tail()),
+                // A wildcard is this end's to expand: no shell did (§5.4).
+                let pattern = glob::is_pattern(&p);
+                let paths = match pattern {
+                    true => glob::expand(&path),
+                    false => vec![path],
+                };
+                if paths.is_empty() {
+                    let reason = "no match".into();
+                    Msg::Skip {
+                        name: p.clone(),
+                        reason,
+                    }
+                    .encode(out.tail());
+                }
+                for path in paths {
+                    match walk::check_source(&path, h.recursive) {
+                        Ok(name) => good.push((name, path)),
+                        Err(reason) => {
+                            // A match is told by its path, below home if
+                            // it is there; a plain path as it was typed.
+                            let name = match pattern {
+                                true => path.strip_prefix(home).unwrap_or(&path),
+                                false => Path::new(&p),
+                            };
+                            let name = name.to_string_lossy().into_owned();
+                            Msg::Skip { name, reason }.encode(out.tail())
+                        }
+                    }
                 }
             }
             Some(Box::new(sender::Sender::new(good, &opts, true)))
