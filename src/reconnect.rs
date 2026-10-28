@@ -108,6 +108,7 @@ impl Backoff {
 /// Serve the session over as many links as it takes, the first one the
 /// session menu's when it opened one (`picked`, DESIGN §4.4). `timing` is
 /// the first connection's clock; every redial starts one of its own.
+/// `netwatch` is the client's network watcher, made before the first dial.
 pub fn run(
     args: &ClientArgs,
     state: &mut State,
@@ -115,9 +116,9 @@ pub fn run(
     signals: &OwnedFd,
     mut picked: Option<client::Picked>,
     mut timing: Timing,
+    netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> u8 {
     let mut backoff = Backoff::new(env_ms("ACS_BACKOFF_MS", 1000));
-    let netwatch = crate::netwatch::NetWatch::new(args.verbose > 0);
     let mut last_early: Option<Instant> = None;
     let mut resuming = false;
     // A dial after a wait; `gated`: the host has just answered the ping
@@ -154,7 +155,7 @@ pub fn run(
                 ended,
                 first,
                 &mut timing,
-                netwatch.as_ref(),
+                netwatch,
             )
         } else {
             // No host to dial: nothing new was learned about the link that
@@ -195,14 +196,7 @@ pub fn run(
         redial = true;
         let detached = if persist && pingable(&args) {
             // The ping gate: wait for the host to answer, then dial.
-            match wait_for_answer(
-                &mut args,
-                state,
-                raw,
-                signals,
-                netwatch.as_ref(),
-                &mut last_early,
-            ) {
+            match wait_for_answer(&mut args, state, raw, signals, netwatch, &mut last_early) {
                 true => {
                     gated = true;
                     false
@@ -225,15 +219,7 @@ pub fn run(
                     wait.as_secs().max(1),
                 ),
             };
-            match offline(
-                state,
-                raw,
-                signals,
-                wait,
-                netwatch.as_ref(),
-                &mut last_early,
-                &msg,
-            ) {
+            match offline(state, raw, signals, wait, netwatch, &mut last_early, &msg) {
                 Offline::Retry => false,
                 Offline::NetworkChanged => {
                     // A new network is a fresh start — and the redial it

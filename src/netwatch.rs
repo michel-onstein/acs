@@ -28,8 +28,8 @@
 //! **The networks held move when the caller acts, not when it reads**
 //! (acs-0n8). [`NetWatch::changed`] hands out a [`Change`]; the set it was
 //! judged against is only replaced by [`Change::acted`]. A caller that
-//! cannot act on the answer — mid-handshake, or inside the offline wait's
-//! rate limit — drops it instead, and the next hint offers the same change
+//! cannot act on the answer — a handshake it does not abandon, or the
+//! offline wait inside its rate limit — drops it instead, and the next hint offers the same change
 //! again rather than being answered "not a change" against a set that has
 //! already moved. Nothing is queued by that: it is one comparison against
 //! the networks of the moment however many hints went by, so a flapping
@@ -251,9 +251,10 @@ impl NetWatch {
 /// (acs-0n8).
 ///
 /// The networks the watcher holds move on [`Change::acted`] and nowhere
-/// else. A caller that cannot act on the answer drops this instead — the
-/// handshake has its own deadline ([`crate::client`], acs-xo1 is acting on
-/// it), and the offline wait allows one early redial per `ACS_EARLY_MS`
+/// else. A caller that cannot act on the answer drops this instead — a
+/// handshake lets a change pass that removed no network, or that came
+/// while ssh asks the user something ([`crate::client`], acs-xo1), and
+/// the offline wait allows one early redial per `ACS_EARLY_MS`
 /// ([`crate::reconnect`]) — and the set stays where it was, so the next
 /// hint reports the same change rather than answering "not a change"
 /// against a set that has already moved. Before this the hint was consumed
@@ -273,6 +274,19 @@ pub struct Change<'a> {
 }
 
 impl Change<'_> {
+    /// Whether a network this machine was on has gone — rather than one
+    /// only appearing beside it (acs-xo1). A dial in flight was made from
+    /// one of the networks held, so a change that removed none of them
+    /// left its address in place; one that removed any may have taken the
+    /// dial's with it.
+    pub fn removed(&self) -> bool {
+        self.watch
+            .nets
+            .borrow()
+            .iter()
+            .any(|n| !self.now.contains(n))
+    }
+
     /// The caller acted on the change — a redial, a ping — so these are the
     /// networks to judge the next hint against, and this change is not
     /// reported twice.
@@ -511,6 +525,27 @@ mod tests {
             w.changed().is_none(),
             "the flap left changes behind to be reported again"
         );
+    }
+
+    /// acs-xo1: a change says whether a network the machine was on went,
+    /// or only whether one appeared — judged against the networks last
+    /// acted on, like the change itself.
+    #[test]
+    fn a_change_says_whether_it_took_a_network_away() {
+        let (s, w) = Standin::watching("192.168.1.5/24\n");
+        s.set("192.168.1.5/24\n10.0.0.5/24\n");
+        s.hint();
+        let grew = w.changed().expect("a second network is a change");
+        assert!(!grew.removed());
+        drop(grew);
+        s.set("10.0.0.5/24\n");
+        s.hint();
+        let moved = w.changed().expect("the first network gone is a change");
+        assert!(moved.removed());
+        moved.acted();
+        s.set("");
+        s.hint();
+        assert!(w.changed().expect("offline is a change").removed());
     }
 
     #[test]
