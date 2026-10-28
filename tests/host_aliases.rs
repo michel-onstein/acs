@@ -244,12 +244,8 @@ fn list_resolves_the_alias_too() {
 /// A client of `name` connected through devbox.lan, with fast redials.
 fn redialling(remote: &Remote, net: &Net, name: &str) -> Client {
     let mut env = net.env(CONFIG);
-    for (k, v) in [
-        ("ACS_BACKOFF_MS", "100"),
-        ("ACS_PING_MS", "200"),
-        ("ACS_DEAD_MS", "800"),
-    ] {
-        env.push((k.into(), v.into()));
+    for (k, v) in FAST {
+        env.push((k.to_string(), v.to_string()));
     }
     let mut c = Client::start_env(
         remote,
@@ -401,12 +397,7 @@ fn a_redial_onto_the_fallback_host_switches_to_its_key() {
     let remote = Remote::installed();
     let ssh = devbox_ssh(&remote);
     let net = Net::new(&["devbox.lan"]);
-    let fast = [
-        ("ACS_BACKOFF_MS", "100"),
-        ("ACS_PING_MS", "200"),
-        ("ACS_DEAD_MS", "800"),
-    ];
-    let mut c = keyed_client(&ssh, &net, &[], &fast);
+    let mut c = keyed_client(&ssh, &net, &[], FAST);
     wait_up(&mut c, "k");
     net.set_up(&["devbox.example.com"]);
     let dialled = remote.connections();
