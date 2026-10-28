@@ -20,6 +20,13 @@
 //!   from 0 after a `RESTART`. Over a new link ([`Endpoint::reconnect`]) a
 //!   file this run placed already is answered `GO` at its size: nothing of
 //!   it is sent again.
+//! - **One writer per part** (acs-hofu.13): a receiver holds an exclusive
+//!   `flock` on its part from before it measures it until it is renamed or
+//!   given up. A lost link's `acs _cp` can live on for up to `ACS_DEAD_MS`
+//!   still writing what reached it, so a redial's receiver that finds the
+//!   part locked answers nothing until the lock is free — then measures
+//!   and hashes what the old one left — and after twice `ACS_DEAD_MS`
+//!   fails the file "in use by another copy", leaving the part alone.
 //! - **Directories** are made `0700 | mode`, so their contents can be
 //!   written, and get their final mode and, with `-p`, their times once
 //!   everything inside them is done — which, since the sender's headers
@@ -31,7 +38,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::proto::{err, Hello, Meta, Msg, Role, Time};
 use super::walk::{reason, MAX_DEPTH};
@@ -72,6 +79,8 @@ struct Part {
     dir: Option<usize>,
     /// The part found on disk, being hashed for its `HAVE`.
     check: Option<Prefix>,
+    /// Another copy holds the part's lock: when to stop waiting for it.
+    wait: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +117,15 @@ pub struct Receiver {
     report: bool,
     verbose: bool,
     outcome: Outcome,
+    /// How long a part locked by another copy is waited for.
+    lock_wait: Duration,
+}
+
+impl Part {
+    /// Its `GO` or `HAVE` was sent: the sender may write it.
+    fn answered(&self) -> bool {
+        self.check.is_none() && self.wait.is_none()
+    }
 }
 
 /// The process's umask, read without changing it for longer than the read.
@@ -145,27 +163,44 @@ fn set_times(f: &File, m: &Meta) -> std::io::Result<()> {
     f.set_times(t)
 }
 
-/// Open the part at `part`, made at `mode` if it is new, and say how long
-/// it is: an earlier link's or an earlier run's, to resume (§7).
-fn open_part(part: &Path, mode: u32) -> std::io::Result<(File, u64)> {
-    match sys::create_new_mode(part, mode) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        other => return other.map(|f| (f, 0)),
+/// Open the part at `part`, made at `mode` if it is new, and take its lock:
+/// with the length it has, an earlier link's or an earlier run's to resume
+/// (§7), or `None` while another copy holds it and may still be writing.
+/// Locked, it must still be the file at `part` — one its last holder
+/// renamed into place or removed is let go and `part` opened again.
+fn open_part(part: &Path, mode: u32) -> std::io::Result<(File, Option<u64>)> {
+    use std::os::unix::fs::MetadataExt;
+    loop {
+        let f = match sys::create_new_mode(part, mode) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Only a regular file is used, and never through a symlink.
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+                    .open(part)?
+            }
+            other => other?,
+        };
+        let m = f.metadata()?;
+        if !m.is_file() {
+            return Err(std::io::Error::other(
+                "a part file is there and is not a regular file",
+            ));
+        }
+        // A filesystem without `flock` is written as it was before it.
+        if !sys::try_flock(f.as_raw_fd()).unwrap_or(true) {
+            return Ok((f, None));
+        }
+        let same =
+            std::fs::symlink_metadata(part).is_ok_and(|n| (n.dev(), n.ino()) == (m.dev(), m.ino()));
+        if same {
+            sys::fchmod(f.as_raw_fd(), mode)?;
+            // Its length now, with the lock: what the last holder left.
+            let len = f.metadata()?.len();
+            return Ok((f, Some(len)));
+        }
     }
-    // Only a regular file is used, and never through a symlink.
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(part)?;
-    let m = f.metadata()?;
-    if !m.is_file() {
-        return Err(std::io::Error::other(
-            "a part file is there and is not a regular file",
-        ));
-    }
-    sys::fchmod(f.as_raw_fd(), mode)?;
-    Ok((f, m.len()))
 }
 
 /// Empty `f` to write it again from its start.
@@ -194,6 +229,9 @@ impl Receiver {
             report: opts.report,
             verbose: opts.report && opts.verbose,
             outcome: Outcome::default(),
+            // The old end goes within `ACS_DEAD_MS` of the silence that
+            // began before this link: twice that is slack for a slow host.
+            lock_wait: Duration::from_millis(2 * crate::reconnect::dead_after()),
         }
     }
 
@@ -428,14 +466,7 @@ impl Receiver {
             self.fail(id, &shown, "has no file name to write".into(), out);
             return Ok(());
         };
-        let opened = open_part(&part, meta.mode & 0o777 & !self.umask).and_then(|(mut f, have)| {
-            // A part longer than the file is no start of it.
-            if have > size {
-                truncate(&mut f)?;
-            }
-            Ok((f, (1..=size).contains(&have).then(|| Prefix::new(have))))
-        });
-        let (file, check) = match opened {
+        let (file, have) = match open_part(&part, meta.mode & 0o777 & !self.umask) {
             Ok(x) => x,
             Err(e) => {
                 self.fail(id, &shown, reason(&e), out);
@@ -445,8 +476,6 @@ impl Receiver {
         if let Some(d) = dir {
             self.dirs[d].open += 1;
         }
-        // A part to resume is answered once it is hashed ([`Self::check`]).
-        let go = check.is_none();
         self.parts.insert(
             id,
             Some(Part {
@@ -458,19 +487,67 @@ impl Receiver {
                 written: 0,
                 meta,
                 dir,
-                check,
+                check: None,
+                wait: Some(Instant::now() + self.lock_wait),
             }),
         );
-        if go {
+        self.locked(id, have, out);
+        Ok(())
+    }
+
+    /// Part `id` was opened, and is locked if `have` is its length: start
+    /// it. A part to resume is answered once it is hashed ([`Self::check`]).
+    fn locked(&mut self, id: u32, have: Option<u64>, out: &mut OutQueue) {
+        let (Some(Some(p)), Some(have)) = (self.parts.get_mut(&id), have) else {
+            return;
+        };
+        p.wait = None;
+        // A part longer than the file is no start of it.
+        if have > p.size {
+            if let Err(e) = truncate(&mut p.file) {
+                let p = self.parts.remove(&id).flatten().expect("just found");
+                return self.abandon(id, p, reason(&e), out);
+            }
+        }
+        p.check = (1..=p.size).contains(&have).then(|| Prefix::new(have));
+        if p.check.is_none() {
             Msg::Go { id, offset: 0 }.encode(out.tail());
         }
-        Ok(())
+    }
+
+    /// Try again for the lock of each part another copy held, and give up
+    /// on one held past its wait — leaving the part to its holder.
+    fn relock(&mut self, out: &mut OutQueue) {
+        let waiting: Vec<u32> = (self.parts.iter())
+            .filter_map(|(&id, p)| p.as_ref()?.wait.map(|_| id))
+            .collect();
+        for id in waiting {
+            let p = self.parts.get_mut(&id).and_then(Option::as_mut);
+            let p = p.expect("waiting");
+            let opened = open_part(&p.part, p.meta.mode & 0o777 & !self.umask);
+            let late = p.wait.is_some_and(|t| Instant::now() >= t);
+            let why = match opened {
+                Ok((f, Some(have))) => {
+                    p.file = f;
+                    self.locked(id, Some(have), out);
+                    continue;
+                }
+                Ok(_) if !late => continue,
+                Ok(_) => "in use by another copy".into(),
+                Err(e) => reason(&e),
+            };
+            let p = self.parts.remove(&id).flatten().expect("waiting");
+            let name = p.name.clone();
+            self.close(p);
+            self.fail(id, &name, why, out);
+        }
     }
 
     /// Hash the next slice of a part found on disk, and once all of it is
     /// in, offer it with `HAVE` (§7). A part that cannot be read is
     /// written again from its start.
     fn check(&mut self, out: &mut OutQueue) -> Result<(), Halt> {
+        self.relock(out);
         let found = self.parts.iter_mut().find_map(|(&id, p)| match p {
             Some(p) if p.check.is_some() => Some((id, p)),
             _ => None,
@@ -555,9 +632,9 @@ impl Receiver {
                 )))
             }
         };
-        if p.check.is_some() {
+        if !p.answered() {
             return Err(Halt::Protocol(format!(
-                "DATA for {} before its HAVE was answered",
+                "DATA for {} before it was answered",
                 p.name
             )));
         }
@@ -582,6 +659,12 @@ impl Receiver {
 
     fn file_end(&mut self, id: u32, out: &mut OutQueue) -> Result<(), Halt> {
         let p = match self.parts.remove(&id) {
+            Some(Some(p)) if !p.answered() => {
+                return Err(Halt::Protocol(format!(
+                    "FILE_END for {} before it was answered",
+                    p.name
+                )))
+            }
             Some(Some(p)) => p,
             Some(None) => return Ok(()),
             None => {
@@ -700,6 +783,10 @@ impl Endpoint for Receiver {
 
     fn busy(&self) -> bool {
         self.parts.values().flatten().any(|p| p.check.is_some())
+    }
+
+    fn waiting(&self) -> bool {
+        self.parts.values().flatten().any(|p| p.wait.is_some())
     }
 
     /// A download's new sender walks from the start: wait for its
@@ -1158,6 +1245,80 @@ mod tests {
         rx.send(file(4, "i", 5)).unwrap();
         let wrong = rx.send(Msg::Restart { id: 4 });
         assert!(matches!(wrong, Err(Halt::Protocol(_))), "{wrong:?}");
+    }
+
+    /// Two receivers on one part (acs-hofu.13): a redial's finds the part a
+    /// lost link's still holds and is writing, and answers nothing — nor
+    /// takes data — until that one lets go; then it offers everything the
+    /// first left. One held past its wait fails, and the part is left to
+    /// its holder. One whose holder renamed it into place meanwhile is
+    /// made again, never written through to the final file.
+    #[test]
+    fn a_part_another_copy_holds_is_waited_for_never_shared() {
+        let t = TempDir::new();
+        let names = ["f", "g", "h"];
+        let file = |id, name: &str| Msg::File {
+            id,
+            name: name.into(),
+            size: 10,
+            meta: dir_meta(),
+        };
+        let data = |id, bytes| Msg::Data { id, bytes };
+        let (mut old, _) = Rx::new(t.path(), &names);
+        old.send(file(1, "f")).unwrap();
+        old.send(data(1, b"0123")).unwrap();
+
+        let (mut new, _) = Rx::new(t.path(), &names);
+        new.answers();
+        new.send(file(1, "f")).unwrap();
+        for _ in 0..3 {
+            new.r.pump(&mut new.out).unwrap();
+        }
+        assert!(new.r.waiting() && !new.r.busy());
+        assert!(new.answers().is_empty(), "answered a part still held");
+        // The old end is still writing what reached it.
+        old.send(data(1, b"45")).unwrap();
+        drop(old);
+        new.r.pump(&mut new.out).unwrap();
+        hash_all(&mut new);
+        assert!(!new.r.waiting());
+        assert_eq!(new.answers(), [have(1, b"012345")]);
+        new.file_rest(1, b"6789");
+        assert_eq!(std::fs::read(t.path().join("f")).unwrap(), b"0123456789");
+
+        // Held past the wait: FAIL, and the part is still the holder's.
+        let (mut old, _) = Rx::new(t.path(), &names);
+        old.send(file(2, "g")).unwrap();
+        old.send(data(2, b"abc")).unwrap();
+        let (mut new, _) = Rx::new(t.path(), &names);
+        new.answers();
+        new.r.lock_wait = Duration::ZERO;
+        new.send(file(2, "g")).unwrap();
+        let early = new.send(data(2, b"x"));
+        assert!(matches!(early, Err(Halt::Protocol(_))), "{early:?}");
+        let (mut new, _) = Rx::new(t.path(), &names);
+        new.answers();
+        new.r.lock_wait = Duration::ZERO;
+        new.send(file(2, "g")).unwrap();
+        new.r.pump(&mut new.out).unwrap();
+        assert_eq!(new.answers(), ["FAIL 2 in use by another copy"]);
+        old.file_rest(2, b"defghij");
+        assert_eq!(std::fs::read(t.path().join("g")).unwrap(), b"abcdefghij");
+
+        // Renamed into place by its holder while waited for.
+        let (mut old, _) = Rx::new(t.path(), &names);
+        old.send(file(3, "h")).unwrap();
+        old.send(data(3, b"01234")).unwrap();
+        let (mut new, _) = Rx::new(t.path(), &names);
+        new.answers();
+        new.send(file(3, "h")).unwrap();
+        old.file_rest(3, b"56789");
+        new.r.pump(&mut new.out).unwrap();
+        assert_eq!(new.answers(), ["GO 3 0"]);
+        new.send(data(3, b"abcde")).unwrap();
+        assert_eq!(std::fs::read(t.path().join("h")).unwrap(), b"0123456789");
+        new.file_rest(3, b"fghij");
+        assert_eq!(std::fs::read(t.path().join("h")).unwrap(), b"abcdefghij");
     }
 
     /// A part longer than the file cannot be its start: it is emptied and

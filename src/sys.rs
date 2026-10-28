@@ -216,15 +216,22 @@ impl Flock {
     /// Take the lock if free; `Ok(None)` if someone else holds it.
     pub fn try_lock(path: &std::path::Path) -> io::Result<Option<Flock>> {
         let file = Self::open(path)?;
-        match retry(|| unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) {
-            Ok(_) => Ok(Some(Flock { file })),
-            Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(None),
-            Err(e) => Err(e),
-        }
+        Ok(try_flock(file.as_raw_fd())?.then_some(Flock { file }))
     }
 
     pub fn fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+}
+
+/// Take `fd`'s exclusive `flock` if it is free: false while another open
+/// of the file holds it, in this process or another.
+pub fn try_flock(fd: RawFd) -> io::Result<bool> {
+    // SAFETY: flock on a descriptor the caller owns.
+    match retry(|| unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) }) {
+        Ok(_) => Ok(true),
+        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 

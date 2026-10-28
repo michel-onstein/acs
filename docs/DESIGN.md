@@ -2760,14 +2760,15 @@ affected by someone else's install.
 
 | Target | Slim | Complete |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 1120 KB | 2.25 MB |
-| `aarch64-unknown-linux-musl` | 994 KB | 2.12 MB |
-| `aarch64-apple-darwin` | 824 KB | 1.95 MB |
-| `x86_64-apple-darwin` | 915 KB | 2.06 MB |
+| `x86_64-unknown-linux-musl` | 1122 KB | 2.25 MB |
+| `aarch64-unknown-linux-musl` | 996 KB | 2.13 MB |
+| `aarch64-apple-darwin` | 841 KB | 1.95 MB |
+| `x86_64-apple-darwin` | 919 KB | 2.06 MB |
 
-The payload set (both Linux builds, gzip'd) is 1126 KB. Measured 2026-10-28
+The payload set (both Linux builds, gzip'd) is 1129 KB. Measured 2026-10-28
 with the copy's phases 1–4 (`src/cp`: the local copy, `acs _cp`, resume and
-redial; the `acscp` link) in release builds (acs-hofu.4). The
+redial; the `acscp` link) and the part's lock (acs-hofu.13) in release
+builds. The
 budget `cargo xtask dist` enforces is slim ≤ 1.15 MB and complete ≤ 2.3 MB
 (goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them, and
 from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9): built into a
@@ -2876,6 +2877,21 @@ on x86_64 Linux). The aarch64 macOS slim build moves in whole pages, so its
 is linked for the hashing: the SHA-256 is the one the install already
 verifies with, and the backoff, liveness and network watcher are the
 session's.
+
+**The part's lock** (acs-hofu.13: one writer per part, decision 14),
+measured with `cargo xtask dist` against 0407ab5, the release with phase 3:
+
+| Target | Slim | Lock | Copy role | Complete | Lock | Copy role |
+| --- | --- | --- | --- | --- | --- | --- |
+| `x86_64-unknown-linux-musl` | 1,122,472 B | +2,568 B | 74,880 B | 2,251,187 B | +5,528 B | 150,898 B |
+| `aarch64-unknown-linux-musl` | 996,456 B | +2,584 B | 63,560 B | 2,125,171 B | +5,544 B | 139,578 B |
+| `aarch64-apple-darwin` | 840,720 B | +16,528 B | 66,672 B | 1,952,240 B | +32 B | 99,184 B |
+| `x86_64-apple-darwin` | 919,184 B | +4,112 B | 65,992 B | 2,061,856 B | +4,144 B | 140,864 B |
+
+The copy role is now 74,880 B of x86_64 slim's 100 KB, leaving about
+25.1 KB for phases 5 and 6, with 27.5 KB of slim room and 48.8 KB of
+complete room left on x86_64 Linux. The macOS figures are whole pages
+again: aarch64's +16,528 B is the page phase 3's +112 B fell short of.
 
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
@@ -3093,3 +3109,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 11 | The suite-wide test deadline `T` (acs-hsw) | Decided 2026-10-28 on acs-2dc's measurements: `T` stays 30 s. Moving it from 30 s to 300 s took `tests/client.rs` from 86 failures in 850 to 6 under deliberate I/O starvation, but the same load without the I/O pressure was already 850 of 850 green, so what a longer `T` buys is a pass under starvation, at the price of every genuine hang reporting minutes later — and it is not one change but many, since the suite's minute and two-minute timers are sized to outlast `T` and would have to move with it (since acs-3sk9 they are derived from `T`, so that part is one edit). Instead the limit is written down: the suite is not expected to pass under sustained I/O starvation, a dial-wait red beside heavy I/O is re-run alone before it is read, and a red on an idle machine is a bug (§9.1) |
 | 12 | The dead-link timeout: fixed, shorter or RTT-adaptive (acs-vq1) | Decided 2026-10-28 with acs-pgn's per-phase timings in hand: it stays a fixed 10 s, with a `PING` after 3 s of silence and `ACS_DEAD_MS` as the override. Silence that netwatch does not explain is mostly a blip the existing TCP connection rides out, and a redial cannot succeed before the path is back anyway, so a shorter interval mainly turns survivable blips into redials — each one discarding typed keys, repainting the screen and costing a full handshake (51 ms cold on loopback, several round trips and possibly a key touch on a real host). An RTT-adaptive interval is decided by its floor on every real path, since a few round trips are under a second and the floor must exceed the ping interval; and the silence it must survive (a stalled host, output queued on a slow or bufferbloated uplink) is what an idle round trip underestimates. The fast cases are covered already: netwatch in 2 s, a closed connection at once. Reopen on `-v` evidence of drops netwatch missed whose redial then succeeded at once (§5.3) |
 | 13 | The copy's size budget (acs-hofu.11) | Decided by the maintainer 2026-10-28: the copy role (`acscp`, `acs cp`, `acs _cp`; ACSCP_DESIGN decision 13, goal 7) may cost **100 KB of the x86_64 musl slim build**, replacing 50 KB. Phases 1 and 2 measured 56,840 B against the old 50,000 B, with no single cheap trim left to close the gap; the larger figure lets the copy ship in release builds (acs-hofu.3) and leaves about 43 KB for phase 3's resume and redial. The overall budget (slim ≤ 1.15 MB, complete ≤ 2.3 MB, goal 2) is unchanged and still holds with the copy in (§8.1) |
+| 14 | Two copies writing one part (acs-hofu.13) | Decided 2026-10-28: **one writer per `.<name>.acscp-part`, by an exclusive `flock`**. A lost link's `acs _cp` lives on until its own liveness ends it (`ACS_DEAD_MS`), still writing what reached it, while the redial's `acs _cp` opens the same part to resume it; two writers would leave bytes past the hashed prefix that nothing re-checks. A receiver takes the part's lock before it measures it and holds it until the file is renamed or given up; a redial's receiver that finds it held answers nothing for that file — the sender's window carries the rest on — and tries again every 100 ms, then measures and hashes what the old one left. Locked, the part must still be the file at its name, or it was renamed into place or removed by its last holder and is opened again. Past twice `ACS_DEAD_MS` the file fails `in use by another copy` and the part is left to its holder; a filesystem without `flock` is written as before. Chosen over having the old end close the part on a lost link: nothing makes the old end learn of the loss before the client redials — the client redials at once on its own detection, which may come first — so only the new end can be made to wait, and the lock also keeps two concurrent `acscp` runs of one file apart |

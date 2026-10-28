@@ -148,6 +148,9 @@ impl Stop {
 /// `HAVE` never keeps the pings from being answered.
 const SLICE: u64 = 1024 * 1024;
 
+/// How often, in ms, an endpoint that is [`Endpoint::waiting`] tries again.
+const WAIT_STEP: u64 = 100;
+
 /// The first `len` bytes of a file, hashed a [`SLICE`] at a time from the
 /// file's current position, which ends at `len`.
 pub(crate) struct Prefix {
@@ -199,6 +202,11 @@ pub(crate) trait Endpoint {
     fn welcomed(&self) -> bool;
     /// Work of its own before the next poll may wait: a part being hashed.
     fn busy(&self) -> bool {
+        false
+    }
+    /// Waiting on something no descriptor reports: a part another copy
+    /// holds the lock of. The poll wakes every [`WAIT_STEP`] to try again.
+    fn waiting(&self) -> bool {
         false
     }
     /// A new link replaces a lost one, to a new far end that knows nothing
@@ -302,10 +310,13 @@ pub(crate) fn drive(
             sys::wait_for(wfd, if out.is_empty() { 0 } else { libc::POLLOUT }),
             sys::pollfd(netwatch.map_or(-1, |w| w.fd()), libc::POLLIN),
         ];
-        let wait = match room && ep.busy() {
+        let mut wait = match room && ep.busy() {
             true => 0,
             false => live.next_deadline_ms().saturating_sub(sys::now_ms()),
         };
+        if ep.waiting() {
+            wait = wait.min(WAIT_STEP);
+        }
         sys::poll(&mut fds, sys::poll_timeout(Duration::from_millis(wait)))
             .map_err(|e| Stop::Fatal(e.to_string()))?;
         if fds[0].revents != 0 {
