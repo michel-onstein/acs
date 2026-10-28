@@ -2,7 +2,8 @@
 //! session's STATUS and print a table. `acs list` asks every alias in the
 //! configuration at once (DESIGN §7.3).
 
-use std::os::fd::AsRawFd;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -180,54 +181,105 @@ pub(crate) fn query(
     };
     let mut dec = Decoder::new();
     dec.push(&rest);
-    let mut sessions = Vec::new();
+    let late = format!(
+        "no answer from {} within {} s",
+        args.transport.destination,
+        timeout.as_secs_f32()
+    );
+    let listed = read_listing(
+        &mut dec,
+        link.from_fd().as_raw_fd(),
+        deadline,
+        Until::Eof,
+        &late,
+        &mut sys::wait_readable,
+    );
+    link.close();
+    listed.map(|l| Some(l.sessions))
+}
+
+/// Where a listing ends: the one way the two connections that carry one
+/// differ (acs-bsar).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Until {
+    /// The connection closing: `_proxy --list`, which ends after its list.
+    /// An ERROR is the answer at once — the host could not list (acs-mum0)
+    /// — frames of no listing's are passed over, and a failed read is
+    /// taken for the close.
+    Eof,
+    /// LIST_END: `_proxy --pick`, whose connection stays open. An ERROR
+    /// ahead of the list is kept with it (a session that would not end);
+    /// one and then the close is the failure to report (acs-5jrq). Any
+    /// other frame is a bad reply, and closing before the end a failure.
+    End,
+}
+
+/// One list from the proxy: every session's STATUS, and the message of an
+/// ERROR sent along (only with [`Until::End`]).
+pub(crate) struct Listing {
+    pub(crate) sessions: Vec<StatusInfo>,
+    pub(crate) error: Option<String>,
+}
+
+/// Read one list of sessions from `from` (what `dec` holds already first)
+/// up to `until`, by `deadline`: `wait` says whether `from` turned
+/// readable in time, and `late` is what to report when it did not.
+pub(crate) fn read_listing(
+    dec: &mut Decoder,
+    from: RawFd,
+    deadline: Instant,
+    until: Until,
+    late: &str,
+    wait: &mut dyn FnMut(RawFd, Instant) -> io::Result<bool>,
+) -> Result<Listing, Failure> {
+    let mut answer = Listing {
+        sessions: Vec::new(),
+        error: None,
+    };
     let mut buf = [0u8; 16 * 1024];
-    let from = link.from_fd().as_raw_fd();
     loop {
         match dec.next_msg() {
+            // Bounded (acs-rip).
             Ok(Some(Msg::StatusReply(s))) => {
-                if let Err(f) = push_session(&mut sessions, s) {
-                    link.close();
-                    return Err(f);
-                }
+                push_session(&mut answer.sessions, s)?;
                 continue;
             }
-            // The host could not list its sessions: that is a failure to
-            // report, not an empty host (acs-mum0).
+            Ok(Some(Msg::Error { message, .. })) if until == Until::Eof => {
+                return Err(Failure::BadReply(message))
+            }
             Ok(Some(Msg::Error { message, .. })) => {
-                link.close();
-                return Err(Failure::BadReply(message));
+                answer.error = Some(message);
+                continue;
             }
-            Ok(Some(_)) => continue,
+            Ok(Some(Msg::ListEnd)) if until == Until::End => return Ok(answer),
+            Ok(Some(_)) if until == Until::Eof => continue,
+            Ok(Some(other)) => return Err(Failure::BadReply(format!("unexpected {other:?}"))),
             Ok(None) => {}
-            Err(e) => {
-                link.close();
-                return Err(Failure::BadReply(e.to_string()));
-            }
+            Err(e) => return Err(Failure::BadReply(e.to_string())),
         }
         // A host that goes quiet after its marker must not hold us forever.
-        match sys::wait_readable(from, deadline) {
-            Ok(false) => {
-                link.close();
-                return Err(Failure::Unreachable(format!(
-                    "no answer from {} within {} s",
-                    args.transport.destination,
-                    timeout.as_secs_f32()
-                )));
-            }
+        match wait(from, deadline) {
             Ok(true) => {}
-            Err(e) => {
-                link.close();
-                return Err(Failure::Unreachable(e.to_string()));
-            }
+            Ok(false) => return Err(Failure::Unreachable(late.to_string())),
+            Err(e) => return Err(Failure::Unreachable(e.to_string())),
         }
         match sys::read(from, &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => dec.push(&buf[..n]),
+            Ok(n) if n > 0 => dec.push(&buf[..n]),
+            Err(e) if until == Until::End => return Err(Failure::Unreachable(e.to_string())),
+            // Closed.
+            _ => {
+                return match until {
+                    Until::Eof => Ok(answer),
+                    Until::End => Err(match answer.error {
+                        Some(e) => Failure::BadReply(e),
+                        None => Failure::Unreachable(
+                            "the connection closed before the session list".into(),
+                        ),
+                    }),
+                }
+            }
         }
     }
-    link.close();
-    Ok(Some(sessions))
 }
 
 /// Compact durations in one unit: `42s`, `7m`, `3h`, `12d`.
@@ -388,6 +440,71 @@ mod tests {
         assert_eq!(sessions.len(), MAX_SESSIONS, "the refused one was kept");
         // And it is reported as a bad reply, not as an unreachable host.
         assert_eq!(e.code(), code::ERROR);
+    }
+
+    /// `frames` as the proxy would send them, then the close, read as a
+    /// listing up to `until` (acs-bsar).
+    fn read_back(frames: &[Msg], until: Until) -> Result<Listing, Failure> {
+        let (r, w) = sys::pipe().unwrap();
+        let mut bytes = Vec::new();
+        for f in frames {
+            f.encode(&mut bytes);
+        }
+        sys::write_all(w.as_raw_fd(), &bytes).unwrap();
+        drop(w);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        read_listing(
+            &mut Decoder::new(),
+            r.as_raw_fd(),
+            deadline,
+            until,
+            "late",
+            &mut sys::wait_readable,
+        )
+    }
+
+    fn error(message: &str) -> Msg {
+        Msg::Error {
+            code: 1,
+            message: message.into(),
+        }
+    }
+
+    /// One reader serves `--list` and `--pick` (acs-bsar); where they
+    /// differ is where the list ends and what an ERROR in it means.
+    #[test]
+    fn one_reader_ends_a_listing_where_its_connection_does() {
+        let one = || {
+            Msg::StatusReply(StatusInfo {
+                name: "main".into(),
+                ..Default::default()
+            })
+        };
+        // `--list`: the close ends it; LIST_END is passed over.
+        let l = read_back(&[one(), Msg::ListEnd, one()], Until::Eof).unwrap();
+        assert_eq!(l.sessions.len(), 2);
+        // `--pick`: LIST_END ends it, and what follows is left unread.
+        let l = read_back(&[one(), Msg::ListEnd, one()], Until::End).unwrap();
+        assert_eq!(l.sessions.len(), 1);
+        // ...and a close before it is a failure, not an empty host.
+        let e = read_back(&[one()], Until::End).err().unwrap();
+        assert!(matches!(e, Failure::Unreachable(_)), "{e:?}");
+        // Anything else is a bad reply to `--pick`, passed over by `--list`.
+        let e = read_back(&[Msg::Detach], Until::End).err().unwrap();
+        assert!(matches!(e, Failure::BadReply(_)), "{e:?}");
+        assert!(read_back(&[Msg::Detach], Until::Eof).is_ok());
+    }
+
+    /// An ERROR that is the whole answer is a bad reply on both paths; one
+    /// ahead of a `--pick` list goes with it (a session that would not end).
+    #[test]
+    fn an_error_is_the_answer_on_both_paths() {
+        let e = read_back(&[error("no")], Until::Eof).err().unwrap();
+        assert!(matches!(&e, Failure::BadReply(m) if m == "no"), "{e:?}");
+        let e = read_back(&[error("no")], Until::End).err().unwrap();
+        assert!(matches!(&e, Failure::BadReply(m) if m == "no"), "{e:?}");
+        let l = read_back(&[error("busy"), Msg::ListEnd], Until::End).unwrap();
+        assert_eq!(l.error.as_deref(), Some("busy"));
     }
 
     fn info(
