@@ -317,12 +317,17 @@ pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
         .config
         .alias(crate::alias::split_user(name).1)
         .and_then(|_| crate::alias_memory::Memory::system());
+    // `reachability_tcp`'s `ssh -G` sees what the dial will: `--ssh` and
+    // the command line's -p/-F/-J/-o/-i (acs-nhrq).
+    let mut ssh = vec![args.transport.ssh.clone()];
+    ssh.extend(args.transport.user_opts.iter().cloned());
     let entry = crate::alias::resolve_remembering(
         name,
         &args.config,
         std::sync::Arc::new(crate::alias::ping),
         &crate::netmatch::system,
         memory.as_ref(),
+        &ssh,
         &mut |m| {
             if verbose {
                 note(&m)

@@ -454,7 +454,8 @@ it is listed — as long as it answers its ping.
 
 With `reachability_tcp: true` (globally or on an alias) a host is checked by
 connecting to its ssh port instead of a ping — the port `ssh -G` gives for
-it, so `~/.ssh/config` decides it — within the same `reachability_timeout`.
+it, so `~/.ssh/config` and the command line's `-p`, `-F`, `-J`, `-o` and
+`--ssh` decide it — within the same `reachability_timeout`.
 That suits hosts and networks that drop pings, and a host whose sshd is
 down no longer counts as up. A host ssh reaches through a `ProxyJump` or a
 `ProxyCommand` has no port of its own to try, so it is still pinged.
