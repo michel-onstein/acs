@@ -6,28 +6,49 @@
 
 mod common;
 
+use acs::timing::{told, Phase};
 use common::*;
 
 const ALIAS: &str = "aliases:\n  devbox:\n    - host: devbox.lan\n";
 
 /// The phases `connection` told, in the order they were told.
-fn phases(text: &str, connection: &str) -> Vec<String> {
-    let tag = format!("acs: timing: {connection}: ");
-    text.split(tag.as_str())
-        .skip(1)
-        .map(|rest| {
-            let end = rest.find(" +").expect("a timing line has its step");
-            let tail = &rest[end..];
-            assert!(
-                tail.split(['\r', '\n'])
-                    .next()
-                    .unwrap()
-                    .ends_with(" ms total)"),
-                "{tail:?}"
-            );
-            rest[..end].to_string()
-        })
+fn phases<'a>(text: &'a str, connection: &str) -> Vec<&'a str> {
+    let all = told(text);
+    let lines = text.matches("acs: timing: ").count();
+    assert_eq!(
+        all.len(),
+        lines,
+        "a timing line that does not parse: {text:?}"
+    );
+    all.into_iter()
+        .filter(|t| t.what == connection)
+        .map(|t| t.phase)
         .collect()
+}
+
+/// DESIGN §7's list of phases, in its order: the `` - `<phase>` `` items
+/// under the bullet that names `timing::Phase`.
+fn design_phases(design: &str) -> Vec<String> {
+    let mut lines = design
+        .lines()
+        .skip_while(|l| !l.contains("`timing::Phase`"));
+    assert!(lines.next().is_some(), "DESIGN §7 names `timing::Phase`");
+    lines
+        .skip_while(|l| !l.starts_with("  - `"))
+        .take_while(|l| !l.is_empty() && l.starts_with("  "))
+        .filter_map(|l| l.strip_prefix("  - `"))
+        .map(|l| l.split('`').next().unwrap().to_string())
+        .collect()
+}
+
+/// acs-fb7r: the phases `-v` can tell are the ones DESIGN lists, in the
+/// same order — a phase added to `Phase` without the doc fails here.
+#[test]
+fn designs_list_of_phases_is_timing_phase() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let design = std::fs::read_to_string(root.join("docs/DESIGN.md")).unwrap();
+    let names: Vec<_> = Phase::ALL.iter().map(|p| p.name()).collect();
+    assert_eq!(design_phases(&design), names);
 }
 
 #[test]

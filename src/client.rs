@@ -17,7 +17,7 @@ use crate::proto::{self, AttachKind, Decoder, Hello, Marker, MarkerScanner, Mode
 use crate::resume::Unacked;
 use crate::ssh::{self, Call};
 use crate::sys;
-use crate::timing::Timing;
+use crate::timing::{Phase, Timing};
 use crate::tty::{self, RawMode};
 
 const STDIN: RawFd = 0;
@@ -104,7 +104,7 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
         wait_for_host(&mut args, &name);
     }
     if args.alias.is_some() {
-        timing.mark("alias resolved");
+        timing.mark(Phase::AliasResolved);
     }
     if args.list && !menu {
         return crate::list::run(&args);
@@ -949,7 +949,7 @@ pub(crate) fn dial_watching(
         };
         match dial_sharing(args, call, remote, timeout, timing, first.clone(), w) {
             Err(e) if moved(&e) => {
-                timing.mark("network moved — dialing again");
+                timing.mark(Phase::NetworkMoved);
                 if args.verbose > 0 {
                     note("the network moved under the dial — dialing again");
                 }
@@ -990,7 +990,7 @@ fn dial_sharing(
     mut w: Watch,
 ) -> io::Result<(Link, Marker)> {
     if crate::mux::joinable(&args.transport, call) {
-        timing.mark("shared ssh master checked");
+        timing.mark(Phase::MasterChecked);
         let window = timeout.min(crate::mux::fallback_window());
         let joined = Watch {
             netwatch: w.netwatch,
@@ -1062,7 +1062,7 @@ fn dial_once(
             format!("cannot run {}: {e}", argv[0].to_string_lossy()),
         )
     })?;
-    timing.mark("ssh spawned");
+    timing.mark(Phase::SshSpawned);
     let to: OwnedFd = child.stdin.take().unwrap().into();
     let from: OwnedFd = child.stdout.take().unwrap().into();
     // The first frames, before anything is read back. Non-blocking, so a
@@ -1176,8 +1176,8 @@ fn dial_once(
         }
     };
     timing.mark(match marker {
-        Marker::Ready { .. } => "ACS-READY seen",
-        Marker::Need { .. } => "ACS-NEED seen",
+        Marker::Ready { .. } => Phase::ReadySeen,
+        Marker::Need { .. } => Phase::NeedSeen,
     });
     if let Some(noise) = scanner.noise_text().filter(|_| args.verbose > 0) {
         note(&format!("skipped remote login output: {noise:?}"));
@@ -1556,7 +1556,7 @@ pub fn connect_and_serve(
                 if let Some(old) = state.master.take() {
                     crate::mux::stop(&old);
                 }
-                timing.mark("network moved — dialing again");
+                timing.mark(Phase::NetworkMoved);
                 if args.verbose > 0 {
                     note("the network moved under the handshake — dialing again");
                 }
@@ -1738,7 +1738,7 @@ fn connect_once(
             }
             match await_installed(&mut link) {
                 Ok(x) => {
-                    timing.mark("acs installed");
+                    timing.mark(Phase::Installed);
                     note(&format!(
                         "installed acs {} on {}",
                         crate::VERSION,
@@ -1971,7 +1971,7 @@ fn serve(
                 Msg::Welcome(w) if !welcomed => {
                     welcomed = true;
                     state.welcomed_at = Some(std::time::Instant::now());
-                    timing.mark("WELCOME received");
+                    timing.mark(Phase::WelcomeReceived);
                     let first = state.instance.is_none();
                     let same = state.instance == Some(w.instance);
                     if !first && !same {

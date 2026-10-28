@@ -10,7 +10,7 @@ use crate::client::{self, code, note, LinkEnd, Outcome, State};
 use crate::keys::Action;
 use crate::proto::{AttachKind, Msg};
 use crate::sys;
-use crate::timing::Timing;
+use crate::timing::{Phase, Timing};
 use crate::tty::RawMode;
 
 pub(crate) fn env_ms(name: &str, default: u64) -> u64 {
@@ -140,7 +140,7 @@ pub fn run(
         // picked up after a network change (DESIGN §7.3).
         let reachable = !redial || gated || redial_alias(&mut args, state);
         if redial && reachable && !gated && args.alias.is_some() {
-            timing.mark("alias resolved");
+            timing.mark(Phase::AliasResolved);
         }
         gated = false;
         let first = picked.take();

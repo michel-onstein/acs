@@ -613,11 +613,12 @@ fn one_socket(dir: &std::path::Path) -> std::path::PathBuf {
     found.pop().unwrap()
 }
 
-/// `acs: timing: <what>: <phase> … (N ms total)` out of a client's output.
-fn total_ms(text: &str, what: &str, phase: &str) -> Option<u64> {
-    let head = format!("timing: {what}: {phase} ");
-    let line = text.lines().find(|l| l.contains(&head))?;
-    line.split('(').nth(1)?.split(' ').next()?.parse().ok()
+/// The total of `what`'s first `phase` timing line in a client's output.
+fn total_ms(text: &str, what: &str, phase: acs::timing::Phase) -> Option<u64> {
+    acs::timing::told(text)
+        .into_iter()
+        .find(|t| t.what == what && t.phase == phase.name())
+        .map(|t| t.total_ms)
 }
 
 /// acs-9n3, over real ssh — the one thing a fake transport cannot test.
@@ -700,8 +701,8 @@ fn e2e_15_a_shared_master_carries_the_second_connection_and_dies_with_the_link()
         "a second master was started instead of the first being used"
     );
 
-    let cold = total_ms(&first, "first connection", "ACS-READY seen");
-    let warm = total_ms(&second, "first connection", "ACS-READY seen");
+    let cold = total_ms(&first, "first connection", acs::timing::Phase::ReadySeen);
+    let warm = total_ms(&second, "first connection", acs::timing::Phase::ReadySeen);
     eprintln!("MEASURED handshake to ACS-READY: cold {cold:?} ms, on the master {warm:?} ms");
     assert!(cold.is_some() && warm.is_some(), "{first}\n---\n{second}");
 

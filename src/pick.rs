@@ -27,7 +27,7 @@ use crate::menu::{Answer, Choice, Menu};
 use crate::proto::{self, Decoder, Marker, Msg, StatusInfo};
 use crate::ssh::{self, Call};
 use crate::sys;
-use crate::timing::Timing;
+use crate::timing::{Phase, Timing};
 use crate::tty::{self, AltScreen, RawMode};
 
 const STDIN: RawFd = 0;
@@ -177,7 +177,7 @@ fn open_pick(
             if was_owed && pick.owed.is_empty() {
                 timing.hello(true);
             }
-            timing.mark("session list received");
+            timing.mark(Phase::SessionListReceived);
             Ok(Some((pick, a.sessions)))
         }
         Err(f) => {
@@ -474,7 +474,7 @@ pub fn every_host(args: &ClientArgs) -> u8 {
         eprintln!("acs: {e}");
         return code::UNREACHABLE;
     }
-    timing.mark("alias resolved");
+    timing.mark(Phase::AliasResolved);
     let netwatch = crate::netwatch::NetWatch::new(picked.verbose > 0);
     client::run(picked, None, timing, netwatch)
 }
