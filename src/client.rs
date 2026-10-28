@@ -776,13 +776,7 @@ fn dial_once(
     let mut scanner = MarkerScanner::new();
     let mut buf = [0u8; 4096];
     let marker = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let mut p = [sys::pollfd(from.as_raw_fd(), libc::POLLIN)];
-        if left.is_zero() || sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32)? == 0
-        {
-            if Instant::now() < deadline {
-                continue; // a signal cut the wait short
-            }
+        if !sys::wait_readable(from.as_raw_fd(), deadline)? {
             let _ = child.kill();
             let _ = child.wait();
             return Err(io::Error::new(
@@ -1619,11 +1613,10 @@ fn serve(
         // waiting for ever: a program that stopped mid-sequence, or a link
         // that died there, must not swallow it (acs-z22).
         notes::flush_due(now);
-        let mut timeout: i64 = -1;
-        let mut consider = |deadline: u64| {
-            let d = deadline.saturating_sub(now) as i64;
-            timeout = if timeout < 0 { d } else { timeout.min(d) };
-        };
+        let mut soonest: Option<u64> = None;
+        // `None` orders below every `Some`, hence the `or`: the soonest
+        // deadline seen, or `d` when it is the first.
+        let mut consider = |d: u64| soonest = soonest.min(Some(d)).or(Some(d));
         if let Some(d) = state.detector.deadline() {
             consider(d);
         }
@@ -1650,7 +1643,7 @@ fn serve(
             sys::pollfd(to, if out.is_empty() { 0 } else { libc::POLLOUT }),
             sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
         ];
-        if sys::poll(&mut fds, timeout.min(i32::MAX as i64) as i32).is_err() {
+        if sys::poll(&mut fds, sys::poll_timeout_ms(soonest, now)).is_err() {
             return lost(link, LinkEnd::Transport);
         }
 

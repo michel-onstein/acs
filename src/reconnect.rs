@@ -372,14 +372,6 @@ fn early_every() -> Duration {
     Duration::from_millis(env_ms("ACS_EARLY_MS", 2000))
 }
 
-/// `d` as a `poll(2)` timeout in milliseconds, clamped to `i32::MAX`: a
-/// bare `as i32` wraps a wait of 2^31 ms or more (an `ACS_BACKOFF_MS` that
-/// large, doubled) to a negative, which `poll` reads as no timeout at all
-/// (acs-wjj9).
-fn poll_timeout(d: Duration) -> i32 {
-    d.as_millis().min(i32::MAX as u128) as i32
-}
-
 /// Wait `wait` before the next redial with the link down: show `msg` as the
 /// status, drop typed keys, but honour the command keys. A `wait` of zero
 /// (the free first attempt, [`Backoff`]) puts the status up and returns at
@@ -419,7 +411,7 @@ fn offline(
             sys::pollfd(signals.as_raw_fd(), libc::POLLIN),
             sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
         ];
-        let _ = sys::poll(&mut fds, poll_timeout(timeout));
+        let _ = sys::poll(&mut fds, sys::poll_timeout(timeout));
         if fds[1].revents != 0 {
             sys::signals::drain(signals.as_raw_fd());
         }
@@ -713,19 +705,6 @@ impl Liveness {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// acs-wjj9: a wait past `i32::MAX` ms clamps instead of wrapping to a
-    /// negative timeout, which `poll` would treat as "block forever".
-    #[test]
-    fn a_wait_past_i32_max_ms_clamps_the_poll_timeout() {
-        assert_eq!(poll_timeout(Duration::from_millis(1500)), 1500);
-        assert_eq!(
-            poll_timeout(Duration::from_millis(i32::MAX as u64)),
-            i32::MAX
-        );
-        assert_eq!(poll_timeout(Duration::from_millis(1 << 31)), i32::MAX);
-        assert_eq!(poll_timeout(Duration::from_millis(u64::MAX)), i32::MAX);
-    }
 
     /// acs-iyq: the first attempt after a drop waits for nothing, and the
     /// doubling starts at `ACS_BACKOFF_MS` from the second.

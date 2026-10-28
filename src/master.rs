@@ -625,7 +625,7 @@ impl Master {
             if self.child.as_ref().is_some_and(|c| c.status.is_some()) {
                 timeout = timeout.min(Duration::from_millis(50));
             }
-            sys::poll(&mut fds, timeout.as_millis().min(i32::MAX as u128) as i32)?;
+            sys::poll(&mut fds, sys::poll_timeout(timeout))?;
 
             if fds[1].revents != 0 {
                 for sig in sys::signals::drain(self.signals.as_raw_fd()) {

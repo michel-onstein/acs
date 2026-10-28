@@ -206,16 +206,8 @@ pub(crate) fn query(
             }
         }
         // A host that goes quiet after its marker must not hold us forever.
-        let left = deadline.saturating_duration_since(Instant::now());
-        let mut p = [sys::pollfd(from, libc::POLLIN)];
-        let ready = if left.is_zero() {
-            Ok(0)
-        } else {
-            sys::poll(&mut p, left.as_millis().min(i32::MAX as u128) as i32)
-        };
-        match ready {
-            Ok(0) if Instant::now() < deadline => continue, // a signal cut the wait short
-            Ok(0) => {
+        match sys::wait_readable(from, deadline) {
+            Ok(false) => {
                 link.close();
                 return Err(Failure::Unreachable(format!(
                     "no answer from {} within {} s",
@@ -223,7 +215,7 @@ pub(crate) fn query(
                     timeout.as_secs_f32()
                 )));
             }
-            Ok(_) => {}
+            Ok(true) => {}
             Err(e) => {
                 link.close();
                 return Err(Failure::Unreachable(e.to_string()));
