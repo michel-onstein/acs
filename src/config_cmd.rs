@@ -1124,10 +1124,22 @@ fn keep_comments(mut before: Vec<String>, next: Option<&mut Node>) {
 fn write(path: &Path, doc: &Document) -> Result<(), Error> {
     // Checked as edited, so an error names a line of the file on disk (or
     // none, for a value the edit added) rather than of the unsaved text
-    // (acs-5mmu); the text is then checked to read back the same.
-    Config::default()
-        .apply(path, &doc.root)
-        .map_err(|e| Error::Usage(format!("{e} (not saved; fix the file by hand)")))?;
+    // (acs-5mmu); the text is then checked to read back the same. Only a
+    // file that is itself refused needs fixing by hand: when it reads
+    // fine, the bad value came from the edit (acs-vz64).
+    Config::default().apply(path, &doc.root).map_err(|e| {
+        let file_ok = match config::read_doc(path) {
+            Ok(Some(d)) => Config::default().apply(path, &d.root).is_ok(),
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        let hint = if file_ok {
+            ""
+        } else {
+            "; fix the file by hand"
+        };
+        Error::Usage(format!("{e} (not saved{hint})"))
+    })?;
     let text = yaml::emit(doc);
     yaml::parse(&text)
         .map_err(|e| e.to_string())

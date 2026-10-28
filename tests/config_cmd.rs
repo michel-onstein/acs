@@ -365,6 +365,36 @@ fn a_refused_edit_does_not_cite_a_line_of_the_unsaved_text() {
     assert_eq!(std::fs::read_to_string(h.local()).unwrap(), before);
 }
 
+/// Regression (acs-vz64): a value refused from the edit itself said to
+/// fix the file by hand, though the file was fine. Only a file that is
+/// refused on its own gets that advice.
+#[test]
+fn a_refused_edit_says_fix_by_hand_only_for_a_bad_file() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    let good = "aliases:\n  web:\n    hosts:\n      - host: web.example\n";
+    std::fs::write(h.local(), good).unwrap();
+    let (c, _, err) = h.run(&["config", "host", "add", "nas", "me@h"]);
+    assert_eq!(c, 2, "{err}");
+    assert!(
+        err.trim_end()
+            .ends_with("bad host name 'me@h' (put a login name in 'user') (not saved)"),
+        "{err}"
+    );
+    assert!(!err.contains("by hand"), "{err}");
+    assert_eq!(std::fs::read_to_string(h.local()).unwrap(), good);
+
+    // The same edit on a file that is refused without it.
+    let bad = format!("install_on_remote: yes please\n{good}");
+    std::fs::write(h.local(), &bad).unwrap();
+    h.fails(
+        &["config", "host", "add", "nas", "me@h"],
+        2,
+        "(not saved; fix the file by hand)",
+    );
+    assert_eq!(std::fs::read_to_string(h.local()).unwrap(), bad);
+}
+
 #[test]
 fn errors_are_clear() {
     let h = Home::new();
