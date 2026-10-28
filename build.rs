@@ -7,16 +7,19 @@ fn main() {
     println!("cargo:rustc-env=ACS_TARGET={target}");
     // Where this build's releases come from, for a fork that publishes its
     // own (docs/VERSIONING.md, "Forking"). Unset — the usual case — leaves
-    // `release::DEFAULT_RELEASES_URL` at acs's own releases. Blank counts as
-    // unset; the value is taken as given otherwise, since whoever builds the
-    // binary already decides what it does. This is not the runtime
-    // `ACS_RELEASES_URL`, which keeps its guards (acs-95w).
+    // `release::DEFAULT_RELEASES_URL` at acs's own releases, and blank
+    // counts as unset. A value that is not an https URL with a host fails
+    // the build rather than producing a binary whose update channel is
+    // silently unreachable (acs-d7x). What the variable means is
+    // `check_releases_url`, in the file included below. This is not the
+    // runtime `ACS_RELEASES_URL`, which keeps its guards (acs-95w).
     println!("cargo:rerun-if-env-changed=ACS_DEFAULT_RELEASES_URL");
-    if let Ok(url) = std::env::var("ACS_DEFAULT_RELEASES_URL") {
-        let url = url.trim().trim_end_matches('/');
-        if !url.is_empty() {
-            println!("cargo:rustc-env=ACS_DEFAULT_RELEASES_URL={url}");
-        }
+    println!("cargo:rerun-if-changed=src/build_channel.rs");
+    let set = std::env::var("ACS_DEFAULT_RELEASES_URL").ok();
+    match check_releases_url(set.as_deref()) {
+        Ok(Some(url)) => println!("cargo:rustc-env=ACS_DEFAULT_RELEASES_URL={url}"),
+        Ok(None) => {}
+        Err(why) => panic!("{why}"),
     }
     // The key this build checks a release's SHA256SUMS signature against,
     // for a fork that signs its own releases (docs/VERSIONING.md,
@@ -26,14 +29,13 @@ fn main() {
     // and blank counts as unset, so neither can leave a build with nothing
     // to verify against. A value that is not an ssh public key line fails
     // the build rather than producing a binary that refuses every release.
-    // What the variable means is `default_release_key`, in the file
-    // included below so the tests can reach it; all that is left here is
-    // the wiring. This is not the runtime `ACS_RELEASE_KEY`, which keeps
+    // What the variable means is `check_release_key`, in the file included
+    // below so the tests can reach it; all that is left here is the
+    // wiring. This is not the runtime `ACS_RELEASE_KEY`, which keeps
     // its guards (acs-o9v).
     println!("cargo:rerun-if-env-changed=ACS_DEFAULT_RELEASE_KEY");
-    println!("cargo:rerun-if-changed=src/release_key.rs");
     let set = std::env::var("ACS_DEFAULT_RELEASE_KEY").ok();
-    match default_release_key(set.as_deref()) {
+    match check_release_key(set.as_deref()) {
         Ok(Some(key)) => println!("cargo:rustc-env=ACS_DEFAULT_RELEASE_KEY={key}"),
         Ok(None) => {}
         Err(why) => panic!("{why}"),
@@ -48,9 +50,10 @@ fn main() {
     }
 }
 
-// `default_release_key`, the one piece of judgement in this file. It is a
-// source include rather than a function here because a build script is not
-// part of the crate and so is not a test target: the crate compiles the
-// same file (`#[cfg(test)] mod release_key`) to test it (acs-okz). Its own
+// `check_releases_url` and `check_release_key`, the only judgement in this
+// file. They are a source include rather than functions here because a
+// build script is not part of the crate and so is not a test target: the
+// crate compiles the same file (`#[cfg(test)] mod build_channel`) to test
+// it (acs-okz), and xtask compiles it for the channel it stamps. Its own
 // `#[cfg(test)]` tests are not compiled into this build script.
-include!("src/release_key.rs");
+include!("src/build_channel.rs");

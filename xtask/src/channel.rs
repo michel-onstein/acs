@@ -37,25 +37,20 @@ impl Channel {
 
     /// The channel `build.rs` gives the binaries `dist` is about to build,
     /// from the values of `ACS_DEFAULT_RELEASES_URL` and
-    /// `ACS_DEFAULT_RELEASE_KEY`: trimmed, blank counting as unset, unset
-    /// meaning acs's own.
-    pub fn from_env(releases: Option<&str>, key: Option<&str>) -> Channel {
-        let releases = releases.unwrap_or_default().trim().trim_end_matches('/');
-        let key = key.unwrap_or_default().trim();
-        Channel {
-            releases: if releases.is_empty() {
-                acs::release::UPSTREAM_RELEASES_URL
-            } else {
-                releases
-            }
-            .to_string(),
-            key: if key.is_empty() {
-                acs::signature::UPSTREAM_RELEASE_KEY
-            } else {
-                key
-            }
-            .to_string(),
-        }
+    /// `ACS_DEFAULT_RELEASE_KEY`: read by the same code `build.rs` reads them
+    /// with (`src/build_channel.rs`), so trimmed, blank counting as unset,
+    /// unset meaning acs's own — and `Err` with the build's own message for
+    /// a value the build would refuse (acs-d7x).
+    pub fn from_env(releases: Option<&str>, key: Option<&str>) -> Result<Channel, String> {
+        use crate::build_channel::{check_release_key, check_releases_url};
+        Ok(Channel {
+            releases: check_releases_url(releases)?
+                .unwrap_or(acs::release::UPSTREAM_RELEASES_URL)
+                .to_string(),
+            key: check_release_key(key)?
+                .unwrap_or(acs::signature::UPSTREAM_RELEASE_KEY)
+                .to_string(),
+        })
     }
 
     /// The stamp's text: one `releases` line and one `key` line.
@@ -154,15 +149,33 @@ mod tests {
     /// What `build.rs` makes of the two variables, read the same way.
     #[test]
     fn the_environment_names_the_channel_build_rs_bakes_in() {
-        let upstream = Channel::from_env(None, None);
+        let upstream = Channel::from_env(None, None).unwrap();
         assert_eq!(upstream.releases, acs::release::UPSTREAM_RELEASES_URL);
         assert_eq!(upstream.key, acs::signature::UPSTREAM_RELEASE_KEY);
-        assert_eq!(Channel::from_env(Some("  "), Some("")), upstream);
+        assert_eq!(Channel::from_env(Some("  "), Some("")), Ok(upstream));
         let f = Channel::from_env(
             Some(" https://dl.example.com/acs/ "),
             Some(&format!(" {FORK_KEY}\n")),
         );
-        assert_eq!(f, fork());
+        assert_eq!(f, Ok(fork()));
+    }
+
+    /// acs-d7x: a value the build would refuse is refused here too, with
+    /// the build's own message, rather than stamped on a `dist/` that the
+    /// build itself is about to fail.
+    #[test]
+    fn a_channel_the_build_would_refuse_is_refused() {
+        let why = Channel::from_env(Some("http://dl.example.com/acs"), Some(FORK_KEY)).unwrap_err();
+        assert!(
+            why.contains("ACS_DEFAULT_RELEASES_URL must be one https URL"),
+            "{why}"
+        );
+        let why = Channel::from_env(Some("https://dl.example.com/acs"), Some("ssh-ed25519 AAAA"))
+            .unwrap_err();
+        assert!(
+            why.contains("ACS_DEFAULT_RELEASE_KEY must be one ssh public key line"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -178,7 +191,7 @@ mod tests {
     #[test]
     fn a_dist_for_another_channel_is_refused() {
         let d = scratch("other");
-        let upstream = Channel::from_env(None, None);
+        let upstream = Channel::from_env(None, None).unwrap();
         std::fs::write(d.join(FILE), fork().stamp()).unwrap();
         let why = check(&d, &upstream).unwrap_err();
         assert!(

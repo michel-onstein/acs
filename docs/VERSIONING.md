@@ -222,8 +222,13 @@ when nothing overrides them, and the one-line installer named in the "acs is
 not installed on that host" message is derived from it, so a fork's users are
 not sent upstream to install. Unset — every build of acs itself — it is
 `https://github.com/michel-onstein/acs/releases`, and an empty value counts as
-unset. It is taken as given, with no https check: whoever builds the binary
-already chooses what it does. The runtime `ACS_RELEASES_URL` override is a
+unset. A value that is not one https URL with a host — `http://`, no scheme,
+an empty or malformed host or port, a space or line break, a query or
+fragment, credentials — **fails the build**, the same way a malformed key
+does, rather than shipping a binary whose update channel is silently
+unreachable (acs-d7x). Past that it is taken as given: whoever builds the
+binary already chooses what it does, and no build can tell whether the
+server answers. The runtime `ACS_RELEASES_URL` override is a
 different matter and keeps its guards — https only unless
 `--allow-insecure-url` is passed on the command line, and ignored outright
 when the real and effective user differ (DESIGN §7.5).
@@ -242,7 +247,10 @@ key as acs's tap is for acs's.
 Neither knob can leave a binary that verifies nothing. Unset — every build of
 acs itself — the key is acs's own, an empty value counts as unset, and a
 value that is not an ssh public key line **fails the build** rather than
-shipping a release that no one can install. A key that is merely the wrong
+shipping a release that no one can install. The body is decoded, not just
+looked at: it must be base64 whose blob names the key type the line declares
+and is made of whole fields, so a truncated paste or an `ssh-rsa` line with
+an ed25519 body is a build error too (acs-d7x). A key that is merely the wrong
 one fails closed: every release is refused, nothing is downloaded or run.
 Like the URL, it is the builder's decision rather than the environment's, so
 it carries none of the limits on the runtime `ACS_RELEASE_KEY` override —
