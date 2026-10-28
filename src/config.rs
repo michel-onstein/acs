@@ -25,7 +25,22 @@ pub struct Origin {
 
 impl std::fmt::Display for Origin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.file.display(), self.line)
+        write!(f, "{}", self.file.display())?;
+        // Line 0 is a value an edit added, not yet in the file (acs-5mmu).
+        if self.line > 0 {
+            write!(f, ":{}", self.line)?;
+        }
+        Ok(())
+    }
+}
+
+/// ` (line N)` after a message about a node, or nothing for one an edit
+/// added (acs-5mmu).
+fn on_line(line: usize) -> String {
+    if line == 0 {
+        String::new()
+    } else {
+        format!(" (line {line})")
     }
 }
 
@@ -678,11 +693,11 @@ fn forwards_value(n: &Node) -> Result<Vec<String>, String> {
             .map(|i| match &i.value {
                 Value::Scalar(s) => crate::ssh::check_local_forward(&s.text)
                     .map(|()| s.text.clone())
-                    .map_err(|e| format!("{e} (line {})", i.line)),
+                    .map_err(|e| format!("{e}{}", on_line(i.line))),
                 other => Err(format!(
-                    "expected a forward such as 8080:localhost:80, found {} (line {})",
+                    "expected a forward such as 8080:localhost:80, found {}{}",
                     other.kind(),
-                    i.line
+                    on_line(i.line)
                 )),
             })
             .collect(),
@@ -882,7 +897,7 @@ fn alias_parts(
 
 /// Name the field (and its line) in an error about its value.
 fn field<T>(key: &str, n: &Node, r: Result<T, String>) -> Result<T, String> {
-    r.map_err(|e| format!("{key}: {e} (line {})", n.line))
+    r.map_err(|e| format!("{key}: {e}{}", on_line(n.line)))
 }
 
 fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, String> {

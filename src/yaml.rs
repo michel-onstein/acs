@@ -5,7 +5,7 @@
 //! Supported: block mappings and sequences (including `- key: value` items),
 //! plain, single- and double-quoted scalars, one-line flow collections
 //! (`[a, b]`, `{k: v}`), comments and blank lines. Anchors, aliases, tags,
-//! block scalars (`|`, `>`), multi-line flow collections and several
+//! directives, block scalars (`|`, `>`), multi-line flow collections and several
 //! documents are refused with the line they are on.
 //!
 //! The tree keeps each node's line, the comment and blank lines before it and
@@ -169,7 +169,14 @@ struct Line {
 
 impl Line {
     fn trivia(&self) -> bool {
-        self.text.is_empty() || self.text.starts_with('#')
+        self.text.is_empty() || self.text.starts_with('#') || self.marker()
+    }
+
+    /// A `---` or `...` document marker: kept as written, like a comment, so
+    /// an edit does not drop it (acs-5mmu).
+    fn marker(&self) -> bool {
+        self.indent == 0
+            && (self.text == "---" || self.text.starts_with("--- ") || self.text == "...")
     }
 }
 
@@ -189,6 +196,7 @@ pub fn parse(src: &str) -> Result<Document> {
     // file every other YAML reader accepts (acs-qjx).
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let mut lines = Vec::new();
+    let (mut content, mut ended) = (false, false);
     for (i, raw) in src.lines().enumerate() {
         let no = i + 1;
         // YAML whitespace is space and tab only: `str::trim_end` would also
@@ -199,20 +207,28 @@ pub fn parse(src: &str) -> Result<Document> {
             return err(no, "tabs are not allowed for indentation; use spaces");
         }
         let indent = raw.len() - text.len();
-        if indent == 0 && (text == "---" || text.starts_with("--- ")) {
-            if lines.iter().any(|l: &Line| !l.trivia()) {
-                return err(no, "only one YAML document is supported");
-            }
-            continue;
-        }
-        if indent == 0 && text == "..." {
-            continue;
-        }
-        lines.push(Line {
+        let line = Line {
             no,
             indent,
             text: text.to_string(),
-        });
+        };
+        if indent == 0 && text.starts_with('%') {
+            return err(no, "directives such as %YAML are not supported");
+        }
+        // A `---` after content, or content after a `...` that ended it, is
+        // a second document.
+        if line.marker() {
+            if content && text != "..." {
+                return err(no, "only one YAML document is supported");
+            }
+            ended = content;
+        } else if !line.trivia() {
+            if ended {
+                return err(no, "only one YAML document is supported");
+            }
+            content = true;
+        }
+        lines.push(line);
     }
     let mut p = Parser {
         lines,
@@ -424,7 +440,7 @@ fn split_key(text: &str, line: usize) -> Result<Option<(String, &str)>> {
             return Ok(None);
         };
         let key = text[..colon].trim_end_matches(YAML_WS);
-        if key.is_empty() || key.contains(" #") {
+        if key.is_empty() || key.contains(" #") || key.contains("\t#") {
             return Ok(None);
         }
         (key.to_string(), &text[colon..])
@@ -479,7 +495,12 @@ fn inline(text: &str, line: usize) -> Result<(Option<(Value, bool)>, Option<Stri
         b'&' | b'*' | b'!' => return err(line, "anchors, aliases and tags are not supported"),
         b'@' | b'`' => return err(line, "a value starting with @ or ` must be quoted"),
         _ => {
-            let end = t.find(" #").unwrap_or(t.len());
+            // A space or a tab separates a comment (acs-5mmu).
+            let end = t
+                .as_bytes()
+                .windows(2)
+                .position(|w| matches!(w, [b' ' | b'\t', b'#']))
+                .unwrap_or(t.len());
             let s = t[..end].trim_end_matches(YAML_WS);
             if s.contains(": ") || s.ends_with(':') {
                 return err(line, format!("a value containing ': ' must be quoted: {s}"));
@@ -491,10 +512,10 @@ fn inline(text: &str, line: usize) -> Result<(Option<(Value, bool)>, Option<Stri
             (v, end, false)
         }
     };
-    let rest = t[used..].trim_start_matches(' ');
+    let rest = t[used..].trim_start_matches([' ', '\t']);
     let comment = if rest.is_empty() {
         None
-    } else if rest.starts_with('#') && (used == t.len() || t.as_bytes()[used] == b' ') {
+    } else if rest.starts_with('#') && matches!(t.as_bytes()[used], b' ' | b'\t') {
         Some(rest.to_string())
     } else {
         return err(line, format!("unexpected text after the value: {rest}"));
@@ -1215,6 +1236,34 @@ list: [a, \"b c\", 3]
             assert_eq!(e.line, *line, "{src:?}: {e}");
             assert!(e.msg.contains(want), "{src:?}: {e}");
         }
+    }
+
+    /// acs-5mmu: a tab separates a comment as a space does, so the comment
+    /// did not become part of the value (and get quoted into it on save).
+    #[test]
+    fn a_tab_before_a_comment_starts_the_comment() {
+        let src = "a: x\t# c\nb: 'y'\t# d\n";
+        let d = parse(src).unwrap();
+        assert_eq!(text(get(&d.root, "a")), "x");
+        assert_eq!(get(&d.root, "a").comment.as_deref(), Some("# c"));
+        assert_eq!(text(get(&d.root, "b")), "y");
+        assert_eq!(emit(&d), "a: x # c\nb: 'y' # d\n");
+        // Not a key `x\t# k`: a scalar and a comment.
+        assert!(parse("x\t# k: v\n").unwrap().root.value.map().is_none());
+    }
+
+    /// acs-5mmu: the document markers survive a round trip; a `%YAML`
+    /// directive is refused by name rather than as a second document.
+    #[test]
+    fn document_markers_are_kept_and_directives_refused() {
+        for src in ["---\na: 1\n...\n", "# c\n--- # d\na: 1\n", "---\n"] {
+            assert_eq!(emit(&parse(src).unwrap()), src);
+        }
+        let e = parse("%YAML 1.2\n---\na: 1\n").unwrap_err();
+        assert_eq!((e.line, e.msg.contains("directive")), (1, true), "{e}");
+        let e = parse("a: 1\n...\nb: 2\n").unwrap_err();
+        assert_eq!(e.line, 3, "{e}");
+        assert!(e.msg.contains("one YAML document"), "{e}");
     }
 
     #[test]
