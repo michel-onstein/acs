@@ -2762,6 +2762,56 @@ slim and 2.22 MB complete — 64 KB and 125 KB more, since the complete build
 carries it again in both Linux payloads — past both old limits with only
 the local copy written.
 
+**The copy's cost** (acs-hofu.10), measured the same way — `cargo xtask
+dist` with the `cfg(debug_assertions)` gates on `src/cp` in `src/lib.rs`
+lifted for the measurement only — against the release without the copy:
+
+| Target | Slim, at 792c178 | Slim, trimmed | Complete, at 792c178 | Complete, trimmed |
+| --- | --- | --- | --- | --- |
+| `x86_64-unknown-linux-musl` | +63,984 B | +49,960 B | +124,875 B | +99,661 B |
+| `aarch64-unknown-linux-musl` | +50,488 B | +42,096 B | — | +91,797 B |
+| `aarch64-apple-darwin` | +50,016 B | +33,472 B | — | +82,576 B |
+| `x86_64-apple-darwin` | +57,704 B | +45,392 B | — | +91,200 B |
+
+So phase 1 now fits the 50 KB (50,000 B) of x86_64 slim that ACSCP_DESIGN
+decision 13 budgets for the whole copy role, with 40 B to spare: phase 2
+(`acs _cp`, the dial, the install) has none left, and will have to win its
+own bytes back or revisit the figure. The macOS sizes move in whole pages,
+so a change there shows only once it crosses one.
+
+Where the x86_64 bytes go, by `nm --size-sort` on an unstripped build
+diffed against the release without the copy: about 37 KB of code, then the
+unwind tables (`.eh_frame`, about 8 KB: an entry per function), strings
+(the usage text, the messages: about 4 KB) and relocations. Of the code,
+the command line and the local copy's set-up are 6.5 KB (all inlined into
+`run`), the protocol loop with the message decoder inlined 5 KB, the
+receiver's message handling 5 KB, the sender 3.5 KB, the walk 2.4 KB, the
+receiver's id map (`hashbrown` and its random keys) 3 KB, the progress meter
+2 KB, `scp`'s remote-argument split 1.4 KB and the receiver's thread 1 KB.
+The trims, each without a change of behaviour, by what each step saved:
+
+- **Float formatting**, 2,960 B: the meter's sizes and rate and the `-v`
+  summary's seconds were `f64`s printed with `{:.1}`, which brought the
+  `f64` formatter in beside the `f32` one the client uses. They are integer
+  arithmetic now, rounding as the float did; a test compares the two.
+- **One protocol loop**, 1,352 B with a first go at the sort: `drive` took
+  `impl Endpoint`, a copy for each end; it takes `dyn Endpoint`.
+- **No second sort, one map, no `Result` collect**, 6,744 B together: a
+  directory's names were sorted as `OsString`s, a sort of their own; they
+  are sorted as `String` keys — each byte one `char` of the same value, so
+  the order is still the bytes' — sharing the binary's `Vec<String>` sort.
+  The receiver kept its open parts and its refused ids in a `HashMap` and a
+  `HashSet`, two copies of the table code; it is one map of `Option`s. The
+  arguments are collected with a loop.
+- **A `Vec` for the window, a byte scan for the errno**, 2,376 B: the
+  sender's window was a `VecDeque`, a ring buffer of its own; it is a
+  `Vec`, its front taken once per file. An I/O error's `(os error N)` was
+  found with a substring searcher; it is found from the last `(`.
+- **Smaller still**, 592 B: reports go through one `note_on(what, why)`
+  rather than a `format!` at each place that reports, the last `(` is found
+  by a byte scan rather than a `char` searcher, and the tenths print their
+  unit themselves.
+
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
 appending the trailer and the macOS builds by rebuilding with

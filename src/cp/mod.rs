@@ -127,9 +127,15 @@ pub fn note(msg: &str) {
     let _ = writeln!(std::io::stderr(), "{NAME}: {line}");
 }
 
+/// [`note`] `what: why`, the shape of every skip and failure reported:
+/// one call rather than a `format!` at each place that reports.
+pub fn note_on(what: &str, why: &str) {
+    note(&[what, ": ", why].concat());
+}
+
 /// Run `ep` over the link `rfd`/`wfd` (one socket, or a pipe each way)
 /// until it is finished or stops.
-pub(crate) fn drive(ep: &mut impl Endpoint, rfd: RawFd, wfd: RawFd) -> Result<(), String> {
+pub(crate) fn drive(ep: &mut dyn Endpoint, rfd: RawFd, wfd: RawFd) -> Result<(), String> {
     let nonblocking = |fd| sys::set_nonblocking(fd, true).map_err(|e| e.to_string());
     nonblocking(rfd)?;
     nonblocking(wfd)?;
@@ -273,7 +279,7 @@ pub fn check_sources(sources: &[PathBuf], recursive: bool) -> (Vec<(String, Path
         match walk::check_source(path, recursive) {
             Ok(name) => good.push((name, path.clone())),
             Err(reason) => {
-                note(&format!("{}: {reason}", path.display()));
+                note_on(&path.display().to_string(), &reason);
                 skipped += 1;
             }
         }
@@ -333,12 +339,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
     if opts.verbose {
         note(&format!(
-            "{} written, {} failed, {} skipped, {} in {:.1}s",
+            "{} written, {} failed, {} skipped, {} in {}",
             o.written,
             o.failed,
             o.skipped,
             progress::bytes(o.bytes),
-            started.elapsed().as_secs_f64()
+            progress::tenths(started.elapsed().as_nanos(), 1_000_000_000, "s")
         ));
     }
     ExitCode::from(o.status())

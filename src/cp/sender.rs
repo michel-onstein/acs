@@ -9,7 +9,6 @@
 //! and only the first file pays the round trip. Directory entries need no
 //! answer and never wait.
 
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -17,7 +16,7 @@ use std::path::PathBuf;
 use super::progress::Progress;
 use super::proto::{Hello, Msg, Role};
 use super::walk::{Entry, Walk};
-use super::{note, Endpoint, Halt, Options, Outcome, HIGH};
+use super::{note_on, Endpoint, Halt, Options, Outcome, HIGH};
 use crate::outq::OutQueue;
 
 /// A file whose header is out and whose data is not all sent.
@@ -48,7 +47,10 @@ pub struct Sender {
     walk: Walk,
     walked: bool,
     window: usize,
-    ahead: VecDeque<Slot>,
+    /// The files out, oldest first. A `Vec`, not a `VecDeque`: taking the
+    /// front moves a window of small slots once per file, and the binary
+    /// keeps no second ring buffer for it (DESIGN §8.1).
+    ahead: Vec<Slot>,
     next_id: u32,
     end_sent: bool,
     report: bool,
@@ -75,7 +77,7 @@ impl Sender {
             walk: Walk::new(sources, opts.recursive),
             walked: false,
             window: opts.window.max(1),
-            ahead: VecDeque::new(),
+            ahead: Vec::new(),
             next_id: 1,
             end_sent: false,
             report: opts.report,
@@ -93,9 +95,9 @@ impl Sender {
         self.outcome
     }
 
-    fn report(&self, msg: &str) {
+    fn report(&self, what: &str, why: &str) {
         if self.report {
-            note(msg);
+            note_on(what, why);
         }
     }
 
@@ -109,7 +111,7 @@ impl Sender {
             Entry::Dir { name, meta } => Msg::Dir { name, meta }.encode(out),
             Entry::DirEnd => Msg::DirEnd.encode(out),
             Entry::Skip { path, reason } => {
-                self.report(&format!("{path}: {reason}"));
+                self.report(&path, &reason);
                 self.outcome.skipped += 1;
                 Msg::Skip { name: path, reason }.encode(out);
             }
@@ -129,7 +131,7 @@ impl Sender {
                     meta,
                 }
                 .encode(out);
-                self.ahead.push_back(Slot {
+                self.ahead.push(Slot {
                     id,
                     path,
                     file,
@@ -145,7 +147,7 @@ impl Sender {
     /// Queue the next chunk of the file at the front, or its end. False
     /// when it may not send yet.
     fn next_chunk(&mut self, out: &mut Vec<u8>) -> bool {
-        let Some(s) = self.ahead.front_mut() else {
+        let Some(s) = self.ahead.first_mut() else {
             return false;
         };
         if !s.go {
@@ -173,7 +175,7 @@ impl Sender {
             // refuses the file rather than keep a wrong copy (§6).
         }
         Msg::FileEnd { id: s.id }.encode(out);
-        self.ahead.pop_front();
+        self.ahead.remove(0);
         if let Some(m) = &mut self.meter {
             m.finish();
         }
@@ -183,7 +185,7 @@ impl Sender {
 
     /// Point the meter at the file now at the front.
     fn start_meter(&mut self) {
-        if let (Some(m), Some(s)) = (&mut self.meter, self.ahead.front()) {
+        if let (Some(m), Some(s)) = (&mut self.meter, self.ahead.first()) {
             m.start(&s.path.display().to_string(), s.size);
         }
     }
@@ -247,7 +249,7 @@ impl Endpoint for Sender {
             Msg::Fail { id, name, message } if self.state == State::Streaming => {
                 self.outcome.failed += 1;
                 let at = self.ahead.iter().position(|s| s.id == id && id != 0);
-                let what = match at.and_then(|i| self.ahead.remove(i)) {
+                let what = match at.map(|i| self.ahead.remove(i)) {
                     Some(s) => {
                         if at == Some(0) {
                             self.start_meter();
@@ -256,7 +258,7 @@ impl Endpoint for Sender {
                     }
                     None => name,
                 };
-                self.report(&format!("{what}: {message}"));
+                self.report(&what, &message);
             }
             Msg::Done { .. } if self.end_sent => self.state = State::Done,
             Msg::Ping(n) => Msg::Pong(n).encode(out.tail()),

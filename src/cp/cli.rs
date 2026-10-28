@@ -258,10 +258,9 @@ where
     }
     let target = positionals.pop().expect("two or more");
     a.target = spec(target)?;
-    a.sources = positionals
-        .into_iter()
-        .map(spec)
-        .collect::<Result<_, _>>()?;
+    for p in positionals {
+        a.sources.push(spec(p)?);
+    }
     Ok(Parsed::Run(Box::new(a)))
 }
 
