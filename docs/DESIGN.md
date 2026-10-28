@@ -1897,7 +1897,8 @@ one of the alias's entries instead of `<name>`:
   it, as `<alias>` or `user@<alias>`; `ACS_REDRAW_ON_RECONNECT` still wins.
 - **None answers**: the client names every host it tried and exits with the
   unreachable code (255) without calling ssh — or, persisting (§5.3),
-  pings them every `reachability_interval` until one answers.
+  pings them every second for the first 30 pings, then every
+  `reachability_interval`, until one answers (§5.3).
 - It applies to every ssh call — the session, `acs list`, install — since they
   share one destination and key. `-v` says which entry was chosen and why.
 - **Redial**: a reconnect (§5.3) resolves the alias again, so after a network

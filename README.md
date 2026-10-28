@@ -421,7 +421,7 @@ into it (`host unset` of its last setting turns it back into a list).
 | `reachability_timeout` | how long an alias's hosts have to answer a ping: `500ms`, `0.5s`, `2s`, up to `60s` (default `500ms`); an alias's own value wins |
 | `reachability_tcp` | check an alias's hosts by connecting to their ssh port (as `ssh -G` names it) instead of pinging them (default `false`); an alias's own value wins |
 | `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
-| `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
+| `reachability_interval` | how often a lost host is pinged while persisting, after the first 30 pings a second apart: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
 | `local_forwards` | ports every session forwards, as `-L` spells them: a list, or one value with commas (`8080:localhost:80,5432:db:5432`); `none` for no forward (default). An alias's own list replaces the global one, and `-L` on the command line adds to it |
 | `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist` and `local_networks` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`) and its `hosts` |
