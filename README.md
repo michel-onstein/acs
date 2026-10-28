@@ -621,6 +621,13 @@ scripts/release-binaries.sh  # (re)publish a tag's binaries to GitHub Releases
 scripts/update-tap.sh vX.Y.Z # point the Homebrew tap at a release
 ```
 
+`scripts/test_linux.sh --only NAME [-- ARGS...]` runs one test target
+instead of the three steps — a file under `tests/` without `.rs`, or `lib` for
+the unit tests — in the same container and with the same flags as the full
+run, so `--only netns` and `--only multiuser` still run as root with their
+ignored tests asked for. Anything after `--` goes to the test harness, such as
+a name filter.
+
 `scripts/e2e_ssh.sh --no-build` reuses the binaries already in `dist/` (about
 20 s instead of a minute), but only when `dist/source.stamp` says they were
 built from the tree as it is now — otherwise it refuses, since a failure from
