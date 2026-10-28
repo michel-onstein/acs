@@ -329,8 +329,9 @@ network move — that is worth reporting.
 acs gives up (exit 255) where there is no session to keep: the host
 cannot be reached at the start, or the link drops before the session was
 attached. With `--persist` (or `persist: true` in the configuration, or
-`ACS_PERSIST=1`) it never gives up on a host: it pings it every 5 seconds
-(`reachability_interval`) and dials as soon as it answers — at the start as
+`ACS_PERSIST=1`) it never gives up on a host: it pings it every second for
+the first 30 seconds, then every 5 (`reachability_interval`), and dials as
+soon as it answers — at the start as
 after a drop, where the ping replaces the backoff. It pings an alias's
 hosts as it does to choose one, and a plain host itself; an alias whose
 hosts all have `reachability_check: false` cannot be pinged and keeps the

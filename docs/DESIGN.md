@@ -904,9 +904,15 @@ or the link is lost before the first `WELCOME` — each exits 255. With
 up on; it is waited for with pings (`alias.rs`, the ping of §7.3) instead
 of ssh dials:
 
-- **The ping gate**: while the host is lost it is pinged every
-  `reachability_interval` (default 5 s, §7.2), and dialled only once it
-  answers — at once, too, after a network change (netwatch). An alias is
+- **The ping gate**: while the host is lost it is pinged every second for
+  the first 30 s, then every `reachability_interval` (default 5 s, §7.2),
+  and dialled only once it answers — at once, too, after a network change
+  (netwatch), which also starts the fast pings over (acs-vxg). Most hosts
+  that go away come back within seconds — a reboot, a VPN reconnecting — so
+  the fast pings put the dial within a second of the host's return rather
+  than up to a whole interval after it; a ping is one packet, and an outage
+  that outlasts the 30 s costs no more of them than before. An interval
+  below a second is used throughout. An alias is
   resolved again each time, so the first of its hosts to answer is the one
   dialled (§7.3); a plain host is pinged itself. A host that answers but
   whose ssh is not up yet gets a dial that fails and the gate again.
@@ -942,6 +948,7 @@ set stays visible; the cost of adding one is a row here.
 | `ACS_NETCHECK_MS` | 2000 | time the host has to answer the `PING` a network change sends while up | only its own `PONG` clears it (acs-br2); time blocked writing to the terminal is not counted (acs-spd) |
 | `ACS_BACKOFF_MS` | 1000 | the first wait of the redial backoff, after the free attempt | doubles to 30 s, or to itself if larger |
 | `ACS_BACKOFF_RESET_MS` | 30000 | how long a link must serve, `WELCOME` to loss, for the backoff to start over | equal to the redial's `ACS_DIAL_TIMEOUT_MS` by default; a redial spending that timeout never resets it (acs-omt2) |
+| `ACS_PERSIST_FAST_MS` | 1000 | the ping gate's first pings after a loss, 30 of them, before it backs off to `reachability_interval` (acs-vxg) | never above `reachability_interval`; a network change starts the 30 over |
 | `ACS_EARLY_MS` | 2000 | at most one network-change redial per interval in the offline wait | separate from `ACS_NETCHECK_MS`: this one guards a redial, that one a ping |
 | `ACS_DIAL_TIMEOUT_MS` (README) | 120000 first, 30000 redial and `acs list` | time to the marker, then to the `WELCOME` | one value sets both deadlines, which default 4:1 (acs-p46) |
 | `ACS_NOTE_HOLD_MS` | 500 | how long a diagnostic line waits for the output it would interrupt to reach a boundary, before it is written anyway | — |
