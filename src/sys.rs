@@ -454,6 +454,25 @@ pub fn tcgetpgrp(fd: RawFd) -> io::Result<i32> {
     cvt(unsafe { libc::tcgetpgrp(fd) })
 }
 
+/// Make `pgrp` the foreground process group of the terminal on `fd`.
+/// `SIGTTOU` is held off for the call, so a caller in the background — acs
+/// taking its terminal back after ssh's prompt (acs-8ax) — is not stopped
+/// by asking.
+pub fn tcsetpgrp(fd: RawFd, pgrp: i32) -> io::Result<()> {
+    // SAFETY: the sets are initialised by sigemptyset before use.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTTOU);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        let r = libc::tcsetpgrp(fd, pgrp);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        cvt(r)?;
+    }
+    Ok(())
+}
+
 // ---- descriptors -----------------------------------------------------------
 
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -692,6 +711,23 @@ pub fn try_wait(pid: i32) -> io::Result<Option<i32>> {
     let mut status = 0;
     let r = retry(|| unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) })?;
     Ok((r == pid).then_some(status))
+}
+
+/// Whether child `pid` has been stopped by a signal since it was last
+/// continued. An exited child is left to be reaped by whoever waits for it.
+pub fn stopped(pid: i32) -> bool {
+    // SAFETY: a zeroed siginfo_t is a valid out-parameter, and si_pid stays
+    // 0 when no child is in the state asked for.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let r = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WSTOPPED | libc::WNOHANG,
+        );
+        r == 0 && info.si_pid() != 0
+    }
 }
 
 /// Exit code a shell would report for a wait status (128+n for signals).
