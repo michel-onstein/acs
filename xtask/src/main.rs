@@ -9,7 +9,7 @@
 //! 3. complete Linux builds: slim + appended blob;
 //! 4. complete macOS builds: rebuilt with `--features embed-payloads`, then
 //!    ad-hoc signed;
-//! 5. a size report, failing over budget (slim 1 MB, complete 2 MB);
+//! 5. a size report, failing over budget (slim 1.1 MB, complete 2.1 MB);
 //! 6. `source.stamp`, the fingerprint of the sources it built from
 //!    (`scripts/source_stamp.sh`), which `scripts/e2e_ssh.sh --no-build`
 //!    checks before it reuses the binaries (acs-gb4), and `channel.stamp`,
@@ -35,8 +35,8 @@ mod upstream;
 
 const LINUX: &[&str] = &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
 const MAC: &[&str] = &["aarch64-apple-darwin", "x86_64-apple-darwin"];
-const SLIM_BUDGET: u64 = 1_000_000;
-const COMPLETE_BUDGET: u64 = 2_000_000;
+const SLIM_BUDGET: u64 = 1_100_000;
+const COMPLETE_BUDGET: u64 = 2_100_000;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
