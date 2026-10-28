@@ -473,7 +473,7 @@ fn offline(
 /// sequence the last frame opened, and a line written into one is read as
 /// part of it. So it goes out through [`client::write_over_stream`], which
 /// ends that sequence first and re-opens it afterwards (acs-p4u, DESIGN §7).
-fn show_status(state: &mut State, msg: &str) {
+pub(crate) fn show_status(state: &mut State, msg: &str) {
     let rows = sys::get_winsize(0).map(|s| s.rows).unwrap_or(24).max(1);
     let mut out = Vec::new();
     if !state.status_shown {

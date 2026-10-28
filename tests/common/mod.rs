@@ -770,6 +770,26 @@ impl Remote {
         writeln!(f, "{line}").unwrap();
     }
 
+    /// Make the next connection ask for a password on the terminal the way
+    /// ssh does — the terminal's echo off first, then the prompt, then a
+    /// line read from `/dev/tty` — and return the file the answer is
+    /// written to (acs-8ax). Like ssh's `readpassphrase`, it starts over
+    /// when job control interrupts it: macOS does not restart a
+    /// `tcsetattr` cut short by a stop.
+    pub fn prompt_on_next_dial(&self) -> PathBuf {
+        let flag = self.root.path().join("prompt-next");
+        let answer = self.root.path().join("prompt-answer");
+        self.remote_env_line(&format!(
+            "if [ -f '{flag}' ]; then rm -f '{flag}'; until stty -echo </dev/tty 2>/dev/null; do :; done; \
+             printf 'Password: ' >/dev/tty; read pw </dev/tty; stty echo </dev/tty; \
+             echo \"$pw\" > '{answer}'; fi",
+            flag = flag.display(),
+            answer = answer.display(),
+        ));
+        std::fs::write(&flag, "").unwrap();
+        answer
+    }
+
     /// Run the remote side under `mask`, a restrictive umask (077) masking
     /// the mode files are created with.
     pub fn remote_umask(&self, mask: &str) {
