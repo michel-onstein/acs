@@ -774,7 +774,10 @@ sequenceDiagram
     `ACS_NETWATCH_FIFO` is the hint (one per write) and `ACS_NETWATCH_NETS`
     a file of the machine's networks, one CIDR per line. The harness points
     every other client at a watcher path that does not exist, so no test
-    but the watcher's own is exposed to the host's network.
+    but the watcher's own is exposed to the host's network. Both are read
+    once, by `NetWatch::new`, and held on the watcher (acs-r1k); the unit
+    tests hand the watcher their paths directly, so no test in that binary
+    sets the environment and none can race another over it.
   - **The platform half is the kernel's, and on Linux the kernel does it**
     (acs-4i2). Everything above tests the *decision*; what neither stand-in
     can say is that a real roam emits a message the socket is subscribed to
@@ -903,6 +906,39 @@ of ssh dials:
   alias's, the global one (default off). Before any entry answered, the
   alias's decides. `--persist` and `--no-reconnect` contradict each other
   and together are a usage error.
+
+**The timer knobs** (acs-r1k). Every deadline above, and the few elsewhere
+that tests need to shorten, is an environment variable in milliseconds
+(seconds where the name says so). They are internal — for tests, not in the
+README's environment table — bar the ones marked README, which are listed
+here only for how they interact with the rest. Each knob is read by the
+process that keeps the deadline: the master's, set for the remote side, are
+the remote environment's. `tests/knobs.rs` fails when a `*_MS` or `*_SECS`
+name appears in `src/` and in neither this table nor the README's, so the
+set stays visible; the cost of adding one is a row here.
+
+| Knob | Default | What it bounds | Interactions |
+| --- | --- | --- | --- |
+| `ACS_PING_MS` | 3000 | silence before a `PING`, client and master alike | must stay well under `ACS_DEAD_MS`, or a quiet link is dead before it is asked |
+| `ACS_DEAD_MS` | 10000 | silence before the link is dead (client redials; master drops its client) | ceiling for `ACS_NETCHECK_MS`, which only brings it forward |
+| `ACS_NETCHECK_MS` | 2000 | time the host has to answer the `PING` a network change sends while up | only its own `PONG` clears it (acs-br2) |
+| `ACS_BACKOFF_MS` | 1000 | the first wait of the redial backoff, after the free attempt | doubles to 30 s, or to itself if larger |
+| `ACS_BACKOFF_RESET_MS` | 30000 | how long a link must serve, `WELCOME` to loss, for the backoff to start over | equal to the redial's `ACS_DIAL_TIMEOUT_MS` by default; a redial spending that timeout never resets it (acs-omt2) |
+| `ACS_EARLY_MS` | 2000 | at most one network-change redial per interval in the offline wait | separate from `ACS_NETCHECK_MS`: this one guards a redial, that one a ping |
+| `ACS_DIAL_TIMEOUT_MS` (README) | 120000 first, 30000 redial and `acs list` | time to the marker, then to the `WELCOME` | one value sets both deadlines, which default 4:1 (acs-p46) |
+| `ACS_NOTE_HOLD_MS` | 500 | how long a diagnostic line waits for the output it would interrupt to reach a boundary, before it is written anyway | — |
+| `ACS_MASTER_REBIND_MS` | 5000 | how often the master checks its socket path is still there (§4.2) | the backstop: a new master for the name prods the old one at once (acs-lbba) |
+| `ACS_MASTER_HELLO_MS` | 10000 | time a new connection to the master has for its first whole message (acs-3anc) | the client's `HELLO` goes with the dial, so this is never a round trip short |
+| `ACS_MASTER_ORPHAN_MS` | 30000 | how long a new master waits for a client to create its session | — |
+| `ACS_PRUNE_AFTER_SECS` | 2592000 (30 days) | how long an unused installed version is kept (§8) | — |
+| `ACS_PRUNE_EVERY_SECS` | 86400 (1 day) | least time between prune runs | — |
+
+Two more of the same shape are plain constants with no knob: `PENDING_MS`
+(100, `keys.rs`), how long an incomplete escape sequence from the local
+terminal is held before it is sent as typed — local stdin only, so no link
+latency reaches it — and the master's `KILL_GRACE` (3 s), between `SIGHUP`
+and `SIGKILL` on a kill. The README's user-facing timers
+(`ACS_ESCAPE_TIMEOUT_MS`, `ACS_CONTROL_FALLBACK_MS`) are documented there.
 
 ### 5.4 Status while disconnected
 
