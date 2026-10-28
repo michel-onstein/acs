@@ -12,6 +12,7 @@ pub mod config;
 pub mod config_cmd;
 pub mod install;
 pub mod keys;
+pub mod layout;
 pub mod list;
 pub mod master;
 pub mod menu;

@@ -191,9 +191,9 @@ fn link_candidates() -> Vec<PathBuf> {
         }
     }
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        v.push(PathBuf::from(home).join(".local/bin/acs"));
+        v.push(crate::layout::user_bin(Path::new(&home)).join("acs"));
     }
-    v.push(PathBuf::from("/usr/local/bin/acs"));
+    v.push(crate::layout::system_link());
     if let Some(path) = std::env::var_os("PATH") {
         v.extend(std::env::split_paths(&path).map(|d| d.join("acs")));
     }
@@ -282,7 +282,7 @@ pub fn run(opts: &Opts) -> Result<String, Error> {
             e.display()
         )));
     }
-    let target = release::archive_target(crate::payload::OWN_TARGET);
+    let target = release::own_archive_target();
     let base = release::releases_url(opts.allow_insecure_url).map_err(Error::Failed)?;
     let tmp = Scratch::new()?;
     let asset = release::lookup(&base, opts.version.as_deref(), &target, &tmp.0, 30)?;
@@ -367,8 +367,8 @@ fn check_writable(dir: &Path) -> Result<(), Error> {
 fn download(base: &str, asset: &Asset, target: &str, tmp: &Path) -> Result<PathBuf, Error> {
     let archive = tmp.join(&asset.file);
     release::fetch(&release::asset_url(base, asset), &archive, 300)?;
-    let data = std::fs::read(&archive).map_err(|e| e.to_string())?;
-    let got = crate::sha256::hex(&crate::sha256::digest(&data));
+    let got = crate::sha256::file(&archive).map_err(|e| e.to_string())?;
+    let got = crate::sha256::hex(&got);
     if got != asset.sha256 {
         return Err(Error::Failed(format!(
             "checksum mismatch for {} (expected {}, got {got}); nothing was changed",

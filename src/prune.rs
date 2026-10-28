@@ -43,7 +43,7 @@ fn root_for(exe: &Path, version: &str, home: &Path) -> Option<PathBuf> {
         return None;
     }
     let root = version_dir.parent()?;
-    let own = home.join(".local/share/acs");
+    let own = crate::layout::user_root(home);
     let same = root == own
         || matches!(
             (std::fs::canonicalize(root), std::fs::canonicalize(&own)),

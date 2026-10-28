@@ -71,12 +71,23 @@ pub fn plan<'a>(
             }
         }
         return Err(format!(
-            "this acs build carries no binary for {target}; build a complete one with `cargo xtask dist`, or install ~/.local/share/acs/{}/acs on the host by hand",
+            concat!(
+                "this acs build carries no binary for {}; build a complete one with `cargo xtask dist`, or install ~/",
+                crate::layout::user_root_str!(),
+                "/{}/acs on the host by hand"
+            ),
+            target,
             crate::VERSION
         ));
     }
     Err(format!(
-        "cannot install acs for {target} from a {own_target} build; install ~/.local/share/acs/{}/acs on the host by hand",
+        concat!(
+            "cannot install acs for {} from a {} build; install ~/",
+            crate::layout::user_root_str!(),
+            "/{}/acs on the host by hand"
+        ),
+        target,
+        own_target,
         crate::VERSION
     ))
 }
@@ -129,9 +140,9 @@ pub fn install(args: &ClientArgs, os: &str, arch: &str) -> Result<(), String> {
         "installing acs {} on {host} ({os} {arch})…",
         crate::VERSION
     ));
-    let token = format!("{:016x}", crate::sys::random_u64());
+    let token = crate::sys::random_token();
     let v = crate::VERSION;
-    let acs_dir = "\"$HOME\"/.local/share/acs";
+    let acs_dir = concat!("\"$HOME\"/", crate::layout::user_root_str!());
     let dir = format!("{acs_dir}/{}", sh_quote(v));
     let tmp = format!("{dir}/acs.new.{token}");
     let make_dir = make_dir(acs_dir, &dir);
@@ -362,7 +373,7 @@ fn finish(f: &Finish) -> Result<(), String> {
         }
         let _ = std::fs::remove_file(&me);
     } else {
-        let got = digest_copy(&me, &mut io::sink()).map_err(|e| e.to_string())?;
+        let got = sha256::file(&me).map_err(|e| e.to_string())?;
         if let Some(want) = &f.sha256 {
             if &sha256::hex(&got) != want {
                 let _ = std::fs::remove_file(&me);
@@ -386,7 +397,7 @@ fn finish(f: &Finish) -> Result<(), String> {
 /// Write the slim build `me` and then the payload set from stdin into
 /// `out`, checking each against its digest; a mismatch removes `me`.
 fn complete(f: &Finish, me: &Path, out: &mut std::fs::File) -> Result<(), String> {
-    let got = digest_copy(me, out).map_err(|e| e.to_string())?;
+    let got = sha256::copy_file(me, out).map_err(|e| e.to_string())?;
     if let Some(want) = &f.slim_sha256 {
         if &sha256::hex(&got) != want {
             let _ = std::fs::remove_file(me);
@@ -409,24 +420,6 @@ fn complete(f: &Finish, me: &Path, out: &mut std::fs::File) -> Result<(), String
     }
     out.write_all(&blob).map_err(|e| e.to_string())?;
     out.sync_all().map_err(|e| e.to_string())
-}
-
-/// Copy the file at `from` into `to` a buffer at a time, returning the
-/// SHA-256 of exactly what was copied.
-fn digest_copy(from: &Path, to: &mut dyn Write) -> io::Result<[u8; 32]> {
-    let mut file = std::fs::File::open(from)?;
-    let mut hash = sha256::Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => return Ok(hash.finish()),
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        hash.update(&buf[..n]);
-        to.write_all(&buf[..n])?;
-    }
 }
 
 fn create_exe(path: &Path) -> Result<std::fs::File, String> {
@@ -455,9 +448,9 @@ fn rename(from: &Path, to: &Path) -> Result<(), String> {
 /// renamed over the old one, so it is never missing.
 fn link_bin(target: &Path, token: &str) -> Result<(), String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
-    let bin = home.join(".local/bin");
+    let bin = crate::layout::user_bin(&home);
     let link = bin.join("acs");
-    if !should_link(&link, target, &home.join(".local/share/acs")) {
+    if !should_link(&link, target, &crate::layout::user_root(&home)) {
         return Ok(());
     }
     std::fs::create_dir_all(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
@@ -626,29 +619,6 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, "hand-installed").unwrap();
         assert!(!should_link(&link, &new, &share), "a regular file");
-    }
-
-    /// acs-zgof: the finisher's digest streams the file through the hash,
-    /// and is the digest of exactly the bytes it copied.
-    #[test]
-    fn digest_copy_hashes_what_it_copies() {
-        let d = crate::testutil::TempDir::new();
-        let f = d.path().join("acs");
-        // Not a multiple of the buffer, so the last read is a short one.
-        let data: Vec<u8> = (0..200_003u32).map(|i| (i * 31 % 251) as u8).collect();
-        std::fs::write(&f, &data).unwrap();
-        let mut out = Vec::new();
-        assert_eq!(digest_copy(&f, &mut out).unwrap(), sha256::digest(&data));
-        assert_eq!(out, data);
-        assert_eq!(
-            digest_copy(&f, &mut io::sink()).unwrap(),
-            sha256::digest(&data)
-        );
-        std::fs::write(&f, b"").unwrap();
-        assert_eq!(
-            digest_copy(&f, &mut io::sink()).unwrap(),
-            sha256::digest(b"")
-        );
     }
 
     #[test]

@@ -37,14 +37,12 @@ const TARGETS: &[(&str, &[(&str, &str)])] = &[
 /// one. The script spells it too, and a test holds the two together.
 pub const VERSION_MARK: &str = "# acs-version: ";
 
-/// The SHA-256 of `file` in a `SHA256SUMS` text (`<hex>  <file>` lines).
+/// The SHA-256 of `file` in a `SHA256SUMS` text, read the way acs reads
+/// one ([`acs::release::sums_line`]).
 pub fn checksum<'a>(sums: &'a str, file: &str) -> Option<&'a str> {
-    sums.lines().find_map(|l| {
-        let (hash, name) = l.split_once(char::is_whitespace)?;
-        let name = name.trim_start().trim_start_matches('*');
-        let hex = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
-        (name == file && hex).then_some(hash)
-    })
+    sums.lines()
+        .filter_map(acs::release::sums_line)
+        .find_map(|(hash, name)| (name == file).then_some(hash))
 }
 
 /// `Formula/acs.rb` for `version`, every archive's checksum from `sums`,

@@ -2553,9 +2553,10 @@ src/
                 addresses, for locality (§7.3)
   yaml.rs       the YAML subset those files use, parsed and written back
   install.rs    remote self-install and _install --finish
+  layout.rs     where acs is installed: the version and link directories
   payload.rs    payload set format, ELF trailer, Mach-O embed
   prune.rs      pruning of unused remote versions
-  sha256.rs     SHA-256 for install checks
+  sha256.rs     SHA-256, of a buffer or streamed from a file
   signature.rs  the release key, and ssh-keygen -Y over a release's SHA256SUMS
   sys.rs        libc wrappers
 xtask/          cargo xtask dist
