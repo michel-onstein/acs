@@ -5,10 +5,10 @@
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use acs::sys;
-use acs::testutil::KillOnDrop;
+use acs::testutil::{wait_until, KillOnDrop};
 
 const CHILD_ENV: &str = "ACS_TTY_CHILD";
 
@@ -58,14 +58,20 @@ fn spawn_child(mode: &str) -> (KillOnDrop, std::os::fd::OwnedFd, std::os::fd::Ow
 
 fn wait_for_raw(master: &std::os::fd::OwnedFd) {
     let mut f = std::fs::File::from(master.try_clone().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(20);
     let mut seen = Vec::new();
     let mut buf = [0u8; 256];
-    while !String::from_utf8_lossy(&seen).contains("RAW") {
-        assert!(Instant::now() < deadline, "child never reported raw mode");
-        let n = f.read(&mut buf).unwrap();
-        seen.extend_from_slice(&buf[..n]);
-    }
+    wait_until(
+        Duration::from_secs(20),
+        || {
+            if String::from_utf8_lossy(&seen).contains("RAW") {
+                return true;
+            }
+            let n = f.read(&mut buf).unwrap();
+            seen.extend_from_slice(&buf[..n]);
+            false
+        },
+        || "child never reported raw mode",
+    );
 }
 
 fn echo_on(slave: &std::os::fd::OwnedFd) -> bool {
@@ -103,17 +109,23 @@ fn alternate_screen_left_after_fatal_signal() {
     // What the child writes after RAW: the way back to the normal screen.
     // Read it before waiting: restoring the settings waits for the
     // terminal to take the output.
-    let mut seen = Vec::new();
+    let seen = std::cell::RefCell::new(Vec::new());
     let mut buf = [0u8; 256];
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !seen.ends_with(b"\x1b[?25h\x1b[?1049l") {
-        assert!(Instant::now() < deadline, "not left: {seen:?}");
-        let mut p = [sys::pollfd(master.as_raw_fd(), libc::POLLIN)];
-        if sys::poll(&mut p, 100).unwrap() > 0 {
-            let n = sys::read(master.as_raw_fd(), &mut buf).unwrap();
-            seen.extend_from_slice(&buf[..n]);
-        }
-    }
+    wait_until(
+        Duration::from_secs(5),
+        || {
+            if seen.borrow().ends_with(b"\x1b[?25h\x1b[?1049l") {
+                return true;
+            }
+            let mut p = [sys::pollfd(master.as_raw_fd(), libc::POLLIN)];
+            if sys::poll(&mut p, 100).unwrap() > 0 {
+                let n = sys::read(master.as_raw_fd(), &mut buf).unwrap();
+                seen.borrow_mut().extend_from_slice(&buf[..n]);
+            }
+            false
+        },
+        || format!("not left: {:?}", seen.borrow()),
+    );
     child.wait().unwrap();
     assert!(echo_on(&slave), "terminal left in raw mode after SIGTERM");
 }

@@ -13,13 +13,10 @@ use std::time::{Duration, Instant};
 use acs::sys;
 use acs::testutil::TempDir;
 
-/// The deadline test helpers wait to. Generous on purpose (acs-kip): the
-/// whole suite runs its targets in parallel, so a laptop building and
-/// running two dozen binaries at once takes many times longer over any one
-/// step than an idle machine does. A test that truly hangs still fails,
-/// only later; one that merely lost the CPU for a second does not, and a
-/// gate that cries wolf teaches people to re-run rather than to read.
-pub const T: Duration = Duration::from_secs(30);
+/// The deadline test helpers wait to; see [`acs::testutil::T`].
+pub use acs::testutil::T;
+/// Deadline waits as free functions, for any condition (acs-bndl).
+pub use acs::testutil::{poll, wait_until};
 
 /// A directory that does not exist: the client finds no configuration file
 /// unless a test gives it one.
@@ -195,18 +192,11 @@ impl Net {
     pub fn wait_pinged(&self, want: &[&str]) {
         let mut want: Vec<String> = want.iter().map(|h| h.to_string()).collect();
         want.sort();
-        let t0 = Instant::now();
-        loop {
-            let got = self.pinged();
-            if got == want {
-                return;
-            }
-            assert!(
-                t0.elapsed() < T,
-                "hosts pinged after {T:?}: {got:?}, want {want:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_until(
+            T,
+            || self.pinged() == want,
+            || format!("hosts pinged: {:?}, want {want:?}", self.pinged()),
+        );
     }
 
     /// The environment for a client with `config` as its configuration and
@@ -966,16 +956,16 @@ impl Remote {
     /// Wait until `extra` more connections have been made than the `base`
     /// [`Remote::connections`] returned before the stimulus.
     pub fn wait_more_connections(&self, base: usize, extra: usize, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while self.connections() < base + extra {
-            assert!(
-                Instant::now() < deadline,
-                "{} connections, waiting for {} more than the {base} there were",
-                self.connections(),
-                extra,
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_until(
+            timeout,
+            || self.connections() >= base + extra,
+            || {
+                format!(
+                    "{} connections, waiting for {extra} more than the {base} there were",
+                    self.connections(),
+                )
+            },
+        );
     }
 
     /// Run the remote command a real ssh would run (the prelude), with the
@@ -1122,17 +1112,15 @@ impl Client {
 
     /// Wait until `ready` holds, or fail at the deadline. For the moments
     /// where a test needs the client to have *reached* a state rather than
-    /// to have been given time to (acs-kip).
+    /// to have been given time to (acs-kip). The free [`wait_until`], with
+    /// the client's output in its failure.
+    #[track_caller]
     pub fn wait_until(&self, what: &str, mut ready: impl FnMut(&Self) -> bool, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while !ready(self) {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting until {what}; output so far:\n{}",
-                self.text()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until(
+            timeout,
+            || ready(self),
+            || format!("waiting until {what}; output so far:\n{}", self.text()),
+        );
     }
 
     /// Everything the client wrote to its terminal so far.
@@ -1221,18 +1209,21 @@ impl Client {
     }
 
     /// Wait for the client to exit; returns its exit code.
+    #[track_caller]
     pub fn wait(&mut self, timeout: Duration) -> i32 {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(st) = self.child.try_wait().unwrap() {
-                use std::os::unix::process::ExitStatusExt;
-                return st.code().unwrap_or(128 + st.signal().unwrap_or(0));
-            }
-            if Instant::now() >= deadline {
-                panic!("client did not exit; output:\n{}", self.text());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        use std::os::unix::process::ExitStatusExt;
+        let (child, output) = (&mut self.child, &self.output);
+        let st = poll(
+            timeout,
+            || child.try_wait().unwrap(),
+            || {
+                format!(
+                    "client did not exit; output:\n{}",
+                    String::from_utf8_lossy(&output.lock().unwrap())
+                )
+            },
+        );
+        st.code().unwrap_or(128 + st.signal().unwrap_or(0))
     }
 }
 
@@ -1370,6 +1361,70 @@ pub fn last_number(c: &Client) -> u64 {
 /// Ctrl-] Ctrl-] then `key`.
 pub fn command(key: u8) -> Vec<u8> {
     vec![0x1d, 0x1d, key]
+}
+
+/// Fast client timers, so a resume takes a fraction of a second.
+pub const FAST: &[(&str, &str)] = &[
+    ("ACS_BACKOFF_MS", "100"),
+    ("ACS_PING_MS", "200"),
+    ("ACS_DEAD_MS", "800"),
+];
+
+/// A program printing `#1#`, `#2#`, … a line every 10 ms, for
+/// [`numbers`] and [`assert_consecutive`] to read.
+pub const TICKER: &str = "i=0; while true; do i=$((i+1)); printf '#%d#\\n' $i; sleep 0.01; done";
+
+/// A program that reports every byte it receives as `in:xx`, as it comes;
+/// [`received`] reads the reports back.
+pub const REPORTER: &str = "stty raw -echo; echo ready; \
+    while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1); printf 'in:%s\\n' $b; done";
+
+/// The bytes a [`REPORTER`] reported, in order, as two hex digits each.
+pub fn received(c: &Client) -> Vec<String> {
+    c.text()
+        .split("in:")
+        .skip(1)
+        .filter_map(|s| s.get(..2).map(String::from))
+        .collect()
+}
+
+/// The command of a session that says `up` and stays: `-- /bin/sh -c …`.
+pub const UP_CMD: &[&str] = &["--", "/bin/sh", "-c", "echo up; sleep 30"];
+
+/// The arguments for session `session` on `devbox` running [`UP_CMD`].
+pub fn up_args(session: &str) -> Vec<&str> {
+    let mut a = vec!["devbox", session];
+    a.extend_from_slice(UP_CMD);
+    a
+}
+
+/// A session that answers each line typed with `got-<name>:<line>`, after
+/// saying `ready-<name>`.
+pub fn echo(name: &str) -> String {
+    format!("echo ready-{name}; while read l; do echo got-{name}:$l; done")
+}
+
+/// The last screen the session menu drew in full: a redraw may be read
+/// half-way, so one that has not reached its closing erase yet is skipped.
+pub fn last_screen(c: &Client) -> String {
+    let text = c.text();
+    let mut screens: Vec<&str> = text.split("\x1b[Hacs: ").skip(1).collect();
+    if screens.last().is_some_and(|s| !s.contains("\x1b[J")) && screens.len() > 1 {
+        screens.pop();
+    }
+    let last = screens.last().expect("no menu drawn");
+    format!("\x1b[Hacs: {last}")
+}
+
+/// The number of session `name`'s row in the [`last_screen`] of the menu.
+pub fn menu_row(c: &Client, name: &str) -> usize {
+    let screen = last_screen(c);
+    let line = screen
+        .split("\r\n")
+        .find(|l| l.contains(&format!(" {name} ")))
+        .unwrap_or_else(|| panic!("no {name} in {screen:?}"));
+    let line = line.trim_start_matches("\x1b[7m");
+    line[2..3].parse().unwrap()
 }
 
 /// A data file with every byte value except `\n` (a pty turns `\n` into

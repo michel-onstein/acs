@@ -210,18 +210,11 @@ impl Fake {
     /// before it becomes the connection, so this is the event itself and
     /// not a guess at how long one takes (acs-o6x).
     fn wait_dial(&self, needle: &str) -> String {
-        let deadline = std::time::Instant::now() + T;
-        loop {
-            if let Some(c) = self.dials().into_iter().find(|c| c.contains(needle)) {
-                return c;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "nothing dialled with {needle:?}: {:?}",
-                self.calls()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        poll(
+            T,
+            || self.dials().into_iter().find(|c| c.contains(needle)),
+            || format!("nothing dialled with {needle:?}: {:?}", self.calls()),
+        )
     }
 
     /// Every dial so far reached acs's master on this one socket. Counting

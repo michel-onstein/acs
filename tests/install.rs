@@ -7,14 +7,6 @@ use std::process::Command;
 
 use common::*;
 
-const CMD: &[&str] = &["--", "/bin/sh", "-c", "echo up; sleep 30"];
-
-fn args(session: &str) -> Vec<&str> {
-    let mut a = vec!["devbox", session];
-    a.extend_from_slice(CMD);
-    a
-}
-
 fn leftovers(remote: &Remote) -> Vec<String> {
     let dir = remote.installed_binary(acs::VERSION);
     std::fs::read_dir(dir.parent().unwrap())
@@ -27,7 +19,7 @@ fn leftovers(remote: &Remote) -> Vec<String> {
 #[test]
 fn same_platform_installs_a_copy_of_itself() {
     let remote = Remote::new();
-    let mut c = Client::start(&remote, &args("s"));
+    let mut c = Client::start(&remote, &up_args("s"));
     c.wait_for(&format!("installing acs {} on devbox (", acs::VERSION), T);
     c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
     c.wait_for("up", T);
@@ -49,7 +41,7 @@ fn same_platform_installs_a_copy_of_itself() {
 fn a_slim_build_cannot_install_another_platform() {
     let remote = Remote::new();
     remote.fake_uname("Linux", "x86_64");
-    let mut c = Client::start(&remote, &args("s"));
+    let mut c = Client::start(&remote, &up_args("s"));
     assert_eq!(c.wait(T), 254);
     c.wait_for("cargo xtask dist", T);
     assert!(!remote.installed_binary(acs::VERSION).exists());
@@ -62,7 +54,7 @@ fn a_complete_build_installs_another_platform_from_its_payloads() {
     // binary, so what gets installed can run here.
     remote.fake_uname("Linux", "x86_64");
     let (client, slim, blob) = complete_client(remote.root.path(), "x86_64-unknown-linux-musl");
-    let mut c = Client::start_exe(&client, &remote, &args("p"), &[]);
+    let mut c = Client::start_exe(&client, &remote, &up_args("p"), &[]);
     c.wait_for("(Linux x86_64)", T);
     c.wait_for("up", T);
     // The installed copy is slim + payloads: byte-identical to the complete
@@ -88,9 +80,9 @@ fn an_install_is_0755_under_a_restrictive_umask() {
         let mut c = if payloads {
             remote.fake_uname("Linux", "x86_64");
             let (client, _, _) = complete_client(remote.root.path(), "x86_64-unknown-linux-musl");
-            Client::start_exe(&client, &remote, &args("u"), &[])
+            Client::start_exe(&client, &remote, &up_args("u"), &[])
         } else {
-            Client::start(&remote, &args("u"))
+            Client::start(&remote, &up_args("u"))
         };
         c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
         c.wait_for("up", T);
@@ -122,9 +114,9 @@ fn an_install_under_a_group_writable_umask_still_runs() {
         let mut c = if payloads {
             remote.fake_uname("Linux", "x86_64");
             let (client, _, _) = complete_client(remote.root.path(), "x86_64-unknown-linux-musl");
-            Client::start_exe(&client, &remote, &args("u"), &[])
+            Client::start_exe(&client, &remote, &up_args("u"), &[])
         } else {
-            Client::start(&remote, &args("u"))
+            Client::start(&remote, &up_args("u"))
         };
         c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
         // The session comes up: nothing refused the freshly installed binary.
@@ -152,7 +144,7 @@ fn a_chatty_login_shell_does_not_break_either_install() {
     remote.login_noise("Welcome to devbox!\nYou have mail.\n");
     remote.fake_uname("Linux", "x86_64");
     let (client, _, _) = complete_client(remote.root.path(), "x86_64-unknown-linux-musl");
-    let mut c = Client::start_exe(&client, &remote, &args("p"), &[]);
+    let mut c = Client::start_exe(&client, &remote, &up_args("p"), &[]);
     c.wait_for("(Linux x86_64)", T);
     c.wait_for("up", T);
     assert!(!c.text().contains("unexpected reply"), "{}", c.text());
@@ -160,7 +152,7 @@ fn a_chatty_login_shell_does_not_break_either_install() {
 
     let remote = Remote::new();
     remote.login_noise("motd\n");
-    let mut c = Client::start(&remote, &args("s"));
+    let mut c = Client::start(&remote, &up_args("s"));
     c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
     c.wait_for("up", T);
 }
@@ -171,7 +163,7 @@ fn a_chatty_login_shell_does_not_break_either_install() {
 fn a_login_banner_that_is_not_utf8_does_not_fail_the_install() {
     let remote = Remote::new();
     remote.login_noise_bytes(b"Welcome to d\xe9vbox \xff\n");
-    let mut c = Client::start(&remote, &args("l"));
+    let mut c = Client::start(&remote, &up_args("l"));
     c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
     c.wait_for("up", T);
     assert!(!c.text().contains("unexpected reply"), "{}", c.text());
@@ -187,7 +179,7 @@ fn a_link_that_cannot_be_made_is_a_warning_not_a_failed_install() {
     let local = remote.home().join(".local");
     std::fs::create_dir_all(&local).unwrap();
     std::fs::write(local.join("bin"), "not a directory\n").unwrap();
-    let mut c = Client::start(&remote, &args("w"));
+    let mut c = Client::start(&remote, &up_args("w"));
     c.wait_for("warning: cannot link ~/.local/bin/acs", T);
     c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
     c.wait_for("up", T);
@@ -202,7 +194,7 @@ fn noise_without_a_newline_does_not_hide_the_markers() {
     let remote = Remote::new();
     remote.login_noise("printf without newline");
     // ACS-NEED, then the install, then ACS-READY.
-    let mut c = Client::start(&remote, &args("n"));
+    let mut c = Client::start(&remote, &up_args("n"));
     c.wait_for(&format!("installed acs {} on devbox", acs::VERSION), T);
     c.wait_for("up", T);
 }
@@ -215,7 +207,7 @@ fn the_bin_link_is_left_alone_unless_it_moves_forward() {
     let link = remote.home().join(".local/bin/acs");
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
     std::fs::write(&link, "#!/bin/sh\necho mine\n").unwrap();
-    let mut c = Client::start(&remote, &args("f"));
+    let mut c = Client::start(&remote, &up_args("f"));
     c.wait_for("up", T);
     assert!(remote.installed_binary(acs::VERSION).exists());
     assert_eq!(
@@ -230,7 +222,7 @@ fn the_bin_link_is_left_alone_unless_it_moves_forward() {
     let link = remote.home().join(".local/bin/acs");
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&newer, &link).unwrap();
-    let mut c = Client::start(&remote, &args("g"));
+    let mut c = Client::start(&remote, &up_args("g"));
     c.wait_for("up", T);
     assert!(remote.installed_binary(acs::VERSION).exists());
     assert_eq!(std::fs::read_link(&link).unwrap(), newer);
@@ -239,8 +231,8 @@ fn the_bin_link_is_left_alone_unless_it_moves_forward() {
 #[test]
 fn concurrent_installs_converge() {
     let remote = Remote::new();
-    let mut a = Client::start(&remote, &args("a"));
-    let mut b = Client::start(&remote, &args("b"));
+    let mut a = Client::start(&remote, &up_args("a"));
+    let mut b = Client::start(&remote, &up_args("b"));
     a.wait_for("up", T);
     b.wait_for("up", T);
     assert_eq!(
@@ -256,7 +248,7 @@ fn other_versions_are_left_alone() {
     let other = remote.home().join(".local/share/acs/0.0.1-old/acs");
     std::fs::create_dir_all(other.parent().unwrap()).unwrap();
     std::fs::write(&other, b"#!/bin/sh\necho old\n").unwrap();
-    let mut c = Client::start(&remote, &args("v"));
+    let mut c = Client::start(&remote, &up_args("v"));
     c.wait_for("up", T);
     assert_eq!(std::fs::read(&other).unwrap(), b"#!/bin/sh\necho old\n");
     assert!(remote.installed_binary(acs::VERSION).exists());
@@ -296,7 +288,7 @@ fn old_unused_versions_are_pruned_at_proxy_start() {
     acs::sys::set_mtime(&old, ninety_days_ago).unwrap();
     acs::sys::set_mtime(&root.join(acs::VERSION), ninety_days_ago).unwrap();
 
-    let mut c = Client::start_env(&remote, &args("pr"), &[("ACS_PRUNE_EVERY_SECS", "0")]);
+    let mut c = Client::start_env(&remote, &up_args("pr"), &[("ACS_PRUNE_EVERY_SECS", "0")]);
     c.wait_for("up", T);
     assert!(!old.exists(), "an old unused version must be pruned");
     // Our own version was marked as used just now.

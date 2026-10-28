@@ -10,8 +10,6 @@ use common::*;
 
 const ALIAS: &str = "aliases:\n  devbox:\n    - host: devbox.lan\n";
 
-const TICKER: &str = "i=0; while true; do i=$((i+1)); printf '#%d#\\n' $i; sleep 0.01; done";
-
 /// The phases `connection` told, in the order they were told.
 fn phases(text: &str, connection: &str) -> Vec<String> {
     let tag = format!("acs: timing: {connection}: ");
@@ -37,14 +35,7 @@ fn the_first_connection_and_a_redial_tell_each_phase_in_order() {
     let remote = Remote::installed();
     let net = Net::new(&["devbox.lan"]);
     let mut env = net.env(ALIAS);
-    env.extend(
-        [
-            ("ACS_BACKOFF_MS", "100"),
-            ("ACS_PING_MS", "200"),
-            ("ACS_DEAD_MS", "800"),
-        ]
-        .map(|(k, v)| (k.to_string(), v.to_string())),
-    );
+    env.extend(FAST.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     let mut c = Client::start_env(
         &remote,
         &["-v", "devbox", "t", "--", "/bin/sh", "-c", TICKER],
