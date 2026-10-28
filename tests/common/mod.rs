@@ -565,13 +565,36 @@ pub fn brewed_copy(dir: &Path) -> PathBuf {
 
 /// A "remote host": its own HOME (with acs installed at the versioned path
 /// the prelude looks for) and its own socket directory.
+///
+/// Its directory is never removed when it is dropped, only when the test
+/// binary exits (acs-hx0m) — see the `Drop` below.
 pub struct Remote {
-    pub root: TempDir,
+    pub root: std::mem::ManuallyDrop<TempDir>,
+}
+
+/// Ends the remote's sessions now, as a [`TempDir`] would, but leaves its
+/// directory to [`remove_at_exit`] (acs-hx0m).
+///
+/// The directory holds the remote's acs, a hard link of [`exe()`] (see
+/// [`Remote::install`]). On macOS, unlinking such a link while another test
+/// thread is spawning a client from [`exe()`] now and then gets that client
+/// SIGKILLed 1–15 ms after the fork, before it writes a byte; nothing is
+/// logged, and its test times out thirty seconds later. In `tests/client.rs`
+/// with one test dropping two installed remotes at once, 10 runs in 270
+/// failed so (several clients at a time); unlinking only the two binaries
+/// and keeping the directories, 2 in 100; keeping everything, 0 in 160.
+/// Removing the directories at exit, when no test is running and nothing is
+/// spawning, takes the unlink out of that window: 0 in 150.
+impl Drop for Remote {
+    fn drop(&mut self) {
+        acs::testutil::end_sessions_under(self.root.path());
+        remove_at_exit(self.root.path().to_path_buf());
+    }
 }
 
 impl Remote {
     pub fn new() -> Remote {
-        let root = TempDir::new();
+        let root = std::mem::ManuallyDrop::new(TempDir::new());
         let r = Remote { root };
         std::fs::create_dir_all(r.home()).unwrap();
         std::fs::create_dir_all(r.sockets()).unwrap();
@@ -1118,8 +1141,13 @@ impl Client {
                 }
             }
             if Instant::now() >= deadline {
+                // Whether the client is still there: a client that died
+                // silently (acs-hx0m) reads very differently from one that
+                // is merely waiting.
+                let st = self.child.try_wait();
                 panic!(
-                    "timed out waiting for {needle:?}; output so far:\n{}",
+                    "timed out waiting for {needle:?}; client {}: {st:?}; output so far:\n{}",
+                    self.child.id(),
                     self.text()
                 );
             }
