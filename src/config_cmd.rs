@@ -1122,17 +1122,35 @@ fn keep_comments(mut before: Vec<String>, next: Option<&mut Node>) {
 
 /// Validate `doc` as a configuration file and write it in place atomically.
 fn write(path: &Path, doc: &Document) -> Result<(), Error> {
-    let text = yaml::emit(doc);
-    let check = yaml::parse(&text).map_err(|e| Error::Io(format!("internal error: {e}")))?;
+    // Checked as edited, so an error names a line of the file on disk (or
+    // none, for a value the edit added) rather than of the unsaved text
+    // (acs-5mmu); the text is then checked to read back the same.
     Config::default()
-        .apply(path, &check.root)
+        .apply(path, &doc.root)
         .map_err(|e| Error::Usage(format!("{e} (not saved; fix the file by hand)")))?;
+    let text = yaml::emit(doc);
+    yaml::parse(&text)
+        .map_err(|e| e.to_string())
+        .and_then(|check| Config::default().apply(path, &check.root))
+        .map_err(|e| Error::Io(format!("internal error: {e}")))?;
     // Edit the file the path leads to, not the link: a configuration
     // kept in dotfiles is reached through a symlink, and renaming over
     // the link would replace it with a regular file and leave the real
     // file behind (acs-q8e). A hard-linked file still gets a new inode,
-    // as any atomic replace does.
-    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // as any atomic replace does. A link made before its file exists
+    // does not canonicalize, so it is followed by hand (acs-5mmu).
+    let mut real = path.to_path_buf();
+    match std::fs::canonicalize(path) {
+        Ok(p) => real = p,
+        Err(_) => {
+            for _ in 0..40 {
+                let Ok(to) = std::fs::read_link(&real) else {
+                    break;
+                };
+                real = real.parent().unwrap_or(Path::new("")).join(to);
+            }
+        }
+    }
     let path = real.as_path();
     let dir = path.parent().unwrap_or(Path::new("."));
     let io = |e: std::io::Error, what: &Path| {

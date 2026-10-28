@@ -10,8 +10,16 @@
 # is unchanged, or older than the tap's, is left alone. --dry-run shows the
 # change and pushes nothing. ACS_TAP_REPO names another tap repository (the
 # tests use a local one). Pushing to GitHub uses gh's token (GH_TOKEN works).
-# ACS_RELEASES_URL says where a vX.Y.Z argument's SHA256SUMS is fetched from,
-# for a fork rendering its own formula (acs-x57).
+#
+# A vX.Y.Z argument's SHA256SUMS is fetched from the build's release channel
+# (`cargo xtask channel`), or from ACS_RELEASES_URL, and its SHA256SUMS.sig
+# is checked against that channel's release key before anything is rendered
+# (acs-oxl4): Homebrew users never see the signature, so an unchecked file
+# here would launder a tampered release into the formula's pinned sha256s.
+# The key is the build's, as in the packaged installer and the formula, so a
+# fork built with ACS_DEFAULT_RELEASE_KEY trusts its own; there is no
+# variable that names another. ACS_XTASK runs that xtask binary instead of
+# `cargo xtask` (the tests use the one cargo built).
 set -eu
 
 usage() {
@@ -30,17 +38,51 @@ for a in "$@"; do
 done
 [ -n "$arg" ] || usage
 repo=${ACS_TAP_REPO:-https://github.com/michel-onstein/homebrew-acs.git}
-releases=${ACS_RELEASES_URL:-https://github.com/michel-onstein/acs/releases}
+root=$(cd "$(dirname "$0")/.." && pwd)
+
+xtask() {
+    if [ -n "${ACS_XTASK:-}" ]; then
+        "$ACS_XTASK" "$@"
+    else
+        (cd "$root" && cargo xtask "$@")
+    fi
+}
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/acs-tap.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 case "$arg" in
     v[0-9]*)
-        # A version: render its formula from the published SHA256SUMS.
-        curl -fsSL -o "$work/SHA256SUMS" "$releases/download/$arg/SHA256SUMS"
-        (cd "$(dirname "$0")/.." && cargo xtask formula --version "$arg" \
-            --sums "$work/SHA256SUMS" --out "$work/acs.rb")
+        # A version: render its formula from the published SHA256SUMS, once
+        # its signature checks out against the build's release key.
+        xtask channel > "$work/channel"
+        key=$(sed -n 's/^key //p' "$work/channel" | head -n 1)
+        releases=${ACS_RELEASES_URL:-$(sed -n 's/^releases //p' "$work/channel" | head -n 1)}
+        if [ -z "$key" ] || [ -z "$releases" ]; then
+            echo "cargo xtask channel named no release key or releases URL" >&2
+            exit 1
+        fi
+        command -v ssh-keygen >/dev/null 2>&1 || {
+            echo "need ssh-keygen to check the release signature" >&2
+            exit 1
+        }
+        base=$releases/download/$arg
+        curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS" || {
+            echo "cannot download $base/SHA256SUMS" >&2
+            exit 1
+        }
+        curl -fsSL -o "$work/SHA256SUMS.sig" "$base/SHA256SUMS.sig" || {
+            echo "the release has no signature for SHA256SUMS ($base/SHA256SUMS.sig); the tap is left alone" >&2
+            exit 1
+        }
+        printf 'releases@acs namespaces="acs-release" %s\n' "$key" > "$work/allowed_signers"
+        ssh-keygen -Y verify -f "$work/allowed_signers" -I releases@acs -n acs-release \
+            -s "$work/SHA256SUMS.sig" < "$work/SHA256SUMS" >/dev/null 2>&1 || {
+            echo "$base/SHA256SUMS is not signed by this build's release key ($key); the tap is left alone" >&2
+            echo "(a fork builds xtask with its ACS_DEFAULT_RELEASE_KEY; docs/VERSIONING.md, \"Forking\")" >&2
+            exit 1
+        }
+        xtask formula --version "$arg" --sums "$work/SHA256SUMS" --out "$work/acs.rb"
         formula=$work/acs.rb
         ;;
     *) formula=$arg ;;

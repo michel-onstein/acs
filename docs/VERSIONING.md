@@ -157,7 +157,17 @@ renders the formula from the release's `SHA256SUMS`
   from its published `SHA256SUMS` — the way to retry if the push failed
   after the release was published. `ACS_TAP_REPO` points it at another
   repository (the tests use a local one) and `ACS_RELEASES_URL` at another
-  release channel to read that `SHA256SUMS` from.
+  release channel to read that `SHA256SUMS` from; by default it is the
+  build's channel.
+- before rendering anything from a published `SHA256SUMS`, it checks
+  `SHA256SUMS.sig` with `ssh-keygen -Y verify`, as the installer does, and
+  refuses a release that is unsigned or not signed by the build's release
+  key (acs-oxl4). Homebrew users never see the signature — brew checks only
+  the sha256s the formula pins — so this is the check they get. The key is
+  the one `cargo xtask channel` reports, xtask's own `RELEASE_KEY`, which is
+  what the formula and the packaged installer carry: a fork that builds with
+  `ACS_DEFAULT_RELEASE_KEY` ("Forking") checks against its own key, and no
+  variable names another.
 
 The formula's homepage and download URLs are the build's
 `DEFAULT_RELEASES_URL` ("Forking"), so a fork's tap points at the fork. To

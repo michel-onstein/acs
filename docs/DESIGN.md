@@ -1601,16 +1601,17 @@ aliases:                       # acs devbox tries its hosts in order
 
 **Parser.** The files use a small subset of YAML — block mappings and lists,
 plain and quoted scalars, one-line `[…]`/`{…}`, comments — parsed by hand in
-`yaml.rs`, which refuses anchors, tags, block scalars and multi-line flow
-collections with the line they are on. A key may be separated from its
-value by a space or a tab, as YAML 1.2 says, and a leading byte-order mark
-is skipped; a tab for *indentation* is still refused, with that advice.
-The tree keeps every node's line and
-the comments around it, so a file rewritten by the client keeps its comments
-and order. Measured on the release profile, a minimal load-and-dump binary
-grows by about 100 KB with `yaml-rust2` and 150 KB with `serde_yaml`, and
-neither keeps comments; the hand-written parser adds 17 KB to `acs` (slim
-build 490 → 507 KB).
+`yaml.rs`, which refuses anchors, tags, directives, block scalars, multi-line
+flow collections and a second document with the line they are on. A key may
+be separated from its value, and a comment from what precedes it, by a space
+or a tab, as YAML 1.2 says, and a leading byte-order mark is skipped; a tab
+for *indentation* is still refused, with that advice.
+The tree keeps every node's line and the comments and `---`/`...` markers
+around it, so a file rewritten by the client keeps its comments and order.
+Measured on the release profile, a minimal load-and-dump binary grows by
+about 100 KB with `yaml-rust2` and 150 KB with `serde_yaml`, and neither
+keeps comments; the hand-written parser adds 17 KB to `acs` (slim build
+490 → 507 KB).
 
 ### 7.3 Host aliases
 
@@ -2150,6 +2151,24 @@ would not be recognised.
   30 days whose sessions have all ended are removed by the next proxy start —
   only under the user's own `~/.local/share/acs`, never in the system-wide
   `/usr/local/lib/acs`, which holds other users' versions.
+- **Old versions in `/usr/local/lib/acs` are the administrator's to remove**
+  (acs-1gy). acs never deletes there — a user cannot remove root's files,
+  and it is not ours to decide which version another user's client still
+  needs — and it does not touch those directories either, so their times
+  say when they were installed, not when they were last used. A directory
+  populated once per release therefore grows by one version each time until
+  its owner trims it: `rm -rf /usr/local/lib/acs/<version>` as root, for any
+  version no client should be on any more. Removing one is always safe. A
+  session already running keeps its binary (Linux keeps a running file
+  until its last process exits), and a client of that version still works:
+  its prelude finds nothing at either path, prints `ACS-NEED`, and the
+  client installs the version under that user's `$HOME` as on first
+  contact. `ps -eo user,args | grep /usr/local/lib/acs/` shows which
+  versions are attached at the moment, since the proxy is exec'd under the
+  path it was found at. There is no `acs prune` command to say any of this
+  at run time: pruning happens silently at a proxy start, and a message
+  there would reach every user on every connection about a directory none
+  of them can change.
 
 When the client reads `ACS-NEED`, it maps the `uname` pair to a target,
 installs a binary for it (below), and redials. Protocol versions are checked in

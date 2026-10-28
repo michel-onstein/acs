@@ -3,6 +3,7 @@
 //! (`ACS_TAP_REPO`): new versions land, an unchanged or older one does not,
 //! and --dry-run pushes nothing.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -60,17 +61,7 @@ impl Scratch {
 
     /// `cargo xtask formula` for `version`, with made-up checksums.
     fn render(&self, version: &str) -> PathBuf {
-        let sums: String = [
-            "aarch64-apple-darwin",
-            "aarch64-unknown-linux-musl",
-            "x86_64-apple-darwin",
-            "x86_64-unknown-linux-musl",
-        ]
-        .iter()
-        .map(|t| format!("{}  acs-{version}-{t}.tar.gz\n", "a".repeat(64)))
-        .collect();
-        let sums_file = self.root.join(format!("SHA256SUMS-{version}"));
-        std::fs::write(&sums_file, sums).unwrap();
+        let sums_file = self.sums(version);
         let formula = self.root.join(format!("acs-{version}.rb"));
         let st = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .args(["formula", "--version", version, "--sums"])
@@ -96,6 +87,98 @@ impl Scratch {
         let mut c = Command::new("sh");
         self.env(&mut c);
         c.arg(script).arg(formula).args(args).output().unwrap()
+    }
+
+    /// A throwaway signing key under the scratch directory: its private
+    /// half's path, and its public line.
+    fn keygen(&self, name: &str) -> (PathBuf, String) {
+        let key = self.root.join(name);
+        let st = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", name, "-f"])
+            .arg(&key)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+        (key, public.trim().to_string())
+    }
+
+    /// Publish `version` under `releases/download/vX.Y.Z/` with made-up
+    /// checksums, and with a `SHA256SUMS.sig` when `signer` names a key.
+    fn publish(&self, version: &str, signer: Option<&Path>) -> PathBuf {
+        let dir = self.root.join(format!("releases/download/v{version}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("SHA256SUMS.sig"));
+        let sums = dir.join("SHA256SUMS");
+        std::fs::copy(self.sums(version), &sums).unwrap();
+        if let Some(key) = signer {
+            let st = Command::new("ssh-keygen")
+                .args(["-q", "-Y", "sign", "-n", "acs-release", "-f"])
+                .arg(key)
+                .arg(&sums)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        sums
+    }
+
+    /// `scripts/update-tap.sh vX.Y.Z <args>` against the releases
+    /// [`Scratch::publish`] writes, with an xtask whose build channel trusts
+    /// `trusted` — the stand-in for a build made with that
+    /// `ACS_DEFAULT_RELEASE_KEY`, which a test cannot recompile xtask for.
+    /// Every xtask subcommand run is appended to `xtask.log`.
+    fn try_update_release(&self, version: &str, trusted: &str, args: &[&str]) -> Output {
+        let wrapper = self.root.join("xtask.sh");
+        let log = self.root.join("xtask.log");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\necho \"$1\" >> '{}'\nif [ \"$1\" = channel ]; then\n    printf 'releases %s\\nkey %s\\n' 'https://example.com/unused' '{trusted}'\n    exit 0\nfi\nexec '{}' \"$@\"\n",
+                log.display(),
+                env!("CARGO_BIN_EXE_xtask"),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/update-tap.sh");
+        let mut c = Command::new("sh");
+        self.env(&mut c);
+        c.env("ACS_XTASK", &wrapper)
+            .env(
+                "ACS_RELEASES_URL",
+                format!("file://{}", self.root.join("releases").display()),
+            )
+            .arg(script)
+            .arg(format!("v{version}"))
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// The xtask subcommands [`Scratch::try_update_release`] ran.
+    fn xtask_runs(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("xtask.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A `SHA256SUMS` for `version`, made-up checksums.
+    fn sums(&self, version: &str) -> PathBuf {
+        let sums: String = [
+            "aarch64-apple-darwin",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-musl",
+        ]
+        .iter()
+        .map(|t| format!("{}  acs-{version}-{t}.tar.gz\n", "a".repeat(64)))
+        .collect();
+        let sums_file = self.root.join(format!("SHA256SUMS-{version}"));
+        std::fs::write(&sums_file, sums).unwrap();
+        sums_file
     }
 
     fn log(&self) -> Vec<String> {
@@ -199,4 +282,94 @@ fn a_formula_whose_urls_are_not_github_shaped_still_lands() {
         "{out:?}"
     );
     assert_eq!(s.log(), ["acs 2.0.0", "tap"]);
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// acs-oxl4: `scripts/update-tap.sh vX.Y.Z` renders a published release's
+/// formula only once that release's SHA256SUMS.sig verifies against the
+/// build's release key. Unsigned, signed by another key, or altered after
+/// signing, it is refused before xtask renders anything and the tap does
+/// not move; signed by the build's key, it lands.
+#[test]
+fn a_published_release_lands_only_when_signed_by_the_build_key() {
+    let s = Scratch::new("signed");
+    let (release_key, trusted) = s.keygen("release");
+    let (other_key, _) = s.keygen("other");
+
+    // No signature at all.
+    s.publish("1.9.0", None);
+    let out = s.try_update_release("1.9.0", &trusted, &[]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr(&out).contains("has no signature for SHA256SUMS"),
+        "{out:?}"
+    );
+    assert_eq!(s.xtask_runs(), ["channel"], "rendered before refusing");
+    assert_eq!(s.log(), ["tap"]);
+
+    // Signed, but by a key the build does not trust.
+    s.publish("1.9.0", Some(&other_key));
+    let out = s.try_update_release("1.9.0", &trusted, &[]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr(&out).contains("is not signed by this build's release key"),
+        "{out:?}"
+    );
+    assert_eq!(
+        s.xtask_runs(),
+        ["channel", "channel"],
+        "rendered before refusing"
+    );
+    assert_eq!(s.log(), ["tap"]);
+
+    // Signed by the right key, then altered: the signature no longer covers
+    // what would be rendered.
+    let sums = s.publish("1.9.0", Some(&release_key));
+    let tampered =
+        std::fs::read_to_string(&sums)
+            .unwrap()
+            .replacen(&"a".repeat(64), &"b".repeat(64), 1);
+    std::fs::write(&sums, tampered).unwrap();
+    let out = s.try_update_release("1.9.0", &trusted, &[]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr(&out).contains("is not signed by this build's release key"),
+        "{out:?}"
+    );
+    assert!(
+        !s.xtask_runs().iter().any(|r| r == "formula"),
+        "{:?}",
+        s.xtask_runs()
+    );
+    assert_eq!(s.log(), ["tap"]);
+
+    // Signed by the build's key: rendered and pushed.
+    s.publish("1.9.0", Some(&release_key));
+    let out = s.try_update_release("1.9.0", &trusted, &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(stdout(&out).contains("tap: acs 1.9.0 pushed"), "{out:?}");
+    assert_eq!(s.xtask_runs().last().map(String::as_str), Some("formula"));
+    assert_eq!(s.log(), ["acs 1.9.0", "tap"]);
+    assert!(s.formula_on_tap().contains("# acs-version: 1.9.0"));
+}
+
+/// The key `scripts/update-tap.sh` trusts is the one xtask was built with —
+/// the same constant the formula and the packaged installer carry — so a
+/// fork built with its own `ACS_DEFAULT_RELEASE_KEY` checks its own
+/// releases with no edit to the script (acs-oxl4).
+#[test]
+fn xtask_channel_names_the_build_release_key() {
+    let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .arg("channel")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    let key = format!("key {}", acs::signature::RELEASE_KEY);
+    let releases = format!("releases {}", acs::release::DEFAULT_RELEASES_URL);
+    assert!(text.lines().any(|l| l == key), "{text}");
+    assert!(text.lines().any(|l| l == releases), "{text}");
 }

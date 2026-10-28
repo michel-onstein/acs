@@ -3,8 +3,9 @@
 # first-contact install from the macOS complete build, TUI escape sequences,
 # the kitty keyboard protocol, mouse reports, OSC 52, key selection by -i and
 # by identity_file, drops (a killed connection, a frozen host), the Ctrl-L
-# sent after a re-attach and a resume, and a -L forward (the session's ssh
-# alone binds the port).
+# sent after a re-attach and a resume, a -L forward (the session's ssh
+# alone binds the port), and a user whose only acs is the system-wide
+# install under /usr/local/lib/acs.
 #
 #   scripts/e2e_ssh.sh [--no-build [--allow-stale-dist]]
 #

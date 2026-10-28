@@ -205,6 +205,11 @@ fn connect_or_start(dir: &Path, name: &str) -> (FrameConn, Vec<String>) {
 /// master's next check used to start a second master, and with it a
 /// second shell, leaving the first running unreachable (acs-lbba). The
 /// check is set an hour away here, so only the prod can bring it back.
+///
+/// "Only the prod" is not timed (acs-ci9u): it used to be a 10 s bound, a
+/// figure a starved host can reach on its own. Against an hour, the
+/// helper's own `T` deadline already tells the two apart, and the refused
+/// spawn is the prod being what answered.
 #[test]
 fn a_reconnect_after_the_socket_is_deleted_finds_the_same_shell() {
     let t = TempDir::new();
@@ -216,13 +221,7 @@ fn a_reconnect_after_the_socket_is_deleted_finds_the_same_shell() {
         &[("ACS_MASTER_REBIND_MS", "3600000")],
     );
     std::fs::remove_file(sock(t.path(), "lb")).unwrap();
-    let started = Instant::now();
     let (c2, refusals) = connect_or_start(t.path(), "lb");
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "came back only after {:?}",
-        started.elapsed()
-    );
     assert!(!refusals.is_empty(), "no master was refused");
     let (mut c2, m) = attach_conn(c2, "lb", "me", None);
     assert!(
@@ -475,6 +474,12 @@ fn kill_escalates_to_sigkill_for_a_group_ignoring_sighup() {
     wait_gone(&sock(t.path(), "k"));
 }
 
+/// "Quickly" means the SIGHUP ended it, without the escalation after the
+/// 3 s grace that the test above waits out. That used to be read off the
+/// clock — under 2 s — which a loaded host breaks by starving the master or
+/// the test, however promptly the master acts (acs-ci9u). The exit status
+/// says it instead: 128 + SIGHUP is a session the hangup ended, where one
+/// that sat out the grace would report 128 + SIGKILL.
 #[test]
 fn kill_ends_a_normal_session_quickly() {
     let t = TempDir::new();
@@ -485,13 +490,11 @@ fn kill_ends_a_normal_session_quickly() {
         "me",
     );
     a.wait_output("armed", T);
-    let t0 = Instant::now();
     a.send(&Msg::Kill {
         identity: "me".into(),
         force: true,
     });
     let status = wait_exit(&mut a);
-    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     assert_eq!(acs::sys::exit_code(status), 128 + libc::SIGHUP as u8);
 }
 
@@ -767,6 +770,25 @@ fn the_last_output_before_exit_is_never_lost() {
     }
 }
 
+/// Wait, up to `T`, for `pid` to spend under a tenth of a half-second
+/// window on the CPU (acs-ci9u). It replaces a fixed 200 ms settle after
+/// the event under test, a deadline for the process's legitimate work that
+/// a starved host could miss, so that the work spilled into the window the
+/// test then measures. A process that spins never gets here at all.
+fn wait_idle(pid: u32, what: &str) {
+    let deadline = Instant::now() + T;
+    loop {
+        let burnt = acs::testutil::cpu_over(pid, Duration::from_millis(500));
+        if burnt < Duration::from_millis(50) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what} never went idle: {burnt:?} of CPU in its last 500 ms"
+        );
+    }
+}
+
 /// Regression (acs-gkl): while a stalled client has the ring full, a pty
 /// that hangs up (the child died) must not make the master spin.
 #[test]
@@ -792,8 +814,11 @@ fn a_hangup_while_the_client_is_stalled_does_not_spin_the_master() {
     std::thread::sleep(Duration::from_millis(1500));
     // The child dies; its pty hangs up while nothing can be read.
     acs::sys::kill(pid, libc::SIGKILL).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     let master = acs::testutil::session_pid(&sock(t.path(), "hs")).unwrap();
+    wait_idle(master, "master");
+    // Once idle, it stays idle. An upper bound on CPU time, unlike one on
+    // wall time, is one load cannot push up: a starved process only gets
+    // less of the CPU. Load can only hide a spin, never invent one.
     let burnt = acs::testutil::cpu_over(master, Duration::from_secs(1));
     assert!(
         burnt < Duration::from_millis(300),
