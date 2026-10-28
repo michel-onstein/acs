@@ -240,6 +240,30 @@ fn no_reconnect_exits_on_a_drop() {
     assert!(remote.session_exists("nr"));
 }
 
+/// Regression (acs-rsn5): a first connection that passes the marker and
+/// then ends before any WELCOME has no session to keep running, and with
+/// `--new` no name to reattach to — it says so, and exits as a failed dial
+/// does (255).
+#[test]
+fn a_link_lost_before_the_welcome_claims_no_session() {
+    let remote = Remote::new();
+    let ready = remote.root.path().join("ready");
+    std::fs::write(&ready, acs::proto::ready_line()).unwrap();
+    let script = remote.root.path().join("ready-then-eof.sh");
+    write_executable(&script, format!("#!/bin/sh\ncat '{}'\n", ready.display()));
+    let script = script.display().to_string();
+    for session in [&["nw"][..], &["--new"]] {
+        let mut args = vec!["--transport-cmd", &script, "devbox"];
+        args.extend_from_slice(session);
+        args.extend_from_slice(&["--", "/bin/sh", "-c", "sleep 30"]);
+        let mut c = Client::spawn(&exe(), &args, FAST);
+        assert_eq!(c.wait(T), 255, "{session:?}: {}", c.text());
+        c.wait_for("connection to devbox lost before the session started", T);
+        assert!(!c.text().contains("keeps running"), "{}", c.text());
+        assert!(!c.text().contains("reattach"), "{}", c.text());
+    }
+}
+
 /// Regression (acs-7k7): a terminal that stops reading for longer than the
 /// dead interval is not a lost link. The client blocks writing to stdout
 /// meanwhile, and judged liveness by what it had decoded before the block
