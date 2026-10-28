@@ -21,12 +21,16 @@ Intel, Linux x86_64 and aarch64), checks it against the release's
 
 | Run as | Binary | On `PATH` as |
 | --- | --- | --- |
-| you | `~/.local/share/acs/<version>/acs` | `~/.local/bin/acs` (a link) |
-| root | `/usr/local/lib/acs/<version>/acs` | `/usr/local/bin/acs` (a link) |
+| you | `~/.local/share/acs/<version>/acs` | `~/.local/bin/acs` (a link), `~/.local/bin/acscp -> acs` |
+| root | `/usr/local/lib/acs/<version>/acs` | `/usr/local/bin/acs` (a link), `/usr/local/bin/acscp -> acs` |
 
 so a client of the same version finds acs already there when it connects
-to this machine. It says how to add the directory to your `PATH` if it is
-not on it, and running it again upgrades in place. The link only moves
+to this machine. `acscp` is acs's second name, for
+[copying files](#copying-files): a relative link to the `acs` beside it, so
+it follows every upgrade. It is made where nothing is, never over a file
+or link you put there, and not beside an `acs` that is yours. It says how
+to add the directory to your `PATH` if it is not on it, and running it
+again upgrades in place. The link only moves
 forward: an older `ACS_VERSION` is installed beside the newer one without
 taking the link, and a file or link at that name it did not make is left
 alone. Either way it says so, and where it put the version. It needs `curl` or
@@ -36,7 +40,7 @@ with the ssh acs needs anyway).
 | Variable | Meaning |
 | --- | --- |
 | `ACS_VERSION=0.2.0` | install that release instead of the latest |
-| `ACS_INSTALL_DIR=~/bin` | put the binary itself in that directory (replacing any `acs` there) |
+| `ACS_INSTALL_DIR=~/bin` | put the binary itself in that directory (replacing any `acs` there), with `acscp -> acs` beside it |
 
 for example `curl -fsSL …/install.sh | ACS_VERSION=0.2.0 sh`.
 
@@ -48,7 +52,8 @@ brew install michel-onstein/acs/acs
 
 installs the same build from the tap
 [michel-onstein/homebrew-acs](https://github.com/michel-onstein/homebrew-acs),
-which every release updates; upgrade it with `brew upgrade acs`.
+which every release updates, with `acscp` linked beside `acs`; upgrade it
+with `brew upgrade acs`.
 
 By hand, the archives are on
 [Releases](https://github.com/michel-onstein/acs/releases):
@@ -57,6 +62,7 @@ By hand, the archives are on
 v=0.2.0 t=aarch64-apple-darwin      # see the release page for the latest
 curl -LO https://github.com/michel-onstein/acs/releases/download/v$v/acs-$v-$t.tar.gz
 tar xzf acs-$v-$t.tar.gz && install -m 755 acs-$v-$t/acs ~/.local/bin/acs
+ln -s acs ~/.local/bin/acscp    # acs run as acscp copies files, like scp
 ```
 
 Or build it yourself:
@@ -223,8 +229,13 @@ acs cp -r project devbox:src/            a directory, recursively
 acs cp devbox:/var/log/syslog devbox:a.txt .    download, several sources from one host
 ```
 
-The same binary run as `acscp` is `acs cp`, so a link makes it a drop-in
-for `scp`: `ln -s "$(command -v acs)" ~/.local/bin/acscp`. An argument is
+The same binary run as `acscp` is `acs cp`, a drop-in for `scp`.
+`install.sh`, the remote install, `acs upgrade` and Homebrew each put a
+relative `acscp -> acs` link beside the `acs` they install, so it follows
+every upgrade; an install from before acscp gets it on its next upgrade.
+None of them touches a file or link already at that name. Where you
+placed `acs` yourself, make it in the same directory:
+`ln -s acs <dir>/acscp`. An argument is
 remote when it is `[user@]host:[path]` with no `/` before the first `:`;
 the host may be an acs alias, and `./a:b` is a local file. `-r` copies
 directories (following symlinks), `-p` keeps the modification and access
