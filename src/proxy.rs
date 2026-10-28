@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use crate::master;
+use crate::outq::OutQueue;
 use crate::proto::{self, err, Decoder, Mode, Msg};
 use crate::session::{self, SocketDir};
 use crate::sys;
@@ -360,7 +361,7 @@ fn wait_for(fd: RawFd, events: libc::c_short) -> libc::pollfd {
 
 fn relay_fds(
     master: UnixStream,
-    mut to_master: Vec<u8>,
+    to_master: Vec<u8>,
     input: RawFd,
     output: RawFd,
 ) -> io::Result<()> {
@@ -368,7 +369,10 @@ fn relay_fds(
     sys::set_nonblocking(input, true)?;
     sys::set_nonblocking(output, true)?;
     let m = master.as_raw_fd();
-    let mut to_client: Vec<u8> = Vec::new();
+    // Each direction writes straight through from `buf` and queues only
+    // what the other side would not take yet (acs-x6os).
+    let mut to_master = OutQueue::from(to_master);
+    let mut to_client = OutQueue::default();
     let mut buf = vec![0u8; 64 * 1024];
     let mut stdin_open = true;
     let limit = 1 << 20;
@@ -406,7 +410,7 @@ fn relay_fds(
         if fds[0].revents != 0 {
             match sys::read(input, &mut buf) {
                 Ok(0) => stdin_open = false,
-                Ok(n) => to_master.extend_from_slice(&buf[..n]),
+                Ok(n) => to_master.send(m, &buf[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => stdin_open = false,
             }
@@ -417,17 +421,17 @@ fn relay_fds(
                     // The master is done: deliver what it said, then leave.
                     return drain(output, &to_client);
                 }
-                Ok(n) => to_client.extend_from_slice(&buf[..n]),
+                Ok(n) => to_client.send(output, &buf[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => return drain(output, &to_client),
             }
         }
-        if flush(m, &mut to_master).is_err() {
+        if !to_master.flush(m) {
             // The master closed after its last words (an EXIT just read):
             // they still go to the client (acs-er6).
             return drain(output, &to_client);
         }
-        if flush(output, &mut to_client).is_err() {
+        if !to_client.flush(output) {
             // The client side is gone.
             return Ok(());
         }
@@ -439,22 +443,8 @@ fn relay_fds(
     }
 }
 
-fn flush(fd: RawFd, buf: &mut Vec<u8>) -> io::Result<()> {
-    while !buf.is_empty() {
-        match sys::write(fd, buf) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => {
-                buf.drain(..n);
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-fn drain(fd: RawFd, buf: &[u8]) -> io::Result<()> {
-    sys::write_all(fd, buf)
+fn drain(fd: RawFd, q: &OutQueue) -> io::Result<()> {
+    sys::write_all(fd, q.queued())
 }
 
 /// `--list`: one STATUS_REPLY frame per live session, to `out`. When the
@@ -698,6 +688,58 @@ mod tests {
         assert!(p(&["--session", "../x"]).is_err());
         assert!(p(&[]).is_err());
         assert!(p(&["--mode", "sideways", "--session", "a"]).is_err());
+    }
+
+    /// Regression (acs-x6os): a megabyte backed up behind a peer that reads
+    /// a few bytes at a time goes through whole and in order, now that the
+    /// relay writes from a cursor instead of moving everything still queued
+    /// down to the front after every partial write.
+    #[test]
+    fn a_backlog_drains_through_a_slow_peer_whole_and_in_order() {
+        use std::io::{Read, Write};
+        const TOTAL: usize = 4 << 20;
+        let sent: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        // A small send buffer, so that every write the relay makes to the
+        // slow peer is a partial one.
+        let size: libc::c_int = 2048;
+        for (fd, opt) in [
+            (ours.as_raw_fd(), libc::SO_SNDBUF),
+            (theirs.as_raw_fd(), libc::SO_RCVBUF),
+        ] {
+            // SAFETY: a valid socket and an int-sized option value.
+            let r = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    opt,
+                    &size as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(r, 0);
+        }
+        let (in_r, in_w) = sys::pipe().unwrap();
+        let (_out_r, out_w) = sys::pipe().unwrap();
+        let feed = sent.clone();
+        let writer = std::thread::spawn(move || {
+            std::fs::File::from(in_w).write_all(&feed).unwrap();
+        });
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::with_capacity(TOTAL);
+            let mut b = [0u8; 16];
+            while got.len() < TOTAL {
+                match theirs.read(&mut b).unwrap() {
+                    0 => break,
+                    n => got.extend_from_slice(&b[..n]),
+                }
+            }
+            got
+        });
+        relay_fds(ours, Vec::new(), in_r.as_raw_fd(), out_w.as_raw_fd()).unwrap();
+        writer.join().unwrap();
+        let got = reader.join().unwrap();
+        assert!(got == sent, "every byte, once, in order");
     }
 
     /// Regression (acs-er6): when the master says its last words (EXIT) and
