@@ -133,7 +133,9 @@ pub(crate) fn no_aliases(config: &crate::config::Config) -> String {
     format!("{what}: list one host with acs list <host>, or add an alias with acs config host add <alias> <host>")
 }
 
-/// Resolve `alias` and ask the host it stands for now, in BatchMode.
+/// Resolve `alias` and ask the host it stands for now, in BatchMode — on
+/// the master acs already has up for that host, if it has one (acs-hmv):
+/// a host with a session open answers without another handshake.
 pub(crate) fn ask(
     base: &ClientArgs,
     alias: &str,
@@ -141,6 +143,9 @@ pub(crate) fn ask(
 ) -> Result<Option<Vec<StatusInfo>>, Failure> {
     let mut args = base.clone();
     client::resolve_alias(&mut args, alias).map_err(Failure::Unreachable)?;
+    // After the alias is resolved: the socket is named for the host it
+    // stands for now, as the session's was.
+    crate::mux::join(&mut args.transport);
     query(&args, Call::Batch, timeout)
 }
 

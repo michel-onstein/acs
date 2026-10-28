@@ -313,13 +313,31 @@ pub fn asset_url(base: &str, a: &Asset) -> String {
     format!("{base}/download/v{}/{}", a.version, a.file)
 }
 
+/// curl's options before `-o <dest> <url>`: one attempt, capped at `t`
+/// seconds in all. curl does not retry by default, but a `~/.curlrc` can
+/// say `--retry`, and each retry gets a fresh `--max-time`; `--retry 0`
+/// on the command line overrides it.
+fn curl_args(t: &str) -> [&str; 5] {
+    ["-fsSL", "--max-time", t, "--retry", "0"]
+}
+
+/// wget's options before `-O <dest> <url>`: one attempt (`-t 1`), each of
+/// its DNS, connect and read phases capped at `t` seconds. wget's default
+/// is 20 tries, so without `-t 1` a refused or stalling server holds the
+/// "3 s" update check for a minute and an upgrade for far longer.
+/// BusyBox wget (Alpine) accepts `-t` and ignores it: it tries once anyway.
+fn wget_args(t: &str) -> [&str; 5] {
+    ["-q", "-T", t, "-t", "1"]
+}
+
 /// Download `url` into `dest` with curl (or wget), giving up after
 /// `timeout_secs`. The error says what failed, not how.
 pub fn fetch(url: &str, dest: &Path, timeout_secs: u32) -> Result<(), String> {
     let t = timeout_secs.to_string();
     let curl = || {
         Command::new("curl")
-            .args(["-fsSL", "--max-time", &t, "-o"])
+            .args(curl_args(&t))
+            .arg("-o")
             .arg(dest)
             .arg(url)
             .stdin(Stdio::null())
@@ -328,7 +346,8 @@ pub fn fetch(url: &str, dest: &Path, timeout_secs: u32) -> Result<(), String> {
     };
     let wget = || {
         Command::new("wget")
-            .args(["-q", "-T", &t, "-O"])
+            .args(wget_args(&t))
+            .arg("-O")
             .arg(dest)
             .arg(url)
             .stdin(Stdio::null())
@@ -397,6 +416,21 @@ pub fn lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// acs-q6ey: both download clients try once, so the 3 s update check
+    /// and an upgrade's timeout are the whole wait. wget defaults to 20
+    /// tries; curl to none, but a `~/.curlrc` can ask for retries.
+    #[test]
+    fn fetch_tries_once_within_its_timeout() {
+        let has =
+            |args: &[&str], flag: &str, value: &str| args.windows(2).any(|w| w == [flag, value]);
+        let curl = curl_args("3");
+        assert!(has(&curl, "--max-time", "3"), "{curl:?}");
+        assert!(has(&curl, "--retry", "0"), "{curl:?}");
+        let wget = wget_args("3");
+        assert!(has(&wget, "-T", "3"), "{wget:?}");
+        assert!(has(&wget, "-t", "1"), "{wget:?}");
+    }
 
     /// acs-5em: a fork builds with `ACS_DEFAULT_RELEASES_URL` set and its
     /// binaries update from the fork; unset — every upstream build — the

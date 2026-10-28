@@ -231,8 +231,10 @@ An ssh handshake is several round trips and, with a hardware key, a touch.
 acs keeps a connection of its own alive for a few minutes after you last
 used a host, so a reattach after a detach — or an `acs list devbox`
 followed by `acs devbox` — opens another channel on it instead of starting
-over. It is acs's own connection, in acs's own `0700` directory
-(`/tmp/acs-mux-<uid>`), never the one your `~/.ssh/config` multiplexes;
+over, and `acs list` over every alias asks any host you have a session
+on through it (a listing never starts one). It is acs's own connection,
+in acs's own `0700` directory (`/tmp/acs-mux-<uid>`), never the one your
+`~/.ssh/config` multiplexes;
 nothing is left behind more than `ACS_CONTROL_PERSIST` seconds (300 by
 default) after the last use, even if acs is killed.
 
