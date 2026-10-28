@@ -6,10 +6,12 @@
 //! on (`prefer_local_network`) or because this machine is on one of the
 //! entry's own `local_networks` (acs-9yv). Under `-v` every entry of the
 //! alias accounts for itself, the ones the choice never reached included
-//! (acs-qis).
+//! (acs-qis). With `reachability_tcp` a host is checked by connecting to
+//! the ssh port `ssh -G` names for it instead of a ping (acs-fbes).
 
-use std::ffi::OsStr;
-use std::net::IpAddr;
+use std::ffi::{OsStr, OsString};
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -75,6 +77,21 @@ pub fn resolve_remembering(
     memory: Option<&Memory>,
     log: &mut dyn FnMut(String),
 ) -> Result<Option<HostEntry>, String> {
+    let ssh = crate::ssh::program();
+    resolve_probing(name, config, reachable, network, memory, ssh, log)
+}
+
+/// [`resolve_remembering`] with `ssh` as the program `ssh -G` runs, for
+/// `reachability_tcp`.
+fn resolve_probing(
+    name: &str,
+    config: &Config,
+    reachable: Arc<Reachable>,
+    network: &dyn Fn() -> Network,
+    memory: Option<&Memory>,
+    ssh: OsString,
+    log: &mut dyn FnMut(String),
+) -> Result<Option<HostEntry>, String> {
     let (user, alias_name) = split_user(name);
     let Some(alias) = config.alias(alias_name) else {
         return Ok(None);
@@ -98,6 +115,7 @@ pub fn resolve_remembering(
     let how = How {
         timeout,
         reachable,
+        tcp: config.reachability_tcp_for(alias).value.then_some(ssh),
         locality,
         memory,
     };
@@ -117,6 +135,9 @@ pub fn split_user(name: &str) -> (Option<&str>, &str) {
 struct How {
     timeout: Duration,
     reachable: Arc<Reachable>,
+    /// `reachability_tcp`: the ssh program whose `-G` names each host's
+    /// port, to connect to instead of pinging.
+    tcp: Option<OsString>,
     locality: Option<Locality>,
     memory: Option<Remembered>,
 }
@@ -139,8 +160,41 @@ impl Remembered {
     }
 }
 
-/// The pings' answers as they come in: `(entry, answered)`.
-type Answers = mpsc::Receiver<(usize, bool)>;
+/// How a host was checked, for the `-v` lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum By {
+    Ping,
+    /// A TCP connect to this port (`reachability_tcp`).
+    Port(u16),
+    /// Pinged after all: ssh reaches it through a ProxyJump or a
+    /// ProxyCommand, so there is no port of its own to connect to.
+    Proxied,
+    /// `ssh -G` named no port in time.
+    NoPort,
+}
+
+impl By {
+    /// What the host answered, or did not, as a `-v` line says it.
+    fn says(self) -> String {
+        match self {
+            By::Ping => "ping".into(),
+            By::Port(p) => format!("on port {p}"),
+            By::Proxied => "ping (ssh reaches it through a proxy)".into(),
+            By::NoPort => "on its ssh port (ssh -G named none)".into(),
+        }
+    }
+}
+
+/// One host's answer: whether it answered, and how it was checked.
+type Answer = (bool, By);
+
+/// Whether an answer came, and was yes.
+fn up(a: Option<Answer>) -> bool {
+    a.is_some_and(|(up, _)| up)
+}
+
+/// The checks' answers as they come in: `(entry, answer)`.
+type Answers = mpsc::Receiver<(usize, Answer)>;
 
 /// The entry to use. The entries are ranked ([`rank`]); every checked host
 /// that could be chosen is pinged at once, and the k-th ranked host is taken
@@ -168,6 +222,7 @@ fn pick(
     let How {
         timeout,
         reachable,
+        tcp,
         locality,
         memory,
     } = how;
@@ -187,11 +242,21 @@ fn pick(
     let (tx, rx) = mpsc::channel();
     let ping = |i: usize| {
         let (tx, host, reachable) = (tx.clone(), entries[i].host.clone(), Arc::clone(&reachable));
+        let (tcp, dest) = (tcp.clone(), entries[i].destination());
         // Not joined: once a host is chosen nobody waits for the others,
-        // whose pings give up at the deadline by themselves.
+        // whose checks give up at the deadline by themselves.
         std::thread::spawn(move || {
-            let _ = tx.send((i, reachable(&host, timeout)));
+            let answer = match &tcp {
+                Some(ssh) => probe_port(ssh, &host, &dest, &*reachable, timeout),
+                None => (reachable(&host, timeout), By::Ping),
+            };
+            let _ = tx.send((i, answer));
         });
+    };
+    // What a check says when no answer came by the deadline.
+    let unanswered = match tcp {
+        Some(_) => "on its ssh port",
+        None => "ping",
     };
     // Caller-side first: it is this machine's own addresses against each
     // entry's networks, so it costs no lookup and no wait.
@@ -231,15 +296,19 @@ fn pick(
             "{name}: {} was used last on these networks",
             e.host
         ));
-        let up = !e.reachability_check || {
+        let taken = !e.reachability_check || {
             wait_for(r, &mut answered, &rx, deadline);
-            answered[r] == Some(true)
+            up(answered[r])
         };
-        if up {
+        if taken {
             let dest = e.destination();
-            match e.reachability_check {
-                true => log(format!("{name}: {} answers ping, using {dest}", e.host)),
-                false => log(format!(
+            match answered[r] {
+                Some((_, by)) => log(format!(
+                    "{name}: {} answers {}, using {dest}",
+                    e.host,
+                    by.says()
+                )),
+                None => log(format!(
                     "{name}: using {dest} (reachability_check is off, {})",
                     e.origin
                 )),
@@ -296,6 +365,7 @@ fn pick(
         answers: &rx,
         deadline,
         timeout,
+        unanswered,
     };
     let (chosen, tried) = walk.run(name, &order, &mut answered, log);
     // Nothing answered: every entry was tried and has its line already, and
@@ -343,7 +413,7 @@ fn candidates(entries: &[HostEntry], order: &[usize]) -> Vec<usize> {
 
 /// Collect answers until entry `i` has one or the deadline passes. An
 /// answer after the deadline counts as none.
-fn wait_for(i: usize, answered: &mut [Option<bool>], answers: &Answers, deadline: Instant) {
+fn wait_for(i: usize, answered: &mut [Option<Answer>], answers: &Answers, deadline: Instant) {
     while answered[i].is_none() {
         let left = deadline.saturating_duration_since(Instant::now());
         match answers.recv_timeout(left) {
@@ -360,6 +430,8 @@ struct Walk<'a> {
     answers: &'a Answers,
     deadline: Instant,
     timeout: Duration,
+    /// What a host that gave no answer by the deadline did not answer.
+    unanswered: &'static str,
 }
 
 impl Walk<'_> {
@@ -370,7 +442,7 @@ impl Walk<'_> {
         &self,
         name: &str,
         order: &[usize],
-        answered: &mut [Option<bool>],
+        answered: &mut [Option<Answer>],
         log: &mut dyn FnMut(String),
     ) -> (Option<usize>, Vec<String>) {
         let mut tried = Vec::new();
@@ -393,19 +465,20 @@ impl Walk<'_> {
                 return (Some(k), tried);
             }
             wait_for(i, answered, self.answers, self.deadline);
-            if answered[i] == Some(true) {
+            let says = answered[i].map_or_else(|| self.unanswered.into(), |(_, by)| by.says());
+            if up(answered[i]) {
                 let why = match why.is_empty() {
                     true => String::new(),
                     false => format!(" ({})", why.join(", ")),
                 };
                 log(format!(
-                    "{name}: {} answers ping, using {dest}{why}",
+                    "{name}: {} answers {says}, using {dest}{why}",
                     e.host
                 ));
                 return (Some(k), tried);
             }
             log(format!(
-                "{name}: {} does not answer ping within {}",
+                "{name}: {} does not answer {says} within {}",
                 e.host,
                 format_timeout(self.timeout)
             ));
@@ -423,7 +496,7 @@ struct Confirm {
     on_net: Vec<Option<Local>>,
     locality: Option<Locality>,
     answers: Answers,
-    answered: Vec<Option<bool>>,
+    answered: Vec<Option<Answer>>,
     deadline: Instant,
 }
 
@@ -444,6 +517,7 @@ impl Confirm {
             answers: &self.answers,
             deadline: self.deadline,
             timeout: Duration::ZERO,
+            unanswered: "",
         };
         if let (Some(k), _) = walk.run("", &order, &mut self.answered, &mut |_| {}) {
             let _ = self.memory.record(&self.entries, &ranked, k);
@@ -589,24 +663,115 @@ fn ping_with(prog: &OsStr, host: &str, deadline: Duration) -> Option<i32> {
 
 fn run_ping(prog: &OsStr, args: &[&str], deadline: Duration) -> Option<i32> {
     let mut c = Command::new(prog);
-    c.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    c.args(args).stdout(Stdio::null());
+    run_until(c, deadline).map(|(code, _)| code)
+}
+
+/// Run `c` for at most `deadline`: its exit code and what it wrote to its
+/// stdout when that is piped, or `None` when it had to be killed at the
+/// deadline or could not be run.
+fn run_until(mut c: Command, deadline: Duration) -> Option<(i32, Vec<u8>)> {
+    c.stdin(Stdio::null()).stderr(Stdio::null());
     // Spawned apart from waited for: several threads ping at once.
     let Ok(mut child) = crate::sys::spawn(&mut c) else {
         return None;
     };
     let end = Instant::now() + deadline;
+    // Read as it comes, so a full pipe cannot hold the child up.
+    let out = child.stdout.take().map(|mut pipe| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = pipe.read_to_end(&mut v);
+            let _ = tx.send(v);
+        });
+        rx
+    });
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Some(status.code().unwrap_or(-1)),
+            Ok(Some(status)) => {
+                let left = end.saturating_duration_since(Instant::now());
+                let out = out.map(|rx| rx.recv_timeout(left).unwrap_or_default());
+                return Some((status.code().unwrap_or(-1), out.unwrap_or_default()));
+            }
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(5)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
+        }
+    }
+}
+
+/// Where ssh dials a destination, as `ssh -G` says.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    /// A host name or address, and the port.
+    Direct(String, u16),
+    /// Through a ProxyJump or a ProxyCommand: no port of its own to try.
+    Proxied,
+}
+
+/// The [`Target`] in `ssh -G` output: its `hostname` and `port`, unless a
+/// `proxyjump` or `proxycommand` other than `none` is set.
+fn target(out: &str) -> Option<Target> {
+    let (mut host, mut port, mut proxied) = (None, None, false);
+    for line in out.lines() {
+        match line.split_once(' ') {
+            Some(("hostname", v)) => host = Some(v.trim()),
+            Some(("port", v)) => port = v.trim().parse().ok(),
+            Some(("proxyjump" | "proxycommand", v)) if v.trim() != "none" => proxied = true,
+            _ => {}
+        }
+    }
+    match proxied {
+        true => Some(Target::Proxied),
+        false => Some(Target::Direct(host?.to_string(), port?)),
+    }
+}
+
+/// Check `host` by connecting to the port ssh dials for `dest` (`ssh -G`,
+/// run with `ssh`) — or, when ssh reaches it through a proxy, by `ping`.
+/// `ssh -G`, the name's lookup and the connect all share `deadline`, as
+/// one ping has it (acs-fbes). The connection is closed at once.
+fn probe_port(ssh: &OsStr, host: &str, dest: &str, ping: &Reachable, deadline: Duration) -> Answer {
+    let end = Instant::now() + deadline;
+    let mut c = Command::new(ssh);
+    c.args(["-G", "--", dest]).stdout(Stdio::piped());
+    let found = run_until(c, deadline)
+        .filter(|(code, _)| *code == 0)
+        .and_then(|(_, out)| target(&String::from_utf8_lossy(&out)));
+    match found {
+        None => (false, By::NoPort),
+        Some(Target::Proxied) => {
+            let left = end.saturating_duration_since(Instant::now());
+            (ping(host, left), By::Proxied)
+        }
+        Some(Target::Direct(name, port)) => (connects(&name, port, end), By::Port(port)),
+    }
+}
+
+/// Whether a TCP connection to `port` on any of `name`'s addresses is made
+/// before `end`. The addresses are tried at once, the first to connect
+/// deciding.
+fn connects(name: &str, port: u16, end: Instant) -> bool {
+    let left = || end.saturating_duration_since(Instant::now());
+    let (tx, rx) = mpsc::channel();
+    for ip in netmatch::resolve(name, left()) {
+        let (tx, t) = (tx.clone(), left());
+        std::thread::spawn(move || {
+            let addr = SocketAddr::new(ip, port);
+            let ok = !t.is_zero() && TcpStream::connect_timeout(&addr, t).is_ok();
+            let _ = tx.send(ok);
+        });
+    }
+    drop(tx);
+    loop {
+        match rx.recv_timeout(left()) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
         }
     }
 }
@@ -1834,5 +1999,207 @@ aliases:
         // Killed, not left to answer late: a shell that started later has
         // already finished the wait this one was cut off in.
         assert!(!late.exists());
+    }
+
+    // ---- reachability_tcp: the ssh port instead of a ping (acs-fbes) -------
+
+    /// A ping that has exited is answered then, not at the deadline: the
+    /// stdout capture `ssh -G` needs must not make a ping without one wait
+    /// for output that never comes. Half the deadline is far more than an
+    /// `exit 0` takes, and far less than the whole.
+    #[test]
+    fn a_ping_that_has_exited_is_not_waited_out() {
+        let dir = TempDir::new();
+        let p = script(&dir, "ping", "exit 0");
+        let start = Instant::now();
+        assert_eq!(
+            ping_with(p.as_os_str(), "h", Duration::from_secs(60)),
+            Some(0)
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn ssh_g_output_names_the_host_and_port_or_a_proxy() {
+        let direct = "user me\nhostname 10.0.0.7\nport 2222\nproxycommand none\n";
+        assert_eq!(
+            target(direct),
+            Some(Target::Direct("10.0.0.7".into(), 2222))
+        );
+        for proxied in ["proxyjump bastion", "proxycommand nc %h %p"] {
+            let out = format!("hostname h\nport 22\n{proxied}\n");
+            assert_eq!(target(&out), Some(Target::Proxied), "{proxied}");
+        }
+        assert_eq!(target("hostname h\n"), None);
+        assert_eq!(target("port 22\n"), None);
+        assert_eq!(target("hostname h\nport many\n"), None);
+    }
+
+    /// A listener that is up and a port that is closed, both on 127.0.0.1.
+    fn ports() -> (std::net::TcpListener, u16) {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        (open, closed_port)
+    }
+
+    /// A fake `ssh` whose `-G` answers for `a` (the closed port), `me@b`
+    /// (the open one), `j` (through a ProxyJump) and `slow` (never in
+    /// time); anything else fails, as ssh does for a bad destination.
+    fn fake_ssh(dir: &TempDir, open: u16, closed: u16) -> OsString {
+        let body = format!(
+            "[ \"$1\" = -G ] || exit 2\nfor d; do :; done\ncase \"$d\" in\n\
+             a) printf 'hostname 127.0.0.1\\nport {closed}\\n' ;;\n\
+             me@b) printf 'hostname 127.0.0.1\\nport {open}\\nproxycommand none\\n' ;;\n\
+             j) printf 'hostname j.internal\\nport 22\\nproxyjump bastion\\n' ;;\n\
+             slow) sleep 30 ;;\n\
+             *) exit 255 ;;\n\
+             esac"
+        );
+        script(dir, "ssh", &body).into_os_string()
+    }
+
+    /// Resolve `name` in `yaml` with `ssh` as the program `ssh -G` runs.
+    fn probing(
+        yaml: &str,
+        name: &str,
+        fake: &Arc<Fake>,
+        ssh: &OsString,
+        memory: Option<&Memory>,
+    ) -> (Result<String, String>, Vec<String>, Duration) {
+        let c = config(yaml);
+        let mut log = Vec::new();
+        let start = Instant::now();
+        let r = resolve_probing(
+            name,
+            &c,
+            fake.reachable(),
+            &no_network,
+            memory,
+            ssh.clone(),
+            &mut |m| log.push(m),
+        );
+        (r.map(|e| e.unwrap().destination()), log, start.elapsed())
+    }
+
+    const TCP: &str = "\
+reachability_timeout: 5s
+aliases:
+  ab:
+    reachability_tcp: true
+    hosts:
+      - host: a
+      - host: b
+        user: me
+";
+
+    #[test]
+    fn a_host_is_checked_by_connecting_to_the_port_ssh_dials() {
+        let dir = TempDir::new();
+        let (open, closed) = ports();
+        let ssh = fake_ssh(&dir, open.local_addr().unwrap().port(), closed);
+        // Both would answer a ping: the ports decide, and nothing is pinged.
+        let fake = Fake::up(&["a", "b"]);
+        let (r, log, _) = probing(TCP, "ab", &fake, &ssh, None);
+        assert_eq!(r, Ok("me@b".into()));
+        let port = open.local_addr().unwrap().port();
+        assert_eq!(
+            log,
+            [
+                format!("ab: a does not answer on port {closed} within 5s"),
+                format!("ab: b answers on port {port}, using me@b"),
+            ]
+        );
+        assert!(fake.pinged().is_empty(), "{:?}", fake.pinged());
+        // The connection was really made, to the listener.
+        open.set_nonblocking(true).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while open.accept().is_err() {
+            assert!(Instant::now() < end, "no connection reached the listener");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Without the setting the same alias is pinged as before.
+        let plain = TCP.replace("    reachability_tcp: true\n", "");
+        let (r, log, _) = probing(&plain, "ab", &fake, &ssh, None);
+        assert_eq!(r, Ok("a".into()));
+        assert_eq!(log[0], "ab: a answers ping, using a");
+    }
+
+    #[test]
+    fn a_host_behind_a_proxy_is_pinged_instead() {
+        let dir = TempDir::new();
+        let (open, closed) = ports();
+        let ssh = fake_ssh(&dir, open.local_addr().unwrap().port(), closed);
+        let yaml = "reachability_tcp: true\naliases:\n  j: [{host: j}]\n";
+        let fake = Fake::up(&["j"]);
+        let (r, log, _) = probing(yaml, "j", &fake, &ssh, None);
+        assert_eq!(r, Ok("j".into()));
+        assert_eq!(
+            log,
+            ["j: j answers ping (ssh reaches it through a proxy), using j"]
+        );
+        // The entry's own host is what is pinged, as without the setting.
+        assert_eq!(fake.pinged(), ["j"]);
+    }
+
+    /// `ssh -G` is held to the deadline like a ping: one that does not
+    /// answer in time is killed, and the host counts as not answering.
+    #[test]
+    fn ssh_g_shares_the_deadline() {
+        let dir = TempDir::new();
+        let (open, closed) = ports();
+        let ssh = fake_ssh(&dir, open.local_addr().unwrap().port(), closed);
+        let yaml = "\
+reachability_timeout: 100ms
+aliases:
+  s:
+    reachability_tcp: true
+    hosts: [{host: slow}, {host: nowhere}]
+";
+        let (r, log, took) = probing(yaml, "s", &Fake::new(&[]), &ssh, None);
+        assert_eq!(
+            r,
+            Err("no host for 's' is reachable (tried slow, nowhere)".into())
+        );
+        // Whether the killed `ssh -G` said so before the deadline or just
+        // after it, the line is the same up to the parenthesis.
+        assert_eq!(log.len(), 2, "{log:?}");
+        for (line, host) in log.iter().zip(["slow", "nowhere"]) {
+            let want = format!("s: {host} does not answer on its ssh port");
+            assert!(line.starts_with(&want), "{log:?}");
+            assert!(line.ends_with(" within 100ms"), "{log:?}");
+        }
+        assert!(took < Duration::from_secs(10), "{took:?}");
+    }
+
+    /// The entry used last here (acs-zpj) is checked on its port too, and
+    /// taken as soon as it connects.
+    #[test]
+    fn the_entry_used_last_is_taken_once_its_port_answers() {
+        let dir = TempDir::new();
+        let (open, closed) = ports();
+        let port = open.local_addr().unwrap().port();
+        let ssh = fake_ssh(&dir, port, closed);
+        let home = memory_at(&dir, HOME);
+        let fake = Fake::new(&[]);
+        let (r, _, _) = probing(TCP, "ab", &fake, &ssh, Some(&home));
+        assert_eq!(r, Ok("me@b".into()));
+        assert_eq!(home.recall("ab").as_deref(), Some("b"));
+        let (r, log, _) = probing(TCP, "ab", &fake, &ssh, Some(&home));
+        assert_eq!(r, Ok("me@b".into()));
+        assert_eq!(
+            log,
+            [
+                "ab: b was used last on these networks".to_string(),
+                format!("ab: b answers on port {port}, using me@b"),
+                "ab: a not waited for: b was used last on these networks".into(),
+            ]
+        );
+        assert!(fake.pinged().is_empty(), "{:?}", fake.pinged());
     }
 }

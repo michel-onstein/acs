@@ -419,11 +419,12 @@ into it (`host unset` of its last setting turns it back into a list).
 | `command_bell` | ring the terminal bell when Ctrl-] Ctrl-] arms command mode (default `true`; `ACS_COMMAND_BELL` overrides it) |
 | `redraw_on_reconnect` | send Ctrl-L after reconnecting to a session (default `true`); an alias's own value wins, and `ACS_REDRAW_ON_RECONNECT` over both |
 | `reachability_timeout` | how long an alias's hosts have to answer a ping: `500ms`, `0.5s`, `2s`, up to `60s` (default `500ms`); an alias's own value wins |
+| `reachability_tcp` | check an alias's hosts by connecting to their ssh port (as `ssh -G` names it) instead of pinging them (default `false`); an alias's own value wins |
 | `persist` | never give up on a lost host: ping it and dial when it answers (default `false`); also on an alias or one of its hosts, the most specific winning; `--persist` and `ACS_PERSIST` over all |
-| `reachability_interval` | how often a lost host is pinged while persisting: `100ms` to `3600s` (default `5s`); an alias's own value wins |
+| `reachability_interval` | how often a lost host is pinged while persisting, after the first 30 pings a second apart: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
 | `local_forwards` | ports every session forwards, as `-L` spells them: a list, or one value with commas (`8080:localhost:80,5432:db:5432`); `none` for no forward (default). An alias's own list replaces the global one, and `-L` on the command line adds to it |
-| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist` and `local_networks` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`) and its `hosts` |
+| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist` and `local_networks` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`) and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -445,6 +446,13 @@ host of an alias whose other hosts are in the global file. With
 machine's networks goes first of all: at home on 192.168.1.0/24,
 `devbox.lan` (192.168.1.20) is used before `devbox.example.com` wherever
 it is listed — as long as it answers its ping.
+
+With `reachability_tcp: true` (globally or on an alias) a host is checked by
+connecting to its ssh port instead of a ping — the port `ssh -G` gives for
+it, so `~/.ssh/config` decides it — within the same `reachability_timeout`.
+That suits hosts and networks that drop pings, and a host whose sshd is
+down no longer counts as up. A host ssh reaches through a `ProxyJump` or a
+`ProxyCommand` has no port of its own to try, so it is still pinged.
 
 acs remembers which host an alias used last on the networks you are on
 (`~/.local/state/acs/aliases`), so away from home, where `devbox.lan` is

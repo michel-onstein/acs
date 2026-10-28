@@ -1550,6 +1550,7 @@ update_check: true             # look for a newer release once a week (§7.6)
 command_bell: true             # ring the bell when command mode arms (§6.1)
 redraw_on_reconnect: true      # send Ctrl-L after reconnecting (§5.2)
 reachability_timeout: 500ms    # how long hosts have to answer a ping (§7.3)
+reachability_tcp: false        # check the ssh port instead of pinging (§7.3)
 persist: false                 # wait for a lost host, pinging it (§5.3)
 reachability_interval: 5s      # how often a lost host is pinged (§5.3)
 local_forwards:                # ports every session forwards, as -L (§7.1)
@@ -1570,6 +1571,7 @@ aliases:                       # acs devbox tries its hosts in order
     identity_file: ~/.ssh/id_lab # the key of every host naming none
     redraw_on_reconnect: false # over the global setting, for this alias
     reachability_timeout: 2s   # so is this
+    reachability_tcp: true     # its hosts drop pings: try their ssh port
     persist: true              # and this, unless an entry says otherwise
     reachability_interval: 30s # and this
     prefer_local_network: true # hosts on this machine's networks first
@@ -1602,8 +1604,9 @@ aliases:                       # acs devbox tries its hosts in order
   written without the list. How an alias is resolved is §7.3.
 - **An alias's own settings**: an alias is a list of entries (or one entry,
   a mapping with `host`), or a mapping of its settings — `identity_file`,
-  `redraw_on_reconnect`, `reachability_timeout`, `persist`,
-  `reachability_interval`, `prefer_local_network` and `local_forwards` —
+  `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`,
+  `persist`, `reachability_interval`, `prefer_local_network` and
+  `local_forwards` —
   and its `hosts`, that list. The list form
   stays the usual one; the mapping is only needed for a setting shared by
   the entries. A file may give the mapping without
@@ -1828,10 +1831,50 @@ one of the alias's entries instead of `<name>`:
     then the "using" line, then for every other entry `<host> not waited
     for: <host> was used last on these networks` (acs-qis's one line per
     entry). On the walk without it, the lines are the usual ones.
-  - Probing the ssh port with a TCP connect instead of ICMP would be a
-    truer signal, and would serve hosts that drop pings; it is a bead of
-    its own, acs-fbes (it needs the port, from `ssh -G`, and an answer for
-    an entry behind a `ProxyJump`).
+  - With `reachability_tcp` (below) the entry used last is checked on
+    its ssh port like every other entry, and taken as soon as it
+    connects; the memory itself is the same.
+- **The ssh port instead of a ping** (`reachability_tcp: true`, global or
+  per alias, default off; acs-fbes): a checked entry is checked by a TCP
+  connect to the port ssh would dial, instead of a ping. It is the truer
+  signal — it is what the dial needs, and a host whose sshd is down
+  answers pings — and it works where ICMP does not: a host that drops
+  pings needs no `reachability_check: false`, and a network that filters
+  ICMP no longer reports a reachable sshd as down.
+  - *The port* is `ssh -G <destination>`'s `hostname` and `port`, so
+    `~/.ssh/config` decides it as it decides the dial (`Host`, `Match`,
+    `HostName`, `Port`). The destination is the entry's, `user@host` when
+    it has a user, since a `Match user` may change either. `ACS_SSH` names
+    the program. The command line's own ssh options (`-p`, `-F`, `-o
+    Port=…`) and `--ssh` are not seen by it yet: the alias is resolved
+    without them.
+  - *The deadline* is the ping's: `ssh -G` (killed at it, as a ping is),
+    the name's lookup (the system resolver, given up on at it) and the
+    connect all share one `reachability_timeout`, from a thread per entry
+    as the pings have. Every address of the name is tried at once and the
+    first to connect answers; the connection is closed straight away,
+    which sshd logs as a connection closed before authentication. An
+    `ssh -G` costs a process per entry, as a ping does, and it runs in
+    the same thread, so choosing still takes at most one deadline.
+  - *Through a proxy*: an entry whose `ssh -G` names a `ProxyJump` or a
+    `ProxyCommand` (other than `none`) has no port acs could connect to —
+    the dial goes to the jump host, not to it — so it is **pinged**, by
+    its `host`, as without the setting, in what is left of the same
+    deadline. That keeps the setting from changing anything for those
+    entries; one the ping cannot reach either is the job of
+    `reachability_check: false`, as it was. `-v` says so: `jumped answers
+    ping (ssh reaches it through a proxy), using jumped`.
+  - *Off by default*: it runs ssh once more per entry, and every
+    existing alias keeps its behaviour. A setting rather than per entry,
+    since the entries of an alias are usually on similar paths; an entry
+    that needs neither stays `reachability_check: false`.
+  - `-v` names the port: `devbox.lan does not answer on port 22 within
+    500ms`, `devbox.example.com answers on port 2222, using …`; an
+    `ssh -G` that fails or does not answer in time reads `does not answer
+    on its ssh port (ssh -G named none)`. `acs config host list` shows
+    `tcp` in the CHECK column for those entries.
+  - It is for an alias's entries only. A plain host waited for with
+    `persist` (§5.3) is still pinged.
 - The chosen entry becomes the ssh destination: `user@host` if it has a
   `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
 - **`user@<alias>`** goes through the alias the same way — same order, same
@@ -1854,7 +1897,8 @@ one of the alias's entries instead of `<name>`:
   it, as `<alias>` or `user@<alias>`; `ACS_REDRAW_ON_RECONNECT` still wins.
 - **None answers**: the client names every host it tried and exits with the
   unreachable code (255) without calling ssh — or, persisting (§5.3),
-  pings them every `reachability_interval` until one answers.
+  pings them every second for the first 30 pings, then every
+  `reachability_interval`, until one answers (§5.3).
 - It applies to every ssh call — the session, `acs list`, install — since they
   share one destination and key. `-v` says which entry was chosen and why.
 - **Redial**: a reconnect (§5.3) resolves the alias again, so after a network
@@ -1965,11 +2009,11 @@ their YAML shape:
 | Command | Effect |
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
-| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`); `set` checks the type |
+| `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`); `set` checks the type |
 | `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
 | `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check] [--prefer] [--persist] [--local-networks N,N]` | append an entry, so repeated adds give an alias its fallback hosts in order. `--local-networks` is checked as the file form is (§7.3) and written back masked |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
-| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false`, `local_forwards <spec>,<spec>\|none` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
+| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `reachability_tcp true\|false`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false`, `local_forwards <spec>,<spec>\|none` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
 | `path` | the two files and whether they exist |
 
 - A setting that is a **list** — `local_forwards` (§7.1) — is given to `set`
