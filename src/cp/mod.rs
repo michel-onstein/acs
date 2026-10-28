@@ -26,7 +26,8 @@
 //! Built so far: phases 1–3 of the design's plan (§12) — the protocol,
 //! the two endpoints, local copies, uploads and downloads with one host,
 //! and resume — and phase 5: the relay between two hosts and remote
-//! wildcards.
+//! wildcards. Local and remote sources in one copy, and downloads from
+//! several hosts, run those pieces in turn (DESIGN decision 17).
 
 pub mod cli;
 pub mod glob;
@@ -121,6 +122,17 @@ impl Outcome {
             true => code::DETACHED,
             false => code::ERROR,
         }
+    }
+
+    /// Count `o`, one part of a copy run in parts, into this one; false
+    /// when it broke off, which ends the copy.
+    fn add(&mut self, o: Outcome) -> bool {
+        self.written += o.written;
+        self.failed += o.failed;
+        self.skipped += o.skipped;
+        self.bytes += o.bytes;
+        self.error = o.error;
+        self.error.is_none()
     }
 }
 
@@ -613,62 +625,91 @@ fn over_ssh(
     }
 }
 
-/// A copy with a host in it: an upload of local sources, a download of
-/// sources all on the same `[user@]host`, or a copy between hosts relayed
-/// through here (ACSCP_DESIGN §5.6). Local and remote sources together,
-/// and downloads from several hosts, are refused.
-fn copy_remote(a: &CopyArgs, opts: &Options) -> Result<Outcome, u8> {
-    let mut hosts = a.sources.iter().filter_map(|s| match s {
-        Spec::Remote(r) => Some(r),
-        Spec::Local(_) => None,
-    });
-    let first = hosts.next();
-    let all_remote = a.sources.iter().all(|s| matches!(s, Spec::Remote(_)));
-    let one_host =
-        all_remote && first.is_some_and(|f| hosts.all(|r| r.destination() == f.destination()));
-    match (&a.target, first) {
-        (Spec::Remote(host), None) => {
-            let (good, skipped) = local_sources(a)?;
-            let hello = hello(Role::Receive, &host.path, names(&good), opts);
-            let mut s = sender::Sender::new(good, opts, false);
-            let r = over_ssh(a, host, hello, &mut s)?;
-            let mut o = s.outcome(r.err());
-            o.skipped += skipped;
-            Ok(o)
-        }
-        (Spec::Local(target), Some(host)) if one_host => {
-            let mut paths = Vec::new();
-            let mut wanted = Vec::new();
-            for s in &a.sources {
-                let Spec::Remote(r) = s else { continue };
-                let Some(n) = wanted_name(&r.path) else {
-                    note(&format!(
-                        "{}:{}: name the file or directory to copy, not the one it is in",
-                        r.destination(),
-                        r.path
-                    ));
-                    return Err(code::USAGE);
-                };
-                paths.push(r.path.clone());
-                wanted.push(n);
+/// One source host's paths and the names they arrive under.
+type Group<'a> = (&'a cli::Remote, Vec<String>, Vec<String>);
+
+/// The command line's remote sources by host, in the order it first names
+/// each; the exit code, told already, for a path that names no file.
+fn groups(a: &CopyArgs) -> Result<Vec<Group<'_>>, u8> {
+    let mut groups: Vec<Group<'_>> = Vec::new();
+    for s in &a.sources {
+        let Spec::Remote(src) = s else { continue };
+        let Some(name) = wanted_name(&src.path) else {
+            note(&format!(
+                "{}:{}: name the file or directory to copy, not the one it is in",
+                src.destination(),
+                src.path
+            ));
+            return Err(code::USAGE);
+        };
+        let at = match groups
+            .iter()
+            .position(|g| g.0.destination() == src.destination())
+        {
+            Some(at) => at,
+            None => {
+                groups.push((src, Vec::new(), Vec::new()));
+                groups.len() - 1
             }
-            // A wildcard may match several: the target must hold them.
-            let several = paths.len() > 1 || paths.iter().any(|p| glob::is_pattern(p));
+        };
+        groups[at].1.push(src.path.clone());
+        groups[at].2.push(name);
+    }
+    Ok(groups)
+}
+
+/// A copy with a host in it (ACSCP_DESIGN §5.6, DESIGN decision 17), run
+/// in parts: first each source host's sources in turn — a download into a
+/// local target, a relay into a remote one — then the local sources, copied
+/// or uploaded. Several sources, or a wildcard, need a directory: a local
+/// target is looked at before anything is dialled, and a remote one by the
+/// first part, before anything is written, which is why the hosts go first.
+fn copy_remote(a: &CopyArgs, opts: &Options) -> Result<Outcome, u8> {
+    let groups = groups(a)?;
+    let (good, skipped) = local_sources(a);
+    let several = a.sources.len() > 1
+        || groups
+            .iter()
+            .any(|g| g.1.iter().any(|p| glob::is_pattern(p)));
+    let mut total = Outcome {
+        skipped,
+        ..Outcome::default()
+    };
+    let more = match &a.target {
+        Spec::Local(target) => {
             if several && !target.is_dir() {
                 note_on(&target.display().to_string(), "not a directory");
                 return Err(code::ERROR);
             }
-            let hello = hello(Role::Send, "", paths, opts);
-            let mut r = receiver::Receiver::asking(target.clone(), wanted, opts);
-            let res = over_ssh(a, host, hello, &mut r)?;
-            Ok(r.outcome(res.err()))
+            let mut more = true;
+            for (host, paths, wanted) in groups {
+                let hello = hello(Role::Send, "", paths, opts);
+                let mut r = receiver::Receiver::asking(target.clone(), wanted, opts);
+                let res = over_ssh(a, host, hello, &mut r)?;
+                more = total.add(r.outcome(res.err()));
+                if !more {
+                    break;
+                }
+            }
+            more
         }
-        (Spec::Remote(dst), Some(_)) if all_remote => relay::copy(a, dst, opts),
-        _ => {
-            note("copying from local and remote sources at once, or from several hosts to this one, is not built yet");
-            Err(code::USAGE)
-        }
+        Spec::Remote(_) if groups.is_empty() => true,
+        Spec::Remote(dst) => total.add(relay::copy(a, dst, groups, several, opts)?),
+    };
+    if !more || good.is_empty() {
+        return Ok(total);
     }
+    let o = match &a.target {
+        Spec::Local(target) => copy_local(target, good, opts),
+        Spec::Remote(host) => {
+            let hello = hello(Role::Receive, &host.path, names(&good), opts);
+            let mut s = sender::Sender::new(good, opts, false);
+            let r = over_ssh(a, host, hello, &mut s)?;
+            s.outcome(r.err())
+        }
+    };
+    total.add(o);
+    Ok(total)
 }
 
 /// A local copy: the sender here and a receiver on a thread of its own,
@@ -720,8 +761,8 @@ pub fn check_sources(sources: &[PathBuf], recursive: bool) -> (Vec<(String, Path
 }
 
 /// The command line's local sources, [checked](check_sources): those that
-/// passed and how many did not, or the exit code when none passed.
-fn local_sources(a: &CopyArgs) -> Result<(Vec<(String, PathBuf)>, u64), u8> {
+/// passed and how many did not.
+fn local_sources(a: &CopyArgs) -> (Vec<(String, PathBuf)>, u64) {
     let local: Vec<PathBuf> = a
         .sources
         .iter()
@@ -730,10 +771,7 @@ fn local_sources(a: &CopyArgs) -> Result<(Vec<(String, PathBuf)>, u64), u8> {
             Spec::Remote(_) => None,
         })
         .collect();
-    match check_sources(&local, a.recursive) {
-        (good, _) if good.is_empty() => Err(code::ERROR),
-        checked => Ok(checked),
-    }
+    check_sources(&local, a.recursive)
 }
 
 /// Entry point of the copy role: `args` after the program name (`acscp`)
@@ -763,11 +801,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
     opts.verbose = a.verbose > 0;
     opts.meter = !a.quiet;
     let o = match (&a.target, a.any_remote()) {
-        (Spec::Local(target), false) => local_sources(&a).map(|(good, skipped)| {
-            let mut o = copy_local(target, good, &opts);
-            o.skipped += skipped;
-            o
-        }),
+        (Spec::Local(target), false) => match local_sources(&a) {
+            (good, _) if good.is_empty() => Err(code::ERROR),
+            (good, skipped) => {
+                let mut o = copy_local(target, good, &opts);
+                o.skipped += skipped;
+                Ok(o)
+            }
+        },
         _ => copy_remote(&a, &opts),
     };
     let o = match o {

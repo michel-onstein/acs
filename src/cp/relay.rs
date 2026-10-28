@@ -21,10 +21,10 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
-use super::cli::{CopyArgs, Remote, Spec};
+use super::cli::{CopyArgs, Remote};
 use super::progress::Progress;
 use super::proto::{err, ty, Msg, Role};
-use super::{dial_cp, hello, note, note_on, prepare, wanted_name, Dialed, Options, Outcome, HIGH};
+use super::{dial_cp, hello, note_on, prepare, Dialed, Group, Options, Outcome, HIGH};
 use crate::client::{code, Link};
 use crate::outq::OutQueue;
 use crate::proto::Decoder;
@@ -317,44 +317,22 @@ impl Relay {
     }
 }
 
-/// `acscp h1:a h2:b`: every source on a host, the target on a host. Each
-/// source host's sources are one relay to the target host, run in turn in
-/// the order the command line names them (§5.6).
-pub(super) fn copy(a: &CopyArgs, dst: &Remote, opts: &Options) -> Result<Outcome, u8> {
-    // Each source host with its paths and the names they arrive under.
-    let mut groups: Vec<(&Remote, Vec<String>, Vec<String>)> = Vec::new();
-    for s in &a.sources {
-        let Spec::Remote(src) = s else { continue };
-        let Some(name) = wanted_name(&src.path) else {
-            note(&format!(
-                "{}:{}: name the file or directory to copy, not the one it is in",
-                src.destination(),
-                src.path
-            ));
-            return Err(code::USAGE);
-        };
-        let at = match groups
-            .iter()
-            .position(|g| g.0.destination() == src.destination())
-        {
-            Some(at) => at,
-            None => {
-                groups.push((src, Vec::new(), Vec::new()));
-                groups.len() - 1
-            }
-        };
-        groups[at].1.push(src.path.clone());
-        groups[at].2.push(name);
-    }
+/// `acscp h1:a h2:b`: the target on a host, and each source host's sources
+/// one relay to it, run in turn in the order the command line first names
+/// the host (§5.6). `need_dir`: several sources in all, or a wildcard, so
+/// the target must be a directory.
+pub(super) fn copy(
+    a: &CopyArgs,
+    dst: &Remote,
+    groups: Vec<Group<'_>>,
+    need_dir: bool,
+    opts: &Options,
+) -> Result<Outcome, u8> {
     let mut relay = Relay {
         outcome: Outcome::default(),
         ended: false,
         done: false,
-        need_dir: a.sources.len() > 1
-            || a.sources.iter().any(|s| match s {
-                Spec::Remote(r) => super::glob::is_pattern(&r.path),
-                Spec::Local(_) => false,
-            }),
+        need_dir,
         meter: opts.meter.then(Progress::on_terminal).flatten(),
         files: Vec::new(),
         on: None,
@@ -368,16 +346,12 @@ pub(super) fn copy(a: &CopyArgs, dst: &Remote, opts: &Options) -> Result<Outcome
         relay.end_line();
         s.link.close();
         r.link.close();
-        let o = std::mem::take(&mut relay.outcome);
+        let mut o = std::mem::take(&mut relay.outcome);
         relay.done = false;
         relay.ended = false;
         relay.files.clear();
-        total.written += o.written;
-        total.failed += o.failed;
-        total.skipped += o.skipped;
-        total.bytes += o.bytes;
-        if let Err(e) = res {
-            total.error = Some(e);
+        o.error = res.err();
+        if !total.add(o) {
             break;
         }
     }
