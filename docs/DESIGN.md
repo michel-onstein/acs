@@ -2760,14 +2760,14 @@ affected by someone else's install.
 
 | Target | Slim | Complete |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 1119 KB | 2.24 MB |
-| `aarch64-unknown-linux-musl` | 993 KB | 2.12 MB |
+| `x86_64-unknown-linux-musl` | 1120 KB | 2.25 MB |
+| `aarch64-unknown-linux-musl` | 994 KB | 2.12 MB |
 | `aarch64-apple-darwin` | 824 KB | 1.95 MB |
 | `x86_64-apple-darwin` | 915 KB | 2.06 MB |
 
-The payload set (both Linux builds, gzip'd) is 1125 KB. Measured 2026-10-28
-with the copy's phases 1–3 (`src/cp`: the local copy, `acs _cp`, resume and
-redial) in release builds (acs-hofu.4). The
+The payload set (both Linux builds, gzip'd) is 1126 KB. Measured 2026-10-28
+with the copy's phases 1–4 (`src/cp`: the local copy, `acs _cp`, resume and
+redial; the `acscp` link) in release builds (acs-hofu.4). The
 budget `cargo xtask dist` enforces is slim ≤ 1.15 MB and complete ≤ 2.3 MB
 (goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them, and
 from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9): built into a
@@ -2858,18 +2858,19 @@ directory's touch are outlined the same way, now that each has two callers
 
 **Phase 3** (acs-hofu.4: resume from the part, `HAVE`/`RESTART`, the
 copy's liveness and its redial loop) measured with `cargo xtask dist`
-against the phase 2 release figures above:
+against 6367dfb, the release with phase 4's `acscp` link and without
+phase 3; the copy role is phase 2's figure above plus the phase:
 
 | Target | Slim | Phase 3 | Copy role | Complete | Phase 3 | Copy role |
 | --- | --- | --- | --- | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 1,118,736 B | +15,648 B | 72,488 B | 2,243,454 B | +30,995 B | 145,667 B |
-| `aarch64-unknown-linux-musl` | 992,880 B | +12,560 B | 61,056 B | 2,117,598 B | +27,907 B | 134,235 B |
-| `aarch64-apple-darwin` | 824,176 B | +112 B | 50,144 B | 1,952,208 B | +32,944 B | 115,568 B |
-| `x86_64-apple-darwin` | 915,072 B | +12,352 B | 61,888 B | 2,057,712 B | +28,960 B | 136,720 B |
+| `x86_64-unknown-linux-musl` | 1,119,904 B | +15,472 B | 72,312 B | 2,245,659 B | +30,698 B | 145,370 B |
+| `aarch64-unknown-linux-musl` | 993,872 B | +12,480 B | 60,976 B | 2,119,627 B | +27,706 B | 134,034 B |
+| `aarch64-apple-darwin` | 824,192 B | +112 B | 50,144 B | 1,952,208 B | +16,528 B | 99,152 B |
+| `x86_64-apple-darwin` | 915,072 B | +12,344 B | 61,880 B | 2,057,712 B | +28,960 B | 136,720 B |
 
-The copy role is now 72,488 B of the 100 KB decision 13 gives it on
-x86_64 slim, leaving about 27.5 KB for phases 5 and 6; every build is
-inside the overall budget (31 KB of slim room and 56 KB of complete room
+The copy role is now 72,312 B of the 100 KB decision 13 gives it on
+x86_64 slim, leaving about 27.7 KB for phases 5 and 6; every build is
+inside the overall budget (30 KB of slim room and 54 KB of complete room
 on x86_64 Linux). The aarch64 macOS slim build moves in whole pages, so its
 +112 B is where a page boundary fell, not what the phase costs. Nothing new
 is linked for the hashing: the SHA-256 is the one the install already
