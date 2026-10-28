@@ -40,7 +40,7 @@ pub(crate) fn backoff_reset_after() -> Duration {
 }
 
 /// Declare the link dead after this much silence (`ACS_DEAD_MS`).
-fn dead_after() -> u64 {
+pub(crate) fn dead_after() -> u64 {
     sys::env_or("ACS_DEAD_MS", DEAD_MS)
 }
 
