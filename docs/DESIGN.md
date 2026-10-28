@@ -2298,8 +2298,8 @@ their YAML shape:
 - Removing something that lives in the other file fails with a pointer to it
   (`it is set in /etc/acs/config.yaml:1 (use --global)`).
 - `config` is a reserved **first** argument (as are `upgrade`, §7.5,
-  `list`, §7, and `cp`, for copying files: local copies only so far, and
-  in debug builds only until the copy's remote end lands). A
+  `list`, §7, and `cp`, for copying files: local copies, uploads and
+  downloads; resume and two-host copies are not built yet). A
   host literally called `config` (or `upgrade`, `list` or `cp`) is reached
   as `user@config`, or with any option before it (`acs -p 22 config`);
   `acs list list` lists a host called `list`. The binary run under the name
@@ -2747,13 +2747,14 @@ affected by someone else's install.
 
 | Target | Slim | Complete |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 1046 KB | 2.10 MB |
-| `aarch64-unknown-linux-musl` | 932 KB | 1.98 MB |
-| `aarch64-apple-darwin` | 774 KB | 1.84 MB |
-| `x86_64-apple-darwin` | 853 KB | 1.92 MB |
+| `x86_64-unknown-linux-musl` | 1103 KB | 2.21 MB |
+| `aarch64-unknown-linux-musl` | 980 KB | 2.09 MB |
+| `aarch64-apple-darwin` | 824 KB | 1.92 MB |
+| `x86_64-apple-darwin` | 903 KB | 2.03 MB |
 
-The payload set (both Linux builds, gzip'd) is 1051 KB. Measured 2026-10-28
-at 792c178, where release builds still leave the copy (`src/cp`) out. The
+The payload set (both Linux builds, gzip'd) is 1109 KB. Measured 2026-10-28
+at cb48a34 with the copy (`src/cp`, phases 1 and 2) in release builds
+(acs-hofu.3). The
 budget `cargo xtask dist` enforces is slim ≤ 1.15 MB and complete ≤ 2.3 MB
 (goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them, and
 from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9): built into a
@@ -2773,11 +2774,11 @@ lifted for the measurement only — against the release without the copy:
 | `aarch64-apple-darwin` | +50,016 B | +33,472 B | — | +82,576 B |
 | `x86_64-apple-darwin` | +57,704 B | +45,392 B | — | +91,200 B |
 
-So phase 1 now fits the 50 KB (50,000 B) of x86_64 slim that ACSCP_DESIGN
-decision 13 budgets for the whole copy role, with 40 B to spare: phase 2
-(`acs _cp`, the dial, the install) has none left, and will have to win its
-own bytes back or revisit the figure. The macOS sizes move in whole pages,
-so a change there shows only once it crosses one.
+So phase 1 fitted the 50 KB (50,000 B) of x86_64 slim that ACSCP_DESIGN
+decision 13 then budgeted for the whole copy role, with 40 B to spare, and
+phase 2 (`acs _cp`, the dial, the install) had none left; the maintainer has
+since raised the figure to 100 KB (decision 13 here). The macOS sizes move
+in whole pages, so a change there shows only once it crosses one.
 
 Where the x86_64 bytes go, by `nm --size-sort` on an unstripped build
 diffed against the release without the copy: about 37 KB of code, then the
@@ -2823,11 +2824,15 @@ lifted for the measurement only — against the same tree with them in place:
 | `aarch64-apple-darwin` | 774,032 B | 824,064 B | +50,032 B | 1,836,640 B | 1,919,264 B | +82,624 B |
 | `x86_64-apple-darwin` | 853,184 B | 902,720 B | +49,536 B | 1,920,992 B | 2,028,752 B | +107,760 B |
 
-Every build is inside the budget, but the whole copy role is 56,840 B of
-x86_64 slim against decision 13's 50,000 B: phase 2 costs about 6,900 B
-over phase 1's 49,960 B. So the copy is still left out of release builds
-(`cfg(debug_assertions)` in `src/lib.rs`, extended to `_cp`) until the
-maintainer raises that figure or the copy is trimmed further. By `nm` on
+Every build is inside the budget. The whole copy role is 56,840 B of
+x86_64 slim — phase 2 costs about 6,900 B over phase 1's 49,960 B — which
+was past the 50,000 B decision 13 then gave it (acs-hofu.11), so the copy
+stayed out of release builds behind `cfg(debug_assertions)` until the
+maintainer set the copy's budget at 100 KB (decision 13 here, 2026-10-28).
+With the gates removed (acs-hofu.3), `cargo xtask dist` measures the
+release builds at the "with the copy" figures above (the complete Linux
+builds within 2 B of them), leaving about
+43 KB of the copy's 100 KB for phase 3 and later. By `nm` on
 unstripped builds, the new code is the copy's dial (`cp::over_ssh`, 2.3 KB),
 `acs _cp` itself (inlined into `run`), and the session's install step,
 which is now one function called from two places (`ready_or_install`,
@@ -3053,3 +3058,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 10 | Reusing an ssh master (acs-9n3) | Revisited 2026-09-23, with the per-phase timings of acs-pgn in hand. §3 set `ControlMaster=no` outright because a reconnect can hang on a dead multiplexer — but that hazard is the redial's, and the price was a full handshake (and a second hardware-key touch) on every first connection, `acs list <host>` and reattach. acs now keeps **its own** master — its own `ControlPath` under `/tmp/acs-mux-<uid>`, its own `ControlPersist`, never the user's — for the first connection and side calls, and `acs list` over every alias joins one that is up but never starts one (acs-hmv: 33 ms against 50 ms per listing on loopback); a redial still opts out, and ends the master the lost link ran on when what ended that link says the connection failed rather than only the channel on it (acs-n1m, §7.1 — a protocol error is bytes arriving, so the connection is up and every sibling session on the master keeps it; so is an ssh that exits with the remote command's status rather than its own 255, acs-b4f); a dial that joins a master must produce its marker within 2 s or the master is ended and the dial made again on its own connection; a session with a `-L` has no master, because a forward asked of a client is opened by the master and would outlive the session. Measured over ssh to a container on loopback, where a handshake costs almost no round trips: 51 ms to `ACS-READY` cold against 13 ms on the master. Every reason acs cannot vouch for the socket's directory costs the speed-up and nothing else; `ACS_CONTROL_PERSIST=0` restores the old dial exactly (§3, §7.1) |
 | 11 | The suite-wide test deadline `T` (acs-hsw) | Decided 2026-10-28 on acs-2dc's measurements: `T` stays 30 s. Moving it from 30 s to 300 s took `tests/client.rs` from 86 failures in 850 to 6 under deliberate I/O starvation, but the same load without the I/O pressure was already 850 of 850 green, so what a longer `T` buys is a pass under starvation, at the price of every genuine hang reporting minutes later — and it is not one change but many, since the suite's minute and two-minute timers are sized to outlast `T` and would have to move with it (since acs-3sk9 they are derived from `T`, so that part is one edit). Instead the limit is written down: the suite is not expected to pass under sustained I/O starvation, a dial-wait red beside heavy I/O is re-run alone before it is read, and a red on an idle machine is a bug (§9.1) |
 | 12 | The dead-link timeout: fixed, shorter or RTT-adaptive (acs-vq1) | Decided 2026-10-28 with acs-pgn's per-phase timings in hand: it stays a fixed 10 s, with a `PING` after 3 s of silence and `ACS_DEAD_MS` as the override. Silence that netwatch does not explain is mostly a blip the existing TCP connection rides out, and a redial cannot succeed before the path is back anyway, so a shorter interval mainly turns survivable blips into redials — each one discarding typed keys, repainting the screen and costing a full handshake (51 ms cold on loopback, several round trips and possibly a key touch on a real host). An RTT-adaptive interval is decided by its floor on every real path, since a few round trips are under a second and the floor must exceed the ping interval; and the silence it must survive (a stalled host, output queued on a slow or bufferbloated uplink) is what an idle round trip underestimates. The fast cases are covered already: netwatch in 2 s, a closed connection at once. Reopen on `-v` evidence of drops netwatch missed whose redial then succeeded at once (§5.3) |
+| 13 | The copy's size budget (acs-hofu.11) | Decided by the maintainer 2026-10-28: the copy role (`acscp`, `acs cp`, `acs _cp`; ACSCP_DESIGN decision 13, goal 7) may cost **100 KB of the x86_64 musl slim build**, replacing 50 KB. Phases 1 and 2 measured 56,840 B against the old 50,000 B, with no single cheap trim left to close the gap; the larger figure lets the copy ship in release builds (acs-hofu.3) and leaves about 43 KB for phase 3's resume and redial. The overall budget (slim ≤ 1.15 MB, complete ≤ 2.3 MB, goal 2) is unchanged and still holds with the copy in (§8.1) |
