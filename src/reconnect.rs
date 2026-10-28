@@ -13,9 +13,24 @@ use crate::sys;
 use crate::timing::{Phase, Timing};
 use crate::tty::RawMode;
 
+/// The default of `ACS_PING_MS`.
+const PING_MS: u64 = 3000;
+
+/// The default of `ACS_DEAD_MS`: a fixed 10 s, deliberately neither
+/// shorter nor scaled by the measured round trip (acs-vq1, DESIGN §5.3,
+/// decision 12). Silence on a link whose network did not move is mostly a
+/// blip TCP rides out by itself, and a redial cannot succeed before the
+/// path is back anyway; a stalled host or a bufferbloated uplink is
+/// silence an idle round trip does not predict. A false alarm costs a
+/// redial — keys typed into it discarded, the screen repainted, a full
+/// handshake — while the drops a shorter interval would catch sooner are
+/// mostly caught already, by netwatch (`ACS_NETCHECK_MS`) or by a closed
+/// connection. `ACS_DEAD_MS` stays the override.
+const DEAD_MS: u64 = 10_000;
+
 /// Send a PING after this much silence (`ACS_PING_MS`).
 fn ping_after() -> u64 {
-    sys::env_or("ACS_PING_MS", 3000)
+    sys::env_or("ACS_PING_MS", PING_MS)
 }
 
 /// How long a link must have served, WELCOME to loss, for the backoff to
@@ -26,7 +41,7 @@ fn backoff_reset_after() -> Duration {
 
 /// Declare the link dead after this much silence (`ACS_DEAD_MS`).
 fn dead_after() -> u64 {
-    sys::env_or("ACS_DEAD_MS", 10_000)
+    sys::env_or("ACS_DEAD_MS", DEAD_MS)
 }
 
 /// How long the host has to answer the PING a network change sends while
@@ -802,6 +817,38 @@ mod tests {
             netcheck_after: 50,
             probe: None,
         }
+    }
+
+    /// acs-vq1 (decision 12): the dead interval is a fixed 10 s, and a
+    /// quiet link is asked three times before it is given up on — so a
+    /// host that misses one PONG to a stall, or a path that blips for a few
+    /// seconds, costs no redial. A fast PONG does not shorten it: the
+    /// interval does not scale with the round trip.
+    #[test]
+    fn the_dead_interval_is_fixed_and_a_quiet_link_is_asked_three_times() {
+        assert_eq!((PING_MS, DEAD_MS), (3000, 10_000));
+        let mut l = liveness(0, PING_MS, DEAD_MS);
+        let mut out = Vec::new();
+        // The first PING is answered in 1 ms, a round trip as short as
+        // loopback's; then the link goes quiet.
+        assert_eq!(l.tick_at(PING_MS, &mut out), Health::Ok);
+        assert_eq!(out, Msg::Ping(PING_MS).to_bytes());
+        out.clear();
+        let last = PING_MS + 1;
+        l.heard = last;
+        l.pong(PING_MS);
+        let mut pings = Vec::new();
+        let mut now = last;
+        while l.tick_at(now, &mut out) == Health::Ok {
+            if !out.is_empty() {
+                assert_eq!(out, Msg::Ping(now).to_bytes());
+                out.clear();
+                pings.push(now - last);
+            }
+            now = l.next_deadline_ms();
+        }
+        assert_eq!(now - last, DEAD_MS, "dead at the fixed interval");
+        assert_eq!(pings, [3000, 6000, 9000], "asked three times first");
     }
 
     /// acs-ft1: a network change under a link that is still up asks the
