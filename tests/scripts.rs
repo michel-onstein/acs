@@ -798,6 +798,147 @@ fn the_installer_uses_the_layout_acs_looks_in() {
     }
 }
 
+/// Run the installer's `link_bin` for `version` with `lib` and `bin` as
+/// its directories, and say what it did: `linked`, `newer` or `theirs`.
+/// The helpers are cut out of the script itself, from the first of them to
+/// where it picks the directories, so the test runs exactly what ships.
+fn installer_link(lib: &Path, bin: &Path, version: &str) -> String {
+    let script = installer();
+    let helpers = script
+        .lines()
+        .skip_while(|l| !l.starts_with("rand() {"))
+        .take_while(|l| !l.starts_with("if [ -n \"${ACS_INSTALL_DIR:-}\" ]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        helpers.contains("link_bin() {"),
+        "the installer's link helpers moved:\n{helpers}"
+    );
+    std::fs::create_dir_all(lib.join(version)).unwrap();
+    std::fs::write(lib.join(version).join("acs"), "new\n").unwrap();
+    std::fs::create_dir_all(bin).unwrap();
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "set -eu\n{helpers}\nlink_bin \"$lib/$version/acs\" \"$bin/acs\"\nprintf %s \"$linked\""
+        ))
+        .env("lib", lib)
+        .env("bin", bin)
+        .env("version", version)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// An installed version under `lib`, as an earlier run left it.
+fn installed(lib: &Path, version: &str) -> PathBuf {
+    let path = lib.join(version).join("acs");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "old\n").unwrap();
+    path
+}
+
+fn symlink(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+fn points_at(link: &Path) -> PathBuf {
+    std::fs::read_link(link).unwrap()
+}
+
+/// acs-feee: the installer moves `bin/acs` by `install::should_link`'s
+/// rule, as acs does on a remote — a link of ours forward only, never
+/// back, and nothing it did not make — instead of renaming over whatever
+/// is there, which as `curl | sh` run by root replaced a user's own file.
+#[test]
+fn the_installer_links_where_nothing_is() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    assert_eq!(installer_link(&lib, &bin, "0.13.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.13.0/acs"));
+}
+
+#[test]
+fn the_installer_moves_its_link_forward() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    // 0.9.0 to 0.10.0: by number, not as text.
+    symlink(&installed(&lib, "0.9.0"), &bin.join("acs"));
+    assert_eq!(installer_link(&lib, &bin, "0.10.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.10.0/acs"));
+    // The same version again: still linked, which is a re-run's no-op.
+    assert_eq!(installer_link(&lib, &bin, "0.10.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.10.0/acs"));
+}
+
+#[test]
+fn the_installer_never_moves_its_link_back() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    let newer = installed(&lib, "0.10.0");
+    symlink(&newer, &bin.join("acs"));
+    // ACS_VERSION=0.9.0: installed beside it, the link left on 0.10.0.
+    assert_eq!(installer_link(&lib, &bin, "0.9.0"), "newer");
+    assert_eq!(points_at(&bin.join("acs")), newer);
+    assert!(lib.join("0.9.0/acs").is_file());
+}
+
+#[test]
+fn the_installer_relinks_from_a_removed_version() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    let gone = installed(&lib, "0.14.0");
+    symlink(&gone, &bin.join("acs"));
+    std::fs::remove_dir_all(gone.parent().unwrap()).unwrap();
+    assert_eq!(installer_link(&lib, &bin, "0.13.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.13.0/acs"));
+}
+
+#[test]
+fn the_installer_knows_its_link_through_a_symlinked_directory() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    installed(&lib, "0.12.0");
+    // As a link made through a symlinked $HOME reads.
+    symlink(&lib, &t.path().join("alias"));
+    symlink(&t.path().join("alias/0.12.0/acs"), &bin.join("acs"));
+    assert_eq!(installer_link(&lib, &bin, "0.13.0"), "linked");
+    assert_eq!(points_at(&bin.join("acs")), lib.join("0.13.0/acs"));
+}
+
+#[test]
+fn the_installer_leaves_a_users_own_file_alone() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("acs"), "mine\n").unwrap();
+    assert_eq!(installer_link(&lib, &bin, "0.13.0"), "theirs");
+    let meta = std::fs::symlink_metadata(bin.join("acs")).unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!(std::fs::read_to_string(bin.join("acs")).unwrap(), "mine\n");
+}
+
+#[test]
+fn the_installer_leaves_a_foreign_link_alone() {
+    let t = TempDir::new();
+    let (lib, bin) = (t.path().join("lib"), t.path().join("bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    // An acs of the user's own, in a directory laid out like ours, and a
+    // dangling one: neither is under lib, so neither is ours to move.
+    let theirs = installed(&t.path().join("src/target"), "release");
+    for target in [theirs, t.path().join("nowhere/0.1.0/acs")] {
+        let _ = std::fs::remove_file(bin.join("acs"));
+        symlink(&target, &bin.join("acs"));
+        assert_eq!(installer_link(&lib, &bin, "0.13.0"), "theirs");
+        assert_eq!(points_at(&bin.join("acs")), target);
+    }
+}
+
 /// acs-sseq: `scripts/update-tap.sh` decides "older than the tap's" with
 /// `sort`, and acs with `release::compare`. They must agree on every pair
 /// of releases, or the tap could be moved backwards.

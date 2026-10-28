@@ -71,16 +71,36 @@ here() {
     fi
     pass "latest ($new) into $bin, linked to $lib/$new"
 
-    # A pinned older version, then back to the latest: upgrades in place.
+    # A pinned older version: installed beside the newer one, which keeps
+    # the link (acs-feee, install::should_link).
     run ACS_VERSION="$old"
     expect_ok "pinned"
     expect_out "pinned" "acs $old ("
-    [ "$(readlink "$bin/acs")" = "$lib/$old/acs" ] || fail "pinned: $bin/acs -> $(readlink "$bin/acs")"
+    expect_out "pinned" "installed acs $old: $lib/$old/acs"
+    expect_out "pinned" "left $bin/acs on acs $new, which is newer"
+    [ "$(readlink "$bin/acs")" = "$lib/$new/acs" ] || fail "pinned: $bin/acs -> $(readlink "$bin/acs")"
+    case $("$lib/$old/acs" --version) in "acs $old ("*) ;; *) fail "pinned: $lib/$old/acs is not $old" ;; esac
+    pass "pinned $old installed beside $new, the link left on $new"
+
+    # A link of ours to an older version: moved forward in place.
+    ln -sf "$lib/$old/acs" "$bin/acs"
     run ACS_VERSION="v$new"
     expect_ok "re-run"
+    expect_out "re-run" "installed acs $new: $bin/acs -> $lib/$new/acs"
     [ "$(readlink "$bin/acs")" = "$lib/$new/acs" ] || fail "re-run: not upgraded"
     case $("$bin/acs" --version) in "acs $new ("*) ;; *) fail "re-run: $bin/acs is not $new" ;; esac
-    pass "pinned $old, then upgraded in place to $new"
+    pass "a link to $old upgraded in place to $new"
+
+    # A file of the user's own at the link's name: left alone, and said so.
+    rm -f "$bin/acs"
+    echo mine >"$bin/acs"
+    run ACS_VERSION="$new"
+    expect_ok "own file"
+    expect_out "own file" "left $bin/acs alone: it is not a link this installer made"
+    [ ! -L "$bin/acs" ] && [ "$(cat "$bin/acs")" = mine ] || fail "own file: $bin/acs was replaced"
+    rm -f "$bin/acs"
+    ln -s "$lib/$new/acs" "$bin/acs"
+    pass "a user's own $bin/acs left alone"
 
     # A directory of one's own: the binary itself goes there.
     run ACS_INSTALL_DIR="$t/own bin"

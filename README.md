@@ -26,14 +26,17 @@ Intel, Linux x86_64 and aarch64), checks it against the release's
 
 so a client of the same version finds acs already there when it connects
 to this machine. It says how to add the directory to your `PATH` if it is
-not on it, and running it again upgrades in place. It needs `curl` or
+not on it, and running it again upgrades in place. The link only moves
+forward: an older `ACS_VERSION` is installed beside the newer one without
+taking the link, and a file or link at that name it did not make is left
+alone. Either way it says so, and where it put the version. It needs `curl` or
 `wget`, `sha256sum`, `shasum` or `openssl`, and `ssh-keygen` (which comes
 with the ssh acs needs anyway).
 
 | Variable | Meaning |
 | --- | --- |
 | `ACS_VERSION=0.2.0` | install that release instead of the latest |
-| `ACS_INSTALL_DIR=~/bin` | put the binary itself in that directory |
+| `ACS_INSTALL_DIR=~/bin` | put the binary itself in that directory (replacing any `acs` there) |
 
 for example `curl -fsSL …/install.sh | ACS_VERSION=0.2.0 sh`.
 
