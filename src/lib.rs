@@ -28,11 +28,11 @@ pub mod proxy;
 pub mod prune;
 pub mod reconnect;
 pub mod release;
-// `build.rs` includes this file as source and is the only thing that runs
-// it; the crate compiles it to test it, since a build script cannot be
-// tested any other way (acs-okz).
+// `build.rs` includes this file as source and xtask compiles it; nothing
+// in the binary runs it. The crate compiles it to test it, since a build
+// script cannot be tested any other way (acs-okz).
 #[cfg(test)]
-mod release_key;
+mod build_channel;
 pub mod resume;
 pub mod safe;
 pub mod session;
