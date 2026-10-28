@@ -709,6 +709,14 @@ pub fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
     }
 }
 
+/// A poll entry for `fd`, or none (`fd -1`) when there is nothing to wait
+/// for: a hung-up pipe, socket or pty reports POLLHUP whatever `events`
+/// asks, which spins a loop whose other side is stuck — the proxy's relay
+/// (acs-wza) and the master's pty while the ring is full (acs-gkl).
+pub fn wait_for(fd: RawFd, events: libc::c_short) -> libc::pollfd {
+    pollfd(if events == 0 { -1 } else { fd }, events)
+}
+
 /// `cmd.spawn()`, one thread at a time. Where there is no `pipe2` (macOS),
 /// the standard library makes a child's pipes with `pipe` and marks them
 /// close-on-exec a moment later; a child another thread forks in between
@@ -1134,6 +1142,24 @@ mod tests {
         assert_eq!(valid_pgrp(-1, 100), None);
         assert_eq!(valid_pgrp(100, 100), None);
         assert_eq!(valid_pgrp(4321, 100), Some(4321));
+    }
+
+    /// acs-wza/acs-gkl: with nothing asked for, a hung-up descriptor is
+    /// left out of the poll instead of reporting POLLHUP on every round.
+    #[test]
+    fn a_descriptor_with_nothing_to_wait_for_is_left_out_of_the_poll() {
+        let (r, w) = pipe().unwrap();
+        drop(w);
+        let mut fds = [wait_for(r.as_raw_fd(), 0)];
+        assert_eq!(fds[0].fd, -1);
+        assert_eq!(poll(&mut fds, 0).unwrap(), 0);
+        let mut fds = [wait_for(r.as_raw_fd(), libc::POLLIN)];
+        assert_eq!(fds[0].fd, r.as_raw_fd());
+        assert_eq!(
+            poll(&mut fds, 0).unwrap(),
+            1,
+            "the hang-up is seen when asked"
+        );
     }
 
     #[test]

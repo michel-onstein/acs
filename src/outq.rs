@@ -2,8 +2,8 @@
 //! reads its input, rather than drained from the front: `drain(..n)` after
 //! every partial write moved everything still queued down to the start —
 //! a megabyte per write, behind a slow peer (acs-m08z in the master,
-//! acs-x6os in the proxy's relay). Shared by both, and the one place a
-//! single flush loop would build on (acs-8uxk).
+//! acs-x6os in the proxy's relay). Shared by both, and so is its
+//! non-blocking flush loop, [`OutQueue::flush`] (acs-8uxk).
 //!
 //! The written prefix is let go of when the queue empties — the usual case,
 //! and free — or, failing that, once it is past [`COMPACT`] and at least as
