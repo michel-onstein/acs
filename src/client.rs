@@ -263,11 +263,18 @@ pub struct Picked {
 /// resolves it the same way.
 pub fn resolve_alias(args: &mut ClientArgs, name: &str) -> Result<(), String> {
     let verbose = args.verbose > 0;
-    let entry = crate::alias::resolve(
+    // The entry used last on these networks goes first (acs-zpj); asked
+    // only for an alias, since it reads this machine's interfaces.
+    let memory = args
+        .config
+        .alias(crate::alias::split_user(name).1)
+        .and_then(|_| crate::alias_memory::Memory::system());
+    let entry = crate::alias::resolve_remembering(
         name,
         &args.config,
         std::sync::Arc::new(crate::alias::ping),
         &crate::netmatch::system,
+        memory.as_ref(),
         &mut |m| {
             if verbose {
                 note(&m)
