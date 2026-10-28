@@ -7,7 +7,7 @@ mod common;
 use std::process::Command;
 
 use acs::proto::{Marker, Mode, Msg};
-use acs::testutil::{hello, FrameConn};
+use acs::testutil::{hello, FrameConn, KillOnDrop};
 use common::*;
 
 #[test]
@@ -17,8 +17,13 @@ fn remote_chain_is_byte_exact() {
     // Raw bytes: control characters, escape sequences, high bytes.
     let data = binary_pattern(&data_file, 200_000);
 
-    let mut child =
-        remote.run_remote(&["_proxy", "--session", "smoke", "--mode", "attach-or-create"]);
+    let mut child = KillOnDrop(remote.run_remote(&[
+        "_proxy",
+        "--session",
+        "smoke",
+        "--mode",
+        "attach-or-create",
+    ]));
     let mut c = FrameConn::from_io(child.stdout.take().unwrap(), child.stdin.take().unwrap());
     assert!(matches!(c.expect_marker(T), Some(Marker::Ready { .. })));
     let mut h = hello("smoke", Mode::AttachOrCreate, "me");
@@ -48,14 +53,12 @@ fn remote_chain_is_byte_exact() {
         &data[..],
         "bytes changed in transit"
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[test]
 fn missing_binary_reports_need() {
     let remote = Remote::new();
-    let mut child = remote.run_remote(&["_proxy", "--list"]);
+    let mut child = KillOnDrop(remote.run_remote(&["_proxy", "--list"]));
     let mut c = FrameConn::from_io(child.stdout.take().unwrap(), child.stdin.take().unwrap());
     match c.expect_marker(T) {
         Some(Marker::Need { os, arch }) => {
@@ -63,7 +66,6 @@ fn missing_binary_reports_need() {
         }
         other => panic!("{other:?}"),
     }
-    let _ = child.wait();
 }
 
 #[test]

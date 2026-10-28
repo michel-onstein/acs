@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use acs::proto::{Marker, Mode, Msg};
-use acs::testutil::{hello, FrameConn};
+use acs::testutil::{hello, FrameConn, KillOnDrop};
 
 /// As `common::T`, which this file cannot reach: generous, because the
 /// suite runs its targets in parallel (acs-kip).
@@ -75,21 +75,19 @@ fn reset(p: &Path) {
 }
 
 /// Start `acs _proxy` as `u` creating `session` (running `sleep`).
-fn start_session(
-    u: &User,
-    session: &str,
-    extra_env: &[(&str, &str)],
-) -> (FrameConn, std::process::Child) {
+fn start_session(u: &User, session: &str, extra_env: &[(&str, &str)]) -> (FrameConn, KillOnDrop) {
     let mut cmd = as_user(u, exe());
     cmd.args(["_proxy", "--session", session, "--mode", "attach-or-create"]);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    // Guarded, so a failed assertion does not leave the proxy behind.
+    let mut child = KillOnDrop(
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let mut c = FrameConn::from_io(child.stdout.take().unwrap(), child.stdin.take().unwrap());
     assert!(matches!(c.expect_marker(T), Some(Marker::Ready { .. })));
     let mut h = hello(session, Mode::AttachOrCreate, "test");
