@@ -764,7 +764,8 @@ sequenceDiagram
     (acs-0n8). `changed()` hands out a `Change`; the set it was judged
     against is replaced by `Change::acted` and nowhere else. The two
     callers that cannot always act — the offline wait inside its rate
-    limit, and the serving loop before the `WELCOME` — drop it instead,
+    limit, and a handshake on a change it lets pass (acs-xo1, below) —
+    drop it instead,
     and the next hint about the same move names the same change rather
     than being answered "not a change" against a set that has already
     moved. Before this the hint was spent either way: the change was not
@@ -882,6 +883,78 @@ sequenceDiagram
     on wake the 10 s window starts from zero however long the sleep was.
     The address that moved is the only evidence available at that moment,
     and it is what this uses.
+- **A network change during the handshake abandons it and dials again at
+  once** (acs-xo1). So a change means something in each of the three
+  phases a client can be in: **offline**, it cuts the wait short and
+  redials (acs-6p8, above); **connected**, it asks the host and shortens
+  the dead-link timeout (acs-ft1, above); and **handshaking** — from the
+  dial until the `WELCOME` — it ends a dial that is very probably doomed,
+  instead of leaving it to run out `ACS_DIAL_TIMEOUT_MS`, 30 s on a redial
+  and 120 s on the first connection. The laptop opened on another network
+  while acs was mid-connect is the case: the connection ssh was making
+  went with the old address the moment the lid opened.
+  - **Both halves of the handshake, every dial that has a session behind
+    it.** The dial watches the network while it waits for the marker —
+    ssh's own handshake, authentication, the remote startup files, the
+    prelude — and the serving loop while it waits for the `WELCOME`. That
+    is the redial, the first connection of a named session, and the
+    session menu's dial that plain `acs <host>` makes (§4.4): the first
+    connection is the 120 s case and the one a user feels most, so it is
+    treated the same. The fresh dial gets a whole timeout of its own; a
+    joined master is ended with the dial, since its connection was made
+    from the network that went. Side calls (`acs list`, the menu's ending
+    of a session) do not watch: they are short and nobody is waiting on a
+    session.
+  - **Abandon, not shorten.** acs-ft1 brings a deadline forward because a
+    connected link has a question it can ask — a `PING` costs one frame
+    and answers in a round trip. A handshake has none: before the marker
+    nothing is listening, and the dial's own remaining work (key exchange,
+    authentication, startup files, an install) legitimately takes longer
+    than any short deadline would allow, so shortening it would kill good
+    dials and still wait on bad ones. Abandoning costs only the time the
+    dial had already spent — nothing typed is lost, keys typed into a
+    redial being dropped anyway (§5.2) — and the fresh dial is made from
+    whatever network the machine is on now.
+  - **What counts: a change that took a network away.** A dial was made
+    from one of the networks the watcher holds; which one is ssh's
+    business (a `ProxyCommand` or `ProxyJump` hides it entirely), so acs
+    cannot ask whether *its* address went — but it can ask, for free,
+    whether *any* did (`Change::removed`, the held set against the new
+    one). A change that only added a network — a second interface, a
+    phone tethering, a VPN coming up — left every address a dial could
+    have been made from in place, and is let pass: dropped, not spent
+    (acs-0n8), so the next hint offers it again, and once the `WELCOME`
+    is in it is acs-ft1's question like any other. A change that removed
+    one is acted on, even where the dial might have been on another
+    interface that survived; that mistake costs one dial, the other one
+    up to two minutes.
+  - **Not while ssh is asking the user something.** Killing ssh at its
+    password prompt would throw away what is being typed there, so a dial
+    that holds the terminal for a prompt is left to finish, the change
+    dropped rather than spent. On a redial with the command keys
+    (acs-8ax, below) that is exact: from the hand-off on, the dial is
+    ssh's to the end, as its stdin is. A dial that shares acs's cooked
+    terminal — the first connection, a redial without a terminal to hand
+    over — cannot see a hand-off, and judges by the terminal's echo, which
+    ssh's password, passphrase and PIN prompts turn off while they read; a
+    terminal acs cannot read the modes of counts as asking. The one prompt
+    that keeps its echo, the host-key question on a first meeting, can be
+    lost to a change on a dial that shares the terminal; the fresh dial
+    asks it again. Past the marker ssh asks nothing, so the serving loop
+    abandons without looking.
+  - **The greeting goes with the dial** (acs-trw), and nothing of it is
+    left behind: the `HELLO` written ahead of the marker went into the
+    pipe of an ssh that is killed, and the fresh dial writes its own into
+    a new one. The remote install (`ACS-NEED`) runs between two dials, so
+    a change during it is read by the dial after the install — which then
+    starts again, at worst, and finds acs installed; a change during the
+    dial that asked for it restarts that dial, which asks again.
+  - **No storm.** Each restart acts on the change, so the networks held
+    move with it and the next hint about the same move is not a change;
+    an interface that keeps coming and going costs one dial per time it
+    goes. Under `-v` a restart says so: `the network moved under the dial
+    — dialing again`, or `under the handshake` past the marker, and the
+    timing lines show the phase as `network moved — dialing again`.
 - Authentication prompts on reconnect (password, hardware key touch) are
   passed through, because ssh gets the controlling tty for prompts even with
   `-T`. With keys in an agent, reconnect is silent.
@@ -924,6 +997,9 @@ sequenceDiagram
     and dials cooked, as before. A non-interactive key — agent, hardware
     touch, `SSH_ASKPASS` — never touches the terminal, so its redial is
     live from end to end; that is the common case the change is for.
+  - **The hand-off is also what keeps a network change out** (acs-xo1,
+    above): a redial that has handed ssh the terminal is not abandoned
+    when the network moves, so a password half-typed is not thrown away.
   - What it does not need: no change to ssh's options. Interactive
     authentication on a redial still works exactly as it did, which is why
     this is not `BatchMode` on redials — that would have made a password
@@ -945,7 +1021,9 @@ sequenceDiagram
   the terminal — and 120 s on the
   first connection (time for a password), then the client exits 255, for the
   marker and again for the handshake (`ACS_DIAL_TIMEOUT_MS` sets both). A
-  takeover question restarts the handshake's clock.
+  takeover question restarts the handshake's clock, and a network change
+  that took an address away ends the handshake at once and starts a fresh
+  one with a whole timeout (acs-xo1, above).
 
 **Persisting.** By default the client gives up where there is no session to
 keep: no host of an alias answers at the start, the first connection fails,
@@ -1000,7 +1078,7 @@ set stays visible; the cost of adding one is a row here.
 | `ACS_BACKOFF_RESET_MS` | 30000 | how long a link must serve, `WELCOME` to loss, for the backoff to start over | equal to the redial's `ACS_DIAL_TIMEOUT_MS` by default; a redial spending that timeout never resets it (acs-omt2) |
 | `ACS_PERSIST_FAST_MS` | 1000 | the ping gate's first pings after a loss, 30 of them, before it backs off to `reachability_interval` (acs-vxg) | never above `reachability_interval`; a network change starts the 30 over |
 | `ACS_EARLY_MS` | 2000 | at most one network-change redial per interval in the offline wait | separate from `ACS_NETCHECK_MS`: this one guards a redial, that one a ping |
-| `ACS_DIAL_TIMEOUT_MS` (README) | 120000 first, 30000 redial and `acs list` | time to the marker, then to the `WELCOME` | one value sets both deadlines, which default 4:1 (acs-p46) |
+| `ACS_DIAL_TIMEOUT_MS` (README) | 120000 first, 30000 redial and `acs list` | time to the marker, then to the `WELCOME` | one value sets both deadlines, which default 4:1 (acs-p46); a network change that removed an address ends either at once and dials again with a fresh one, unless ssh is asking the user something (acs-xo1) |
 | `ACS_NOTE_HOLD_MS` | 500 | how long a diagnostic line waits for the output it would interrupt to reach a boundary, before it is written anyway | — |
 | `ACS_MASTER_REBIND_MS` | 5000 | how often the master checks its socket path is still there (§4.2) | the backstop: a new master for the name prods the old one at once (acs-lbba) |
 | `ACS_MASTER_HELLO_MS` | 10000 | time a new connection to the master has for its first whole message (acs-3anc) | the client's `HELLO` goes with the dial, so this is never a round trip short |

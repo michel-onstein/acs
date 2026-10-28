@@ -41,11 +41,14 @@ const STDOUT: RawFd = 1;
 /// installed there, or the connection lost while the menu was up). `Err` is
 /// the exit status when the user left the menu or the host could not be
 /// asked. `always` shows the menu even with nothing detached
-/// (`acs list <host>`). `timing` is the first connection's clock.
+/// (`acs list <host>`). `timing` is the first connection's clock;
+/// `netwatch`, the client's network watcher, which the dial watches
+/// (acs-xo1, DESIGN §5.3).
 pub fn choose(
     args: &mut ClientArgs,
     always: bool,
     timing: &mut Timing,
+    netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> Result<Option<Picked>, u8> {
     let Target::Pick(default) = args.target.clone() else {
         return Ok(None);
@@ -67,7 +70,7 @@ pub fn choose(
     let ahead = (!always).then(|| client::pick_hello(args, &default));
     let greeted = ahead.as_ref().map(|h| h.size);
     let (mut pick, sessions) =
-        match open_pick(args, Call::Session, timeout, timing, ahead).map_err(fail)? {
+        match open_pick(args, Call::Session, timeout, timing, ahead, netwatch).map_err(fail)? {
             Some(p) => p,
             // acs is not installed there yet: the attach installs it, and
             // there is nothing to pick.
@@ -116,12 +119,14 @@ pub fn choose(
 /// Dial `_proxy --pick` and read its first list: `Ok(None)` if acs of our
 /// version is not installed there. `timing` is told when the list is in.
 /// `ahead` is the HELLO to send with the dial, for `--eager` (acs-xvg).
+/// `netwatch` is watched while the dial waits (acs-xo1).
 fn open_pick(
     args: &ClientArgs,
     call: Call,
     timeout: Duration,
     timing: &mut Timing,
     ahead: Option<proto::Hello>,
+    netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> Result<Option<(Pick, Vec<StatusInfo>)>, Failure> {
     // `_proxy --pick` sends the list before it reads anything. Plain
     // `acs <host>` sends the HELLO of the session it would make with
@@ -135,8 +140,9 @@ fn open_pick(
     };
     let remote = ssh::remote_acs(crate::VERSION, proxy_args);
     let first = ahead.map(|h| Msg::Hello(h).to_bytes()).unwrap_or_default();
-    let (mut link, marker) = client::dial(args, call, &remote, timeout, timing, first)
-        .map_err(|e| Failure::Unreachable(e.to_string()))?;
+    let (mut link, marker) =
+        client::dial_watching(args, call, &remote, timeout, timing, first, netwatch, None)
+            .map_err(|e| Failure::Unreachable(e.to_string()))?;
     let owed = link.take_pending();
     let rest = match marker {
         Marker::Ready { proto: p, rest } if p == proto::PROTO_VERSION => rest,
@@ -469,7 +475,8 @@ pub fn every_host(args: &ClientArgs) -> u8 {
         return code::UNREACHABLE;
     }
     timing.mark("alias resolved");
-    client::run(picked, None, timing)
+    let netwatch = crate::netwatch::NetWatch::new(picked.verbose > 0);
+    client::run(picked, None, timing, netwatch)
 }
 
 /// The arguments for the session picked from the every-host menu on alias
@@ -535,6 +542,7 @@ fn end_on(args: &ClientArgs, alias: &str, menu: &mut Menu, h: usize, session: &s
             Call::Batch,
             client::answer_timeout(true),
             &mut Timing::off(),
+            None,
             None,
         ) {
             Ok(Some((mut pick, _))) => {

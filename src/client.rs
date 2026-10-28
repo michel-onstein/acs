@@ -111,9 +111,12 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     // No session named: pick one on the host just resolved (DESIGN §4.4),
     // over the connection the session then uses.
     let always = args.list;
+    // Made before the first dial, so a change while it waits is seen
+    // (acs-xo1), and the one watcher the whole client keeps.
+    let netwatch = crate::netwatch::NetWatch::new(args.verbose > 0);
     loop {
-        match crate::pick::choose(&mut args, always, &mut timing) {
-            Ok(picked) => return ExitCode::from(run(args, picked, timing)),
+        match crate::pick::choose(&mut args, always, &mut timing, netwatch.as_ref()) {
+            Ok(picked) => return ExitCode::from(run(args, picked, timing, netwatch)),
             // The host could not be reached for the menu: persisting, wait
             // until it answers a ping, then ask again.
             Err(code::UNREACHABLE) if !args.list && persist(&args) => {
@@ -828,11 +831,87 @@ pub fn dial(
     timing: &mut Timing,
     first: Vec<u8>,
 ) -> io::Result<(Link, Marker)> {
+    dial_watching(args, call, remote, timeout, timing, first, None, None)
+}
+
+/// [`dial`], watching this machine's network while it waits (acs-xo1,
+/// DESIGN §5.3) and, with `keys`, with the command keys live
+/// ([`DialKeys`]). A change that takes away a network the dial may have
+/// been made from abandons the dial and makes it again at once, rather
+/// than waiting out `timeout` for an answer that went with the address —
+/// unless ssh is asking the user something ([`ssh_is_asking`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dial_watching(
+    args: &ClientArgs,
+    call: Call,
+    remote: &str,
+    timeout: Duration,
+    timing: &mut Timing,
+    first: Vec<u8>,
+    netwatch: Option<&crate::netwatch::NetWatch>,
+    mut keys: Option<&mut DialKeys>,
+) -> io::Result<(Link, Marker)> {
+    loop {
+        let w = Watch {
+            netwatch,
+            keys: keys.as_deref_mut(),
+        };
+        match dial_sharing(args, call, remote, timeout, timing, first.clone(), w) {
+            Err(e) if moved(&e) => {
+                timing.mark("network moved — dialing again");
+                if args.verbose > 0 {
+                    note("the network moved under the dial — dialing again");
+                }
+            }
+            r => return r,
+        }
+    }
+}
+
+/// What a dial watches besides its transport.
+struct Watch<'w, 'k> {
+    netwatch: Option<&'w crate::netwatch::NetWatch>,
+    keys: Option<&'w mut DialKeys<'k>>,
+}
+
+/// The error a dial abandoned for a network change ends in, and only that
+/// one: nothing else in a dial is a `ConnectionAborted`.
+fn moved(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::ConnectionAborted
+}
+
+/// Whether ssh may be asking the user something on a dial that shares
+/// acs's terminal (the cooked one): its password, passphrase and PIN
+/// prompts turn the terminal's echo off while they read. A terminal that
+/// cannot be asked counts as asking — the side to be wrong on.
+fn ssh_is_asking() -> bool {
+    sys::tcgetattr(STDIN).map_or(true, |t| t.c_lflag & libc::ECHO == 0)
+}
+
+/// One dial, through acs's shared ssh master where it may (acs-9n3).
+fn dial_sharing(
+    args: &ClientArgs,
+    call: Call,
+    remote: &str,
+    timeout: Duration,
+    timing: &mut Timing,
+    first: Vec<u8>,
+    mut w: Watch,
+) -> io::Result<(Link, Marker)> {
     if crate::mux::joinable(&args.transport, call) {
         timing.mark("shared ssh master checked");
         let window = timeout.min(crate::mux::fallback_window());
-        match dial_once(args, call, remote, window, timing, first.clone(), None) {
+        let joined = Watch {
+            netwatch: w.netwatch,
+            keys: w.keys.as_deref_mut(),
+        };
+        match dial_once(args, call, remote, window, timing, first.clone(), joined) {
             Ok(x) => return Ok(x),
+            // The master's connection was made from the network that went.
+            Err(e) if moved(&e) => {
+                crate::mux::stop(&args.transport);
+                return Err(e);
+            }
             // A master that is up but cannot carry a channel is worse than
             // none: take it down, so the dial below and the next client
             // both make their own connection.
@@ -852,10 +931,10 @@ pub fn dial(
             Err(e) => return Err(e),
         }
     }
-    dial_once(args, call, remote, timeout, timing, first, None)
+    dial_once(args, call, remote, timeout, timing, first, w)
 }
 
-/// One dial; with `keys`, one whose command keys are live ([`DialKeys`]).
+/// One dial; with `w.keys`, one whose command keys are live ([`DialKeys`]).
 fn dial_once(
     args: &ClientArgs,
     call: Call,
@@ -863,8 +942,9 @@ fn dial_once(
     timeout: Duration,
     timing: &mut Timing,
     first: Vec<u8>,
-    mut keys: Option<&mut DialKeys>,
+    w: Watch,
 ) -> io::Result<(Link, Marker)> {
+    let Watch { netwatch, mut keys } = w;
     let deadline = Instant::now() + timeout;
     let mut cmd = args.transport.command(call, remote);
     if let Some(k) = keys.as_deref_mut() {
@@ -915,35 +995,60 @@ fn dial_once(
     let mut buf = [0u8; 4096];
     let pid = child.id() as i32;
     let marker = loop {
-        let ready = match keys.as_deref_mut() {
-            None => sys::wait_readable(from.as_raw_fd(), deadline)?,
-            Some(k) => {
-                // ssh stopping for the terminal is noticed by looking, so
-                // the poll never sleeps long.
-                let mut wait = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(50));
-                if let Some(d) = k.state.detector.deadline() {
-                    wait = wait.min(Duration::from_millis(d.saturating_sub(sys::now_ms())));
-                }
-                let mut fds = [
-                    sys::pollfd(from.as_raw_fd(), libc::POLLIN),
-                    sys::pollfd(if k.handed { -1 } else { STDIN }, libc::POLLIN),
-                ];
-                sys::poll(&mut fds, sys::poll_timeout(wait))?;
-                if k.step(pid, fds[1].revents != 0) {
+        let mut wait = deadline.saturating_duration_since(Instant::now());
+        if let Some(k) = keys.as_deref() {
+            // ssh stopping for the terminal is noticed by looking, so the
+            // poll never sleeps long.
+            wait = wait.min(Duration::from_millis(50));
+            if let Some(d) = k.state.detector.deadline() {
+                wait = wait.min(Duration::from_millis(d.saturating_sub(sys::now_ms())));
+            }
+        }
+        let stdin = match keys.as_deref() {
+            Some(k) if !k.handed => STDIN,
+            _ => -1,
+        };
+        let mut fds = [
+            sys::pollfd(from.as_raw_fd(), libc::POLLIN),
+            sys::pollfd(stdin, libc::POLLIN),
+            sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
+        ];
+        sys::poll(&mut fds, sys::poll_timeout(wait))?;
+        if let Some(k) = keys.as_deref_mut() {
+            if k.step(pid, fds[1].revents != 0) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+        }
+        // This machine's network moved while the dial waits (acs-xo1). The
+        // drain is unconditional, as in `serve`; a change that only added
+        // a network left the dial's own address alone and is dropped, to
+        // be offered again (acs-0n8). So is one while ssh asks the user
+        // something: killing it would throw away what they are typing.
+        // Looked at after `step`, so a stop for the terminal in this very
+        // pass is already a hand-off.
+        if fds[2].revents != 0 {
+            if let Some(change) = netwatch.and_then(|w| w.changed()) {
+                let asking = match keys.as_deref() {
+                    Some(k) => k.handed,
+                    None => ssh_is_asking(),
+                };
+                if change.removed() && !asking {
+                    change.acted();
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(io::ErrorKind::Interrupted.into());
-                }
-                match fds[0].revents != 0 {
-                    true => true,
-                    false if Instant::now() < deadline => continue,
-                    false => false,
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "this machine's network moved under the dial",
+                    ));
                 }
             }
-        };
-        if !ready {
+        }
+        if fds[0].revents == 0 {
+            if Instant::now() < deadline {
+                continue;
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(io::Error::new(
@@ -1080,6 +1185,10 @@ pub enum LinkEnd {
     /// not decode. The connection carried those bytes a moment ago, so it
     /// is up; what broke is the conversation on this one channel.
     Channel,
+    /// This machine's network moved under a link still owed its `WELCOME`
+    /// (acs-xo1): abandoned, and dialled again at once by
+    /// [`connect_and_serve`], which is the only thing that sees this.
+    Moved,
 }
 
 impl LinkEnd {
@@ -1093,7 +1202,7 @@ impl LinkEnd {
     /// master is the one that strands somebody.
     pub fn failed_the_connection(self) -> bool {
         match self {
-            LinkEnd::Transport | LinkEnd::Silent => true,
+            LinkEnd::Transport | LinkEnd::Silent | LinkEnd::Moved => true,
             LinkEnd::Channel => false,
         }
     }
@@ -1198,8 +1307,14 @@ pub fn pick_hello(args: &ClientArgs, default: &str) -> Hello {
 
 /// Run the session until it ends or the user leaves; returns the exit code.
 /// `picked` is the first connection when the session menu opened it;
-/// `timing`, the first connection's clock.
-pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
+/// `timing`, the first connection's clock; `netwatch`, the client's network
+/// watcher (DESIGN §5.3).
+pub fn run(
+    args: ClientArgs,
+    picked: Option<Picked>,
+    timing: Timing,
+    netwatch: Option<crate::netwatch::NetWatch>,
+) -> u8 {
     if !sys::isatty(STDIN) {
         eprintln!("acs: stdin is not a terminal");
         return code::USAGE;
@@ -1242,7 +1357,15 @@ pub fn run(args: ClientArgs, picked: Option<Picked>, timing: Timing) -> u8 {
         welcomed_at: None,
     };
     let mut raw: Option<RawMode> = None;
-    let result = crate::reconnect::run(&args, &mut state, &mut raw, &signals, picked, timing);
+    let result = crate::reconnect::run(
+        &args,
+        &mut state,
+        &mut raw,
+        &signals,
+        picked,
+        timing,
+        netwatch.as_ref(),
+    );
     leave(&mut state, &mut raw);
     result
 }
@@ -1289,8 +1412,46 @@ pub fn write_over_stream(state: &State, bytes: &[u8]) {
 /// dialing. `timing` is this connection's clock. `netwatch` is the client's
 /// network watcher, polled here too so a change is noticed while the link
 /// is up and not only while it is down (acs-ft1).
+///
+/// A handshake this machine's network moved under is made again at once
+/// (acs-xo1, DESIGN §5.3): the dial does that itself while it waits for the
+/// marker, and a link past its marker but not yet WELCOMEd ends in
+/// [`LinkEnd::Moved`], which is answered here and never returned.
 #[allow(clippy::too_many_arguments)]
 pub fn connect_and_serve(
+    args: &ClientArgs,
+    state: &mut State,
+    raw: &mut Option<RawMode>,
+    signals: &OwnedFd,
+    resuming: bool,
+    ended: Option<LinkEnd>,
+    mut picked: Option<Picked>,
+    timing: &mut Timing,
+    netwatch: Option<&crate::netwatch::NetWatch>,
+) -> Outcome {
+    loop {
+        let first = picked.take();
+        match connect_once(
+            args, state, raw, signals, resuming, ended, first, timing, netwatch,
+        ) {
+            Outcome::LinkLost(LinkEnd::Moved) => {
+                // A master is a connection made from the network that went.
+                if let Some(old) = state.master.take() {
+                    crate::mux::stop(&old);
+                }
+                timing.mark("network moved — dialing again");
+                if args.verbose > 0 {
+                    note("the network moved under the handshake — dialing again");
+                }
+            }
+            o => return o,
+        }
+    }
+}
+
+/// One go of [`connect_and_serve`].
+#[allow(clippy::too_many_arguments)]
+fn connect_once(
     args: &ClientArgs,
     state: &mut State,
     raw: &mut Option<RawMode>,
@@ -1379,13 +1540,14 @@ pub fn connect_and_serve(
                 handed: false,
                 left: None,
             };
-            let dialed = dial_once(
+            let dialed = dial_watching(
                 args,
                 call,
                 &remote,
                 timeout,
                 timing,
                 greeting,
+                netwatch,
                 Some(&mut keys),
             );
             keys.finish();
@@ -1405,7 +1567,9 @@ pub fn connect_and_serve(
             if let Some(r) = raw.as_mut() {
                 let _ = r.suspend();
             }
-            dial(args, call, &remote, timeout, timing, greeting)
+            dial_watching(
+                args, call, &remote, timeout, timing, greeting, netwatch, None,
+            )
         }
     };
     let (link, marker) = match dialed {
@@ -1896,19 +2060,23 @@ fn serve(
         // change costs nothing and one that did not is replaced in about a
         // second rather than after ten of silence.
         //
-        // Before the WELCOME the handshake deadline is already the one that
-        // applies, so the change is read and nothing is done with it —
-        // acting on it there is acs-xo1, which has the blocking dial to
-        // deal with as well. It is *not* spent by being read (acs-0n8):
-        // the change is dropped rather than accepted, so the networks held
-        // stay where they were and the kernel's next word about the same
-        // move is the same change again, instead of "not a change" against
-        // a set that has already moved.
+        // Before the WELCOME there is nothing to ask — liveness starts with
+        // it — and a change that took a network away has probably taken
+        // the handshake's connection with it, so the link is abandoned and
+        // dialled again at once (acs-xo1, as the dial does before its
+        // marker). ssh is past its prompts here. A change that only added
+        // a network is read and dropped rather than accepted (acs-0n8): the
+        // networks held stay where they were, and the kernel's next word
+        // about the same move is the same change again, instead of "not a
+        // change" against a set that has already moved.
         if fds[4].revents != 0 {
             if let Some(change) = netwatch.and_then(|w| w.changed()) {
                 if welcomed {
                     liveness.netcheck(&mut out);
                     change.acted();
+                } else if change.removed() {
+                    change.acted();
+                    return lost(link, LinkEnd::Moved);
                 }
             }
         }
