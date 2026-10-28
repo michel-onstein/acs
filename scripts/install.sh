@@ -11,6 +11,10 @@
 #   as root   /usr/local/lib/acs/<version>/acs, linked from /usr/local/bin/acs
 #
 # so a client of the same version finds it there and has nothing to upload.
+# Beside the acs link it makes acscp -> acs (relative), the name acs copies
+# files under (ACSCP_DESIGN §9), by the same rule: made where nothing is,
+# never over a file or link the user put there, and not beside an acs that
+# is the user's own.
 # Running it again upgrades in place. The link follows the rule acs keeps
 # for ~/.local/bin/acs on a remote (DESIGN §8): it is made where nothing
 # is, and moved only when it is a link of ours (into the versioned
@@ -21,8 +25,8 @@
 #
 # Environment:
 #   ACS_VERSION=X.Y.Z     install that release instead of the latest
-#   ACS_INSTALL_DIR=DIR   put the binary itself in DIR (no versioned layout
-#                         and no link: DIR/acs is replaced)
+#   ACS_INSTALL_DIR=DIR   put the binary itself in DIR (no versioned layout:
+#                         DIR/acs is replaced, with DIR/acscp -> acs beside it)
 #   ACS_RELEASES_URL=URL  where releases are (default: the GitHub releases).
 #                         Must be https unless ACS_ALLOW_INSECURE_URL=1, and
 #                         it is ignored when running through sudo (acs-95w).
@@ -264,6 +268,38 @@ link_bin() { # link_bin <target> <link>
     linked=linked
 }
 
+# The second name of acs (layout::COPY_NAME; tests/scripts.rs holds the two
+# together): run as acscp, it copies files.
+copy_name=acscp
+
+# Put $1/acscp -> acs beside an acs of ours (ACSCP_DESIGN §9), relative, so
+# whatever repoints acs moves acscp with it. Only where $linked says the acs
+# there is ours (linked, newer, or unset: placed by ACS_INSTALL_DIR); made
+# where nothing is, kept when it is already a link to the bare name acs,
+# and anything else the user put there is left alone, as $bin/acs is.
+# Failing is a warning, never a failed install: `acs cp` needs no link.
+# Sets $copied to linked, theirs, failed or skipped (the acs is theirs).
+link_copy() { # link_copy <dir>
+    copied=skipped
+    case "${linked:-placed}" in linked | newer | placed) ;; *) return 0 ;; esac
+    c="$1/$copy_name"
+    if [ -L "$c" ]; then
+        copied=theirs
+        [ "$(readlink "$c")" = acs ] && copied=linked
+        return 0
+    elif [ -e "$c" ]; then
+        copied=theirs
+        return 0
+    fi
+    rm -f "$c.new.$tag"
+    if ln -s acs "$c.new.$tag" 2>/dev/null && mv -f "$c.new.$tag" "$c" 2>/dev/null; then
+        copied=linked
+    else
+        rm -f "$c.new.$tag"
+        copied=failed
+    fi
+}
+
 if [ -n "${ACS_INSTALL_DIR:-}" ]; then
     bin=$ACS_INSTALL_DIR
     mkdir -p "$bin" || die "cannot create $bin"
@@ -287,6 +323,7 @@ else
     installed="$lib/$version/acs"
     link_bin "$installed" "$bin/acs"
 fi
+link_copy "$bin"
 
 case "${linked:-placed}" in
     placed) say "installed acs $version: $installed" ;;
@@ -299,6 +336,10 @@ case "${linked:-placed}" in
         say "installed acs $version: $installed"
         say "left $bin/acs alone: it is not a link this installer made (remove it and run again to link it)"
         ;;
+esac
+case "$copied" in
+    theirs) say "left $bin/$copy_name alone: it is not a link this installer made (\`acs cp\` works without it)" ;;
+    failed) say "warning: cannot link $bin/$copy_name -> acs (\`acs cp\` works without it)" ;;
 esac
 
 # ---- after -------------------------------------------------------------------

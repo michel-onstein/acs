@@ -2416,8 +2416,11 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   the remote install lay it out (§8) — gets the new version beside it, and
   the links that pointed at the running binary (the path it was run as,
   `~/.local/bin/acs`, `/usr/local/bin/acs`, `acs` on `PATH`) are repointed.
-  The old version stays: clients of that version may still use it on this
-  host, and `prune.rs` removes it once unused.
+  Beside each repointed link named `acs` the relative `acscp -> acs` link
+  already follows; one missing (an install from before acscp) is made by
+  §8's rule, and a failure is a warning. The old version stays: clients of
+  that version may still use it on this host, and `prune.rs` removes it
+  once unused.
 - **Homebrew**: a binary whose real path is in a keg —
   `<prefix>/Cellar/acs/<version>/bin/acs`, for `/opt/homebrew`, `/usr/local`
   or `/home/linuxbrew/.linuxbrew` — is brew's to replace, and replacing it
@@ -2518,6 +2521,16 @@ a newline of its own, so a startup file that printed without one
   `~/.local/bin` a regular file or unwritable) is a warning from the
   finisher, not a failed install: the binary under
   `~/.local/share/acs/<version>/` is complete and every connection works.
+- Beside an `acs` link of ours — just made, or kept on a newer version —
+  the finisher also makes `~/.local/bin/acscp -> acs`, the name the same
+  binary copies files under (ACSCP_DESIGN §9). It is **relative**, so
+  whatever repoints `acs` moves it too; it is made only where nothing is,
+  a link to the bare name `acs` is kept, and a file or other link there is
+  left alone, as is any `acs` the user put there (it gets no `acscp`).
+  `install.sh` makes the same link in each of its layouts, `ACS_INSTALL_DIR`
+  included, and `acs upgrade` (§7.5) and the Homebrew formula
+  (`bin.install_symlink`) too. A failure is a warning: `acs cp` needs no
+  link.
 - `acs _proxy` touches its version directory on start; versions untouched for
   30 days whose sessions have all ended are removed by the next proxy start —
   only under the user's own `~/.local/share/acs`, never in the system-wide

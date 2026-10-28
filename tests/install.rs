@@ -34,6 +34,12 @@ fn same_platform_installs_a_copy_of_itself() {
     );
     let link = remote.home().join(".local/bin/acs");
     assert_eq!(std::fs::read_link(&link).unwrap(), installed);
+    // acs-hofu.5: `acscp` beside it, relative, so the host can copy onward.
+    let copy = link.with_file_name(acs::layout::COPY_NAME);
+    assert_eq!(
+        std::fs::read_link(&copy).unwrap(),
+        std::path::Path::new("acs")
+    );
     assert!(leftovers(&remote).is_empty(), "{:?}", leftovers(&remote));
 }
 
@@ -214,6 +220,9 @@ fn the_bin_link_is_left_alone_unless_it_moves_forward() {
         std::fs::read_to_string(&link).unwrap(),
         "#!/bin/sh\necho mine\n"
     );
+    // acs-hofu.5: an `acs` of the user's own gets no `acscp` that runs it.
+    let copy = link.with_file_name(acs::layout::COPY_NAME);
+    assert!(std::fs::symlink_metadata(&copy).is_err());
 
     let remote = Remote::new();
     let newer = remote.home().join(".local/share/acs/99.0.0/acs");
@@ -226,6 +235,12 @@ fn the_bin_link_is_left_alone_unless_it_moves_forward() {
     c.wait_for("up", T);
     assert!(remote.installed_binary(acs::VERSION).exists());
     assert_eq!(std::fs::read_link(&link).unwrap(), newer);
+    // A newer `acs` of ours keeps the link, and gets `acscp` beside it.
+    let copy = link.with_file_name(acs::layout::COPY_NAME);
+    assert_eq!(
+        std::fs::read_link(&copy).unwrap(),
+        std::path::Path::new("acs")
+    );
 }
 
 #[test]

@@ -16,7 +16,7 @@
 //! Either way the **remote shell** checks the SHA-256 the client computed
 //! before the upload is made executable (acs-4km), and `_install --finish`
 //! then renames the file into place atomically and repoints
-//! `~/.local/bin/acs`. The prelude then runs the candidates again, with
+//! `~/.local/bin/acs`, with `~/.local/bin/acscp -> acs` beside it. The prelude then runs the candidates again, with
 //! every check it makes on any connection, and execs the proxy on what is
 //! left of stdin.
 //! A running executable cannot be written to on Linux (ETXTBSY), so the
@@ -445,14 +445,22 @@ fn finish(f: &Finish) -> Result<(), String> {
         }
         rename(&me, &final_path)?;
     }
-    if let Err(e) = link_bin(&final_path) {
+    match link_bin(&final_path) {
+        // `acscp` beside an `acs` of ours, so this host can be the client
+        // for the next hop, for copies too (ACSCP_DESIGN §9).
+        Ok(Some(bin)) => {
+            if let Err(e) = link_copy_name(&bin) {
+                eprintln!("acs: warning: cannot link {e} (`acs cp` works without it)");
+            }
+        }
+        Ok(None) => {}
         // The link is a convenience: nothing in the protocol depends on it
         // (DESIGN §8), and the client finds the binary through the prelude.
         // So it is a warning after the ok, not a failed install (acs-iry).
-        eprintln!(
+        Err(e) => eprintln!(
             "acs: warning: cannot link ~/.local/bin/acs: {e} (acs is installed at {})",
             final_path.display()
-        );
+        ),
     }
     Ok(())
 }
@@ -490,35 +498,52 @@ fn rename(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// Point `~/.local/bin/acs` at the newest install: a temporary symlink
-/// renamed over the old one, so it is never missing.
-fn link_bin(target: &Path) -> Result<(), String> {
+/// renamed over the old one, so it is never missing. Returns the bin
+/// directory when the `acs` there is ours afterwards — linked now, or a
+/// link of ours to a newer version — so the caller may put `acscp` beside
+/// it; `None` when it is the user's own and was left alone.
+fn link_bin(target: &Path) -> Result<Option<PathBuf>, String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
     let bin = crate::layout::user_bin(&home);
     let link = bin.join("acs");
-    if !should_link(&link, target, &crate::layout::user_root(&home)) {
-        return Ok(());
+    match judge_link(&link, target, &crate::layout::user_root(&home)) {
+        BinLink::Link => {}
+        BinLink::Newer => return Ok(Some(bin)),
+        BinLink::Theirs => return Ok(None),
     }
     std::fs::create_dir_all(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
-    crate::sys::symlink_atomic(target, &link).map_err(|e| format!("{}: {e}", link.display()))
+    crate::sys::symlink_atomic(target, &link).map_err(|e| format!("{}: {e}", link.display()))?;
+    Ok(Some(bin))
+}
+
+/// What to do with `~/.local/bin/acs` for the version just installed.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum BinLink {
+    /// Point it at the new version.
+    Link,
+    /// Leave it: a link of ours to a newer version.
+    Newer,
+    /// Leave it: a file or link the user put there.
+    Theirs,
 }
 
 /// Whether `~/.local/bin/acs` (`link`) should point at `target`, the
 /// version just installed under `share`: when it is missing, or a link of
 /// ours (into `share`) to an older or vanished version. A file or link the
 /// user put there is left alone, and a newer version keeps the link.
-fn should_link(link: &Path, target: &Path, share: &Path) -> bool {
+fn judge_link(link: &Path, target: &Path, share: &Path) -> BinLink {
     let meta = match std::fs::symlink_metadata(link) {
         // Nothing there: link. Anything else wrong with the path (~/.local
         // /bin is a regular file): try, so the failure is said out loud
         // rather than passed over (acs-iry).
-        Err(_) => return true,
+        Err(_) => return BinLink::Link,
         Ok(m) => m,
     };
     if !meta.file_type().is_symlink() {
-        return false;
+        return BinLink::Theirs;
     }
     let Ok(current) = std::fs::read_link(link) else {
-        return false;
+        return BinLink::Theirs;
     };
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let share_c = canon(share);
@@ -531,10 +556,10 @@ fn should_link(link: &Path, target: &Path, share: &Path) -> bool {
             .unwrap_or_else(|| current.clone()),
     };
     if !(current.starts_with(share) || current_c.starts_with(&share_c)) {
-        return false;
+        return BinLink::Theirs;
     }
     if !current_c.exists() {
-        return true;
+        return BinLink::Link;
     }
     let version = |p: &Path| {
         p.parent()
@@ -542,10 +567,53 @@ fn should_link(link: &Path, target: &Path, share: &Path) -> bool {
             .and_then(|n| n.to_str())
             .map(str::to_string)
     };
-    match (version(&current_c), version(target)) {
+    let forward = match (version(&current_c), version(target)) {
         (Some(have), Some(new)) => crate::release::compare(&new, &have).map_or(true, |o| o.is_ge()),
         _ => true,
+    };
+    if forward {
+        BinLink::Link
+    } else {
+        BinLink::Newer
     }
+}
+
+/// What [`link_copy_name`] found at `dir/acscp`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum CopyLink {
+    /// Nothing was there: the link was made.
+    Made,
+    /// Our link was already there; it follows `acs` by itself.
+    Kept,
+    /// A file or another link the user put there, left alone.
+    Theirs,
+}
+
+/// Put `dir/acscp -> acs` beside an `acs` of ours (ACSCP_DESIGN §9): the
+/// link is relative, so whatever repoints `acs` — `acs upgrade`, an
+/// `install.sh` re-run, a newer remote install — moves `acscp` with it. It
+/// is made only where nothing is; a link whose target is the bare name
+/// `acs` is ours and kept; anything else is the user's and left alone, as
+/// `~/.local/bin/acs` is (acs-feee). Shared by the remote install's
+/// finisher and `acs upgrade`; the error names the path.
+pub(crate) fn link_copy_name(dir: &Path) -> Result<CopyLink, String> {
+    let link = dir.join(crate::layout::COPY_NAME);
+    match std::fs::symlink_metadata(&link) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", link.display())),
+        Ok(m) if m.file_type().is_symlink() => {
+            let ours = std::fs::read_link(&link).is_ok_and(|t| t == Path::new("acs"));
+            return Ok(if ours {
+                CopyLink::Kept
+            } else {
+                CopyLink::Theirs
+            });
+        }
+        Ok(_) => return Ok(CopyLink::Theirs),
+    }
+    crate::sys::symlink_atomic(Path::new("acs"), &link)
+        .map_err(|e| format!("{}: {e}", link.display()))?;
+    Ok(CopyLink::Made)
 }
 
 #[cfg(test)]
@@ -647,20 +715,53 @@ mod tests {
             std::os::unix::fs::symlink(to, &link).unwrap();
         };
 
-        assert!(should_link(&link, &new, &share), "missing");
+        let judge = || judge_link(&link, &new, &share);
+        assert_eq!(judge(), BinLink::Link, "missing");
         set(&version("0.1.9"));
-        assert!(should_link(&link, &new, &share), "older");
+        assert_eq!(judge(), BinLink::Link, "older");
         set(&new);
-        assert!(should_link(&link, &new, &share), "same");
+        assert_eq!(judge(), BinLink::Link, "same");
         set(&version("0.10.0"));
-        assert!(!should_link(&link, &new, &share), "newer stays");
+        assert_eq!(judge(), BinLink::Newer, "newer stays");
         set(&share.join("0.0.1/acs"));
-        assert!(should_link(&link, &new, &share), "dangling, pruned");
+        assert_eq!(judge(), BinLink::Link, "dangling, pruned");
         set(Path::new("/bin/sh"));
-        assert!(!should_link(&link, &new, &share), "someone else's link");
+        assert_eq!(judge(), BinLink::Theirs, "someone else's link");
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, "hand-installed").unwrap();
-        assert!(!should_link(&link, &new, &share), "a regular file");
+        assert_eq!(judge(), BinLink::Theirs, "a regular file");
+    }
+
+    /// acs-hofu.5: `acscp` is a relative link to the `acs` beside it, made
+    /// where nothing is, kept when it is ours, and never over the user's.
+    #[test]
+    fn the_copy_name_links_to_the_acs_beside_it() {
+        let d = crate::testutil::TempDir::new();
+        let bin = d.path();
+        let link = bin.join(crate::layout::COPY_NAME);
+        std::fs::write(bin.join("acs"), "acs").unwrap();
+
+        assert_eq!(link_copy_name(bin), Ok(CopyLink::Made));
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("acs"));
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "acs");
+        // A re-run keeps it, and it follows `acs` wherever that moves.
+        assert_eq!(link_copy_name(bin), Ok(CopyLink::Kept));
+        std::fs::write(bin.join("acs"), "newer").unwrap();
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "newer");
+
+        // Another link, even to this acs by its full path, is the user's.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(bin.join("acs"), &link).unwrap();
+        assert_eq!(link_copy_name(bin), Ok(CopyLink::Theirs));
+        assert_eq!(std::fs::read_link(&link).unwrap(), bin.join("acs"));
+        // So is a file.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, "mine").unwrap();
+        assert_eq!(link_copy_name(bin), Ok(CopyLink::Theirs));
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "mine");
+        // A directory that cannot take it is an error naming the path.
+        let err = link_copy_name(&bin.join("no/such/dir")).unwrap_err();
+        assert!(err.contains("no/such/dir/acscp"), "{err}");
     }
 
     #[test]

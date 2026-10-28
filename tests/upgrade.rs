@@ -157,6 +157,14 @@ fn a_versioned_install_gets_the_new_version_beside_it() {
     assert!(version_of(&link).starts_with(&format!("acs {NEW} ")));
     // The old version stays for clients that still use it on this host.
     assert_eq!(std::fs::read(&old).unwrap(), std::fs::read(exe()).unwrap());
+    // acs-hofu.5: an install from before acscp gains the relative link,
+    // which already runs the new version (ACSCP_DESIGN §9).
+    let copy = link.with_file_name(acs::layout::COPY_NAME);
+    assert_eq!(
+        std::fs::read_link(&copy).unwrap(),
+        std::path::Path::new("acs")
+    );
+    assert!(version_of(&copy).starts_with(&format!("acs {NEW} ")));
 }
 
 #[test]
