@@ -381,62 +381,81 @@ pub fn run(cmd: &Cmd, target: &Path) -> Result<String, Error> {
     match cmd {
         Cmd::Help => unreachable!("answered above"),
         Cmd::Path => Ok(paths(&files)),
-        Cmd::Show => Ok(show(&Config::load_files(&files)?, &files)),
-        Cmd::Get(key) => {
+        Cmd::Show | Cmd::Get(_) | Cmd::HostList => {
             let c = Config::load_files(&files)?;
-            match (key.as_str(), scalar(&c, key)) {
-                (_, Some((n, _))) => Ok(format!("{}\n", value_text(&n))),
-                ("aliases", None) => Ok(host_list(&c)),
-                (other, None) => Err(unknown_key(other).into()),
+            match cmd {
+                Cmd::Show => Ok(show(&c, &files)),
+                Cmd::Get(key) => match (key.as_str(), scalar(&c, key)) {
+                    (_, Some((n, _))) => Ok(format!("{}\n", value_text(&n))),
+                    ("aliases", None) => Ok(host_list(&c)),
+                    (other, None) => Err(unknown_key(other).into()),
+                },
+                _ => Ok(host_list(&c)),
             }
         }
-        Cmd::HostList => Ok(host_list(&Config::load_files(&files)?)),
         Cmd::Set(..)
         | Cmd::Unset(..)
         | Cmd::HostAdd { .. }
         | Cmd::HostRemove { .. }
         | Cmd::HostSet { .. }
         | Cmd::HostUnset { .. } => {
+            // Each file is read and parsed once, here, and handed to every
+            // check that needs it (acs-siqo): a host set used to parse both
+            // files to find its alias, the target again to edit it, and the
+            // other file again to check the two together.
+            let mut docs = [config::read_doc(&files[0]), config::read_doc(&files[1])];
             // A setting of an alias with no hosts anywhere would leave a
             // configuration the client refuses.
             if let Cmd::HostSet { alias, .. } = cmd {
-                if Config::load_files(&files)?.alias(alias).is_none() {
+                if Config::merge(&files, &docs)?.alias(alias).is_none() {
                     return Err(format!(
                         "no alias '{alias}' (add its first host with: acs config host add {alias} <host>)"
                     )
                     .into());
                 }
             }
-            let mut doc = config::read_doc(target)?.unwrap_or_else(empty_doc);
-            let msg = edit(&mut doc, cmd).map_err(|e| {
+            // Edited where it lies, not moved out.
+            let [first, second] = &mut docs;
+            let (mine, theirs, other) = if target == files[0] {
+                (first, &*second, &files[1])
+            } else {
+                (second, &*first, &files[0])
+            };
+            let doc = match mine {
+                Ok(d) => d.get_or_insert_with(empty_doc),
+                Err(e) => return Err(std::mem::take(e).into()),
+            };
+            // The other file only informs: a broken one is left alone.
+            let theirs = theirs.as_ref().ok().and_then(Option::as_ref);
+            let msg = edit(doc, cmd).map_err(|e| {
                 // Point at the other file when the thing is defined there.
-                let other = if target == files[0] {
-                    &files[1]
-                } else {
-                    &files[0]
-                };
-                match defined_in(other, cmd) {
+                match defined_in(other, theirs, cmd) {
                     Some(hint) => format!("{e}; {hint}"),
                     None => e,
                 }
             })?;
-            together(&doc, target, &files)?;
-            write(target, &doc)?;
+            together(doc, target, &files, theirs)?;
+            write(target, doc)?;
             Ok(format!("{msg} in {}\n", pretty(target)))
         }
     }
 }
 
-/// Refuse an edit that leaves `doc`, merged with the other file, a
-/// configuration the client refuses: an alias's identity_file in one file
-/// whose hosts were all in the other. A broken file is left to `write`
-/// (this one) or alone (the other).
-fn together(doc: &Document, target: &Path, files: &[PathBuf; 2]) -> Result<(), String> {
+/// Refuse an edit that leaves `doc`, merged with `theirs` (the other
+/// file), a configuration the client refuses: an alias's identity_file in
+/// one file whose hosts were all in the other. A broken file is left to
+/// `write` (this one) or alone (the other).
+fn together(
+    doc: &Document,
+    target: &Path,
+    files: &[PathBuf; 2],
+    theirs: Option<&Document>,
+) -> Result<(), String> {
     let mut c = Config::default();
     for f in files {
         if f == target {
             let _ = c.apply(f, &doc.root);
-        } else if let Ok(Some(other)) = config::read_doc(f) {
+        } else if let Some(other) = theirs {
             let _ = c.apply(f, &other.root);
         }
     }
@@ -663,9 +682,8 @@ pub fn host_list(c: &Config) -> String {
 
 /// Where `cmd`'s key or alias is defined in `other`, as a hint for an edit
 /// that found nothing to change in its own file.
-fn defined_in(other: &Path, cmd: &Cmd) -> Option<String> {
-    let doc = config::read_doc(other).ok()??;
-    let map = doc.root.value.map()?;
+fn defined_in(other: &Path, doc: Option<&Document>, cmd: &Cmd) -> Option<String> {
+    let map = doc?.root.value.map()?;
     let alias = |name: &str| {
         let (hi, ai) = alias_at(map, name)?;
         Some(&map[hi].1.value.map()?[ai].1)
