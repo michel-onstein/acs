@@ -307,7 +307,9 @@ reports that host as failed rather than as having no sessions.
 `acs _proxy --pick` serves the session menu (§4.4) on the session's own
 connection. After `ACS-READY` it sends the list as `--list` does, one
 `STATUS_REPLY` per session, closed by `LIST_END`, since the connection
-stays open. It then reads the client's frames:
+stays open. If the directory cannot be read, an `ERROR` takes the place of
+`LIST_END` and the proxy ends, and the menu shows that error (acs-5jrq).
+It then reads the client's frames:
 
 - `END_SESSION <name, identity, force>` (the menu's `x`): it sends that
   master `KILL`, as `x` inside the session does, **carrying the identity
