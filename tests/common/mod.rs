@@ -1410,12 +1410,11 @@ pub fn gzip(data: &[u8]) -> Vec<u8> {
 /// whose `target` entry is this same binary (so a fake remote of that
 /// platform can run what gets installed).
 pub fn complete_client(dir: &Path, target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) {
-    let slim = std::fs::read(exe()).unwrap();
-    let gz = gzip(&slim);
+    let (slim, gz) = slim_and_gz();
     let blob = acs::payload::build(&[acs::payload::Input {
         target,
-        raw: &slim,
-        gz: &gz,
+        raw: slim,
+        gz,
     }]);
     let path = dir.join("acs-complete");
     let mut full = slim.clone();
@@ -1423,7 +1422,20 @@ pub fn complete_client(dir: &Path, target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) 
     std::fs::write(&path, &full).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    (path, slim, blob)
+    (path, slim.clone(), blob)
+}
+
+/// This acs binary and its `gzip -9`, read and compressed once per test
+/// binary (acs-dz3r): the binary does not change while its tests run, and a
+/// `gzip -9` of its ~5 MB costs about 2 s of CPU per call.
+fn slim_and_gz() -> (&'static Vec<u8>, &'static Vec<u8>) {
+    static PAIR: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+    let (slim, gz) = PAIR.get_or_init(|| {
+        let slim = std::fs::read(exe()).unwrap();
+        let gz = gzip(&slim);
+        (slim, gz)
+    });
+    (slim, gz)
 }
 
 /// What a missing `ssh-keygen` is reported as. `Command::status()` answers
@@ -1432,6 +1444,28 @@ pub fn complete_client(dir: &Path, target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) 
 /// tool is named here.
 const NEEDS_KEYGEN: &str =
     "ssh-keygen must be on PATH: the release signature is made and checked with it (acs-o9v)";
+
+/// The release signing pair, `(private key file, public key line)`, made
+/// once per test binary (acs-dz3r) rather than by an `ssh-keygen` per
+/// server: every server signs with it, and the one test that needs a
+/// release signed by somebody else makes that key itself
+/// (`sign_with_another_key`).
+fn release_pair() -> &'static (String, String) {
+    static PAIR: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    PAIR.get_or_init(|| {
+        let dir = TempDir::new();
+        let key = dir.path().join("signer");
+        let st = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"])
+            .arg(&key)
+            .status()
+            .expect(NEEDS_KEYGEN);
+        assert!(st.success());
+        let private = std::fs::read_to_string(&key).unwrap();
+        let public = std::fs::read_to_string(dir.path().join("signer.pub")).unwrap();
+        (private, public.trim().to_string())
+    })
+}
 
 /// A stand-in for GitHub Releases over plain HTTP, for `ACS_RELEASES_URL`:
 /// the real `curl` downloads from it. Paths are as on GitHub
@@ -1508,26 +1542,25 @@ impl ReleaseServer {
     }
 
     /// The public half of the key this server signs its releases with
-    /// (acs-o9v), for `ACS_RELEASE_KEY`. A key per server, made on first
-    /// use, so one test's key is never another's.
+    /// (acs-o9v), for `ACS_RELEASE_KEY`.
     pub fn release_key(&self) -> String {
-        self.signing_key();
-        std::fs::read_to_string(self.root.path().join("signer.pub"))
-            .unwrap()
-            .trim()
-            .to_string()
+        release_pair().1.clone()
     }
 
-    /// The private half's path, making the pair if it is not there yet.
+    /// The private half's path, written into this server's directory on
+    /// first use.
     fn signing_key(&self) -> PathBuf {
         let key = self.root.path().join("signer");
         if !key.is_file() {
-            let st = Command::new("ssh-keygen")
-                .args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"])
-                .arg(&key)
-                .status()
-                .expect(NEEDS_KEYGEN);
-            assert!(st.success());
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&key)
+                .unwrap();
+            f.write_all(release_pair().0.as_bytes()).unwrap();
         }
         key
     }
