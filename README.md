@@ -227,6 +227,7 @@ acs cp [-rpqvC46] [-P port] [-i identity] [-J jump] [-F config] [-o opt=value] s
 acs cp notes.txt devbox:                 upload into the home directory
 acs cp -r project devbox:src/            a directory, recursively
 acs cp devbox:/var/log/syslog devbox:a.txt .    download, several sources from one host
+acs cp -r devbox:project nas:backup/     between two hosts, through this machine
 ```
 
 The same binary run as `acscp` is `acs cp`, a drop-in for `scp`.
@@ -258,8 +259,17 @@ part is the only state, so a copy you stop with Ctrl-C — or one
 `--no-reconnect` ended — is finished from it by running the same `acs cp`
 again. A part no later run claims stays until you remove it.
 
-Not built yet: copying between two hosts or from local and remote sources
-at once, and wildcards in a remote path — name each remote file.
+A copy between two hosts goes through this machine, as `scp -3` does:
+acs opens a connection to each, installing acs on either where it is
+missing, and passes the stream from one to the other without writing
+anything here. Sources on several hosts are copied one host after
+another, and the target's host may be one of them. Such a copy does not
+reconnect: a lost link ends it and says so, and running the same command
+again goes on from the part already on the target.
+
+Not built yet: local and remote sources in one copy, downloads from
+several hosts at once, and wildcards in a remote path — name each remote
+file.
 
 ### ssh options
 
