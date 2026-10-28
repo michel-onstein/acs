@@ -710,7 +710,34 @@ impl Link {
     pub(crate) fn set_pending(&mut self, pending: Vec<u8>) {
         self.pending = pending;
     }
+
+    /// What EOF on the link says, from how ssh exited (acs-b4f, DESIGN
+    /// §7.1). OpenSSH exits 255 for its own failure — the connection, or
+    /// a master that went — and with the remote command's status
+    /// otherwise, which is our channel ending on a connection still up.
+    ///
+    /// Only a channel on the master asks: nothing else has a master to
+    /// keep, and a redial (never muxed) must go at once (acs-iyq). The
+    /// wait is [`REAP_BOUND`]; an ssh that has not exited by then, or
+    /// that a signal ended, is the connection, as before this rule.
+    fn eof(&mut self) -> LinkEnd {
+        let until = Instant::now() + REAP_BOUND;
+        while self.muxed {
+            match self.child.try_wait() {
+                Ok(Some(s)) if s.code().is_some_and(|c| c != 255) => return LinkEnd::Exited,
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
+                _ => break,
+            }
+        }
+        LinkEnd::Transport
+    }
 }
+
+/// How long EOF on a channel waits for its ssh to exit ([`Link::eof`]).
+/// A mux client exits as soon as its master hands it the channel's status,
+/// a moment after the EOF; 100 ms is far more than that on any machine,
+/// and well under the handshake the redial that follows pays anyway.
+const REAP_BOUND: Duration = Duration::from_millis(100);
 
 /// How long a fresh connection may take to answer: to print its marker,
 /// and then to WELCOME us (DESIGN §5.3). One the user is in front of may
@@ -1187,7 +1214,8 @@ pub enum LinkEnd {
     /// or the poll watching them failing. ssh exits when its connection
     /// does — that is what `ServerAliveInterval=0` (DESIGN §3) leaves it
     /// to the TCP stack to notice — so this is the connection having
-    /// failed until something says otherwise.
+    /// failed until something says otherwise — which, for EOF on a
+    /// channel, ssh's exit status may ([`LinkEnd::Exited`]).
     Transport,
     /// Nothing came back in time: `ACS_DEAD_MS` of silence, or
     /// `ACS_NETCHECK_MS` after this machine's network moved (acs-ft1), or
@@ -1198,6 +1226,10 @@ pub enum LinkEnd {
     /// not decode. The connection carried those bytes a moment ago, so it
     /// is up; what broke is the conversation on this one channel.
     Channel,
+    /// EOF on a channel whose ssh then exited with the remote command's
+    /// status — anything but 255 ([`Link::eof`], acs-b4f): the command
+    /// ended, and the connection under it said so.
+    Exited,
     /// This machine's network moved under a link still owed its `WELCOME`
     /// (acs-xo1): abandoned, and dialled again at once by
     /// [`connect_and_serve`], which is the only thing that sees this.
@@ -1216,7 +1248,7 @@ impl LinkEnd {
     pub fn failed_the_connection(self) -> bool {
         match self {
             LinkEnd::Transport | LinkEnd::Silent | LinkEnd::Moved => true,
-            LinkEnd::Channel => false,
+            LinkEnd::Channel | LinkEnd::Exited => false,
         }
     }
 }
@@ -2208,7 +2240,10 @@ fn serve(
 
         if fds[0].revents != 0 {
             match sys::read(from, &mut buf) {
-                Ok(0) => return lost(link, LinkEnd::Transport),
+                Ok(0) => {
+                    let why = link.eof();
+                    return lost(link, why);
+                }
                 Ok(n) => {
                     dec.push(&buf[..n]);
                     // Bytes from the host are proof it is there. Their
@@ -2290,10 +2325,54 @@ mod tests {
         assert!(LinkEnd::Transport.failed_the_connection());
         assert!(LinkEnd::Silent.failed_the_connection());
         assert!(!LinkEnd::Channel.failed_the_connection());
+        assert!(!LinkEnd::Exited.failed_the_connection());
         // No reason at all is the blunt side too: `connect_and_serve` ends
         // the master when it is given `None`.
         let unknown: Option<LinkEnd> = None;
         assert!(unknown.map_or(true, LinkEnd::failed_the_connection));
+    }
+
+    /// acs-b4f: EOF on a channel is read from ssh's exit status. 255 is
+    /// ssh's own failure, the connection; anything else is the remote
+    /// command's. An ssh still running at the bound, and any link that is
+    /// not a channel on the master, keep the old answer — and the latter
+    /// without waiting at all.
+    #[test]
+    fn eof_on_a_channel_is_read_from_how_ssh_exited() {
+        let link = |sh: &str, muxed: bool| {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", sh])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let to: OwnedFd = child.stdin.take().unwrap().into();
+            let from: OwnedFd = child.stdout.take().unwrap().into();
+            Link {
+                child,
+                to,
+                from,
+                pending: Vec::new(),
+                muxed,
+            }
+        };
+        let eof = |sh: &str, muxed: bool| {
+            let mut l = link(sh, muxed);
+            let t = Instant::now();
+            let why = l.eof();
+            l.close();
+            (why, t.elapsed())
+        };
+        assert_eq!(eof("exit 1", true).0, LinkEnd::Exited);
+        assert_eq!(eof("exit 6", true).0, LinkEnd::Exited);
+        assert_eq!(eof("exit 255", true).0, LinkEnd::Transport);
+        assert_eq!(eof("kill -9 $$", true).0, LinkEnd::Transport);
+        let (why, took) = eof("exec sleep 30", true);
+        assert_eq!(why, LinkEnd::Transport);
+        assert!(took >= REAP_BOUND && took < REAP_BOUND * 20, "{took:?}");
+        let (why, took) = eof("exec sleep 30", false);
+        assert_eq!(why, LinkEnd::Transport);
+        assert!(took < REAP_BOUND, "a link off the master waited: {took:?}");
     }
 
     /// acs-odd: the configured `local_forwards` join the command line's
