@@ -15,6 +15,12 @@ root=$(pwd)
 installer="$root/scripts/install.sh"
 old=${ACS_TEST_OLD:-0.12.0}
 
+# The installer's own version -> tag mapping (vX.Y.Z up to 0.18.0, X.Y.Z
+# after; docs/VERSIONING.md "Tags"), for the mirror laid out below.
+eval "$(sed -n '/^last_v_tag=/,/^}/p' "$installer")"
+[ "$(release_tag 0.18.0)" = v0.18.0 ] && [ "$(release_tag 0.19.0)" = 0.19.0 ] ||
+    { echo "FAIL: install.sh's release_tag" >&2; exit 1; }
+
 fail() {
     echo "FAIL: $*" >&2
     exit 1
@@ -84,7 +90,8 @@ here() {
     pass "latest ($new) into $bin, linked to $lib/$new, with acscp -> acs"
 
     # A pinned older version: installed beside the newer one, which keeps
-    # the link (acs-feee, install::should_link).
+    # the link (acs-feee, install::should_link). $old is v-tagged, so this
+    # also fetches by the old tag form.
     run ACS_VERSION="$old"
     expect_ok "pinned"
     expect_out "pinned" "acs $old ("
@@ -155,7 +162,7 @@ here() {
     # once its signature checks out, so reaching the checksum check takes
     # a copy of the installer that trusts the throwaway key -- substituted
     # the way `cargo xtask package` substitutes a fork's (acs-x57).
-    mirror="$t/mirror/download/v$new"
+    mirror="$t/mirror/download/$(release_tag "$new")"
     mkdir -p "$mirror"
     echo "$latest" >"$mirror/SHA256SUMS"
     for f in $(echo "$latest" | sed 's/.* //'); do

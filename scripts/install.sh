@@ -126,9 +126,31 @@ command -v ssh-keygen >/dev/null 2>&1 ||
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/acs-install.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
+# The tag a release is published under (docs/VERSIONING.md, "Tags"):
+# vX.Y.Z up to $last_v_tag, X.Y.Z after it. Installed acs up to 0.17.0 only
+# knows the download/v<version>/ path, so 0.18.0 kept the v as the bridge
+# they upgrade through; release::LAST_V_TAG in acs is the same cutoff.
+last_v_tag=0.18.0
+release_tag() { # release_tag X.Y.Z
+    old_ifs=$IFS
+    IFS=.
+    # shellcheck disable=SC2086 # split on the dots, on purpose
+    set -- $1 $last_v_tag
+    IFS=$old_ifs
+    if [ "$1" -lt "$4" ] ||
+        { [ "$1" -eq "$4" ] && { [ "$2" -lt "$5" ] ||
+            { [ "$2" -eq "$5" ] && [ "$3" -le "$6" ]; }; }; }; then
+        printf 'v%s.%s.%s\n' "$1" "$2" "$3"
+    else
+        printf '%s.%s.%s\n' "$1" "$2" "$3"
+    fi
+}
+
 # SHA256SUMS names every archive, so it also tells the latest version.
 if [ -n "$want" ]; then
-    base="$releases/download/v$want"
+    printf '%s\n' "$want" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' ||
+        die "ACS_VERSION wants X.Y.Z, not '$want'"
+    base="$releases/download/$(release_tag "$want")"
 else
     base="$releases/latest/download"
 fi
@@ -164,8 +186,8 @@ if [ -n "$want" ] && [ "$version" != "$want" ]; then
 fi
 
 say "downloading acs $version for $target"
-fetch "$releases/download/v$version/$file" "$tmp/$file" ||
-    die "cannot download $releases/download/v$version/$file"
+archive="$releases/download/$(release_tag "$version")/$file"
+fetch "$archive" "$tmp/$file" || die "cannot download $archive"
 got=$(sha256 "$tmp/$file")
 if [ "$got" != "$sum" ]; then
     die "checksum mismatch for $file (expected $sum, got $got); nothing was installed"

@@ -6,7 +6,7 @@
 #
 # Safe to re-run: with nothing unreleased it does nothing. Run after a
 # merge to main (the ship skill does); it pushes a chore(release) commit
-# and a vX.Y.Z tag to origin/main from a throwaway worktree, then publishes
+# and an X.Y.Z tag to origin/main from a throwaway worktree, then publishes
 # that release's binaries to GitHub (scripts/release-binaries.sh; set
 # ACS_NO_PUBLISH=1 to skip).
 set -eu
@@ -19,7 +19,9 @@ trap 'rm -f "$before" "$after"' EXIT
 # fetches them itself, so without this a checkout with stale tags would see
 # every tag it was missing as new and publish those releases again (acs-zc4).
 git fetch --tags origin main
-git tag --list 'v[0-9]*' | sort > "$before"
+# Release tags in either form: vX.Y.Z up to v0.18.0, X.Y.Z after
+# (docs/VERSIONING.md, "Tags").
+git tag --list 'v[0-9]*' '[0-9]*' | sort > "$before"
 
 cargo xtask bump "$@"
 
@@ -28,7 +30,7 @@ for a in "$@"; do
 done
 [ -z "${ACS_NO_PUBLISH:-}" ] || exit 0
 
-git tag --list 'v[0-9]*' | sort > "$after"
+git tag --list 'v[0-9]*' '[0-9]*' | sort > "$after"
 for tag in $(comm -13 "$before" "$after"); do
     scripts/release-binaries.sh "$tag"
 done

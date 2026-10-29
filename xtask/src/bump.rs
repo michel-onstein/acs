@@ -294,7 +294,12 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn last_tag(repo: &Path, rev: &str) -> Result<Option<(String, Version)>, String> {
-    let tags = git(repo, &["tag", "--list", "v*", "--merged", rev])?;
+    // Both forms: releases up to 0.18.0 are tagged vX.Y.Z, later ones X.Y.Z
+    // (docs/VERSIONING.md, "Tags"), and Version::parse takes either.
+    let tags = git(
+        repo,
+        &["tag", "--list", "v[0-9]*", "[0-9]*", "--merged", rev],
+    )?;
     Ok(tags
         .lines()
         .filter_map(|t| Version::parse(t).map(|v| (t.to_string(), v)))
@@ -364,7 +369,7 @@ fn run(o: &Opts) -> Result<(), String> {
         Some((tag, v)) => (format!("{tag}..{head}"), v.max(current)),
         None => {
             // First release: the current version is released as it is.
-            println!("no release tag yet: tagging {head} as v{current}");
+            println!("no release tag yet: tagging {head} as {current}");
             let new = o.force.map_or(current, |l| current.bump(l));
             return release(o, &head, new, &[], new != current);
         }
@@ -391,7 +396,7 @@ fn run(o: &Opts) -> Result<(), String> {
         None => aggregate(&decisions.iter().map(|(_, d)| d.clone()).collect::<Vec<_>>()),
     };
     if level == Level::None {
-        println!("nothing to release since v{base} (current {current})");
+        println!("nothing to release since {base} (current {current})");
         return Ok(());
     }
     let new = base.bump(level);
@@ -406,7 +411,9 @@ fn release(
     decisions: &[(Commit, Decision)],
     edit: bool,
 ) -> Result<(), String> {
-    let tag = format!("v{new}");
+    // A bare X.Y.Z: 0.18.0 was the last release tagged with a `v`
+    // (acs::release::LAST_V_TAG, docs/VERSIONING.md "Tags").
+    let tag = new.to_string();
     if o.dry_run {
         println!(
             "dry run: would {}tag {tag} and push to {}/{}",
@@ -552,7 +559,7 @@ mod tests {
         assert_eq!(conventional("Fix master stall when x"), None);
         assert_eq!(conventional("acs v1: persistent ssh sessions"), None);
         assert_eq!(
-            conventional("chore(release): v1.0.0"),
+            conventional("chore(release): 1.0.0"),
             Some(("chore".into(), false))
         );
     }
@@ -592,6 +599,10 @@ mod tests {
             (commit("fix: x", "Semver: major", &src), Level::Minor),
             (
                 commit("chore(release): v0.2.0", "", &[("Cargo.toml", 2)]),
+                Level::None,
+            ),
+            (
+                commit("chore(release): 0.19.0", "", &[("Cargo.toml", 2)]),
                 Level::None,
             ),
             (

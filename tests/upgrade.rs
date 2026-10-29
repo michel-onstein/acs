@@ -120,6 +120,13 @@ fn upgrades_a_plain_binary_in_place() {
         0o755
     );
     assert!(version_of(&acs).starts_with(&format!("acs {NEW} ")));
+    // A release after 0.18.0 is fetched from its bare tag.
+    let archive = format!("/download/{NEW}/");
+    assert!(
+        server.hits().iter().any(|h| h.contains(&archive)),
+        "{:?}",
+        server.hits()
+    );
     // Nothing is left next to it.
     let names: Vec<_> = std::fs::read_dir(acs.parent().unwrap())
         .unwrap()
@@ -257,6 +264,15 @@ fn already_current_or_newer_does_nothing() {
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("→ 0.0.1"), "{out}");
     assert!(version_of(&acs).starts_with("acs 0.0.1 "));
+    // A release up to 0.18.0 is fetched from its `v` tag.
+    assert!(
+        server
+            .hits()
+            .iter()
+            .any(|h| h.contains("/download/v0.0.1/")),
+        "{:?}",
+        server.hits()
+    );
 }
 
 #[test]

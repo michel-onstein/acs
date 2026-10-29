@@ -103,10 +103,12 @@ impl Scratch {
         (key, public.trim().to_string())
     }
 
-    /// Publish `version` under `releases/download/vX.Y.Z/` with made-up
-    /// checksums, and with a `SHA256SUMS.sig` when `signer` names a key.
-    fn publish(&self, version: &str, signer: Option<&Path>) -> PathBuf {
-        let dir = self.root.join(format!("releases/download/v{version}"));
+    /// Publish the release tagged `tag` (`X.Y.Z`, or `vX.Y.Z` up to
+    /// v0.18.0) under `releases/download/<tag>/` with made-up checksums, and
+    /// with a `SHA256SUMS.sig` when `signer` names a key.
+    fn publish(&self, tag: &str, signer: Option<&Path>) -> PathBuf {
+        let version = tag.trim_start_matches('v');
+        let dir = self.root.join(format!("releases/download/{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(dir.join("SHA256SUMS.sig"));
         let sums = dir.join("SHA256SUMS");
@@ -123,12 +125,12 @@ impl Scratch {
         sums
     }
 
-    /// `scripts/update-tap.sh vX.Y.Z <args>` against the releases
+    /// `scripts/update-tap.sh <tag> <args>` against the releases
     /// [`Scratch::publish`] writes, with an xtask whose build channel trusts
     /// `trusted` — the stand-in for a build made with that
     /// `ACS_DEFAULT_RELEASE_KEY`, which a test cannot recompile xtask for.
     /// Every xtask subcommand run is appended to `xtask.log`.
-    fn try_update_release(&self, version: &str, trusted: &str, args: &[&str]) -> Output {
+    fn try_update_release(&self, tag: &str, trusted: &str, args: &[&str]) -> Output {
         let wrapper = self.root.join("xtask.sh");
         let log = self.root.join("xtask.log");
         std::fs::write(
@@ -150,7 +152,7 @@ impl Scratch {
                 format!("file://{}", self.root.join("releases").display()),
             )
             .arg(script)
-            .arg(format!("v{version}"))
+            .arg(tag)
             .args(args)
             .output()
             .unwrap()
@@ -216,7 +218,7 @@ fn a_release_updates_the_tap_once() {
     let rendered = std::fs::read_to_string(&f).unwrap();
     assert_eq!(s.formula_on_tap(), rendered.trim_end());
     assert!(
-        rendered.contains("/releases/download/v1.9.0/acs-1.9.0-x86_64-unknown-linux-musl.tar.gz")
+        rendered.contains("/releases/download/1.9.0/acs-1.9.0-x86_64-unknown-linux-musl.tar.gz")
     );
 
     // The same release again (re-published): nothing to commit.
@@ -227,7 +229,7 @@ fn a_release_updates_the_tap_once() {
     // The next release replaces it.
     s.update(&s.render("1.10.0"), &[]);
     assert_eq!(s.log(), ["acs 1.10.0", "acs 1.9.0", "tap"]);
-    assert!(s.formula_on_tap().contains("/v1.10.0/acs-1.10.0-"));
+    assert!(s.formula_on_tap().contains("/1.10.0/acs-1.10.0-"));
 
     // Re-publishing an older release does not move the tap back.
     let out = s.update(&f, &[]);
@@ -354,6 +356,23 @@ fn a_published_release_lands_only_when_signed_by_the_build_key() {
     assert_eq!(s.xtask_runs().last().map(String::as_str), Some("formula"));
     assert_eq!(s.log(), ["acs 1.9.0", "tap"]);
     assert!(s.formula_on_tap().contains("# acs-version: 1.9.0"));
+}
+
+/// The bridge (docs/VERSIONING.md, "Tags"): `v0.18.0` was published with
+/// its `v`, from a checkout that already tags bare; retrying its tap update
+/// by that tag still finds its SHA256SUMS and renders a formula that
+/// downloads from `v0.18.0`.
+#[test]
+fn a_v_tagged_release_still_lands_by_its_tag() {
+    let s = Scratch::new("vtag");
+    let (release_key, trusted) = s.keygen("release");
+    s.publish("v0.18.0", Some(&release_key));
+    let out = s.try_update_release("v0.18.0", &trusted, &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(stdout(&out).contains("tap: acs 0.18.0 pushed"), "{out:?}");
+    let f = s.formula_on_tap();
+    assert!(f.contains("# acs-version: 0.18.0"), "{f}");
+    assert!(f.contains("/releases/download/v0.18.0/acs-0.18.0-"), "{f}");
 }
 
 /// The key `scripts/update-tap.sh` trusts is the one xtask was built with —

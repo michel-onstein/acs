@@ -59,11 +59,14 @@ By hand, the archives are on
 [Releases](https://github.com/michel-onstein/acs/releases):
 
 ```sh
-v=0.2.0 t=aarch64-apple-darwin      # see the release page for the latest
-curl -LO https://github.com/michel-onstein/acs/releases/download/v$v/acs-$v-$t.tar.gz
+v=0.19.0 t=aarch64-apple-darwin     # see the release page for the latest
+curl -LO https://github.com/michel-onstein/acs/releases/download/$v/acs-$v-$t.tar.gz
 tar xzf acs-$v-$t.tar.gz && install -m 755 acs-$v-$t/acs ~/.local/bin/acs
 ln -s acs ~/.local/bin/acscp    # acs run as acscp copies files, like scp
 ```
+
+Releases up to 0.18.0 are tagged with a `v`, so theirs are under
+`download/v$v/` ([VERSIONING.md](docs/VERSIONING.md), "Tags").
 
 Or build it yourself:
 
@@ -716,7 +719,7 @@ scripts/e2e_ssh.sh      # end to end over real ssh against a container host
 scripts/test_install.sh # install.sh against the real releases, here and in containers
 scripts/version-bump.sh # release the next version and publish its binaries
 scripts/release-binaries.sh  # (re)publish a tag's binaries to GitHub Releases
-scripts/update-tap.sh vX.Y.Z # point the Homebrew tap at a release
+scripts/update-tap.sh X.Y.Z  # point the Homebrew tap at a release
 ```
 
 `scripts/test_linux.sh --only NAME [-- ARGS...]` runs one test target

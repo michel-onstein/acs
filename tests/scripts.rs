@@ -609,13 +609,19 @@ fn run_bump(dir: &Path, root: &Path) -> Vec<String> {
 #[test]
 fn version_bump_only_releases_the_tag_it_made() {
     let dir = TempDir::new();
-    let root = bump_checkout(dir.path(), &["v0.1.0"], &["v0.1.0", "v0.2.0"], "v0.3.0");
+    // The bridge: origin has v-tags up to v0.18.0, the bump makes 0.19.0.
+    let root = bump_checkout(dir.path(), &["v0.17.0"], &["v0.17.0", "v0.18.0"], "0.19.0");
     let log = run_bump(dir.path(), &root);
     let released: Vec<&String> = log
         .iter()
         .filter(|l| l.starts_with("release-binaries"))
         .collect();
-    assert_eq!(released, ["release-binaries v0.3.0"], "{log:?}");
+    assert_eq!(released, ["release-binaries 0.19.0"], "{log:?}");
+    // Both forms are listed, so v0.18.0 is not taken for a new tag.
+    assert!(
+        log.iter().any(|l| l == "git tag --list v[0-9]* [0-9]*"),
+        "{log:?}"
+    );
     // The tags are fetched before they are snapshotted.
     let fetch = log.iter().position(|l| l.starts_with("git fetch --tags"));
     let list = log.iter().position(|l| l.starts_with("git tag --list"));
@@ -626,7 +632,7 @@ fn version_bump_only_releases_the_tag_it_made() {
 #[test]
 fn version_bump_without_a_new_tag_releases_nothing() {
     let dir = TempDir::new();
-    let root = bump_checkout(dir.path(), &["v0.1.0"], &["v0.1.0", "v0.2.0"], "");
+    let root = bump_checkout(dir.path(), &["v0.18.0"], &["v0.18.0", "0.19.0"], "");
     let log = run_bump(dir.path(), &root);
     assert!(
         !log.iter().any(|l| l.starts_with("release-binaries")),
@@ -778,6 +784,81 @@ fn the_installer_and_acs_read_sha256sums_alike() {
             format!("{hash} {name}"),
             "install.sh cut {line:?}"
         );
+    }
+}
+
+/// The bridge (docs/VERSIONING.md, "Tags"): the installer maps a version
+/// to its release tag — `v` up to 0.18.0, bare after — exactly as
+/// `release::release_tag` does. Run on the script's own function.
+#[test]
+fn the_installer_maps_a_version_to_its_tag_as_acs_does() {
+    let script = installer();
+    assert!(
+        script.contains(&format!("\nlast_v_tag={}\n", acs::release::LAST_V_TAG)),
+        "install.sh and release::LAST_V_TAG disagree on the cutoff"
+    );
+    let func = script
+        .lines()
+        .skip_while(|l| !l.starts_with("last_v_tag="))
+        .take_while(|l| *l != "}")
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        func.contains("release_tag()"),
+        "the function moved:\n{func}"
+    );
+    for v in [
+        "0.1.0", "0.9.9", "0.17.0", "0.17.99", "0.18.0", "0.18.1", "0.19.0", "0.100.0", "1.0.0",
+        "1.17.0", "10.0.0",
+    ] {
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{func}\n}}\nrelease_tag {v}"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{v}: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            acs::release::release_tag(v),
+            "install.sh on {v}"
+        );
+    }
+}
+
+/// `ACS_VERSION` reaches the release by its tag: `0.17.0` (or `v0.17.0`, as
+/// it always could be spelled) fetches from `download/v0.17.0/`, `0.19.0`
+/// from `download/0.19.0/`, and anything but X.Y.Z is refused before a
+/// download. Against an empty mirror, so the URL is in the failure.
+#[test]
+fn the_installer_fetches_a_pinned_version_from_its_tag() {
+    let dir = TempDir::new();
+    let releases = format!("file://{}", dir.path().display());
+    let run = |want: &str| -> String {
+        let out = Command::new("sh")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"))
+            .env("ACS_RELEASES_URL", &releases)
+            .env("ACS_ALLOW_INSECURE_URL", "1")
+            .env("ACS_VERSION", want)
+            .env_remove("SUDO_USER")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{want}: {out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    for (want, tag) in [
+        ("0.17.0", "v0.17.0"),
+        ("v0.17.0", "v0.17.0"),
+        ("0.18.0", "v0.18.0"),
+        ("0.19.0", "0.19.0"),
+        ("v0.19.0", "0.19.0"),
+    ] {
+        let err = run(want);
+        let url = format!("cannot download {releases}/download/{tag}/SHA256SUMS");
+        assert!(err.contains(&url), "{want}: {err}");
+    }
+    for bad in ["0.19", "0.19.0-rc1", "../0.19.0"] {
+        let err = run(bad);
+        assert!(err.contains("ACS_VERSION wants X.Y.Z"), "{bad}: {err}");
     }
 }
 
@@ -1107,19 +1188,29 @@ fn the_installer_carries_the_same_release_key_and_checks_before_reading() {
     );
 }
 
-/// A real git repository at `<dir>/notes` holding `release-changes.sh`, with
-/// one empty commit per subject in `history` (oldest first), and a tag
-/// wherever an entry is a `vX.Y.Z` instead of a subject.
+/// A real git repository at `<dir>/notes` holding the release scripts
+/// (`release-changes.sh`, `release-binaries.sh` and the `release-tags.sh`
+/// both read), with one empty commit per subject in `history` (oldest
+/// first), and a tag wherever an entry is a `vX.Y.Z` or `X.Y.Z` instead of a
+/// subject. It is its own `origin`, for `release-binaries.sh`'s fetch.
 fn notes_checkout(dir: &Path, history: &[&str]) -> PathBuf {
     let root = dir.join("notes");
     std::fs::create_dir_all(root.join("scripts")).unwrap();
-    let dest = root.join("scripts/release-changes.sh");
-    std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/release-changes.sh"),
-        &dest,
-    )
-    .unwrap();
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for s in [
+        "release-changes.sh",
+        "release-binaries.sh",
+        "release-tags.sh",
+    ] {
+        let dest = root.join("scripts").join(s);
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts")
+                .join(s),
+            &dest,
+        )
+        .unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let git = |args: &[&str]| {
         let out = Command::new("git")
             .args(args)
@@ -1139,10 +1230,9 @@ fn notes_checkout(dir: &Path, history: &[&str]) -> PathBuf {
         );
     };
     git(&["init", "-q", "-b", "main"]);
+    git(&["remote", "add", "origin", root.to_str().unwrap()]);
     for h in history {
-        let tag = h
-            .strip_prefix('v')
-            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+        let tag = acs::release::parse_version(h).is_some();
         if tag {
             git(&["tag", h]);
         } else {
@@ -1185,17 +1275,17 @@ fn release_notes_leave_out_the_bookkeeping() {
         dir.path(),
         &[
             "feat: the first thing",
-            "v0.1.0",
+            "0.1.0",
             "feat(timing): name the greeting as its own phase",
             "chore(beads): close acs-ftn, file the phase-name drift",
             "fix(e2e): check the client binary",
             "chore(ci): pin the runner image",
-            "chore(release): v0.2.0",
-            "v0.2.0",
+            "chore(release): 0.2.0",
+            "0.2.0",
         ],
     );
     assert_eq!(
-        changes(&root, "v0.2.0"),
+        changes(&root, "0.2.0"),
         [
             "- chore(ci): pin the runner image",
             "- fix(e2e): check the client binary",
@@ -1215,11 +1305,11 @@ fn a_first_release_says_so_and_still_filters() {
         &[
             "feat: the first thing",
             "chore(beads): file acs-aaa",
-            "v0.1.0",
+            "0.1.0",
         ],
     );
     assert_eq!(
-        changes(&root, "v0.1.0"),
+        changes(&root, "0.1.0"),
         ["First release.", "", "- feat: the first thing"]
     );
 }
@@ -1233,11 +1323,136 @@ fn a_release_of_only_bookkeeping_lists_nothing() {
         dir.path(),
         &[
             "feat: the first thing",
-            "v0.1.0",
+            "0.1.0",
             "chore(beads): close acs-ftn",
-            "chore(release): v0.2.0",
-            "v0.2.0",
+            "chore(release): 0.2.0",
+            "0.2.0",
         ],
     );
-    assert!(changes(&root, "v0.2.0").is_empty());
+    assert!(changes(&root, "0.2.0").is_empty());
+}
+
+/// The bridge (docs/VERSIONING.md, "Tags"): the releases up to v0.18.0 are
+/// v-tagged and 0.19.0 on are not. The previous release is found by version
+/// across both forms, so 0.19.0's notes list what landed since v0.18.0 —
+/// not since some older v-tag, nor everything as a first release — and
+/// v0.18.0's own notes still run from v0.17.0. The default is the newest.
+#[test]
+fn release_notes_find_the_previous_tag_across_both_forms() {
+    let dir = TempDir::new();
+    let root = notes_checkout(
+        dir.path(),
+        &[
+            "feat: in 0.9",
+            "v0.9.0",
+            "feat: in 0.17",
+            "v0.17.0",
+            "fix: in 0.18",
+            "chore(release): v0.18.0",
+            "v0.18.0",
+            "feat: in 0.19",
+            "chore(release): 0.19.0",
+            "0.19.0",
+            "fix: in 0.19.1",
+            "chore(release): 0.19.1",
+            "0.19.1",
+        ],
+    );
+    assert_eq!(changes(&root, "0.19.0"), ["- feat: in 0.19"]);
+    assert_eq!(changes(&root, "v0.18.0"), ["- fix: in 0.18"]);
+    assert_eq!(changes(&root, "0.19.1"), ["- fix: in 0.19.1"]);
+    assert_eq!(changes(&root, ""), ["- fix: in 0.19.1"]);
+}
+
+/// `scripts/release-tags.sh`: every release tag, newest first by version,
+/// both forms in one order — `git tag --sort=-v:refname` would put each
+/// `v`-tag above every bare one, and `v0.18.0` above `0.19.0`.
+#[test]
+fn release_tags_order_both_forms_as_one_sequence() {
+    let dir = TempDir::new();
+    let root = notes_checkout(
+        dir.path(),
+        &[
+            "a", "v0.2.0", "b", "v0.10.0", "c", "v0.18.0", "d", "0.19.0", "e", "0.19.10", "f",
+            "0.19.2",
+        ],
+    );
+    let out = Command::new("sh")
+        .arg(root.join("scripts/release-tags.sh"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["0.19.10", "0.19.2", "0.19.0", "v0.18.0", "v0.10.0", "v0.2.0"]
+    );
+}
+
+/// What `scripts/release-binaries.sh` sets out to build: the tag it is given
+/// in either form, or with none the newest release by version. It runs
+/// against a `cargo` that fails, so it stops right after naming the tag
+/// and checking it out. `v0.18.0` is published from a checkout that already
+/// tags bare (the bridge), so it must still be taken by name.
+#[test]
+fn release_binaries_takes_either_tag_form_and_finds_the_latest() {
+    let dir = TempDir::new();
+    let root = notes_checkout(dir.path(), &["feat: a", "v0.17.0", "feat: b", "v0.18.0"]);
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh
+exit 1
+",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let building = |args: &[&str]| -> String {
+        let out = Command::new("sh")
+            .arg(root.join("scripts/release-binaries.sh"))
+            .args(args)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "the fake cargo should stop it");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("== building ").map(str::to_string))
+            .unwrap_or_else(|| panic!("{out:?}"))
+    };
+    // Only v-tags yet: the newest is v0.18.0.
+    assert_eq!(building(&[]), "v0.18.0");
+    let git = |args: &[&str]| {
+        let st = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    git(&["tag", "0.19.0"]);
+    // A bare tag beside them: the newest by version, whatever its form.
+    assert_eq!(building(&[]), "0.19.0");
+    // Either form by name.
+    assert_eq!(building(&["v0.18.0"]), "v0.18.0");
+    assert_eq!(building(&["0.19.0"]), "0.19.0");
+    // And no worktree is left behind by the failed build.
+    let out = Command::new("git")
+        .args(["worktree", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
 }

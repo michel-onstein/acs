@@ -1728,8 +1728,10 @@ impl ReleaseServer {
             "{}  acs-{version}-riscv64-unknown-linux-musl.tar.gz\n{sum}  {name}.tar.gz\n",
             "a".repeat(64)
         );
-        self.put(&format!("/download/v{version}/{name}.tar.gz"), data);
-        let versioned = format!("/download/v{version}/SHA256SUMS");
+        // Tagged as the real releases are: `v` up to 0.18.0, bare after.
+        let tag = acs::release::release_tag(version);
+        self.put(&format!("/download/{tag}/{name}.tar.gz"), data);
+        let versioned = format!("/download/{tag}/SHA256SUMS");
         self.put(&versioned, sums.clone());
         self.publish_signature(&versioned, &sums, None);
         if latest {

@@ -3,7 +3,10 @@
 # Formula/acs.rb to michel-onstein/homebrew-acs and push it.
 #
 #   scripts/update-tap.sh FORMULA [--dry-run]    a file from cargo xtask formula
-#   scripts/update-tap.sh vX.Y.Z [--dry-run]     render that release's formula
+#   scripts/update-tap.sh TAG [--dry-run]        render that release's formula
+#
+# TAG is the release's tag as published: vX.Y.Z up to v0.18.0, X.Y.Z from
+# 0.19.0 on (docs/VERSIONING.md, "Tags").
 #
 # scripts/release-binaries.sh runs it after publishing a release; run it by
 # hand to retry. The tap is cloned into a temporary directory; a formula that
@@ -11,7 +14,7 @@
 # change and pushes nothing. ACS_TAP_REPO names another tap repository (the
 # tests use a local one). Pushing to GitHub uses gh's token (GH_TOKEN works).
 #
-# A vX.Y.Z argument's SHA256SUMS is fetched from the build's release channel
+# A TAG argument's SHA256SUMS is fetched from the build's release channel
 # (`cargo xtask channel`), or from ACS_RELEASES_URL, and its SHA256SUMS.sig
 # is checked against that channel's release key before anything is rendered
 # (acs-oxl4): Homebrew users never see the signature, so an unchecked file
@@ -23,7 +26,7 @@
 set -eu
 
 usage() {
-    echo "usage: scripts/update-tap.sh FORMULA|vX.Y.Z [--dry-run]" >&2
+    echo "usage: scripts/update-tap.sh FORMULA|TAG [--dry-run]" >&2
     exit 2
 }
 
@@ -52,8 +55,9 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/acs-tap.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 case "$arg" in
-    v[0-9]*)
-        # A version: render its formula from the published SHA256SUMS, once
+    */* | *.rb) formula=$arg ;;
+    v[0-9]* | [0-9]*)
+        # A release tag, either form: render its formula from the published SHA256SUMS, once
         # its signature checks out against the build's release key.
         xtask channel > "$work/channel"
         key=$(sed -n 's/^key //p' "$work/channel" | head -n 1)
@@ -82,7 +86,7 @@ case "$arg" in
             echo "(a fork builds xtask with its ACS_DEFAULT_RELEASE_KEY; docs/VERSIONING.md, \"Forking\")" >&2
             exit 1
         }
-        xtask formula --version "$arg" --sums "$work/SHA256SUMS" --out "$work/acs.rb"
+        xtask formula --version "${arg#v}" --sums "$work/SHA256SUMS" --out "$work/acs.rb"
         formula=$work/acs.rb
         ;;
     *) formula=$arg ;;
