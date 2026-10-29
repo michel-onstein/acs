@@ -33,7 +33,7 @@ fn packages_every_target_with_checksums_and_notes() {
     let readme = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../README.md");
 
     let st = Command::new(env!("CARGO_BIN_EXE_xtask"))
-        .args(["package", "--version", "v0.9.1", "--dist"])
+        .args(["package", "--version", "0.9.1", "--dist"])
         .arg(&dist)
         .arg("--out")
         .arg(&out)

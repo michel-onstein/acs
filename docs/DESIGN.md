@@ -2386,12 +2386,19 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   (`…/releases/latest/download/SHA256SUMS`): its archive names carry the
   version, and it holds the checksum the download must match — the same file
   the one-line installer reads, so the two always agree. No GitHub API call,
-  so no rate limit. `ACS_RELEASES_URL` points both elsewhere (a mirror, the
-  tests' server), under two limits (acs-95w): it must be `https`, because the
-  sums travel with the payload and so prove only that the server agrees with
-  itself, and `--allow-insecure-url` on the command line is what accepts any
-  other scheme — an environment variable would be set by whoever set the URL,
-  and would be worth nothing. It is ignored outright when the real and
+  so no rate limit. A named release (`acs upgrade --version X.Y.Z`, the
+  installer's `ACS_VERSION`) and every archive are fetched from
+  `…/releases/download/<tag>/`, where the tag is `vX.Y.Z` up to 0.18.0 and
+  the bare `X.Y.Z` after it — `release::release_tag`, with the cutoff in
+  `release::LAST_V_TAG` and `scripts/install.sh`'s `last_v_tag`
+  (VERSIONING.md, "Tags"): acs up to 0.17.0 knows only the `v` path, so
+  0.18.0 kept it as the release they upgrade through. `ACS_RELEASES_URL`
+  points acs and the installer elsewhere (a mirror, the tests' server),
+  under two limits (acs-95w): it must be `https`, because the sums travel
+  with the payload and so prove only that the server agrees with itself, and
+  `--allow-insecure-url` on the command line is what accepts any other
+  scheme — an environment variable would be set by whoever set the URL, and
+  would be worth nothing. It is ignored outright when the real and
   effective user differ, so whoever seeds the environment of a `sudo acs
   upgrade` does not thereby choose the binary it installs. The background
   update check only compares version numbers, downloading and running

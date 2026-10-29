@@ -529,9 +529,14 @@ mod tests {
         let o = parse(&args("--check --version 1.2.3")).unwrap();
         assert!(o.check);
         assert_eq!(o.version.as_deref(), Some("1.2.3"));
+        // Either spelling: release::release_tag maps both to the tag.
         assert_eq!(
             parse(&args("--version=v0.4.0")).unwrap().version.as_deref(),
             Some("v0.4.0")
+        );
+        assert_eq!(
+            parse(&args("--version=0.19.0")).unwrap().version.as_deref(),
+            Some("0.19.0")
         );
         assert!(parse(&args("--version latest"))
             .unwrap_err()

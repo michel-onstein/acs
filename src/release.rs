@@ -299,16 +299,33 @@ pub fn bare(version: &str) -> &str {
     version.strip_prefix('v').unwrap_or(version)
 }
 
+/// The last release tagged `vX.Y.Z`; every later one is tagged `X.Y.Z`
+/// (docs/VERSIONING.md, "Tags"). Installed acs up to 0.17.0 only knows the
+/// `download/v<version>/` path, so 0.18.0 kept the `v` as the bridge they
+/// upgrade through; `scripts/install.sh` carries the same cutoff.
+pub const LAST_V_TAG: &str = "0.18.0";
+
+/// The release tag of `version` (with or without a leading `v`):
+/// `v<version>` up to [`LAST_V_TAG`], `<version>` after it.
+pub fn release_tag(version: &str) -> String {
+    let v = bare(version);
+    match compare(v, LAST_V_TAG) {
+        Some(Ordering::Greater) => v.to_string(),
+        Some(_) => format!("v{v}"),
+        None => v.to_string(),
+    }
+}
+
 /// The `SHA256SUMS` URL of the latest release, or of `version`.
 pub fn sums_url(base: &str, version: Option<&str>) -> String {
     match version {
-        Some(v) => format!("{base}/download/v{}/SHA256SUMS", bare(v)),
+        Some(v) => format!("{base}/download/{}/SHA256SUMS", release_tag(v)),
         None => format!("{base}/latest/download/SHA256SUMS"),
     }
 }
 
 pub fn asset_url(base: &str, a: &Asset) -> String {
-    format!("{base}/download/v{}/{}", a.version, a.file)
+    format!("{base}/download/{}/{}", release_tag(&a.version), a.file)
 }
 
 /// curl's options before `-o <dest> <url>`: one attempt, capped at `t`
@@ -583,7 +600,7 @@ nothexnothexnothexnothexnothexnothexnothexnothexnothexnothexnoth  acs-0.2.0-x86_
         ] {
             assert_eq!(sums_line(&bad), None, "{bad:?}");
         }
-        // The archive's version has no `v`: the tag does, the file not.
+        // The archive's version never has a `v`, whatever its tag has.
         let sums = format!("{h}  acs-v0.2.0-aarch64-apple-darwin.tar.gz\n");
         assert_eq!(find_asset(&sums, "aarch64-apple-darwin"), None);
     }
@@ -658,13 +675,51 @@ nothexnothexnothexnothexnothexnothexnothexnothexnothexnothexnoth  acs-0.2.0-x86_
             "https://example.com/r/latest/download/SHA256SUMS"
         );
         assert_eq!(
+            sums_url(b, Some("1.2.3")),
+            "https://example.com/r/download/1.2.3/SHA256SUMS"
+        );
+        assert_eq!(
             sums_url(b, Some("v1.2.3")),
-            "https://example.com/r/download/v1.2.3/SHA256SUMS"
+            "https://example.com/r/download/1.2.3/SHA256SUMS"
+        );
+        assert_eq!(
+            sums_url(b, Some("0.17.0")),
+            "https://example.com/r/download/v0.17.0/SHA256SUMS"
         );
         let a = find_asset(SUMS, "aarch64-apple-darwin").unwrap();
         assert_eq!(
             asset_url(b, &a),
             "https://example.com/r/download/v0.2.0/acs-0.2.0-aarch64-apple-darwin.tar.gz"
         );
+        let a = Asset {
+            version: "0.19.0".into(),
+            ..a
+        };
+        assert_eq!(
+            asset_url(b, &a),
+            "https://example.com/r/download/0.19.0/acs-0.2.0-aarch64-apple-darwin.tar.gz"
+        );
+    }
+
+    /// The bridge: 0.18.0 is the last `v` tag, because installed acs up to
+    /// 0.17.0 only knows `download/v<version>/`; from 0.19.0 on the tag is
+    /// the bare version. Either spelling of the version maps the same way.
+    #[test]
+    fn a_version_maps_to_its_release_tag() {
+        assert_eq!(LAST_V_TAG, "0.18.0");
+        for (version, tag) in [
+            ("0.1.0", "v0.1.0"),
+            ("0.17.0", "v0.17.0"),
+            ("0.18.0", "v0.18.0"),
+            ("v0.18.0", "v0.18.0"),
+            ("0.18.0-rc1", "v0.18.0-rc1"),
+            ("0.18.1", "0.18.1"),
+            ("0.19.0", "0.19.0"),
+            ("v0.19.0", "0.19.0"),
+            ("0.19.0-rc1", "0.19.0-rc1"),
+            ("1.0.0", "1.0.0"),
+        ] {
+            assert_eq!(release_tag(version), tag, "{version}");
+        }
     }
 }

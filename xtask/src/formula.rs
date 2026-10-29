@@ -88,6 +88,9 @@ pub fn render_with(version: &str, sums: &str, releases: &str) -> Result<String, 
     f.push_str(&format!("  homepage \"{repo}\"\n"));
     f.push_str("  license \"MIT\"\n\n");
     f.push_str("  livecheck do\n    url :stable\n    strategy :github_latest\n  end\n");
+    // `v0.18.0` and before, `0.19.0` on (docs/VERSIONING.md, "Tags"): an
+    // old release published again keeps the tag it has.
+    let tag = acs::release::release_tag(version);
     for (os, cpus) in TARGETS {
         f.push_str(&format!("\n  on_{os} do\n"));
         for (i, (cpu, target)) in cpus.iter().enumerate() {
@@ -97,9 +100,7 @@ pub fn render_with(version: &str, sums: &str, releases: &str) -> Result<String, 
                 f.push('\n');
             }
             f.push_str(&format!("    on_{cpu} do\n"));
-            f.push_str(&format!(
-                "      url \"{releases}/download/v{version}/{file}\"\n"
-            ));
+            f.push_str(&format!("      url \"{releases}/download/{tag}/{file}\"\n"));
             f.push_str(&format!("      sha256 \"{sha}\"\n"));
             f.push_str("    end\n");
         }
@@ -229,7 +230,7 @@ mod tests {
             "{f}"
         );
         assert!(
-            f.contains(&format!("url \"{releases}/download/v1.2.3/")),
+            f.contains(&format!("url \"{releases}/download/1.2.3/")),
             "{f}"
         );
         // A fork's, with no rebuild: nothing of acs's own survives.
@@ -241,7 +242,7 @@ mod tests {
         );
         assert!(
             f.contains(
-                "url \"https://github.com/someone/acs-fork/releases/download/v1.2.3/acs-1.2.3-aarch64-apple-darwin.tar.gz\""
+                "url \"https://github.com/someone/acs-fork/releases/download/1.2.3/acs-1.2.3-aarch64-apple-darwin.tar.gz\""
             ),
             "{f}"
         );
@@ -258,7 +259,7 @@ mod tests {
         // The first CPU of an OS block, whole.
         let block = |os: &str, cpu: &str, target: &str, digit: char| {
             format!(
-                "on_{os} do\n    on_{cpu} do\n      url \"https://github.com/michel-onstein/acs/releases/download/v1.2.3/acs-1.2.3-{target}.tar.gz\"\n      sha256 \"{}\"\n    end\n",
+                "on_{os} do\n    on_{cpu} do\n      url \"https://github.com/michel-onstein/acs/releases/download/1.2.3/acs-1.2.3-{target}.tar.gz\"\n      sha256 \"{}\"\n    end\n",
                 digit.to_string().repeat(64)
             )
         };
@@ -266,7 +267,7 @@ mod tests {
             f.contains(&block("macos", "arm", "aarch64-apple-darwin", '0')),
             "{f}"
         );
-        let intel = "    on_intel do\n      url \"https://github.com/michel-onstein/acs/releases/download/v1.2.3/acs-1.2.3-x86_64-apple-darwin.tar.gz\"\n      sha256 \"2222";
+        let intel = "    on_intel do\n      url \"https://github.com/michel-onstein/acs/releases/download/1.2.3/acs-1.2.3-x86_64-apple-darwin.tar.gz\"\n      sha256 \"2222";
         assert!(f.contains(intel), "{f}");
         // Linux: the static musl builds, with their own checksums.
         assert!(
@@ -294,6 +295,19 @@ mod tests {
         assert!(f.contains("assert_includes remotes, \"x86_64-unknown-linux-musl\"\n"));
         assert!(f.contains("assert_includes remotes, \"aarch64-unknown-linux-musl\"\n"));
         assert!(f.ends_with("  end\nend\n"));
+    }
+
+    /// The bridge (docs/VERSIONING.md, "Tags"): 0.18.0 is the last release
+    /// tagged `v`, so its formula — rendered again from a later checkout —
+    /// downloads from `v0.18.0`, and 0.19.0's from the bare tag.
+    #[test]
+    fn the_download_url_names_the_releases_tag() {
+        let old = render("0.18.0", &sums("0.18.0")).unwrap();
+        assert!(old.contains("/download/v0.18.0/acs-0.18.0-"), "{old}");
+        assert!(!old.contains("/download/0.18.0/"), "{old}");
+        let new = render("0.19.0", &sums("0.19.0")).unwrap();
+        assert!(new.contains("/download/0.19.0/acs-0.19.0-"), "{new}");
+        assert!(!new.contains("/download/v0.19.0/"), "{new}");
     }
 
     /// acs-u3qn: the formula names its release on a line of its own, in a

@@ -76,8 +76,10 @@ pub fn notes_with(
         .or(archives.first().map(|(_, f)| f.as_str()))
         .unwrap_or("acs.tar.gz");
     let dir = example.trim_end_matches(".tar.gz");
+    // The release's tag: `v` up to 0.18.0, bare after (docs/VERSIONING.md).
+    let tag = acs::release::release_tag(version);
     n.push_str(&format!(
-        "\n```sh\ncurl -LO {releases}/download/v{version}/{example}\ntar xzf {example}\ninstall -m 755 {dir}/acs ~/.local/bin/acs\nln -s acs ~/.local/bin/{copy}    # acs run as acscp copies files, like scp\nacs --version\n```\n\n",
+        "\n```sh\ncurl -LO {releases}/download/{tag}/{example}\ntar xzf {example}\ninstall -m 755 {dir}/acs ~/.local/bin/acs\nln -s acs ~/.local/bin/{copy}    # acs run as acscp copies files, like scp\nacs --version\n```\n\n",
         copy = acs::layout::COPY_NAME
     ));
     n.push_str("On macOS, a file downloaded with a browser is quarantined; clear it with `xattr -d com.apple.quarantine ~/.local/bin/acs` (curl does not set it).\n\n");
@@ -341,7 +343,13 @@ mod tests {
         let n = notes("1.2.3", &a, "- feat: something\n");
         assert!(n.contains("| macOS, Apple silicon | `acs-1.2.3-aarch64-apple-darwin.tar.gz` |"));
         assert!(n.contains("| Linux x86_64 (static) |"));
-        assert!(n.contains("releases/download/v1.2.3/acs-1.2.3-aarch64-apple-darwin.tar.gz"));
+        assert!(n.contains("releases/download/1.2.3/acs-1.2.3-aarch64-apple-darwin.tar.gz"));
+        // An old release published again keeps its `v` tag (the bridge).
+        let old = notes("0.18.0", &a, "");
+        assert!(
+            old.contains("releases/download/v0.18.0/acs-1.2.3-aarch64"),
+            "{old}"
+        );
         assert!(n.contains("install -m 755 acs-1.2.3-aarch64-apple-darwin/acs"));
         // acs-hofu.5: the by-hand install makes the relative acscp link too.
         assert!(n.contains("\nln -s acs ~/.local/bin/acscp "), "{n}");
@@ -372,7 +380,7 @@ mod tests {
         );
         assert!(
             n.contains(&format!(
-                "curl -LO {fork}/download/v1.2.3/acs-1.2.3-aarch64-apple-darwin.tar.gz"
+                "curl -LO {fork}/download/1.2.3/acs-1.2.3-aarch64-apple-darwin.tar.gz"
             )),
             "{n}"
         );

@@ -6,9 +6,11 @@
 # assets if it exists). Then points the Homebrew tap at it
 # (scripts/update-tap.sh; ACS_NO_TAP=1 skips that).
 #
-#   scripts/release-binaries.sh [vX.Y.Z] [--dry-run]
+#   scripts/release-binaries.sh [TAG] [--dry-run]
 #
-# The tag defaults to the newest vX.Y.Z on origin. Needs gh with access to the
+# TAG is vX.Y.Z up to v0.18.0 and X.Y.Z from 0.19.0 on (docs/VERSIONING.md,
+# "Tags"); it defaults to the newest release tag on origin, in either form
+# (scripts/release-tags.sh). Needs gh with access to the
 # repository and the tap (GH_TOKEN works), cargo-zigbuild and zig. --dry-run
 # builds and packages but uploads nothing, prints where the assets are and
 # shows what the tap would get.
@@ -21,16 +23,16 @@ dry=0
 for a in "$@"; do
     case "$a" in
         --dry-run | -n) dry=1 ;;
-        v[0-9]*) tag=$a ;;
-        *) echo "usage: scripts/release-binaries.sh [vX.Y.Z] [--dry-run]" >&2; exit 2 ;;
+        v[0-9]* | [0-9]*) tag=$a ;;
+        *) echo "usage: scripts/release-binaries.sh [TAG] [--dry-run]" >&2; exit 2 ;;
     esac
 done
 
 git fetch --quiet --tags origin
 if [ -z "$tag" ]; then
-    tag=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)
+    tag=$(scripts/release-tags.sh | head -n 1)
 fi
-[ -n "$tag" ] || { echo "no vX.Y.Z tag to release" >&2; exit 1; }
+[ -n "$tag" ] || { echo "no release tag to release" >&2; exit 1; }
 git rev-parse -q --verify "refs/tags/$tag" >/dev/null || { echo "no tag $tag" >&2; exit 1; }
 version=${tag#v}
 

@@ -5,14 +5,45 @@
 `scripts/update-tap.sh` (`cargo xtask formula`). The fork knobs ("Forking")
 are all built: a fork publishes a complete release — binaries, packaged
 installer, Homebrew formula and notes — without editing a tracked source
-file (acs-x57).
+file (acs-x57). Release tags are bare from 0.19.0 on, with v0.18.0 the
+bridge ("Tags", acs-aycl).
 
 acs follows semantic versioning, and the version moves after every merge to
 `main` — when whoever landed it runs the bump ("Who runs it"). The version
 lives in `Cargo.toml` (and so in
 `Cargo.lock`, in `acs --version`, and in the remote install path
-`~/.local/share/acs/<version>/`); each release is an annotated tag `vX.Y.Z` on
-a `chore(release): vX.Y.Z` commit.
+`~/.local/share/acs/<version>/`); each release is an annotated tag `X.Y.Z` on
+a `chore(release): X.Y.Z` commit — releases up to 0.18.0 were tagged
+`vX.Y.Z` ("Tags").
+
+## Tags
+
+From 0.19.0 on a release's tag is the bare version, `0.19.0`; every release
+up to and including 0.18.0 is tagged `v0.18.0` and keeps that tag. The
+switch (acs-aycl, 2026-10-29) went through a **bridge release**:
+
+- Installed acs up to 0.17.0 fetches a named release and every archive from
+  `…/releases/download/v<version>/` (`acs upgrade`; the weekly update check
+  reads only `…/latest/download/SHA256SUMS`). An archive published under a
+  bare tag is unreachable from them by that path.
+- So **v0.18.0 was published with its `v`**: they upgrade to it as to any
+  release, and 0.18.0 knows both forms. From 0.19.0 the bump tags bare.
+- Clients map a version to its tag — `vX.Y.Z` up to 0.18.0, `X.Y.Z` after —
+  in one place per language: `release::release_tag` with the cutoff
+  `release::LAST_V_TAG` (acs and xtask's formula and notes), and
+  `release_tag` with `last_v_tag` in `scripts/install.sh`
+  (`ACS_VERSION=0.17.0` still fetches `v0.17.0`). Either spelling of the
+  version is accepted (`acs upgrade --version v0.19.0`). The
+  `…/latest/download/` paths do not name a tag and are unaffected.
+- Everything that lists or parses tags takes both forms and orders them as
+  one sequence by version: the bump's previous tag, `scripts/release-tags.sh`
+  (newest first) and through it `scripts/release-binaries.sh`'s latest and
+  `scripts/release-changes.sh`'s previous — so 0.19.0's notes list the
+  changes since v0.18.0 — and the tags `scripts/version-bump.sh` publishes.
+  `git tag --sort=-v:refname` would not do: it compares the `v` as text.
+- `scripts/release-binaries.sh v0.18.0` and `scripts/update-tap.sh v0.18.0`
+  still work from a checkout that tags bare, rendering URLs under
+  `v0.18.0`.
 
 ## The rules
 
@@ -29,7 +60,7 @@ MAJOR resets MINOR and PATCH to 0. Nothing but `--major` produces it.
 
 ### How a commit is read
 
-Each squash commit on `main` since the last `vX.Y.Z` tag is classified; the
+Each squash commit on `main` since the last release tag is classified; the
 highest level among them is the release:
 
 1. A **`Semver: minor|patch|none` trailer** in the commit message, or a
@@ -107,8 +138,8 @@ Every release is published on
 
 ### What the notes list as the changes
 
-`scripts/release-changes.sh [vX.Y.Z]` prints that list on its own — one line
-per pull request merged since the previous `vX.Y.Z` tag, newest first, taken
+`scripts/release-changes.sh [TAG]` prints that list on its own — one line
+per pull request merged since the previous release tag, newest first, taken
 from the first-parent log. Run it to see what a release's notes will say.
 
 The bookkeeping is left out, because the notes are read by someone about to
@@ -125,7 +156,7 @@ release that is *only* bookkeeping lists no changes at all rather than
 failing.
 
 `scripts/version-bump.sh` publishes them right after it tags a release;
-`scripts/release-binaries.sh [vX.Y.Z]` does it on its own (for example to
+`scripts/release-binaries.sh [TAG]` does it on its own (for example to
 publish an existing tag again: it replaces the assets). It builds from the
 exact tag in a throwaway worktree, needs `gh` with access to the repository
 (`GH_TOKEN` works), `cargo-zigbuild` and `zig`, and `--dry-run` builds and
@@ -153,7 +184,7 @@ renders the formula from the release's `SHA256SUMS`
   (an old tag published again) is left out, so the tap never moves back;
 - `--dry-run` shows the change without committing; the release's own
   `--dry-run` runs it that way, and `ACS_NO_TAP=1` skips the tap altogether;
-- `scripts/update-tap.sh vX.Y.Z` renders and pushes that release's formula
+- `scripts/update-tap.sh TAG` renders and pushes that release's formula
   from its published `SHA256SUMS` — the way to retry if the push failed
   after the release was published. `ACS_TAP_REPO` points it at another
   repository (the tests use a local one) and `ACS_RELEASES_URL` at another
