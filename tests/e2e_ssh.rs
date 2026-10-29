@@ -793,6 +793,9 @@ fn e2e_16_the_system_wide_install_alone_attaches_without_installing() {
     // housekeeping, which only ever touches the user's own versions
     // directory, made none either.
     assert_eq!(h.root_sh(own).trim(), "", "solo got an acs of its own");
+    // Gone again, so that every user after this one meets the host as it
+    // was: with it there, e2e_18's first contact would find root's copy.
+    h.root_sh(&format!("rm -rf {system}"));
     eprintln!("VERIFIED the system-wide install alone attaches over ssh, installing nothing");
 }
 
@@ -908,5 +911,400 @@ fn e2e_17_a_listing_over_every_alias_joins_the_master_a_session_has_up() {
     let _ = Command::new("ssh").args(&args).output();
     eprintln!(
         "VERIFIED acs list over every alias joins the session's master ({pid}) and starts none"
+    );
+}
+
+// ---- acscp (acs-hofu.8, ACSCP_DESIGN §11) ---------------------------------
+
+impl Host {
+    /// The ssh options again, spelled for `acs cp`: the port is `-P`, as
+    /// for `scp`, since `-p` is preserve.
+    fn cp_args(&self) -> Vec<String> {
+        self.ssh_args()
+            .into_iter()
+            .map(|a| if a == "-p" { "-P".into() } else { a })
+            .collect()
+    }
+
+    /// `acs cp <args>` from `cwd`, with no configuration of the caller's and
+    /// no ssh master unless `env` asks for one; its exit code and stderr.
+    fn cp(&self, cwd: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
+        let out = self.cp_command(cwd, args, env).output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn cp_command(&self, cwd: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Command {
+        let mut c = Command::new(&self.client);
+        c.current_dir(cwd)
+            .arg("cp")
+            .args(self.cp_args())
+            .args(args)
+            .env("XDG_CONFIG_HOME", NO_CONFIG)
+            .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
+            .env("ACS_NO_UPDATE_CHECK", "1")
+            .env("ACS_CONTROL_PERSIST", NO_MASTER)
+            .envs(env.iter().copied());
+        c
+    }
+
+    /// The host's clock, in Unix seconds: what its file times are read
+    /// against.
+    fn now(&self) -> u64 {
+        self.root_sh("date +%s").trim().parse().unwrap()
+    }
+
+    /// How many logins sshd has accepted so far: each is a handshake.
+    fn logins(&self) -> usize {
+        let out = Command::new("docker")
+            .args(["logs", &self.container])
+            .output()
+            .unwrap();
+        let all = [out.stdout, out.stderr].concat();
+        String::from_utf8_lossy(&all)
+            .matches("Accepted publickey for ")
+            .count()
+    }
+}
+
+/// `n` bytes that are not all one value, so a chunk out of place shows.
+fn noise(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    let mut v = Vec::with_capacity(n + 8);
+    while v.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v.truncate(n);
+    v
+}
+
+/// Every regular file under `root` as `relative path → (mode, mtime)`.
+fn modes_and_times(root: &std::path::Path) -> Vec<(String, u32, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, u32, i64)>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let m = std::fs::metadata(&p).unwrap();
+            if m.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let rel = p.strip_prefix(root).unwrap().display().to_string();
+                out.push((rel, m.mode() & 0o7777, m.mtime()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// The copy's own first contact, on an account nothing has reached before:
+/// `acs cp` installs acs on the one connection and copies; the install
+/// leaves both of the copy's names, `acscp` and `acs cp`, working on the
+/// host; and `acs _cp` marks its version directory used, so a host reached
+/// only by copies does not have that version pruned under it.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn e2e_18_acscp_first_contact_installs_acs_and_both_copy_names() {
+    let h = host();
+    let v = acs::VERSION;
+    let home = "/home/copier";
+    assert_eq!(
+        h.root_sh(&format!("ls -A {home}/.local 2>/dev/null; true"))
+            .trim(),
+        "",
+        "copier starts with an acs"
+    );
+    assert_eq!(
+        h.root_sh(&format!("ls /usr/local/lib/acs/{v} 2>/dev/null; true"))
+            .trim(),
+        "",
+        "a system-wide install would answer copier's first contact"
+    );
+    let dir = acs::testutil::TempDir::new();
+    std::fs::write(dir.path().join("hello.txt"), "copied over ssh\n").unwrap();
+    let (code, err) = h.cp(
+        dir.path(),
+        &["-v", "-q", "hello.txt", "copier@127.0.0.1:"],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("installing acs"), "{err}");
+    assert!(err.contains(&format!("installed acs {v}")), "{err}");
+    assert_eq!(
+        h.root_sh(&format!("cat {home}/hello.txt")),
+        "copied over ssh\n"
+    );
+
+    // Both names: `acscp` a relative link to the `acs` link beside it.
+    let links = h.root_sh(&format!(
+        "readlink {home}/.local/bin/acscp; readlink {home}/.local/bin/acs"
+    ));
+    let links: Vec<&str> = links.lines().collect();
+    assert_eq!(links[0], "acs", "{links:?}");
+    assert!(links[1].contains(&format!("{v}/acs")), "{links:?}");
+    let both = h.root_sh(&format!(
+        "su copier -s /bin/sh -c 'cd && {home}/.local/bin/acscp hello.txt a.txt \
+         && {home}/.local/bin/acs cp a.txt b.txt && cat b.txt'"
+    ));
+    assert_eq!(both, "copied over ssh\n", "acscp then acs cp on the host");
+
+    // A copy marks its version used: set a year back, a copy brings it to now.
+    let vdir = format!("{home}/.local/share/acs/{v}");
+    h.root_sh(&format!("touch -t 200001010000 {vdir}"));
+    let (code, err) = h.cp(dir.path(), &["-q", "copier@127.0.0.1:b.txt", "."], &[]);
+    assert_eq!(code, 0, "{err}");
+    let touched: u64 = h
+        .root_sh(&format!("stat -c %Y {vdir}"))
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        h.now().saturating_sub(touched) < 600,
+        "acs _cp left its version directory at {touched}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "copied over ssh\n"
+    );
+    eprintln!(
+        "VERIFIED acscp first contact: installed acs {v} on the copy's connection, \
+         acscp and acs cp both work on the host, acs _cp touched {vdir}"
+    );
+}
+
+/// A tree up and back down with `-r -p`: the same files (`diff -r`), and
+/// each file's mode and modification time kept both ways.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn e2e_19_acscp_r_p_round_trip_is_identical() {
+    let h = host();
+    let dir = acs::testutil::TempDir::new();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub/deeper")).unwrap();
+    let files: [(&str, Vec<u8>, u32, u64); 5] = [
+        ("a.txt", b"alpha\n".to_vec(), 0o640, 978_307_200),
+        (
+            "sub/run.sh",
+            b"#!/bin/sh\necho hi\n".to_vec(),
+            0o755,
+            1_000_000_000,
+        ),
+        ("sub/deeper/empty", Vec::new(), 0o600, 1_100_000_000),
+        ("sub/deeper/blob", noise(3 << 20, 7), 0o644, 1_200_000_000),
+        (
+            "sub/odd name [1]",
+            b"spaces and brackets\n".to_vec(),
+            0o604,
+            1_300_000_000,
+        ),
+    ];
+    use std::os::unix::fs::PermissionsExt;
+    for (name, body, mode, t) in &files {
+        let p = tree.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(*mode)).unwrap();
+        acs::sys::set_mtime(&p, *t).unwrap();
+    }
+    h.root_sh("rm -rf /home/dev/tree");
+
+    let (code, err) = h.cp(
+        dir.path(),
+        &["-r", "-p", "-q", "tree", "dev@127.0.0.1:"],
+        &[],
+    );
+    assert_eq!(code, 0, "up: {err}");
+    // On the host, as sent.
+    let there =
+        h.root_sh("cd /home/dev/tree && find . -type f -exec stat -c '%a %Y %n' {} + | sort");
+    for (name, _, mode, t) in &files {
+        let row = format!("{mode:o} {t} ./{name}");
+        assert!(there.lines().any(|l| l == row), "no `{row}` in:\n{there}");
+    }
+
+    let back = dir.path().join("back");
+    std::fs::create_dir(&back).unwrap();
+    let (code, err) = h.cp(
+        dir.path(),
+        &["-r", "-p", "-q", "dev@127.0.0.1:tree", "back"],
+        &[],
+    );
+    assert_eq!(code, 0, "down: {err}");
+    let diff = Command::new("diff")
+        .arg("-r")
+        .arg(&tree)
+        .arg(back.join("tree"))
+        .output()
+        .unwrap();
+    assert!(
+        diff.status.success(),
+        "diff -r:\n{}{}",
+        String::from_utf8_lossy(&diff.stdout),
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    assert_eq!(modes_and_times(&tree), modes_and_times(&back.join("tree")));
+    eprintln!("VERIFIED acscp -r -p up and down over ssh: diff -r clean, modes and times kept");
+}
+
+/// The link killed mid-file (`sshd-session` on the host, as e2e_07 does to
+/// a session): the copy redials by itself and resumes from the part on the
+/// host — at least the quarter that was there when the link died — rather
+/// than sending the file again, and what lands is the file.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn e2e_20_acscp_killed_mid_copy_resumes_from_the_part() {
+    let h = host();
+    let size: u64 = std::env::var("ACS_E2E_CP_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200)
+        << 20;
+    let dir = acs::testutil::TempDir::new();
+    let big = dir.path().join("big");
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&big).unwrap());
+        let chunk = 1 << 20;
+        for i in 0..size / chunk {
+            f.write_all(&noise(chunk as usize, i + 1)).unwrap();
+        }
+    }
+    let want = acs::sha256::hex(&acs::sha256::file(&big).unwrap());
+    h.root_sh("rm -f /home/dev/big /home/dev/.big.acscp-part");
+
+    // Watched from inside the container, where a poll costs nothing: the
+    // link dies once the part holds a quarter of the file.
+    let quarter = size / 4;
+    let watch = format!(
+        "f=/home/dev/.big.acscp-part; \
+         while [ ! -e /home/dev/big ] && [ \"$(stat -c %s $f 2>/dev/null || echo 0)\" -lt {quarter} ]; \
+         do sleep 0.01; done; \
+         if [ -e /home/dev/big ]; then echo finished-first; exit 0; fi; \
+         echo killed-at $(stat -c %s $f); \
+         pkill -f '[s]shd-session: dev@' || pkill -f '[s]shd: dev@'"
+    );
+    let watcher = Command::new("docker")
+        .args(["exec", &h.container, "sh", "-c", &watch])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t0 = Instant::now();
+    let (code, err) = h.cp(
+        dir.path(),
+        &["-v", "-q", "big", "dev@127.0.0.1:"],
+        &[("ACS_BACKOFF_MS", "300")],
+    );
+    let took = t0.elapsed();
+    let said = String::from_utf8_lossy(&watcher.wait_with_output().unwrap().stdout).into_owned();
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        said.starts_with("killed-at "),
+        "the link was not killed: {said}"
+    );
+    assert!(err.contains("reconnecting"), "{err}");
+    let resumed: u64 = err
+        .lines()
+        .find_map(|l| {
+            l.split("resuming after ")
+                .nth(1)?
+                .split(' ')
+                .next()?
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no resume:\n{err}"));
+    assert!(
+        resumed >= quarter && resumed < size,
+        "resumed after {resumed} of {size} bytes; the part held {quarter}+ at the kill:\n{err}"
+    );
+    let got = h.root_sh("sha256sum /home/dev/big");
+    assert!(got.starts_with(&want), "{got} vs {want}");
+    assert_eq!(
+        h.root_sh("ls -A /home/dev | grep acscp-part; true").trim(),
+        "",
+        "a part was left behind"
+    );
+    h.root_sh("rm -f /home/dev/big");
+    eprintln!(
+        "VERIFIED acscp over a killed link: {} MB, the link {}, resumed after {resumed} bytes, \
+         sha256 equal, {took:?} in all",
+        size >> 20,
+        said.trim()
+    );
+}
+
+/// A copy to a host with a session up rides the session's ssh master: no
+/// new login on the host (sshd's own log says so), the same master pid
+/// after, still the one socket — and the session streams straight through.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn e2e_21_acscp_joins_the_sessions_master() {
+    let h = host();
+    let dir = acs::testutil::TempDir::new();
+    let mux = dir.path().join("mux");
+    let mux_s = mux.to_str().unwrap().to_string();
+    let env: Vec<(&str, &str)> = vec![
+        ("ACS_CONTROL_DIR", &mux_s),
+        ("ACS_CONTROL_PERSIST", "300"),
+        ("ACS_NO_UPDATE_CHECK", "1"),
+    ];
+    let check = |sock: &std::path::Path| -> Option<String> {
+        let mut args = vec!["-o".to_string(), format!("ControlPath={}", sock.display())];
+        args.extend(h.ssh_args());
+        args.extend(["-O", "check", "--", "dev@127.0.0.1"].map(String::from));
+        let out = Command::new("ssh").args(&args).output().unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stderr).trim().to_string())
+    };
+    let mut c = h.client("cpmux", TICKER, &env);
+    c.wait_for("#10#", T);
+    let sock = one_socket(&mux);
+    let pid = check(&sock).expect("no master under the session");
+
+    std::fs::write(dir.path().join("up.txt"), noise(1 << 20, 3)).unwrap();
+    let before = h.logins();
+    let (code, err) = h.cp(dir.path(), &["-v", "-q", "up.txt", "dev@127.0.0.1:"], &env);
+    assert_eq!(code, 0, "up: {err}");
+    assert!(err.contains("shared ssh master at"), "{err}");
+    assert!(
+        err.contains(&format!("ControlPath={}", sock.display())),
+        "{err}"
+    );
+    let down = dir.path().join("down");
+    std::fs::create_dir(&down).unwrap();
+    let (code, err) = h.cp(dir.path(), &["-q", "dev@127.0.0.1:up.txt", "down"], &env);
+    assert_eq!(code, 0, "down: {err}");
+    let after = h.logins();
+    assert_eq!(
+        after, before,
+        "the copies logged in again: a second handshake"
+    );
+    assert_eq!(check(&sock).as_deref(), Some(&pid[..]), "another master");
+    assert_eq!(one_socket(&mux), sock);
+    assert_eq!(
+        std::fs::read(dir.path().join("up.txt")).unwrap(),
+        std::fs::read(down.join("up.txt")).unwrap()
+    );
+    let last = *numbers(&c.text()).last().unwrap();
+    c.wait_for(&format!("#{}#", last + 20), T);
+    assert_consecutive(&c.text());
+
+    c.send(&command(b'x'));
+    c.wait(T);
+    let mut args = vec!["-o".to_string(), format!("ControlPath={}", sock.display())];
+    args.extend(h.ssh_args());
+    args.extend(["-O", "exit", "--", "dev@127.0.0.1"].map(String::from));
+    let _ = Command::new("ssh").args(&args).output();
+    h.root_sh("rm -f /home/dev/up.txt");
+    eprintln!(
+        "VERIFIED acscp up and down ride the session's master ({pid}): \
+         {before} logins before, {after} after"
     );
 }

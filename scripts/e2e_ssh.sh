@@ -4,8 +4,12 @@
 # the kitty keyboard protocol, mouse reports, OSC 52, key selection by -i and
 # by identity_file, drops (a killed connection, a frozen host), the Ctrl-L
 # sent after a re-attach and a resume, a -L forward (the session's ssh
-# alone binds the port), and a user whose only acs is the system-wide
-# install under /usr/local/lib/acs.
+# alone binds the port), a user whose only acs is the system-wide
+# install under /usr/local/lib/acs, and acscp (ACSCP_DESIGN §11): its own
+# first-contact install with both copy names after it and `acs _cp`
+# touching its version directory, an `-r -p` tree up and back compared with
+# `diff -r`, a 200 MB copy (ACS_E2E_CP_MB) resumed from its part after
+# `sshd-session` is killed mid-file, and a copy riding a session's master.
 #
 #   scripts/e2e_ssh.sh [--no-build [--allow-stale-dist]]
 #

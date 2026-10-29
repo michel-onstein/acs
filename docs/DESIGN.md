@@ -108,8 +108,10 @@ flowchart LR
 
 ## 3. Architecture
 
-One executable, `acs`, with three roles. The user only ever types the first;
-the other two are hidden subcommands the binary invokes on the remote.
+One executable, `acs`, with three session roles and two for the copy. Of the
+session's, the user only ever types the first; the other two are hidden
+subcommands the binary invokes on the remote. The copy is the same split: the
+user types `acscp`, and `acs _cp` is its hidden far end.
 
 ```mermaid
 flowchart LR
@@ -124,6 +126,13 @@ flowchart LR
 | **client** | local | one terminal session, across reconnects | raw mode, command key, resize, reconnect loop, renders pty bytes to stdout |
 | **proxy** | remote, spawned by `sshd` | one ssh connection | find or start the master, then relay frames between ssh's stdio and the master's socket |
 | **master** | remote, daemonised | the session | own the pty and child, keep the output ring, serve one active client |
+| **copy** (`acscp`, `acs cp`) | local | one copy, across redials | `scp`'s command line; walk and send, or receive and place, files over the copy protocol; resume from the part after a lost link; relay between two hosts ([ACSCP_DESIGN.md](ACSCP_DESIGN.md)) |
+| **copy end** (`acs _cp`) | remote, spawned by `sshd` | one ssh connection | the far end of a copy: the same sender or receiver, paths and wildcards from the `HELLO`, its version directory marked used (ACSCP_DESIGN §8) |
+
+The copy is a second program in the same binary, built since acs-hofu
+(ACSCP_DESIGN §12): it shares the dial, the install, the ssh master and the
+redial with the session, but no session state — `acs _cp` never looks at a
+session directory.
 
 Why keep a separate proxy rather than have the master talk to ssh: the master
 must outlive every ssh connection, and `sshd` must see its channel close when
@@ -3019,7 +3028,7 @@ short (acs-u3qn).
 
 ```text
 src/
-  lib.rs        role dispatch (client | _proxy | _master | _install), --version
+  lib.rs        role dispatch (client | cp | _proxy | _master | _cp | _install), --version
   cli.rs        dsh-compatible arguments, ssh option passthrough
   client.rs     dial, handshake, session loop, detach/exit, messages
   reconnect.rs  liveness, backoff, offline status line, takeover prompt
@@ -3055,6 +3064,19 @@ src/
                 (build.rs and xtask; tests only in the crate)
   signature.rs  the release key, and ssh-keygen -Y over a release's SHA256SUMS
   sys.rs        libc wrappers
+  cp/           the copy role, acscp / acs cp / acs _cp (ACSCP_DESIGN §10.2)
+    mod.rs      entry point, the dial and redial (over_ssh), the parts a
+                mixed copy runs in
+    cli.rs      scp's command line: sources, target, ssh options
+    proto.rs    the copy's messages, their codec, the name checks
+    sender.rs   walk the sources, send headers ahead of their data
+    receiver.rs place files through .<name>.acscp-part, resume, the
+                part's flock
+    walk.rs     the source checks and the directory walk
+    glob.rs     remote wildcards, expanded by acs _cp
+    relay.rs    a copy between two hosts, spliced through this machine
+    remote.rs   acs _cp: the far end's HELLO, paths, version touch
+    progress.rs the progress meter and the end-of-copy summary
 xtask/          cargo xtask dist
 tests/          integration tests (tests/common: fake remote, pty runner)
 scripts/        verify.sh, test_linux.sh, e2e_ssh.sh, source_stamp.sh

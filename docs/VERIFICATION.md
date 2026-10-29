@@ -1,7 +1,8 @@
 # acs — verification
 
 **Status:** Automated end-to-end checks pass (2026-09-24; the installer
-suite, `scripts/test_install.sh`, back from stale on 2026-10-27, acs-t8t);
+suite, `scripts/test_install.sh`, back from stale on 2026-10-27, acs-t8t;
+acscp's over real ssh and across accounts on 2026-10-28, acs-hofu.8);
 the checks that need a person at a real terminal are listed at the end, not
 yet done.
 
@@ -27,9 +28,10 @@ those tests ran.
 - Client: `dist/aarch64-apple-darwin/acs` (complete build from
   `cargo xtask dist`), macOS on Apple silicon.
 - Host: Alpine Linux container (`scripts/e2e/Dockerfile`) running OpenSSH
-  `sshd`, users `dev` and `solo` (the user the system-wide install is
-  checked as, with no acs of its own) accepting only a freshly generated
-  ed25519 key, reached
+  `sshd`, users `dev`, `solo` (the user the system-wide install is
+  checked as, with no acs of its own) and `copier` (first reached by
+  `acscp`, so the copy's own first-contact install is checked) accepting
+  only a freshly generated ed25519 key, reached
   as `acs -F /dev/null -i <key> -p <port> … dev@127.0.0.1` (a free port docker
   picks, or `ACS_E2E_PORT`). The image sets `AllowTcpForwarding yes`, which
   Alpine ships as `no`, so that `-L` can be exercised at all; that is a test
@@ -46,6 +48,11 @@ those tests ran.
 | `-L` forwards a port, and only on the session's ssh | `scripts/e2e_ssh.sh` (`e2e_14`): `acs -L <free port>:127.0.0.1:22 … dev@127.0.0.1 fwd`, the port read with a plain TCP connect, `acs list` given the same `-L` while the session holds the port, then the session's ssh killed to force a redial (2026-09-23) | Pass — the container's sshd banner comes back through the port; the `acs list` side call succeeds and its stderr never names the port, so its ssh never asked to bind it; after the redial a new ssh rebinds the port and the banner comes back |
 | The ssh master acs owns | `scripts/e2e_ssh.sh` (`e2e_15`, acs-9n3): a session, detached, then the same `acs` again; `ssh -O check` on acs's control socket between each step; then the host's `sshd-session` killed to force a redial (2026-09-23) | Pass — the detach leaves one master (`0600` socket in a `0700` directory), the reattach is served by that same pid rather than a second one, and the redial after the kill ends it (`-O check` then fails). Measured: 51 ms to `ACS-READY` cold against 13 ms on the master, over loopback where a handshake costs almost no round trips |
 | The system-wide install alone, over ssh | `scripts/e2e_ssh.sh` (`e2e_16`, acs-1gy): root puts this tree's Linux build at `/usr/local/lib/acs/<version>/acs` (root-owned, `0755` throughout), then `acs solo@127.0.0.1 sys` as a user with no acs under `$HOME`; the container's process list read while attached, and solo's `~/.local/share/acs` and `~/.local/bin` after (2026-10-27) | Pass — attaches with no "installing acs", the proxy runs as `/usr/local/lib/acs/<version>/acs _proxy …`, and solo is left with no copy and no link of its own. Shown red first by making root's binary `0775`, which the prelude refuses: solo then got a first-contact install, and its proxy ran from `/home/solo/.local/share/acs/<version>/acs` |
+| acscp's own first contact | `scripts/e2e_ssh.sh` (`e2e_18`, acs-hofu.8): `acs cp -v hello.txt copier@127.0.0.1:` to an account nothing has reached, with no system-wide install on the host; then `~/.local/bin/acscp` and `~/.local/bin/acs cp` run on the host as copier; then copier's version directory set to 2000 and a download made (2026-10-28) | Pass — "installing acs … installed acs 0.17.0" on the copy's own connection and the file landed; `acscp -> acs` beside the `acs` link, and both names copy on the host; `acs _cp` brought its version directory's mtime to now. Shown red first by accident: run after `e2e_16` left root's copy in `/usr/local/lib/acs`, the first contact attached on that and installed nothing, so `e2e_16` now removes it |
+| acscp `-r -p` round trip | `e2e_19`: a tree of five files (modes 0640/0755/0600/0644/0604, mtimes 2001–2011, an empty file, a 3 MB one, a name with spaces and brackets) up with `acs cp -r -p tree dev@127.0.0.1:`, read back with `stat` on the host, then down with `acs cp -r -p dev@127.0.0.1:tree back` (2026-10-28) | Pass — every mode and mtime as sent on the host; `diff -r` clean; modes and mtimes equal after the round trip |
+| acscp resumes after a killed link | `e2e_20`: a 200 MB file (`ACS_E2E_CP_MB`) uploaded with `-v`; a watcher inside the container kills dev's `sshd-session` once the host's `.big.acscp-part` holds a quarter of it (2026-10-28) | Pass — two runs: killed at 53,018,624 and 54,099,968 bytes, the copy redialled by itself and resumed after 53,051,392 and 54,263,808 bytes (the part, not a resend), sha256 equal, no part left; about 1.4 s for the whole copy over loopback |
+| acscp rides the session's master | `e2e_21`: a session up on acs's master (`ACS_CONTROL_PERSIST=300`), then an upload with `-v` and a download; sshd's own "Accepted publickey" lines counted before and after, `ssh -O check` on the socket (2026-10-28) | Pass — both copies on the session's `ControlPath`, no new login (41 before, 41 after), the same master pid and still one socket, and the session's ticker consecutive throughout |
+| acscp across Unix accounts | `tests/multiuser.rs` under `scripts/test_linux.sh` (acs-hofu.8): alice, with her own per-version install, copies into bob's `0755` directory by upload and by a local copy, and downloads bob's `0600` file; then alice's and bob's version directories and a stale version of alice's set a year back before a copy of alice's (2026-10-28) | Pass — every copy into bob's directory fails "Permission denied" and leaves nothing there, not even a part; the download fails and nothing reaches alice. `acs _cp` touched alice's version directory only — bob's is untouched — and pruned nothing |
 | vim | `vim -u NONE -N`, then `:q` | Pass — alternate screen entered and left, exit status 0, terminal restored |
 | OSC 52 and OSC 8 | program prints a clipboard write and a hyperlink | Pass — both byte-exact at the client |
 | Kitty keyboard protocol | program pushes kitty flags; client sends Ctrl-] Ctrl-] d as `CSI 93;5u` | Pass — detaches; the pushed flags are popped on the way out |
@@ -122,6 +129,13 @@ claimed as verified:
     mid-handshake and rate-limited cases and not a failure. *No line at
     all* across a roam is the failure this check exists for: before
     acs-4i2 it was indistinguishable from a network that did not move.
+- **acscp over a real network** (acs-hofu.15): a 2 GB file over Wi-Fi with
+  the laptop lid closed for about a minute halfway — the copy must redial
+  on wake by itself, resume from the part (`-v`: "resuming after N bytes
+  already there") and land a file whose sha256 matches — and an `scp -r`
+  timing comparison on the same tree to the same host. The container runs
+  above prove the resume after a killed link and the round trip; neither
+  says anything about sleep/wake or how fast a real link is.
 - **A real host that needs `-i`, such as corello.** The container host proves
   `-i` passthrough; connecting to a work host installs acs there, which is
   the owner's call.
