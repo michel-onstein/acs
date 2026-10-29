@@ -90,6 +90,12 @@ acs upgrade --check    # only say whether there is a newer one
 acs upgrade --version 0.2.0   # that release, even an older one
 ```
 
+acs 0.18.0 and older know only `v`-tagged releases: they upgrade to 0.19.0
+(published under `v0.19.0` as well) and on from there. Once 0.20.0 is out,
+one still on 0.18.0 or older runs `acs upgrade --version 0.19.0` first, or
+re-runs the one-line installer ([VERSIONING.md](docs/VERSIONING.md),
+"Tags").
+
 ### Release signatures
 
 A release's `SHA256SUMS` is signed, and both the installer and `acs

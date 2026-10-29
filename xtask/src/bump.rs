@@ -295,7 +295,9 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 fn last_tag(repo: &Path, rev: &str) -> Result<Option<(String, Version)>, String> {
     // Both forms: releases up to 0.18.0 are tagged vX.Y.Z, later ones X.Y.Z
-    // (docs/VERSIONING.md, "Tags"), and Version::parse takes either.
+    // (docs/VERSIONING.md, "Tags"), and Version::parse takes either. 0.19.0
+    // is tagged both ways on one commit; whichever wins the tie, the range
+    // and the version are the same.
     let tags = git(
         repo,
         &["tag", "--list", "v[0-9]*", "[0-9]*", "--merged", rev],

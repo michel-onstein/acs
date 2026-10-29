@@ -204,7 +204,7 @@ fn release_lifecycle() {
     assert_eq!(list.lines().count(), 1, "{list}");
 }
 
-/// The bridge (docs/VERSIONING.md, "Tags"): a history tagged up to
+/// The tag cutoff (docs/VERSIONING.md, "Tags"): a history tagged up to
 /// `v0.18.0` releases `0.19.0` — a bare tag, on a bare release subject —
 /// and the next bump finds that bare tag, not `v0.18.0`, as the last one.
 #[test]
@@ -242,5 +242,38 @@ fn a_bare_tag_follows_a_v_tag_history() {
     let out = bump(&s, &[]);
     assert!(out.contains("0.19.0 → 0.19.1 (patch)"), "{out}");
     assert!(!out.contains("new thing"), "{out}");
+    assert_eq!(remote_tags(&s).last().unwrap(), "0.19.1");
+}
+
+/// 0.19.0 is the real bridge (docs/VERSIONING.md, "Tags"): it is tagged
+/// both `0.19.0` and `v0.19.0` on the same commit, so installed acs up to
+/// 0.18.0 can reach it. Two spellings of one version are one release: the
+/// bump releases nothing new for the second tag, and the next change bumps
+/// from 0.19.0, counting only what landed since that commit.
+#[test]
+fn two_spellings_of_one_version_on_one_commit_are_one_release() {
+    let s = setup("two-spellings");
+    let w = s.work();
+    git(&w, &["tag", "-a", "v0.18.0", "-m", "acs 0.18.0"]);
+    git(&w, &["push", "-q", "origin", "main", "v0.18.0"]);
+    change(&s, "feat: bare tags", "src/lib.rs", 3);
+    let out = bump(&s, &[]);
+    assert!(out.contains("0.18.0 → 0.19.0 (minor)"), "{out}");
+    // The mirror: the same commit, tagged again with a `v`.
+    git(&w, &["fetch", "-q", "--tags", "origin", "main"]);
+    git(
+        &w,
+        &["tag", "-a", "v0.19.0", "-m", "acs 0.19.0", "0.19.0^{}"],
+    );
+    git(&w, &["push", "-q", "origin", "v0.19.0"]);
+    assert_eq!(remote_tags(&s), ["v0.18.0", "0.19.0", "v0.19.0"]);
+
+    let out = bump(&s, &[]);
+    assert!(out.contains("nothing to release"), "{out}");
+
+    change(&s, "fix: after the bridge", "src/lib.rs", 1);
+    let out = bump(&s, &[]);
+    assert!(out.contains("0.19.0 → 0.19.1 (patch)"), "{out}");
+    assert!(!out.contains("bare tags"), "{out}");
     assert_eq!(remote_tags(&s).last().unwrap(), "0.19.1");
 }

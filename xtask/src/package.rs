@@ -344,7 +344,7 @@ mod tests {
         assert!(n.contains("| macOS, Apple silicon | `acs-1.2.3-aarch64-apple-darwin.tar.gz` |"));
         assert!(n.contains("| Linux x86_64 (static) |"));
         assert!(n.contains("releases/download/1.2.3/acs-1.2.3-aarch64-apple-darwin.tar.gz"));
-        // An old release published again keeps its `v` tag (the bridge).
+        // An old release published again keeps its `v` tag.
         let old = notes("0.18.0", &a, "");
         assert!(
             old.contains("releases/download/v0.18.0/acs-1.2.3-aarch64"),

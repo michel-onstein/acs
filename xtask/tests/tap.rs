@@ -358,7 +358,7 @@ fn a_published_release_lands_only_when_signed_by_the_build_key() {
     assert!(s.formula_on_tap().contains("# acs-version: 1.9.0"));
 }
 
-/// The bridge (docs/VERSIONING.md, "Tags"): `v0.18.0` was published with
+/// The tag cutoff (docs/VERSIONING.md, "Tags"): `v0.18.0` was published with
 /// its `v`, from a checkout that already tags bare; retrying its tap update
 /// by that tag still finds its SHA256SUMS and renders a formula that
 /// downloads from `v0.18.0`.

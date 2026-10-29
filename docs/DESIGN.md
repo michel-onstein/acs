@@ -2391,8 +2391,9 @@ latest (or the given) GitHub release (`release.rs`, `upgrade.rs`):
   `…/releases/download/<tag>/`, where the tag is `vX.Y.Z` up to 0.18.0 and
   the bare `X.Y.Z` after it — `release::release_tag`, with the cutoff in
   `release::LAST_V_TAG` and `scripts/install.sh`'s `last_v_tag`
-  (VERSIONING.md, "Tags"): acs up to 0.17.0 knows only the `v` path, so
-  0.18.0 kept it as the release they upgrade through. `ACS_RELEASES_URL`
+  (VERSIONING.md, "Tags"): acs up to 0.18.0 knows only the `v` path, so
+  0.19.0 — the first release that knows both — is published under
+  `v0.19.0` as well, as the release they upgrade through. `ACS_RELEASES_URL`
   points acs and the installer elsewhere (a mirror, the tests' server),
   under two limits (acs-95w): it must be `https`, because the sums travel
   with the payload and so prove only that the server agrees with itself, and
