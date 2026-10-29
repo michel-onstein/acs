@@ -1,8 +1,8 @@
 # acscp — design
 
-**Status:** Built (phases 1–6, PRs #393–#420 and the phase 6 PR, epic
+**Status:** Built (phases 1–6, PRs #393–#423, epic
 acs-hofu); by-hand checks still to do: a 2 GB copy over Wi-Fi with the
-lid closed a minute halfway, and an `scp -r` timing comparison
+lid closed a minute halfway, and an `scp -r` timing comparison, acs-hofu.15
 ([VERIFICATION.md](VERIFICATION.md)). The implementation plan, with what
 landed where, is §12; the decisions are §13, and the ones taken while
 building are DESIGN §12 decisions 13–17.
@@ -987,7 +987,7 @@ phase is built**:
 | 5, relay | acs-hofu.6 | #415 | two-host copies (DESIGN §12 decision 15) |
 | 5, remote wildcards | acs-hofu.7 | #417 | expanded by `acs _cp` (DESIGN §12 decision 16) |
 | mixed sources | acs-hofu.14 | #419 | local and remote sources, several-host downloads (DESIGN §12 decision 17) |
-| 6, end to end and docs | acs-hofu.8 | the phase 6 PR | e2e over ssh, VERIFICATION.md, this status |
+| 6, end to end and docs | acs-hofu.8 | #423 | e2e over ssh, VERIFICATION.md, this status |
 
 The plan as drawn before any of it was built (the budget box is as
 projected; the raise turned out to be to 2.3 MB, and a 100 KB copy budget
