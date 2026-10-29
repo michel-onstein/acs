@@ -300,9 +300,11 @@ pub fn bare(version: &str) -> &str {
 }
 
 /// The last release tagged `vX.Y.Z`; every later one is tagged `X.Y.Z`
-/// (docs/VERSIONING.md, "Tags"). Installed acs up to 0.17.0 only knows the
-/// `download/v<version>/` path, so 0.18.0 kept the `v` as the bridge they
-/// upgrade through; `scripts/install.sh` carries the same cutoff.
+/// (docs/VERSIONING.md, "Tags"). Installed acs up to 0.18.0 only knows the
+/// `download/v<version>/` path: 0.18.0 was tagged before this mapping
+/// existed, so it is not the bridge. 0.19.0 is — published under both
+/// `0.19.0` and `v0.19.0`, so they can upgrade to it. `scripts/install.sh`
+/// carries the same cutoff.
 pub const LAST_V_TAG: &str = "0.18.0";
 
 /// The release tag of `version` (with or without a leading `v`):
@@ -701,9 +703,10 @@ nothexnothexnothexnothexnothexnothexnothexnothexnothexnothexnoth  acs-0.2.0-x86_
         );
     }
 
-    /// The bridge: 0.18.0 is the last `v` tag, because installed acs up to
-    /// 0.17.0 only knows `download/v<version>/`; from 0.19.0 on the tag is
-    /// the bare version. Either spelling of the version maps the same way.
+    /// 0.18.0 is the last release tagged only with a `v`; from 0.19.0 on
+    /// the tag is the bare version (0.19.0 is also mirrored under
+    /// `v0.19.0` for acs up to 0.18.0, which only knows
+    /// `download/v<version>/`). Either spelling maps the same way.
     #[test]
     fn a_version_maps_to_its_release_tag() {
         assert_eq!(LAST_V_TAG, "0.18.0");

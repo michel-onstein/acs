@@ -5,8 +5,9 @@
 `scripts/update-tap.sh` (`cargo xtask formula`). The fork knobs ("Forking")
 are all built: a fork publishes a complete release — binaries, packaged
 installer, Homebrew formula and notes — without editing a tracked source
-file (acs-x57). Release tags are bare from 0.19.0 on, with v0.18.0 the
-bridge ("Tags", acs-aycl).
+file (acs-x57). Release tags are bare from 0.19.0 on; 0.19.0 is also
+published as `v0.19.0`, the bridge for acs up to 0.18.0 ("Tags", acs-aycl,
+acs-yodd).
 
 acs follows semantic versioning, and the version moves after every merge to
 `main` — when whoever landed it runs the bump ("Who runs it"). The version
@@ -22,12 +23,18 @@ From 0.19.0 on a release's tag is the bare version, `0.19.0`; every release
 up to and including 0.18.0 is tagged `v0.18.0` and keeps that tag. The
 switch (acs-aycl, 2026-10-29) went through a **bridge release**:
 
-- Installed acs up to 0.17.0 fetches a named release and every archive from
-  `…/releases/download/v<version>/` (`acs upgrade`; the weekly update check
-  reads only `…/latest/download/SHA256SUMS`). An archive published under a
-  bare tag is unreachable from them by that path.
-- So **v0.18.0 was published with its `v`**: they upgrade to it as to any
-  release, and 0.18.0 knows both forms. From 0.19.0 the bump tags bare.
+- Installed acs up to **0.18.0** fetches a named release and every archive
+  from `…/releases/download/v<version>/` (`acs upgrade`; the weekly update
+  check reads only `…/latest/download/SHA256SUMS`). An archive published
+  under a bare tag is unreachable from them by that path.
+- So **0.19.0 is the bridge**: it is tagged both `0.19.0` and `v0.19.0` on
+  the same commit, and the identical release is published under each
+  (`scripts/release-binaries.sh 0.19.0`, then `… v0.19.0`). Old clients
+  upgrade to `v0.19.0` as to any release, and 0.19.0 knows both forms.
+  From 0.20.0 on there are bare tags only.
+- **Stragglers still on 0.18.0 or older once 0.20.0 ships cannot
+  self-upgrade**: `latest` names 0.20.0, which has no `v` tag. They re-run
+  the one-line installer (README), or `acs upgrade --version 0.19.0` first.
 - Clients map a version to its tag — `vX.Y.Z` up to 0.18.0, `X.Y.Z` after —
   in one place per language: `release::release_tag` with the cutoff
   `release::LAST_V_TAG` (acs and xtask's formula and notes), and
@@ -41,9 +48,30 @@ switch (acs-aycl, 2026-10-29) went through a **bridge release**:
   `scripts/release-changes.sh`'s previous — so 0.19.0's notes list the
   changes since v0.18.0 — and the tags `scripts/version-bump.sh` publishes.
   `git tag --sort=-v:refname` would not do: it compares the `v` as text.
+  Two spellings of one version on one commit are one release:
+  `release-tags.sh` lists the bare one first, `release-changes.sh` takes the
+  previous release to be the next older *version*, so `0.19.0` and
+  `v0.19.0` both list the changes since v0.18.0, and the bump counts from
+  that commit whichever tag it sees.
 - `scripts/release-binaries.sh v0.18.0` and `scripts/update-tap.sh v0.18.0`
   still work from a checkout that tags bare, rendering URLs under
   `v0.18.0`.
+
+### Lesson: a bridge must already contain the client change
+
+The switch was first announced with **v0.18.0 as the bridge**, and that was
+wrong (acs-yodd, 2026-10-29). v0.18.0 had been tagged at `bdf53b0`, before
+the pull request that taught acs bare tags (#425) merged, so the 0.18.0
+binary still knew only `download/v<version>/` — and acs 0.17.0 and 0.18.0
+got a 404 from `acs upgrade` for 0.19.0. It was repaired by publishing
+0.19.0 a second time under `v0.19.0`.
+
+A bridge release is one an old client can reach by the old rule **and**
+that carries the new rule. It must therefore be cut from a commit that
+already contains the client change; tagging an older commit as the bridge
+bridges nothing, because the binary at that tag was built before the change
+existed. Before naming a bridge, check the release's own binary — `git
+merge-base --is-ancestor <change> <tag>` — not just its tag.
 
 ## The rules
 

@@ -23,7 +23,13 @@ tag=${1:-}
 [ -n "$tag" ] || { echo "no release tag to list the changes of" >&2; exit 1; }
 git rev-parse -q --verify "refs/tags/$tag" >/dev/null || { echo "no tag $tag" >&2; exit 1; }
 
-prev=$(scripts/release-tags.sh | grep -A1 -xF "$tag" | sed -n 2p)
+# The next older tag of another version: 0.19.0 and v0.19.0 are one release
+# under two spellings on the same commit, so neither is the other's previous
+# (docs/VERSIONING.md, "Tags").
+prev=$(scripts/release-tags.sh | awk -v t="$tag" '
+    function bare(s) { sub(/^v/, "", s); return s }
+    found && bare($0) != bare(t) { print; exit }
+    $0 == t { found = 1 }')
 range=$tag
 if [ -n "$prev" ]; then
     range="$prev..$tag"

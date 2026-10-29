@@ -297,7 +297,7 @@ mod tests {
         assert!(f.ends_with("  end\nend\n"));
     }
 
-    /// The bridge (docs/VERSIONING.md, "Tags"): 0.18.0 is the last release
+    /// The tag cutoff (docs/VERSIONING.md, "Tags"): 0.18.0 is the last release
     /// tagged `v`, so its formula — rendered again from a later checkout —
     /// downloads from `v0.18.0`, and 0.19.0's from the bare tag.
     #[test]

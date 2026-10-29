@@ -127,9 +127,10 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/acs-install.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 # The tag a release is published under (docs/VERSIONING.md, "Tags"):
-# vX.Y.Z up to $last_v_tag, X.Y.Z after it. Installed acs up to 0.17.0 only
-# knows the download/v<version>/ path, so 0.18.0 kept the v as the bridge
-# they upgrade through; release::LAST_V_TAG in acs is the same cutoff.
+# vX.Y.Z up to $last_v_tag, X.Y.Z after it. Installed acs up to 0.18.0 only
+# knows the download/v<version>/ path (0.18.0 was tagged before this
+# mapping existed), so 0.19.0, the bridge, is published under v0.19.0 too;
+# release::LAST_V_TAG in acs is the same cutoff.
 last_v_tag=0.18.0
 release_tag() { # release_tag X.Y.Z
     old_ifs=$IFS

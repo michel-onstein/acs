@@ -609,7 +609,7 @@ fn run_bump(dir: &Path, root: &Path) -> Vec<String> {
 #[test]
 fn version_bump_only_releases_the_tag_it_made() {
     let dir = TempDir::new();
-    // The bridge: origin has v-tags up to v0.18.0, the bump makes 0.19.0.
+    // The tag switch: origin has v-tags up to v0.18.0, the bump makes 0.19.0.
     let root = bump_checkout(dir.path(), &["v0.17.0"], &["v0.17.0", "v0.18.0"], "0.19.0");
     let log = run_bump(dir.path(), &root);
     let released: Vec<&String> = log
@@ -787,7 +787,7 @@ fn the_installer_and_acs_read_sha256sums_alike() {
     }
 }
 
-/// The bridge (docs/VERSIONING.md, "Tags"): the installer maps a version
+/// The tag cutoff (docs/VERSIONING.md, "Tags"): the installer maps a version
 /// to its release tag — `v` up to 0.18.0, bare after — exactly as
 /// `release::release_tag` does. Run on the script's own function.
 #[test]
@@ -1332,7 +1332,7 @@ fn a_release_of_only_bookkeeping_lists_nothing() {
     assert!(changes(&root, "0.2.0").is_empty());
 }
 
-/// The bridge (docs/VERSIONING.md, "Tags"): the releases up to v0.18.0 are
+/// The tag cutoff (docs/VERSIONING.md, "Tags"): the releases up to v0.18.0 are
 /// v-tagged and 0.19.0 on are not. The previous release is found by version
 /// across both forms, so 0.19.0's notes list what landed since v0.18.0 —
 /// not since some older v-tag, nor everything as a first release — and
@@ -1362,6 +1362,44 @@ fn release_notes_find_the_previous_tag_across_both_forms() {
     assert_eq!(changes(&root, "v0.18.0"), ["- fix: in 0.18"]);
     assert_eq!(changes(&root, "0.19.1"), ["- fix: in 0.19.1"]);
     assert_eq!(changes(&root, ""), ["- fix: in 0.19.1"]);
+}
+
+/// 0.19.0 is the real bridge (docs/VERSIONING.md, "Tags"): it is tagged both
+/// `0.19.0` and `v0.19.0` on the same commit, so installed acs up to 0.18.0
+/// reaches it. `scripts/release-tags.sh` lists the bare one first, every
+/// time; neither spelling is the other's previous release, so both get the
+/// changes since v0.18.0, not an empty list; and 0.20.0's run from 0.19.0.
+#[test]
+fn two_spellings_of_one_version_on_one_commit_are_one_release() {
+    let dir = TempDir::new();
+    let root = notes_checkout(
+        dir.path(),
+        &[
+            "fix: in 0.18",
+            "v0.18.0",
+            "feat: in 0.19",
+            "0.19.0",
+            "v0.19.0",
+            "feat: in 0.20",
+            "0.20.0",
+        ],
+    );
+    let out = Command::new("sh")
+        .arg(root.join("scripts/release-tags.sh"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["0.20.0", "0.19.0", "v0.19.0", "v0.18.0"]
+    );
+    assert_eq!(changes(&root, "0.19.0"), ["- feat: in 0.19"]);
+    assert_eq!(changes(&root, "v0.19.0"), ["- feat: in 0.19"]);
+    assert_eq!(changes(&root, "0.20.0"), ["- feat: in 0.20"]);
 }
 
 /// `scripts/release-tags.sh`: every release tag, newest first by version,
@@ -1396,7 +1434,7 @@ fn release_tags_order_both_forms_as_one_sequence() {
 /// in either form, or with none the newest release by version. It runs
 /// against a `cargo` that fails, so it stops right after naming the tag
 /// and checking it out. `v0.18.0` is published from a checkout that already
-/// tags bare (the bridge), so it must still be taken by name.
+/// tags bare, so it must still be taken by name.
 #[test]
 fn release_binaries_takes_either_tag_form_and_finds_the_latest() {
     let dir = TempDir::new();
