@@ -506,3 +506,157 @@ fn the_home_candidate_takes_the_same_owners_and_no_others() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- the copy across accounts (acs-hofu.8, ACSCP_DESIGN §8, §11) ----------
+
+/// `u`'s own per-version install of this acs, as a first-contact install
+/// leaves it: `~/.local/share/acs/<version>/acs`, theirs, `0755`, in
+/// directories of theirs. The version directory is returned.
+fn install_for(u: &User) -> PathBuf {
+    let share = u.home.join(".local/share");
+    let dir = share.join(format!("acs/{}", acs::VERSION));
+    let _ = std::fs::remove_dir_all(share.join("acs"));
+    std::fs::create_dir_all(&dir).unwrap();
+    common::copy_out_of_process(&exe(), &dir.join("acs"));
+    for p in [
+        u.home.join(".local"),
+        share.clone(),
+        share.join("acs"),
+        dir.clone(),
+        dir.join("acs"),
+    ] {
+        std::os::unix::fs::chown(&p, Some(u.uid), Some(u.gid)).unwrap();
+        set_mode(&p, 0o755);
+    }
+    dir
+}
+
+/// A file of `u`'s at `path`.
+fn own_file(u: &User, path: &Path, body: &str, mode: u32) {
+    plant(path, body, u.uid, mode);
+    std::os::unix::fs::chown(path, Some(u.uid), Some(u.gid)).unwrap();
+}
+
+/// `acs cp` run as `u`, whose "ssh" runs the remote command right here as
+/// `u` — the prelude, then `u`'s own `acs _cp` — so both ends of the copy
+/// are that account, as over a real login.
+fn cp_as(u: &User, args: &[&str]) -> (bool, String) {
+    let transport = PathBuf::from("/tmp/acs-cp-transport.sh");
+    if !transport.exists() {
+        plant(&transport, "#!/bin/sh\nexec /bin/sh -c \"$1\"\n", 0, 0o755);
+    }
+    let out = client_as(u)
+        .arg("cp")
+        .arg("-q")
+        .arg("--transport-cmd")
+        .arg(&transport)
+        .args(args)
+        .env("ACS_CONTROL_PERSIST", "0")
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn mtime(p: &Path) -> std::time::SystemTime {
+    std::fs::metadata(p).unwrap().modified().unwrap()
+}
+
+/// A copy runs as the account that logged in, so the far end's own file
+/// permissions decide, as for `scp`: alice cannot write into bob's
+/// directory, by upload or by a local copy, nor read his file by download —
+/// and nothing of hers, not even a part, is left in his directory.
+#[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
+fn a_copy_into_another_users_directory_fails() {
+    require();
+    let (alice, bob) = (user("alice"), user("bob"));
+    install_for(&alice);
+    let inbox = bob.home.join("inbox");
+    reset(&inbox);
+    std::fs::create_dir(&inbox).unwrap();
+    std::os::unix::fs::chown(&inbox, Some(bob.uid), Some(bob.gid)).unwrap();
+    set_mode(&inbox, 0o755);
+    let secret = bob.home.join("secret");
+    own_file(&bob, &secret, "bob's\n", 0o600);
+    own_file(&alice, &alice.home.join("note"), "alice's\n", 0o644);
+
+    // Her own home works: the harness itself is sound.
+    let (ok, err) = cp_as(&alice, &["note", "devbox:copied"]);
+    assert!(ok, "alice could not copy into her own home: {err}");
+    assert_eq!(
+        std::fs::read_to_string(alice.home.join("copied")).unwrap(),
+        "alice's\n"
+    );
+    let _ = std::fs::remove_file(alice.home.join("copied"));
+
+    let into = format!("devbox:{}/", inbox.display());
+    let (ok, err) = cp_as(&alice, &["note", &into]);
+    assert!(!ok, "alice wrote into bob's directory: {err}");
+    assert!(err.contains("ermission denied"), "{err}");
+    let (ok, err) = cp_as(&alice, &["note", &format!("{}/", inbox.display())]);
+    assert!(!ok, "a local copy wrote into bob's directory: {err}");
+    assert!(err.contains("ermission denied"), "{err}");
+    let left: Vec<_> = std::fs::read_dir(&inbox).unwrap().collect();
+    assert!(left.is_empty(), "left in bob's directory: {left:?}");
+
+    let (ok, err) = cp_as(&alice, &[&format!("devbox:{}", secret.display()), "got"]);
+    assert!(!ok, "alice read bob's 0600 file: {err}");
+    assert!(!alice.home.join("got").exists(), "bob's file reached alice");
+
+    reset(&inbox);
+    let _ = std::fs::remove_file(&secret);
+    let _ = std::fs::remove_file(alice.home.join("note"));
+    let _ = std::fs::remove_dir_all(alice.home.join(".local"));
+}
+
+/// `acs _cp` runs from its user's own per-version install and marks that
+/// version used (ACSCP_DESIGN §8), as the proxy does, so a host used only
+/// for copies does not have the version it copies with pruned under it. It
+/// touches only its own account's version directory — never bob's copy of
+/// the same version — and prunes nothing, not even a version long unused.
+#[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
+fn a_copy_runs_its_users_own_version_and_marks_only_that_one_used() {
+    use std::os::unix::fs::MetadataExt;
+    require();
+    let (alice, bob) = (user("alice"), user("bob"));
+    let mine = install_for(&alice);
+    let theirs = install_for(&bob);
+    let stale = mine.parent().unwrap().join("0.0.1-old");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::os::unix::fs::chown(&stale, Some(alice.uid), Some(alice.gid)).unwrap();
+    // A year ago: well past the 30 days a prune would take it at.
+    let long_ago = acs::sys::unix_now() - 365 * 86_400;
+    for d in [&mine, &theirs, &stale] {
+        acs::sys::set_mtime(d, long_ago).unwrap();
+    }
+    let before = mtime(&theirs);
+    own_file(&alice, &alice.home.join("note"), "alice's\n", 0o644);
+
+    let (ok, err) = cp_as(&alice, &["note", "devbox:copied"]);
+    assert!(ok, "{err}");
+    let age = std::time::SystemTime::now()
+        .duration_since(mtime(&mine))
+        .unwrap_or_default();
+    assert!(
+        age < Duration::from_secs(600),
+        "alice's version directory was not touched: {age:?} old"
+    );
+    assert_eq!(
+        mtime(&theirs),
+        before,
+        "bob's version directory was touched"
+    );
+    assert!(stale.is_dir(), "acs _cp pruned a version");
+    // The copy ran alice's binary as alice: what it wrote is hers.
+    let meta = std::fs::metadata(alice.home.join("copied")).unwrap();
+    assert_eq!(meta.uid(), alice.uid);
+
+    let _ = std::fs::remove_dir_all(alice.home.join(".local"));
+    let _ = std::fs::remove_dir_all(bob.home.join(".local"));
+    let _ = std::fs::remove_file(alice.home.join("note"));
+    let _ = std::fs::remove_file(alice.home.join("copied"));
+}

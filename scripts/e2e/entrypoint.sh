@@ -1,7 +1,7 @@
 #!/bin/sh
-# Install the key from $AUTHORIZED_KEY for `dev` and `solo`, then run sshd.
+# Install the key from $AUTHORIZED_KEY for `dev`, `solo` and `copier`, then run sshd.
 set -eu
-for u in dev solo; do
+for u in dev solo copier; do
     mkdir -p "/home/$u/.ssh"
     printf '%s\n' "$AUTHORIZED_KEY" > "/home/$u/.ssh/authorized_keys"
     chown -R "$u:$u" "/home/$u/.ssh"
