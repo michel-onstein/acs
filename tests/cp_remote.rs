@@ -826,11 +826,8 @@ fn a_lost_link_ends_a_copy_between_two_hosts() {
     assert_eq!((one.connections(), two.connections()), (1, 1));
     assert!(!two.home().join("big").exists());
     let part = two.home().join(".big.acscp-part");
-    assert!(
-        weighed(&part) > CUT / 2,
-        "the part holds {}",
-        weighed(&part)
-    );
+    let held = weighed(&part);
+    assert!(held > CUT / 2 && held <= CUT, "the part holds {held}");
 
     // The second run carries to the target host only what its part lacks.
     let carried = w.path().join("carried");
@@ -849,7 +846,10 @@ fn a_lost_link_ends_a_copy_between_two_hosts() {
     assert_eq!(status, 0, "{err}");
     assert!(std::fs::read(two.home().join("big")).unwrap() == big);
     assert!(!part.exists());
-    carried_once(weighed(&carried), size);
+    // Bounded on what the part held, not on `CUT`: the cut is on the source
+    // host's link, and what was in flight past it — in the relay's queue and
+    // the pipes — was lost with it, so the part can hold well under `CUT`.
+    carried_once(held, weighed(&carried), size);
 }
 
 /// A transport in front of `remote`'s, written in `dir`: the first
@@ -952,16 +952,21 @@ fn a_download_cut_mid_file_resumes_from_its_part() {
     assert!(err.contains("out: resuming from the "), "{err}");
     assert!(std::fs::read(cp.local().join("out")).unwrap() == big);
     assert!(!cp.local().join(".out.acscp-part").exists());
-    carried_once(weighed(&second), size);
+    carried_once(CUT, weighed(&second), size);
 }
 
-/// What the second connection carried of a `size`-byte file whose first
-/// carried [`CUT`] bytes: only the rest, so about the file once between
-/// them. Without the part it would be all of the file again.
-fn carried_once(second: usize, size: usize) {
-    let what = format!("the second connection carried {second} bytes of {size}, cut at {CUT}");
-    assert!(second > 0 && second < size - CUT / 2, "{what}");
-    assert!(CUT + second < size + 128 * 1024, "{what}");
+/// What the second connection carried of a `size`-byte file whose part
+/// held `had` bytes after the first: only the rest, so about the file once
+/// between them. Without the part it would be all of the file again. Where
+/// the cut is on the link into the part's host, all of [`CUT`] reaches the
+/// part and `had` is `CUT`; where it is a hop further back it is the part's
+/// own weight.
+fn carried_once(had: usize, second: usize, size: usize) {
+    let what = format!(
+        "the second connection carried {second} bytes of {size}, the part held {had} (cut at {CUT})"
+    );
+    assert!(second > 0 && second < size - had / 2, "{what}");
+    assert!(had + second < size + 128 * 1024, "{what}");
 }
 
 /// The same for an upload, the cut on the way to the host: the host's
@@ -994,7 +999,7 @@ fn an_upload_cut_mid_file_resumes_from_its_part() {
     assert!(err.contains("big: resuming after "), "{err}");
     assert!(std::fs::read(remote.home().join("big")).unwrap() == big);
     assert!(!remote.home().join(".big.acscp-part").exists());
-    carried_once(weighed(&second), size);
+    carried_once(CUT, weighed(&second), size);
 }
 
 /// A part that is not the start of the file it is named for — another
