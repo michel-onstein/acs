@@ -202,3 +202,35 @@ fn waiting_twice_for_the_same_text_needs_it_twice() {
         t0.elapsed()
     );
 }
+
+/// acs-41td: a fake ssh waiting on its call log's lock gives up once the
+/// log's directory is gone, rather than retrying the `mkdir` forever — four
+/// orphaned this way ran for days at ~8% CPU each.
+#[test]
+fn a_call_log_wait_ends_when_its_directory_goes() {
+    let tmp = acs::testutil::TempDir::new();
+    let logs = tmp.path().join("logs");
+    std::fs::create_dir(&logs).unwrap();
+    let log = logs.join("calls");
+    // Held, so the script waits for it.
+    std::fs::create_dir(log.with_extension("lock")).unwrap();
+    let script = tmp.path().join("fake");
+    write_executable(&script, format!("#!/bin/sh\n{}", log_call_sh(&log)));
+    let mut child = KillOnDrop(Command::new(&script).arg("x").spawn().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "ended with the lock held"
+    );
+    std::fs::remove_dir_all(&logs).unwrap();
+    let mut status = None;
+    acs::testutil::wait_until(
+        T,
+        || {
+            status = child.try_wait().unwrap();
+            status.is_some()
+        },
+        || "the fake to give up",
+    );
+    assert_eq!(status.unwrap().code(), Some(255));
+}

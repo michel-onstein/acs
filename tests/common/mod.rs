@@ -311,13 +311,20 @@ impl NetWatch {
 /// `" -- "` to read the destination — fails on a fragment that has no
 /// destination in it. `mkdir` is atomic on every filesystem here, so it is
 /// the lock.
+///
+/// **The wait gives up once the log's directory is gone** (acs-41td). A
+/// fake still running when its test's [`TempDir`] is removed — the test
+/// panicked, or its harness was killed mid-suite — would otherwise retry a
+/// `mkdir` under a parent that no longer exists, every 10 ms, forever:
+/// orphaned to launchd, four of them ran for days at ~8% CPU each.
 pub fn log_call_sh(log: &Path) -> String {
     format!(
-        "until mkdir '{lock}' 2>/dev/null; do sleep 0.01; done\n\
+        "until mkdir '{lock}' 2>/dev/null; do [ -d '{dir}' ] || exit 255; sleep 0.01; done\n\
          printf '%s\\n' \"$*\" >> '{log}'\n\
          rmdir '{lock}'\n",
         log = log.display(),
         lock = log.with_extension("lock").display(),
+        dir = log.parent().expect("a log inside a directory").display(),
     )
 }
 

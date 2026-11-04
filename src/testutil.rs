@@ -35,8 +35,61 @@ impl Drop for TempDir {
         // A session's master outlives its test otherwise: end every session
         // whose socket lives here before the directory goes.
         end_sessions_under(&self.path);
+        kill_processes_under(&self.path);
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// SIGTERM every process whose command line names a path inside `root` —
+/// a fake `ssh` or transport script run from it, say (acs-41td). Those are
+/// started by the acs under test, not by the test, so no [`KillOnDrop`]
+/// holds them; once the directory is removed they would run on, orphaned,
+/// with nothing left to end them. The trailing `/` keeps a sibling whose
+/// name merely starts with this one out of it.
+///
+/// Matched here rather than by `pkill -f`: `pkill` cannot list processes
+/// under the macOS sandbox agents run in, and it would fail silently.
+pub fn kill_processes_under(root: &Path) {
+    let needle = format!("{}/", root.display());
+    let me = std::process::id();
+    for (pid, args) in command_lines() {
+        if pid != me && args.contains(&needle) {
+            let _ = crate::sys::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+}
+
+/// Every process's pid and command line: from `/proc` on Linux, so the
+/// Alpine test container needs no particular `ps`; from `ps` elsewhere.
+fn command_lines() -> Vec<(u32, String)> {
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        let found: Vec<(u32, String)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+                let raw = std::fs::read(e.path().join("cmdline")).ok()?;
+                Some((pid, String::from_utf8_lossy(&raw).replace('\0', " ")))
+            })
+            .collect();
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,args="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (pid, args) = l.trim_start().split_once(' ')?;
+            Some((pid.parse().ok()?, args.to_string()))
+        })
+        .collect()
 }
 
 /// A child process killed and reaped when dropped, so a test that panics
@@ -639,6 +692,42 @@ mod tests {
         assert!(msg.starts_with("after 100ms: the moon, after "), "{msg}");
         assert!(looks.get() > 1, "looked {} times", looks.get());
         assert!(msg.ends_with(&format!("{} looks", looks.get())), "{msg}");
+    }
+
+    /// acs-41td: dropping a TempDir ends a script still running from it,
+    /// though nothing in the test holds the process — and leaves a process
+    /// from a sibling directory, whose name extends this one's, alone.
+    #[test]
+    fn dropping_a_temp_dir_ends_the_scripts_running_from_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let spin = |dir: &std::path::Path| {
+            let script = dir.join("ssh");
+            std::fs::write(&script, "while :; do sleep 0.01; done\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            KillOnDrop(
+                std::process::Command::new("/bin/sh")
+                    .arg(&script)
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let dir = super::TempDir::new();
+        let sibling = std::path::PathBuf::from(format!("{}0", dir.path().display()));
+        std::fs::create_dir(&sibling).unwrap();
+        let mut doomed = spin(dir.path());
+        let mut spared = spin(&sibling);
+        drop(dir);
+        super::wait_until(
+            super::T,
+            || doomed.try_wait().unwrap().is_some(),
+            || "the script in the dropped dir to end",
+        );
+        assert!(
+            spared.try_wait().unwrap().is_none(),
+            "sibling's script ended"
+        );
+        drop(spared);
+        let _ = std::fs::remove_dir_all(&sibling);
     }
 
     /// A child the test already waited for is left alone by the guard.
