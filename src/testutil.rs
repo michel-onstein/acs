@@ -35,8 +35,105 @@ impl Drop for TempDir {
         // A session's master outlives its test otherwise: end every session
         // whose socket lives here before the directory goes.
         end_sessions_under(&self.path);
+        kill_processes_under(&self.path);
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// SIGTERM every process whose command line names a path inside `root` —
+/// a fake `ssh` or transport script run from it, say (acs-41td). Those are
+/// started by the acs under test, not by the test, so no [`KillOnDrop`]
+/// holds them; once the directory is removed they would run on, orphaned,
+/// with nothing left to end them. The trailing `/` keeps a sibling whose
+/// name merely starts with this one out of it.
+///
+/// **The process table is read in this process; nothing is spawned.** A
+/// child forked from a test binary shares, until its `exec`, every open
+/// file the test holds — a `flock`ed part included — so a lock a test has
+/// just let go stays held a moment longer, and the next copy sees it taken.
+/// Running `ps` from here broke `cp::receiver`'s part-lock tests on every
+/// run; `pkill` broke them too, and cannot list processes at all under the
+/// macOS sandbox agents run in.
+pub fn kill_processes_under(root: &Path) {
+    let needle = format!("{}/", root.display());
+    let me = std::process::id();
+    for (pid, args) in command_lines() {
+        if pid != me && args.contains(&needle) {
+            let _ = crate::sys::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+}
+
+/// Every process's pid and arguments, joined by spaces, from `/proc`.
+#[cfg(not(target_os = "macos"))]
+fn command_lines() -> Vec<(u32, String)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let raw = std::fs::read(e.path().join("cmdline")).ok()?;
+            Some((pid, String::from_utf8_lossy(&raw).replace('\0', " ")))
+        })
+        .collect()
+}
+
+/// Every process's pid and arguments, joined by spaces, the way `ps` reads
+/// them: `proc_listallpids`, then `sysctl(KERN_PROCARGS2)` per pid.
+#[cfg(target_os = "macos")]
+fn command_lines() -> Vec<(u32, String)> {
+    // SAFETY: a null buffer asks for the count alone.
+    let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    // Room for processes started since the count.
+    let mut pids = vec![0 as libc::pid_t; n as usize + 64];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: `pids` holds `bytes` bytes.
+    let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    pids.truncate(n.max(0) as usize);
+    pids.into_iter()
+        .filter(|&p| p > 0)
+        .filter_map(|p| Some((p as u32, procargs(p)?)))
+        .collect()
+}
+
+/// A process's arguments from `KERN_PROCARGS2`: an `int` argc, the exec
+/// path and its NUL padding, then argc NUL-terminated arguments (and the
+/// environment after them, which is left out).
+#[cfg(target_os = "macos")]
+fn procargs(pid: libc::pid_t) -> Option<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut len = buf.len();
+    // SAFETY: `buf` holds `len` bytes; the kernel writes at most that.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 || len < 4 {
+        return None;
+    }
+    let buf = &buf[..len];
+    let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?).max(0) as usize;
+    let rest = &buf[4..];
+    let path_end = rest.iter().position(|&b| b == 0)?;
+    let args_start = path_end + rest[path_end..].iter().position(|&b| b != 0)?;
+    let args: Vec<_> = rest[args_start..]
+        .split(|&b| b == 0)
+        .take(argc)
+        .map(String::from_utf8_lossy)
+        .collect();
+    Some(args.join(" "))
 }
 
 /// A child process killed and reaped when dropped, so a test that panics
@@ -639,6 +736,56 @@ mod tests {
         assert!(msg.starts_with("after 100ms: the moon, after "), "{msg}");
         assert!(looks.get() > 1, "looked {} times", looks.get());
         assert!(msg.ends_with(&format!("{} looks", looks.get())), "{msg}");
+    }
+
+    /// acs-41td: dropping a TempDir ends a script still running from it,
+    /// though nothing in the test holds the process — and leaves a process
+    /// from a sibling directory, whose name extends this one's, alone.
+    #[test]
+    fn dropping_a_temp_dir_ends_the_scripts_running_from_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let spin = |dir: &std::path::Path| {
+            let script = dir.join("ssh");
+            let up = dir.join("up");
+            std::fs::write(
+                &script,
+                format!(": > '{}'\nwhile :; do sleep 0.01; done\n", up.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            KillOnDrop(
+                std::process::Command::new("/bin/sh")
+                    .arg(&script)
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let dir = super::TempDir::new();
+        let sibling = std::path::PathBuf::from(format!("{}0", dir.path().display()));
+        std::fs::create_dir(&sibling).unwrap();
+        let mut doomed = spin(dir.path());
+        let mut spared = spin(&sibling);
+        // Running the script, not still the fork that is about to: until its
+        // exec a child's arguments are this test binary's.
+        for d in [dir.path(), sibling.as_path()] {
+            super::wait_until(
+                super::T,
+                || d.join("up").exists(),
+                || format!("{} to start", d.display()),
+            );
+        }
+        drop(dir);
+        super::wait_until(
+            super::T,
+            || doomed.try_wait().unwrap().is_some(),
+            || "the script in the dropped dir to end",
+        );
+        assert!(
+            spared.try_wait().unwrap().is_none(),
+            "sibling's script ended"
+        );
+        drop(spared);
+        let _ = std::fs::remove_dir_all(&sibling);
     }
 
     /// A child the test already waited for is left alone by the guard.
