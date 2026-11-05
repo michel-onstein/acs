@@ -2,7 +2,9 @@
 
 **Status:** Automated end-to-end checks pass (2026-09-24; the installer
 suite, `scripts/test_install.sh`, back from stale on 2026-10-27, acs-t8t;
-acscp's over real ssh and across accounts on 2026-10-28, acs-hofu.8);
+acscp's over real ssh and across accounts on 2026-10-28, acs-hofu.8;
+acscp's by-hand checks, a closed lid and an `scp -r` timing, on 2026-11-05,
+acs-hofu.15);
 the checks that need a person at a real terminal are listed at the end, not
 yet done.
 
@@ -53,6 +55,8 @@ those tests ran.
 | acscp resumes after a killed link | `e2e_20`: a 200 MB file (`ACS_E2E_CP_MB`) uploaded with `-v`; a watcher inside the container kills dev's `sshd-session` once the host's `.big.acscp-part` holds a quarter of it (2026-10-28) | Pass — two runs: killed at 53,018,624 and 54,099,968 bytes, the copy redialled by itself and resumed after 53,051,392 and 54,263,808 bytes (the part, not a resend), sha256 equal, no part left; about 1.4 s for the whole copy over loopback |
 | acscp rides the session's master | `e2e_21`: a session up on acs's master (`ACS_CONTROL_PERSIST=300`), then an upload with `-v` and a download; sshd's own "Accepted publickey" lines counted before and after, `ssh -O check` on the socket (2026-10-28) | Pass — both copies on the session's `ControlPath`, no new login (41 before, 41 after), the same master pid and still one socket, and the session's ticker consecutive throughout |
 | acscp across Unix accounts | `tests/multiuser.rs` under `scripts/test_linux.sh` (acs-hofu.8): alice, with her own per-version install, copies into bob's `0755` directory by upload and by a local copy, and downloads bob's `0600` file; then alice's and bob's version directories and a stale version of alice's set a year back before a copy of alice's (2026-10-28) | Pass — every copy into bob's directory fails "Permission denied" and leaves nothing there, not even a part; the download fails and nothing reaches alice. `acs _cp` touched alice's version directory only — bob's is untouched — and pruned nothing |
+| acscp through a closed lid, by hand | acscp 0.19.1 on macOS arm64 over Wi-Fi to tolot (Ubuntu, OpenSSH 8.9p1): `acscp -v big tolot:acscp-big`, `big` 2 GiB of random bytes, the lid closed for about a minute at 57%, no external display (2026-11-05, acs-hofu.15) | Pass — on wake "no answer from the far end — reconnecting now", the redial ready in 1.3 s, then "resuming after 1233846272 bytes already there" (the meter stood at 57%, 1.1 GB); "1 written, 0 failed, 2.0GB in 608.7s", sha256 equal on both ends, exactly 2147483648 bytes, no part left. The dead-link timer found the lost link: the network watcher's `PF_ROUTE` hints across the sleep all read "still on" the same addresses, rightly not a change, since the Mac woke on the same network |
+| acscp `-r` against `scp -r`, by hand | the same Mac, Wi-Fi and host (local OpenSSH 10.5p1): a tree of 2,000 files of 4 KiB and three of 100 MiB (2,003 files, 308 MB), copied with `scp -q -r` and `acscp -q -r` alternately, three runs each, the target removed before every run (2026-11-05, acs-hofu.15) | Pass — `scp -r` 578.1, 502.7 and 502.1 s; `acscp -r` 81.7, 69.4 and 72.3 s. Medians 502.7 s against 72.3 s, about 7× faster, every run complete and exit 0. That the gap is `scp`'s per-file round trips (SFTP by default since OpenSSH 9.0) against acscp's headers sent ahead of their data is the likely reading, not one measured |
 | vim | `vim -u NONE -N`, then `:q` | Pass — alternate screen entered and left, exit status 0, terminal restored |
 | OSC 52 and OSC 8 | program prints a clipboard write and a hyperlink | Pass — both byte-exact at the client |
 | Kitty keyboard protocol | program pushes kitty flags; client sends Ctrl-] Ctrl-] d as `CSI 93;5u` | Pass — detaches; the pushed flags are popped on the way out |
@@ -129,13 +133,6 @@ claimed as verified:
     mid-handshake and rate-limited cases and not a failure. *No line at
     all* across a roam is the failure this check exists for: before
     acs-4i2 it was indistinguishable from a network that did not move.
-- **acscp over a real network** (acs-hofu.15): a 2 GB file over Wi-Fi with
-  the laptop lid closed for about a minute halfway — the copy must redial
-  on wake by itself, resume from the part (`-v`: "resuming after N bytes
-  already there") and land a file whose sha256 matches — and an `scp -r`
-  timing comparison on the same tree to the same host. The container runs
-  above prove the resume after a killed link and the round trip; neither
-  says anything about sleep/wake or how fast a real link is.
 - **A real host that needs `-i`, such as corello.** The container host proves
   `-i` passthrough; connecting to a work host installs acs there, which is
   the owner's call.

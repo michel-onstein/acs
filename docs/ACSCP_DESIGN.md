@@ -1,8 +1,9 @@
 # acscp — design
 
-**Status:** Built (phases 1–6, PRs #393–#423, epic
-acs-hofu); by-hand checks still to do: a 2 GB copy over Wi-Fi with the
-lid closed a minute halfway, and an `scp -r` timing comparison, acs-hofu.15
+**Status:** Built and verified (phases 1–6, PRs #393–#423, epic
+acs-hofu). The by-hand checks passed on 2026-11-05 (acs-hofu.15): a 2 GiB
+copy over Wi-Fi resumed after a minute with the lid closed, and `acscp -r`
+ran about 7× faster than `scp -r` on the same tree
 ([VERIFICATION.md](VERIFICATION.md)). The implementation plan, with what
 landed where, is §12; the decisions are §13, and the ones taken while
 building are DESIGN §12 decisions 13–17.
@@ -964,7 +965,8 @@ gzip'd, in both Linux payloads.
   never made beside an `acs` that is not ours.
 - **By hand**: a 2 GB copy over Wi-Fi with the laptop lid closed for a
   minute halfway, and `scp`'s `-r` of the same tree for a timing
-  comparison, recorded in [VERIFICATION.md](VERIFICATION.md).
+  comparison, recorded in [VERIFICATION.md](VERIFICATION.md). Both passed
+  on 2026-11-05 (acs-hofu.15).
 
 ## 12. Implementation plan
 
