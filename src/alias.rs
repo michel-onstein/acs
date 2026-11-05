@@ -658,7 +658,7 @@ fn run_ping(prog: &OsStr, args: &[&str], deadline: Duration) -> Option<i32> {
 /// Run `c` for at most `deadline`: its exit code and what it wrote to its
 /// stdout when that is piped, or `None` when it had to be killed at the
 /// deadline or could not be run.
-fn run_until(mut c: Command, deadline: Duration) -> Option<(i32, Vec<u8>)> {
+pub(crate) fn run_until(mut c: Command, deadline: Duration) -> Option<(i32, Vec<u8>)> {
     c.stdin(Stdio::null()).stderr(Stdio::null());
     // Spawned apart from waited for: several threads ping at once.
     let Ok(mut child) = crate::sys::spawn(&mut c) else {
@@ -704,19 +704,27 @@ enum Target {
 /// The [`Target`] in `ssh -G` output: its `hostname` and `port`, unless a
 /// `proxyjump` or `proxycommand` other than `none` is set.
 fn target(out: &str) -> Option<Target> {
-    let (mut host, mut port, mut proxied) = (None, None, false);
+    if proxied(out) {
+        return Some(Target::Proxied);
+    }
+    let (mut host, mut port) = (None, None);
     for line in out.lines() {
         match line.split_once(' ') {
             Some(("hostname", v)) => host = Some(v.trim()),
             Some(("port", v)) => port = v.trim().parse().ok(),
-            Some(("proxyjump" | "proxycommand", v)) if v.trim() != "none" => proxied = true,
             _ => {}
         }
     }
-    match proxied {
-        true => Some(Target::Proxied),
-        false => Some(Target::Direct(host?.to_string(), port?)),
-    }
+    Some(Target::Direct(host?.to_string(), port?))
+}
+
+/// Whether `ssh -G` output sets a `proxyjump` or `proxycommand` other than
+/// `none`: ssh reaches the host through another one (acs-7sti).
+pub(crate) fn proxied(out: &str) -> bool {
+    out.lines().any(|line| {
+        matches!(line.split_once(' '),
+            Some(("proxyjump" | "proxycommand", v)) if v.trim() != "none")
+    })
 }
 
 /// Check `host` by connecting to the port ssh dials for `dest` (`ssh -G`,

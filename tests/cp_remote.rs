@@ -537,7 +537,9 @@ fn a_download_from_two_hosts_lands_here() {
 }
 
 /// A fake `ssh`, written in `dir`, that runs each destination's transport
-/// (`Remote::transport`, or [`hostile`]) and refuses any other.
+/// (`Remote::transport`, or [`hostile`]) and refuses any other. Its
+/// `ssh -G` names no proxy, and starts no transport: every session dial
+/// asks it first (acs-7sti).
 fn router(dir: &Path, hosts: &[(&str, &str)]) -> String {
     let mut cases = String::new();
     for (dest, transport) in hosts {
@@ -548,6 +550,7 @@ fn router(dir: &Path, hosts: &[(&str, &str)]) -> String {
         &path,
         format!(
             "#!/bin/sh\n\
+             [ \"$1\" = -G ] && exit 0\n\
              while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
              dest=$2\nshift 2\n\
              case \"$dest\" in\n{cases}esac\n\

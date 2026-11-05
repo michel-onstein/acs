@@ -1037,7 +1037,11 @@ fn dial_once(
 ) -> io::Result<(Link, Marker)> {
     let Watch { netwatch, mut keys } = w;
     let deadline = Instant::now() + timeout;
-    let mut cmd = conn.transport.command(call, remote);
+    // Asked on every dial, not once: through a proxy the session goes
+    // without ssh's ConnectTimeout, and an alias may have moved the
+    // destination since the last one (acs-7sti, DESIGN §3).
+    let transport = conn.transport.for_dial(call);
+    let mut cmd = transport.command(call, remote);
     if let Some(k) = keys.as_deref_mut() {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
@@ -1047,7 +1051,7 @@ fn dial_once(
         note_max(
             &format!(
                 "running {}",
-                ssh::display_argv(&conn.transport.argv(call, remote))
+                ssh::display_argv(&transport.argv(call, remote))
             ),
             16 * crate::safe::MAX_FIELD,
         );
@@ -1056,7 +1060,7 @@ fn dial_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     let mut child = sys::spawn(&mut cmd).map_err(|e| {
-        let argv = conn.transport.argv(call, remote);
+        let argv = transport.argv(call, remote);
         io::Error::new(
             e.kind(),
             format!("cannot run {}: {e}", argv[0].to_string_lossy()),

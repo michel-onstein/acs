@@ -411,12 +411,22 @@ impl Ssh {
         write_executable(
             &s.path(),
             format!(
-                "#!/bin/sh\n{log}\
-                 while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+                "#!/bin/sh\n\
+                 if [ \"$1\" = -G ]; then\n\
+                 [ -f '{jump}' ] && echo 'proxyjump bastion' || echo 'proxyjump none'\n\
+                 exit 0\nfi\n\
+                 {log}\
+                 timeout=no\n\
+                 while [ $# -gt 0 ] && [ \"$1\" != -- ]; do\n\
+                 [ \"$1\" = ConnectTimeout=10 ] && timeout=yes\nshift\ndone\n\
                  dest=$2\nshift 2\n\
+                 if [ -f '{jump}' ] && [ $timeout = yes ]; then\n\
+                 echo 'Connection timed out during banner exchange' >&2\n\
+                 echo 'Connection to UNKNOWN port 65535 timed out' >&2\nexit 255\nfi\n\
                  case \"$dest\" in\n{cases}esac\n\
                  echo \"ssh: connect to host $dest port 22: Connection refused\" >&2\nexit 255\n",
                 log = log_call_sh(&s.log()),
+                jump = s.jump_file().display(),
             ),
         );
         s
@@ -428,6 +438,20 @@ impl Ssh {
 
     fn log(&self) -> PathBuf {
         self.dir.path().join("calls")
+    }
+
+    fn jump_file(&self) -> PathBuf {
+        self.dir.path().join("jump")
+    }
+
+    /// From now on every host is behind a `ProxyJump` whose login takes
+    /// longer than 10 s, as a person typing the jump host's password does
+    /// (acs-7sti): `ssh -G` names a `proxyjump`, and a call carrying
+    /// `ConnectTimeout=10` fails as OpenSSH does once the banner it is
+    /// waiting for misses that timeout. Modelled rather than waited out,
+    /// so the test costs no 10 s.
+    pub fn behind_slow_jump_host(&self) {
+        std::fs::write(self.jump_file(), "").unwrap();
     }
 
     /// The arguments of every call so far.
