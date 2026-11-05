@@ -1049,6 +1049,27 @@ sequenceDiagram
   - When the dial ends, however it ends, the terminal is taken back for
     acs's group and left cooked until the `WELCOME`, as a cooked dial
     leaves it (§5.2).
+  - **The prompt runs without the program's input modes** (acs-9t7p). The
+    hand-off restores the cooked termios, but the terminal's own modes are
+    still the remote program's — zsh's bracketed paste among them, so a
+    passphrase pasted at ssh's prompt arrived inside the paste markers and
+    was refused. So before the hand-off acs writes, from what the mode
+    observer has seen (§6.4), the defaults for every mode that changes
+    what the keyboard and mouse send or hides what is typed: bracketed
+    paste, mouse and focus reporting, the kitty keyboard flags (covered by
+    a pushed legacy entry, so their values need not be known),
+    modifyOtherKeys, application cursor keys and keypad, a hidden cursor,
+    synchronized output. The program set them once and will not set them
+    again, so a `WELCOME` that resumes it — `Resumed` or `Gap` — turns
+    them back on, the kitty entry popped; a `Fresh` one resets and forgets
+    them as before, and a leave in between undoes them with the rest. The
+    **alternate screen and a scroll region stay**: leaving the one, or
+    resetting the other (which homes the cursor), would move the prompt
+    off the line the user is looking at, and neither comes back without
+    the program repainting — the Ctrl-L redraw on reconnect cleans up the
+    prompt's line where it is on. Attributes are not tracked, so they are
+    not touched. A dial whose ssh never stops for the terminal writes
+    nothing.
   - **Which dials:** a redial (the first connection has no session to
     detach from, and keeps the cooked dial with ssh in acs's group) while
     acs has the terminal — in raw mode and the foreground of the terminal
@@ -1408,7 +1429,9 @@ the few mode-setting sequences above and records what is on. It never modifies,
 delays or reorders the stream. On detach, exit, or an abandoned reconnect, the
 client writes the matching resets (for example `CSI ? 1000 l`, `CSI ? 1049 l`,
 `CSI < u`) and restores the original `termios`. On a successful resume it does
-nothing, because the terminal state is still correct. A resume after a **gap**
+nothing, because the terminal state is still correct — unless the redial
+handed ssh the terminal for a prompt, for which the input modes were turned
+off; those it turns back on (acs-9t7p, §5.2). A resume after a **gap**
 clears the screen but keeps the recorded modes: the program is the same one,
 still in them, so a later detach still resets them. A **fresh** attach to
 another program (the session was restarted) writes the old program's resets

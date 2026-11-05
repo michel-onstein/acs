@@ -521,6 +521,49 @@ fn a_password_prompt_during_a_redial_gets_the_terminal() {
     assert!(!text.contains("hunter2"), "{text:?}");
 }
 
+/// Regression (acs-9t7p): a redial's prompt does not run under the remote
+/// program's input modes. With bracketed paste left on by the program, a
+/// password pasted at ssh's prompt arrived wrapped in the paste markers and
+/// was refused; the terminal now sees the mode turned off before the prompt
+/// and turned on again once the session resumes, without the program
+/// having to set it a second time.
+#[test]
+fn a_redial_prompt_runs_without_the_programs_bracketed_paste() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "bp",
+        "printf '\\033[?2004h'; echo ready; while read l; do echo got:$l; done",
+        FAST,
+    );
+    c.wait_for("ready", T);
+    let answer = remote.prompt_on_next_dial();
+    remote.cut_link();
+    c.wait_for("Password: ", T);
+    let text = c.text();
+    let prompt = text.rfind("Password: ").unwrap();
+    let on = text.rfind("\x1b[?2004h").unwrap();
+    let before = &text[on..prompt];
+    assert!(
+        before.contains("\x1b[?2004l"),
+        "bracketed paste still on at the prompt: {before:?}"
+    );
+    c.send(b"hunter2\r");
+    let tail = after_the_pop(&mut c);
+    let text = c.text();
+    let after = &text[text.rfind("Password: ").unwrap()..];
+    assert!(
+        after.contains("\x1b[?2004h"),
+        "bracketed paste not given back: {after:?} / {tail:?}"
+    );
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+}
+
 /// The text written after the last title pop, once the client has resumed.
 fn after_the_pop(c: &mut Client) -> String {
     c.wait_for("\x1b[23;0t", T);

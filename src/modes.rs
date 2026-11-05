@@ -4,7 +4,9 @@
 //! remote program should not leave behind — mouse reporting, bracketed paste,
 //! the alternate screen, a hidden cursor, keyboard protocols, synchronized
 //! output — and produces the resets for when the client leaves without the
-//! program having cleaned up (detach, exit, abandoned reconnect).
+//! program having cleaned up (detach, exit, abandoned reconnect) — and, for
+//! ssh's prompt during a redial, the input modes off and back on again
+//! ([`ModeObserver::prompt_reset`], DESIGN §5.2, acs-9t7p).
 //!
 //! It never modifies, delays or reorders the stream: the caller writes the
 //! bytes to the terminal and hands the same bytes to [`ModeObserver::observe`].
@@ -62,8 +64,8 @@ pub struct ModeObserver {
     kitty_depth: u32,
     /// Kitty flags set in place with `CSI = flags ; mode u`.
     kitty_set: bool,
-    /// xterm modifyOtherKeys level, if non-zero.
-    modify_other_keys: bool,
+    /// xterm modifyOtherKeys level; 0 is off.
+    modify_other_keys: u32,
     /// Keypad application mode (`ESC =`).
     keypad_app: bool,
     /// A scroll region was set.
@@ -79,6 +81,12 @@ pub struct ModeObserver {
     /// can be written again after a reconnect on a terminal without the
     /// xterm title stack (DESIGN §5.4).
     title: Option<Vec<u8>>,
+    /// The program's modes are switched off for a prompt of someone else's
+    /// ([`ModeObserver::prompt_reset`]), and owed back.
+    prompting: bool,
+    /// That reset pushed a legacy entry onto the kitty keyboard stack,
+    /// which a leave must pop too.
+    prompt_kitty: bool,
 }
 
 /// The longest OSC body kept for [`ModeObserver::title`]; a longer one is
@@ -119,7 +127,7 @@ impl ModeObserver {
         self.dec.is_empty()
             && self.kitty_depth == 0
             && !self.kitty_set
-            && !self.modify_other_keys
+            && self.modify_other_keys == 0
             && !self.keypad_app
             && !self.scroll_region
     }
@@ -355,7 +363,7 @@ impl ModeObserver {
             (Some(b'>'), b'm') => {
                 let p = nums(&body[1..]);
                 if p.first() == Some(&4) {
-                    self.modify_other_keys = p.get(1).copied().unwrap_or(0) != 0;
+                    self.modify_other_keys = p.get(1).copied().unwrap_or(0);
                 }
             }
             (None | Some(b'0'..=b'9' | b';'), b'r') => {
@@ -384,13 +392,15 @@ impl ModeObserver {
         if self.is_clean() {
             return out;
         }
-        if self.kitty_depth > 0 {
-            out.extend_from_slice(format!("\x1b[<{}u", self.kitty_depth).as_bytes());
+        // The legacy entry a prompt pushed sits on top of the program's.
+        let pushed = self.kitty_depth + u32::from(self.prompt_kitty);
+        if pushed > 0 {
+            out.extend_from_slice(format!("\x1b[<{pushed}u").as_bytes());
         }
         if self.kitty_set {
             out.extend_from_slice(b"\x1b[=0;1u");
         }
-        if self.modify_other_keys {
+        if self.modify_other_keys != 0 {
             out.extend_from_slice(b"\x1b[>4;0m");
         }
         if self.keypad_app {
@@ -425,6 +435,82 @@ impl ModeObserver {
             restore(&mut out, 25);
         }
         out.extend_from_slice(b"\x1b[0m");
+        out
+    }
+
+    /// Bytes that switch off, for a prompt that is not the program's — ssh
+    /// asking for a password or a key passphrase during a redial (acs-9t7p,
+    /// DESIGN §5.2) — the modes that change what the keyboard and mouse
+    /// send or hide what is typed: bracketed paste, mouse and focus
+    /// reporting, the kitty keyboard flags, modifyOtherKeys, application
+    /// cursor keys and keypad, a hidden cursor, synchronized output. A
+    /// pasted password would otherwise reach ssh wrapped in paste markers.
+    ///
+    /// The alternate screen and a scroll region stay: leaving the one, or
+    /// resetting the other (which homes the cursor), moves the prompt off
+    /// the line the user is looking at, and neither can be put back
+    /// without the program repainting. Attributes stay too, since they are
+    /// not tracked and so could not be given back.
+    ///
+    /// Remembers that it did, so [`ModeObserver::prompt_restore`] can give
+    /// the modes back and [`ModeObserver::reset_sequence`] still undoes
+    /// everything. Empty when nothing is on, or it already ran.
+    pub fn prompt_reset(&mut self) -> Vec<u8> {
+        if self.prompting {
+            return Vec::new();
+        }
+        let out = self.prompt_bytes(true);
+        self.prompting = !out.is_empty();
+        self.prompt_kitty = self.prompting && self.kitty_on();
+        out
+    }
+
+    /// Bytes that turn back on what [`ModeObserver::prompt_reset`] turned
+    /// off, for the same program once its stream carries on: the program
+    /// set them once and will not set them again. Empty when no reset is
+    /// owed.
+    pub fn prompt_restore(&mut self) -> Vec<u8> {
+        if !self.prompting {
+            return Vec::new();
+        }
+        let out = self.prompt_bytes(false);
+        self.prompting = false;
+        self.prompt_kitty = false;
+        out
+    }
+
+    fn kitty_on(&self) -> bool {
+        self.kitty_depth > 0 || self.kitty_set
+    }
+
+    /// The prompt's modes off (`reset`) or back as the program had them.
+    fn prompt_bytes(&self, reset: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        // A legacy entry pushed over the program's, and popped again: the
+        // flags themselves need not be known to give them back.
+        if self.kitty_on() {
+            out.extend_from_slice(match reset {
+                true => b"\x1b[>0u",
+                false => b"\x1b[<u",
+            });
+        }
+        if self.modify_other_keys != 0 {
+            let level = if reset { 0 } else { self.modify_other_keys };
+            out.extend_from_slice(format!("\x1b[>4;{level}m").as_bytes());
+        }
+        if self.keypad_app {
+            out.extend_from_slice(match reset {
+                true => b"\x1b>",
+                false => b"\x1b=",
+            });
+        }
+        for (&m, &on) in &self.dec {
+            if ALT_SCREEN.contains(&m) {
+                continue;
+            }
+            let set = on != reset;
+            out.extend_from_slice(format!("\x1b[?{m}{}", if set { 'h' } else { 'l' }).as_bytes());
+        }
         out
     }
 }
@@ -683,5 +769,65 @@ mod tests {
         assert_eq!(o.title(), Some(&b"shell"[..]));
         o.clear();
         assert_eq!(o.title(), None);
+    }
+
+    /// Regression (acs-9t7p): a prompt during a redial gets the input modes
+    /// off — bracketed paste above all, or a pasted password reaches ssh
+    /// inside the paste markers — and the program gets them back after.
+    #[test]
+    fn a_prompt_turns_the_input_modes_off_and_gives_them_back() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?1h\x1b=\x1b[?25l");
+        let off = o.prompt_reset();
+        assert_eq!(
+            String::from_utf8_lossy(&off),
+            "\x1b>\x1b[?1l\x1b[?25h\x1b[?1000l\x1b[?1004l\x1b[?1006l\x1b[?2004l"
+        );
+        // Once only: a second hand-over in the same outage writes nothing.
+        assert!(o.prompt_reset().is_empty());
+        let on = o.prompt_restore();
+        assert_eq!(
+            String::from_utf8_lossy(&on),
+            "\x1b=\x1b[?1h\x1b[?25l\x1b[?1000h\x1b[?1004h\x1b[?1006h\x1b[?2004h"
+        );
+        assert!(o.prompt_restore().is_empty());
+        // The modes are still the program's, for the leave.
+        assert!(o.reset_sequence().starts_with(b"\x1b>\x1b[?1l"));
+    }
+
+    /// acs-9t7p: the alternate screen and a scroll region are left as
+    /// they are for the prompt, and a clean terminal needs nothing.
+    #[test]
+    fn a_prompt_keeps_the_screen_and_a_clean_terminal_needs_nothing() {
+        let mut o = ModeObserver::new();
+        assert!(o.prompt_reset().is_empty());
+        assert!(o.prompt_restore().is_empty());
+        o.observe(b"\x1b[?1049h\x1b[2;20r");
+        assert!(o.prompt_reset().is_empty());
+        o.observe(b"\x1b[?2004h");
+        assert_eq!(o.prompt_reset(), b"\x1b[?2004l");
+        assert_eq!(o.prompt_restore(), b"\x1b[?2004h");
+    }
+
+    /// acs-9t7p: the kitty flags are covered by a legacy entry of their
+    /// own and uncovered after, so their values need not be known; a leave
+    /// in between pops that entry too. modifyOtherKeys comes back at the
+    /// level the program chose.
+    #[test]
+    fn a_prompt_covers_the_keyboard_protocols() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[>5u\x1b[>4;2m");
+        assert_eq!(o.prompt_reset(), b"\x1b[>0u\x1b[>4;0m");
+        assert_eq!(o.reset_sequence(), b"\x1b[<2u\x1b[>4;0m\x1b[0m");
+        assert_eq!(o.prompt_restore(), b"\x1b[<u\x1b[>4;2m");
+        assert_eq!(o.reset_sequence(), b"\x1b[<1u\x1b[>4;0m\x1b[0m");
+        // Set in place, with nothing pushed: still covered by a push.
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[=1;1u");
+        assert_eq!(o.prompt_reset(), b"\x1b[>0u");
+        assert_eq!(o.reset_sequence(), b"\x1b[<1u\x1b[=0;1u\x1b[0m");
+        // A clear (another program) forgets the debt with the modes.
+        o.clear();
+        assert!(o.prompt_restore().is_empty());
     }
 }
