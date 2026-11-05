@@ -564,6 +564,47 @@ fn a_redial_prompt_runs_without_the_programs_bracketed_paste() {
     assert_eq!(c.wait(T), 0, "{}", c.text());
 }
 
+/// Regression (acs-2m14): a redial's prompt is not written into a sequence
+/// the program's stream left open. The status line re-opens the program's
+/// unfinished CSI after it, so a hand-off that wrote nothing of its own
+/// gave ssh a terminal still inside it, and the `P` of `Password: ` was
+/// read as the CSI's final byte. The hand-off now ends the sequence, and
+/// the resume opens it again for the program's next byte.
+#[test]
+fn a_redial_prompt_is_not_written_into_an_open_sequence() {
+    let remote = Remote::installed();
+    let mut c = start(
+        &remote,
+        "oc",
+        "printf 'ready\\033[1;2'; while read l; do echo got:$l; done",
+        FAST,
+    );
+    c.wait_for("ready\x1b[1;2", T);
+    let answer = remote.prompt_on_next_dial();
+    remote.cut_link();
+    c.wait_for("Password: ", T);
+    let text = c.text();
+    let prompt = text.rfind("Password: ").unwrap();
+    let opened = text[..prompt].rfind("\x1b[1;2").unwrap();
+    let before = &text[opened..prompt];
+    assert!(
+        before.contains("\x1b\\"),
+        "the prompt went into the open CSI: {before:?}"
+    );
+    c.send(b"hunter2\r");
+    after_the_pop(&mut c);
+    let text = c.text();
+    let after = &text[text.rfind("Password: ").unwrap()..];
+    assert!(
+        after.contains("\x1b[1;2"),
+        "the program's CSI not opened again: {after:?}"
+    );
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
+    c.send(&command(b'd'));
+    assert_eq!(c.wait(T), 0, "{}", c.text());
+}
+
 /// The text written after the last title pop, once the client has resumed.
 fn after_the_pop(c: &mut Client) -> String {
     c.wait_for("\x1b[23;0t", T);

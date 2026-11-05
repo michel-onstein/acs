@@ -1070,6 +1070,14 @@ sequenceDiagram
     prompt's line where it is on. Attributes are not tracked, so they are
     not touched. A dial whose ssh never stops for the terminal writes
     nothing.
+  - **Nor inside the program's open sequence** (acs-2m14). A link lost
+    mid-CSI leaves the status line re-opening that CSI after it (§7,
+    acs-p4u), and the first bytes of ssh's prompt would finish it — the
+    `P` of `Password:` read as its final byte. The prompt is not the
+    program's stream carrying on, so the hand-off ends the sequence and
+    puts the observer's place in it aside; a `Resumed` `WELCOME` opens it
+    again for the program's next byte, and a `Gap` or `Fresh` one forgets
+    it, as it forgets a sequence the status line stepped over.
   - **Which dials:** a redial (the first connection has no session to
     detach from, and keeps the cooked dial with ssh in acs's group) while
     acs has the terminal — in raw mode and the foreground of the terminal
