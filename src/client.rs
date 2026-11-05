@@ -845,6 +845,14 @@ impl DialKeys<'_> {
     fn step(&mut self, pid: i32, readable: bool) -> bool {
         if sys::stopped(pid) {
             if !self.handed {
+                // The prompt is not the program's: its input modes off
+                // first, bracketed paste above all, or a pasted password
+                // reaches ssh inside the markers (acs-9t7p). The WELCOME
+                // gives them back.
+                let off = self.state.observer.prompt_reset();
+                if !off.is_empty() {
+                    write_over_stream(self.state, &off);
+                }
                 let _ = self.raw.suspend();
                 let _ = sys::tcsetpgrp(STDIN, pid);
                 self.handed = true;
@@ -2056,7 +2064,14 @@ fn serve(
                         let _ = r.resume_discarding();
                     }
                     match w.kind {
-                        AttachKind::Resumed => {}
+                        // The same program, whose modes ssh's prompt took
+                        // away (acs-9t7p): back on, since it set them once.
+                        AttachKind::Resumed => {
+                            let on = state.observer.prompt_restore();
+                            if !on.is_empty() {
+                                write_over_stream(state, &on);
+                            }
+                        }
                         // Neither of these two streams carries on where it
                         // stopped, so a sequence left unfinished is ended
                         // and not re-opened (acs-p4u): another program is
@@ -2084,6 +2099,7 @@ fn serve(
                             // them for leave(), but not a half-seen sequence.
                             let mut out = state.observer.interrupt_sequence().to_vec();
                             out.extend_from_slice(b"\x1b[H\x1b[J");
+                            out.extend_from_slice(&state.observer.prompt_restore());
                             let _ = sys::write_all(STDOUT, &out);
                             state.observer.resync();
                             notes::stream(&state.observer);
