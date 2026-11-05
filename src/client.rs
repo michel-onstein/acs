@@ -1031,6 +1031,43 @@ fn ssh_is_asking() -> bool {
     sys::tcgetattr(STDIN).map_or(true, |t| t.c_lflag & libc::ECHO == 0)
 }
 
+/// acs's own lines kept out of ssh's prompt on a dial that shares acs's
+/// cooked terminal (acs-vwny) — the first connection, a redial with no
+/// terminal to hand over. There is no hand-off to see, so the hold follows
+/// the echo ssh's password, passphrase and PIN prompts turn off: notes
+/// wait while it is off and are written as it comes back on, or when the
+/// dial ends. Only a terminal seen with its echo off holds — one whose
+/// modes cannot be read has no prompt on it to protect, and a `-v` line
+/// is worth more on time.
+#[derive(Default)]
+struct SharedPrompt {
+    holding: bool,
+}
+
+impl SharedPrompt {
+    /// Look at the terminal once, before anything this pass of the dial
+    /// may raise.
+    fn follow(&mut self) {
+        let asking = sys::tcgetattr(STDIN).is_ok_and(|t| t.c_lflag & libc::ECHO == 0);
+        if asking == self.holding {
+            return;
+        }
+        match asking {
+            true => notes::hand_over(),
+            false => notes::take_back(),
+        }
+        self.holding = asking;
+    }
+}
+
+impl Drop for SharedPrompt {
+    fn drop(&mut self) {
+        if self.holding {
+            notes::take_back();
+        }
+    }
+}
+
 /// One dial, through acs's shared ssh master where it may (acs-9n3).
 fn dial_sharing(
     conn: &Connection,
@@ -1141,6 +1178,7 @@ fn dial_once(
     let mut scanner = MarkerScanner::new();
     let mut buf = [0u8; 4096];
     let pid = child.id() as i32;
+    let mut prompt = SharedPrompt::default();
     let marker = loop {
         let mut wait = deadline.saturating_duration_since(Instant::now());
         if let Some(k) = keys.as_deref() {
@@ -1161,6 +1199,12 @@ fn dial_once(
             sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
         ];
         sys::poll(&mut fds, sys::poll_timeout(wait))?;
+        // A dial without the keys shares the terminal with ssh: its prompt
+        // is seen by the echo it turns off, and acs's lines wait for it
+        // (acs-vwny). One with the keys holds them from its hand-off.
+        if keys.is_none() {
+            prompt.follow();
+        }
         if let Some(k) = keys.as_deref_mut() {
             if k.step(pid, fds[1].revents != 0) {
                 let _ = child.kill();
