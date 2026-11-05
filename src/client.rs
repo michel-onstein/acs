@@ -845,14 +845,19 @@ impl DialKeys<'_> {
     fn step(&mut self, pid: i32, readable: bool) -> bool {
         if sys::stopped(pid) {
             if !self.handed {
-                // The prompt is not the program's: its input modes off
-                // first, bracketed paste above all, or a pasted password
-                // reaches ssh inside the markers (acs-9t7p). The WELCOME
-                // gives them back.
-                let off = self.state.observer.prompt_reset();
+                // The prompt is not the program's stream: the sequence
+                // that stream left open is ended, not re-opened the way
+                // the status line re-opens it, or the prompt's first bytes
+                // finish it (acs-2m14); and the program's input modes go
+                // off, bracketed paste above all, or a pasted password
+                // reaches ssh inside the markers (acs-9t7p). A resuming
+                // WELCOME gives both back.
+                let mut off = self.state.observer.suspend_sequence();
+                off.extend_from_slice(&self.state.observer.prompt_reset());
                 if !off.is_empty() {
-                    write_over_stream(self.state, &off);
+                    let _ = sys::write_all(STDOUT, &off);
                 }
+                notes::stream(&self.state.observer);
                 let _ = self.raw.suspend();
                 let _ = sys::tcsetpgrp(STDIN, pid);
                 self.handed = true;
@@ -2065,12 +2070,20 @@ fn serve(
                     }
                     match w.kind {
                         // The same program, whose modes ssh's prompt took
-                        // away (acs-9t7p): back on, since it set them once.
+                        // away (acs-9t7p): back on, since it set them once;
+                        // then the sequence its stream was in when the
+                        // prompt stepped out of it, which the next byte
+                        // carries on (acs-2m14).
                         AttachKind::Resumed => {
                             let on = state.observer.prompt_restore();
                             if !on.is_empty() {
                                 write_over_stream(state, &on);
                             }
+                            let back = state.observer.resume_sequence();
+                            if !back.is_empty() {
+                                let _ = sys::write_all(STDOUT, &back);
+                            }
+                            notes::stream(&state.observer);
                         }
                         // Neither of these two streams carries on where it
                         // stopped, so a sequence left unfinished is ended

@@ -87,6 +87,22 @@ pub struct ModeObserver {
     /// That reset pushed a legacy entry onto the kitty keyboard stack,
     /// which a leave must pop too.
     prompt_kitty: bool,
+    /// Where the stream was when it was stepped out of for someone else's
+    /// output ([`ModeObserver::suspend_sequence`]), to be stepped back into
+    /// when the program's stream carries on.
+    held: Option<Box<Place>>,
+}
+
+/// The stream's place inside a sequence or a character: what
+/// [`ModeObserver::suspend_sequence`] puts aside.
+#[derive(Default)]
+struct Place {
+    lex: Option<Lex>,
+    seq: Vec<u8>,
+    seq_full: bool,
+    utf8_left: u8,
+    utf8: Vec<u8>,
+    osc: Option<Vec<u8>>,
 }
 
 /// The longest OSC body kept for [`ModeObserver::title`]; a longer one is
@@ -108,12 +124,56 @@ impl ModeObserver {
     /// skipped output (a gap): the program is the same and still in its
     /// modes, but the next byte may start anywhere (acs-xk4).
     pub fn resync(&mut self) {
-        self.lex = None;
-        self.seq.clear();
-        self.seq_full = false;
-        self.utf8_left = 0;
-        self.utf8.clear();
-        self.osc = None;
+        self.held = None;
+        self.take_place();
+    }
+
+    /// The stream's place, leaving it at a boundary.
+    fn take_place(&mut self) -> Place {
+        Place {
+            lex: self.lex.take(),
+            seq: std::mem::take(&mut self.seq),
+            seq_full: std::mem::take(&mut self.seq_full),
+            utf8_left: std::mem::take(&mut self.utf8_left),
+            utf8: std::mem::take(&mut self.utf8),
+            osc: self.osc.take(),
+        }
+    }
+
+    /// Step out of the sequence the stream is in for output that is not
+    /// the program's and does not carry it on — ssh's prompt during a
+    /// redial (acs-2m14, DESIGN §5.2): the bytes that end it
+    /// ([`ModeObserver::interrupt_sequence`]), with the place put aside, so
+    /// the observer is at a boundary while the terminal is.
+    /// [`ModeObserver::resume_sequence`] steps back in. Empty at a boundary,
+    /// or when already stepped out.
+    pub fn suspend_sequence(&mut self) -> Vec<u8> {
+        if self.at_boundary() {
+            return Vec::new();
+        }
+        let out = self.interrupt_sequence().to_vec();
+        let place = self.take_place();
+        self.held = Some(Box::new(place));
+        out
+    }
+
+    /// Step back into what [`ModeObserver::suspend_sequence`] stepped out
+    /// of, for the same program's stream carrying on: the bytes that open
+    /// it again ([`ModeObserver::reopen_sequence`], empty where that cannot
+    /// be done), with the place restored. Empty when nothing was held. A
+    /// [`ModeObserver::resync`] or [`ModeObserver::clear`] forgets it.
+    pub fn resume_sequence(&mut self) -> Vec<u8> {
+        let Some(p) = self.held.take() else {
+            return Vec::new();
+        };
+        let p = *p;
+        self.lex = p.lex;
+        self.seq = p.seq;
+        self.seq_full = p.seq_full;
+        self.utf8_left = p.utf8_left;
+        self.utf8 = p.utf8;
+        self.osc = p.osc;
+        self.reopen_sequence().unwrap_or_default()
     }
 
     /// The window title the program last set with `OSC 0` or `OSC 2`, if
@@ -688,6 +748,40 @@ mod tests {
         o.observe(long.as_bytes());
         o.observe(b"m\x1b[1;2");
         assert_eq!(o.reopen_sequence().unwrap(), b"\x1b[1;2");
+    }
+
+    /// acs-2m14: a sequence stepped out of for someone else's output is
+    /// ended, the observer at a boundary meanwhile, and stepped back into
+    /// as it was; a resync forgets it.
+    #[test]
+    fn a_suspended_sequence_is_stepped_back_into() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b[1;2");
+        assert_eq!(o.suspend_sequence(), b"\x1b\\");
+        assert!(o.at_boundary());
+        assert_eq!(o.interrupt_sequence(), b"");
+        assert!(o.suspend_sequence().is_empty());
+        assert_eq!(o.resume_sequence(), b"\x1b[1;2");
+        assert!(!o.at_boundary());
+        assert!(o.resume_sequence().is_empty());
+        // The program's next byte finishes what it started.
+        o.observe(b"h");
+        assert!(o.at_boundary());
+        // A string is ended and not written again, but still read to its end.
+        o.observe(b"\x1b]2;half");
+        assert_eq!(o.suspend_sequence(), b"\x1b\\");
+        assert!(o.resume_sequence().is_empty());
+        o.observe(b" a title\x07");
+        assert_eq!(o.title(), Some(&b"half a title"[..]));
+        // At a boundary there is nothing to step out of.
+        assert!(o.suspend_sequence().is_empty());
+        assert!(o.resume_sequence().is_empty());
+        // A resync forgets the place.
+        o.observe(b"\x1b[3");
+        o.suspend_sequence();
+        o.resync();
+        assert!(o.resume_sequence().is_empty());
+        assert!(o.at_boundary());
     }
 
     /// The bytes of a half-read character are forgotten with the rest of
