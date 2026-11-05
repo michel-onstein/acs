@@ -60,7 +60,10 @@ impl Fake {
             cases.push_str(&format!("    '{dest}') t='{}' ;;\n", remote.transport()));
         }
         let body = format!(
-            "#!/bin/sh\n{log}\
+            "#!/bin/sh\n\
+             # Every session dial asks whether it is proxied (acs-7sti): no.\n\
+             [ \"$1\" = -G ] && exit 0\n\
+             {log}\
              # The master this call names, if it names one at all.\n\
              cp=\n\
              for a in \"$@\"; do case \"$a\" in ControlPath=/*) cp=${{a#ControlPath=}} ;; esac; done\n\

@@ -591,3 +591,84 @@ fn the_verbose_command_line_reaches_the_acs_arguments() {
     c.send(&command(b'x'));
     c.wait(T);
 }
+
+/// The session's options on every ssh call that ran the session's own
+/// remote command — not `-O` control calls.
+fn session_calls(ssh: &Ssh) -> Vec<String> {
+    ssh.calls()
+        .into_iter()
+        .filter(|c| SshCall::of(c).remote.contains("_proxy"))
+        .collect()
+}
+
+/// acs-7sti: through a jump host the session's dial carries no
+/// `ConnectTimeout`. OpenSSH applies it to the banner exchange, and behind
+/// a `ProxyJump` the banner waits on the jump host's login — so a password
+/// typed there in more than 10 s cut the dial off ("Connection timed out
+/// during banner exchange") and acs dialled again, for ever. The fake
+/// fails exactly so on any call that still carries the timeout.
+#[test]
+fn a_dial_through_a_jump_host_has_no_ten_second_cutoff() {
+    let remote = Remote::installed();
+    let ssh = Ssh::new(&[("devbox", &remote)]);
+    ssh.behind_slow_jump_host();
+    let mut c = Client::spawn(
+        &exe(),
+        &[
+            "--ssh",
+            &ssh.path().display().to_string(),
+            "devbox",
+            "jumped",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo up; sleep 30",
+        ],
+        &[],
+    );
+    c.wait_for("up", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+    let calls = session_calls(&ssh);
+    assert!(!calls.is_empty(), "no session call in {:?}", ssh.calls());
+    for call in calls {
+        assert!(
+            !SshCall::of(&call).opts.contains("ConnectTimeout"),
+            "{call}"
+        );
+    }
+}
+
+/// acs-7sti, the other side: a host ssh dials directly keeps
+/// `ConnectTimeout=10`, so a redial into a dead network still fails fast
+/// (DESIGN §3).
+#[test]
+fn a_direct_dial_keeps_its_connect_timeout() {
+    let remote = Remote::installed();
+    let ssh = Ssh::new(&[("devbox", &remote)]);
+    let mut c = Client::spawn(
+        &exe(),
+        &[
+            "--ssh",
+            &ssh.path().display().to_string(),
+            "devbox",
+            "direct",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo up; sleep 30",
+        ],
+        &[],
+    );
+    c.wait_for("up", T);
+    c.send(&command(b'x'));
+    c.wait(T);
+    let calls = session_calls(&ssh);
+    assert!(!calls.is_empty(), "no session call in {:?}", ssh.calls());
+    for call in calls {
+        assert!(
+            SshCall::of(&call).opts.contains("ConnectTimeout=10"),
+            "{call}"
+        );
+    }
+}

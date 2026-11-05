@@ -7,17 +7,23 @@ use std::process::Command;
 
 /// Options the session transport depends on. They come before the user's so
 /// they win: ssh keeps the first value it sees for an option.
-pub const TRANSPORT_OPTS: &[&str] = &[
-    "-T",
-    "-e",
-    "none",
-    "-o",
-    "ServerAliveInterval=0",
-    // A redial into a dead network must fail fast so the client returns to
-    // its backoff wait, where the command keys work.
-    "-o",
-    "ConnectTimeout=10",
-];
+pub const TRANSPORT_OPTS: &[&str] = &["-T", "-e", "none", "-o", "ServerAliveInterval=0"];
+
+/// The session's connect timeout, after [`TRANSPORT_OPTS`]: a redial into
+/// a dead network must fail fast so the client returns to its backoff wait,
+/// where the command keys work.
+///
+/// **Not given through a proxy** (acs-7sti, DESIGN §3): OpenSSH applies
+/// `ConnectTimeout` to the banner exchange as well as the connect, and
+/// behind a `ProxyJump` or `ProxyCommand` the banner only arrives once the
+/// jump host has logged in — so the 10 s would cover a person typing the
+/// jump host's password. There acs's own dial deadlines bound the dial.
+pub const CONNECT_TIMEOUT_OPTS: &[&str] = &["-o", "ConnectTimeout=10"];
+
+/// How long `ssh -G` may take to say whether a session dial goes through a
+/// proxy ([`Transport::through_proxy`]). It reads files and runs nothing
+/// that touches the network — unless the user's config has a `Match exec`.
+const PROXY_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// No multiplexer at all: this connection is its own, and looks at no
 /// control socket — neither the user's nor acs's (DESIGN §3). Every redial
@@ -92,6 +98,11 @@ pub struct Transport {
     /// default, and whatever acs cannot vouch for — dials exactly as §3
     /// always did.
     pub mux: Option<crate::mux::Mux>,
+    /// ssh reaches the destination through a `ProxyJump` or a
+    /// `ProxyCommand`, so the session's calls go without
+    /// [`CONNECT_TIMEOUT_OPTS`] (acs-7sti). Set per dial by
+    /// [`Transport::for_dial`]; `false` keeps the timeout.
+    pub proxied: bool,
 }
 
 /// The ssh program when the command line names none: `ACS_SSH`, else
@@ -110,7 +121,35 @@ impl Transport {
             local_forwards: Vec::new(),
             transport_cmd: None,
             mux: None,
+            proxied: false,
         }
+    }
+
+    /// Whether ssh dials the destination through a `ProxyJump` or a
+    /// `ProxyCommand`, as `ssh -G` says with the user's options — so a `-J`
+    /// or `-o ProxyJump=…` on the command line counts as much as the
+    /// user's ssh_config (acs-7sti). `false` where `ssh -G` fails or is
+    /// slow: the connect timeout then stays, as it always was.
+    pub fn through_proxy(&self) -> bool {
+        let mut c = Command::new(&self.ssh);
+        c.arg("-G")
+            .args(&self.user_opts)
+            .args([OsStr::new("--"), OsStr::new(&self.destination)])
+            .stdout(std::process::Stdio::piped());
+        crate::alias::run_until(c, PROXY_CHECK)
+            .filter(|(code, _)| *code == 0)
+            .is_some_and(|(_, out)| crate::alias::proxied(&String::from_utf8_lossy(&out)))
+    }
+
+    /// This transport as a dial of kind `call` uses it: a session's dial,
+    /// made by ssh, learns whether it goes through a proxy now — an alias
+    /// may have moved the destination since the last dial.
+    pub fn for_dial(&self, call: Call) -> Transport {
+        let mut tr = self.clone();
+        if call.is_session() && self.transport_cmd.is_none() {
+            tr.proxied = self.through_proxy();
+        }
+        tr
     }
 
     /// Whether the user's options name a key: `-i`, or `-o IdentityFile`.
@@ -141,6 +180,9 @@ impl Transport {
             Call::Batch => BATCH_OPTS,
         };
         v.extend(fixed.iter().map(OsString::from));
+        if call.is_session() && !self.proxied {
+            v.extend(CONNECT_TIMEOUT_OPTS.iter().map(OsString::from));
+        }
         v.extend(self.control_opts(call));
         v.extend(self.user_opts.iter().cloned());
         // The user's session, and nothing else, gets the forwards: the side
@@ -617,6 +659,7 @@ mod tests {
             local_forwards: Vec::new(),
             transport_cmd: None,
             mux: None,
+            proxied: false,
         }
     }
 
@@ -1002,6 +1045,65 @@ mod tests {
             // Every complaint says what a spec should look like.
             assert!(e.contains("port:host:hostport"), "{bad:?}: {e}");
         }
+    }
+
+    /// acs-7sti: a session dial through a proxy goes without
+    /// `ConnectTimeout`, which would cover the jump host's password prompt;
+    /// every other option is the same, and a batch call keeps its own.
+    #[test]
+    fn a_proxied_session_call_has_no_connect_timeout() {
+        let mut tr = t();
+        tr.proxied = true;
+        for call in [Call::Session, Call::Redial] {
+            let direct = strs(t().argv(call, "R"));
+            let mut want = direct.clone();
+            let at = want.iter().position(|a| a == "ConnectTimeout=10").unwrap();
+            want.drain(at - 1..=at);
+            assert_eq!(strs(tr.argv(call, "R")), want);
+        }
+        let batch = strs(tr.argv(Call::Batch, "R"));
+        assert!(
+            batch.contains(&"ConnectTimeout=10".to_string()),
+            "{batch:?}"
+        );
+    }
+
+    /// acs-7sti: `ssh -G`, given the user's options, decides — so a `-J`
+    /// on the command line and a `ProxyCommand` in ssh_config both count,
+    /// `none` does not, and an ssh that cannot answer leaves the timeout.
+    #[test]
+    fn ssh_dash_g_says_whether_a_dial_goes_through_a_proxy() {
+        let dir = TempDir::new();
+        let fake = dir.path().join("ssh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n[ \"$1\" = -G ] || exit 2\n\
+             for d; do :; done\n\
+             case \" $* \" in *' -J '*) echo 'proxyjump bastion'; exit 0 ;; esac\n\
+             case \"$d\" in\n\
+             cfg) echo 'proxycommand nc -X connect %h %p' ;;\n\
+             broken) exit 255 ;;\n\
+             *) printf 'proxyjump none\\nproxycommand none\\n' ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tr = |dest: &str, opts: &[&str]| Transport {
+            ssh: fake.clone().into(),
+            user_opts: opts.iter().map(OsString::from).collect(),
+            ..Transport::new(dest)
+        };
+        assert!(tr("box", &["-J", "me@bastion"]).through_proxy());
+        assert!(tr("cfg", &[]).through_proxy());
+        assert!(!tr("box", &[]).through_proxy());
+        assert!(!tr("broken", &[]).through_proxy());
+        // A session dial learns it; a batch call and the test transport
+        // never ask.
+        assert!(tr("cfg", &[]).for_dial(Call::Redial).proxied);
+        assert!(!tr("cfg", &[]).for_dial(Call::Batch).proxied);
+        let mut cmd = tr("cfg", &[]);
+        cmd.transport_cmd = Some("sh -c".into());
+        assert!(!cmd.for_dial(Call::Session).proxied);
     }
 
     #[test]
