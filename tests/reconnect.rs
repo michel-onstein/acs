@@ -1502,16 +1502,55 @@ fn a_network_change_leaves_a_redial_asking_for_a_password_alone() {
     let dialled = remote.connections();
     remote.cut_link();
     c.wait_for("Password: ", T);
-    watch.set_networks("10.0.0.5/24\n");
-    watch.hint();
-    c.wait_for("acs: network change not acted on", T);
+    // The line saying so waits for the prompt to be over (acs-esyy), so
+    // the client having judged the change is what is waited for here.
+    watch.move_to_and_wait("10.0.0.5/24\n");
     c.send(b"hunter2\r");
+    c.wait_for("acs: network change not acted on", T);
     c.wait_resumed();
     c.send(b"after\r");
     c.wait_for("got:\x0cafter", T);
     let said = std::fs::read_to_string(&answer).unwrap_or_default();
     assert_eq!(said.trim(), "hunter2");
     assert_eq!(remote.connections(), dialled + 1, "{}", c.text());
+}
+
+/// Regression (acs-esyy): acs's own lines are not written into ssh's
+/// prompt. With `-v`, the network watcher's trace printed while a redial
+/// had handed ssh the terminal, so the prompt read `Password: acs:
+/// network …`; it is now held until acs has the terminal back, and
+/// written then.
+///
+/// Two hints, each waited for: the second can only be read once the first
+/// has been judged and every line about it raised, so whatever the first
+/// would have printed into the prompt is on the screen by then.
+#[test]
+fn a_redial_prompt_is_not_interrupted_by_v_lines() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let mut c = Client::start_env(&remote, &echoing("vp"), &refs(&env));
+    c.wait_session("vp");
+    c.wait_for("up", T);
+    let answer = remote.prompt_on_next_dial();
+    remote.cut_link();
+    c.wait_for("Password: ", T);
+    watch.move_to_and_wait("10.0.0.5/24\n");
+    watch.move_to_and_wait("10.0.0.5/24\n");
+    let text = c.text();
+    let prompt = text.rfind("Password: ").unwrap();
+    let at_prompt = &text[prompt..];
+    assert!(
+        !at_prompt.contains("acs:"),
+        "a line written into the prompt: {at_prompt:?}"
+    );
+    c.send(b"hunter2\r");
+    // Held, not dropped: written once acs has the terminal back, ahead of
+    // the resume.
+    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    c.wait_resumed();
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
 }
 
 /// acs-xo1: the same on the first connection, whose dial shares acs's

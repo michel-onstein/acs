@@ -1078,6 +1078,16 @@ sequenceDiagram
     puts the observer's place in it aside; a `Resumed` `WELCOME` opens it
     again for the program's next byte, and a `Gap` or `Fresh` one forgets
     it, as it forgets a sequence the status line stepped over.
+  - **Nor are acs's own lines** (acs-esyy). Every `acs:` note raised while
+    ssh has the terminal — under `-v` the network watcher's trace
+    (`network: … not a change`, `network changed`, `not acted on`) and the
+    dial's phase lines (`ACS-READY seen`), otherwise the rare note about
+    what the remote said — would land in the prompt's line, which then read
+    `Password: acs: network: …`. They are **held**, oldest first, and
+    written as the dial ends and the terminal is acs's again, ahead of the
+    `WELCOME`. None is dropped: a `-v` trace is evidence, and the dial's
+    timeout bounds how many can wait. What is written before the hand-off
+    — `running ssh …`, `ssh spawned` — goes out as before.
   - **Which dials:** a redial (the first connection has no session to
     detach from, and keeps the cooked dial with ssh in acs's group) while
     acs has the terminal — in raw mode and the foreground of the terminal
