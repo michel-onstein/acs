@@ -1067,6 +1067,10 @@ sequenceDiagram
 - **Before the first WELCOME there is a deadline too**: liveness only starts
   with WELCOME, and `ConnectTimeout` only covers the TCP connect, so a host
   that accepts and then says nothing would otherwise hold the client forever.
+  **Not so through a proxy** (acs-7sti, open): OpenSSH applies
+  `ConnectTimeout` to the banner exchange too, and behind a `ProxyJump` the
+  banner waits on the jump host's login, so a password or passphrase asked
+  there is cut off after 10 s.
   A connection has 30 s on a redial (`ACS_REDIAL_TIMEOUT_MS`) — then it is
   dropped and the client goes back to its backoff wait, where the command
   keys work even when ssh had the terminal — and 120 s on the first
