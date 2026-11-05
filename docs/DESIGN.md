@@ -1088,6 +1088,18 @@ sequenceDiagram
     `WELCOME`. None is dropped: a `-v` trace is evidence, and the dial's
     timeout bounds how many can wait. What is written before the hand-off
     — `running ssh …`, `ssh spawned` — goes out as before.
+  - **Nor on a dial that shares the terminal** (acs-vwny) — the first
+    connection, a redial with no terminal to hand over. There is no
+    hand-off to see, so the same hold follows the terminal's echo, as the
+    network watcher's judgement does (acs-xo1, above): each time the dial
+    wakes it looks, holds acs's lines while the echo is off and writes
+    them as it comes back on, or as the dial ends. A slow first connection
+    under `-v` still shows its phases as they happen; only the lines raised
+    while ssh's password, passphrase or PIN prompt is up wait, and they
+    are written once the answer is in, at the dial's next wake — at the
+    latest its marker. A terminal acs cannot read the
+    modes of holds nothing, and the host-key question, which keeps its
+    echo, is not seen — a line can still land in that one.
   - **Which dials:** a redial (the first connection has no session to
     detach from, and keeps the cooked dial with ssh in acs's group) while
     acs has the terminal — in raw mode and the foreground of the terminal

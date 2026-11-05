@@ -1565,14 +1565,48 @@ fn a_network_change_leaves_a_first_dial_asking_for_a_password_alone() {
     let base = remote.connections();
     let mut c = Client::start_env(&remote, &echoing("pf"), &refs(&env));
     c.wait_for("Password: ", T);
-    watch.set_networks("10.0.0.5/24\n");
-    watch.hint();
-    c.wait_for("acs: network change not acted on", T);
+    // Waited for: read, judged and left alone while the prompt is up. The
+    // line saying so waits for the password (acs-vwny).
+    watch.move_to_and_wait("10.0.0.5/24\n");
     c.send(b"hunter2\r");
+    c.wait_for("acs: network change not acted on", T);
     c.wait_session("pf");
     let said = std::fs::read_to_string(&answer).unwrap_or_default();
     assert_eq!(said.trim(), "hunter2");
     assert_eq!(remote.connections(), base + 1, "{}", c.text());
+}
+
+/// Regression (acs-vwny): acs-esyy's hold on the first connection, whose
+/// ssh shares acs's cooked terminal and so never hands it over. The prompt
+/// is seen by the echo it turns off: a `-v` line raised while it is up —
+/// here the network watcher's trace — waits for the password rather than
+/// reading `Password: acs: network changed: …`, and is written once the
+/// echo is back.
+///
+/// Two hints, each waited for, as in the redial's test above.
+#[test]
+fn a_first_dial_prompt_is_not_interrupted_by_v_lines() {
+    let remote = Remote::installed();
+    let watch = NetWatch::new("192.168.1.5/24\n");
+    let env = handshake_env(&watch);
+    let answer = remote.prompt_on_next_dial();
+    let mut c = Client::start_env(&remote, &echoing("fp"), &refs(&env));
+    c.wait_for("Password: ", T);
+    watch.move_to_and_wait("10.0.0.5/24\n");
+    watch.move_to_and_wait("10.0.0.5/24\n");
+    let text = c.text();
+    let prompt = text.rfind("Password: ").unwrap();
+    let at_prompt = &text[prompt..];
+    assert!(
+        !at_prompt.contains("acs:"),
+        "a line written into the prompt: {at_prompt:?}"
+    );
+    c.send(b"hunter2\r");
+    // Held, not dropped.
+    c.wait_for("acs: network changed: 192.168.1.5/24 → 10.0.0.5/24", T);
+    c.wait_session("fp");
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
 }
 
 /// A flapping interface is still **one** redial (acs-6p8's storm, kept out
