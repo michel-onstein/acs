@@ -282,6 +282,25 @@ impl NetWatch {
         release_fifo(&self.fifo());
     }
 
+    /// [`set_networks`](Self::set_networks) and [`hint`](Self::hint), and
+    /// return only once the client has read the networks for that hint —
+    /// for a test that has to know the hint was judged while something was
+    /// still true (ssh asking for a password) when the line saying so may be
+    /// held back (acs-esyy). The networks file is a FIFO for the one read:
+    /// opening it for writing waits for the client to open it for reading.
+    pub fn move_to_and_wait(&self, nets: &str) {
+        use std::io::Write;
+        let file = self.nets_file();
+        std::fs::remove_file(&file).unwrap();
+        make_fifo(&file);
+        self.hint();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        f.write_all(nets.as_bytes()).unwrap();
+        drop(f);
+        std::fs::remove_file(&file).unwrap();
+        self.set_networks(nets);
+    }
+
     /// The environment that points a client at this watcher.
     pub fn env(&self) -> Vec<(String, String)> {
         vec![

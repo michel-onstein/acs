@@ -532,6 +532,9 @@ mod notes {
         /// How many notes have been written, so the status line knows one
         /// may have scrolled it off its row.
         static WRITTEN: Cell<u64> = const { Cell::new(0) };
+        /// `Some` while a redial has handed ssh the terminal ([`hand_over`],
+        /// acs-esyy): every note raised meanwhile waits here, oldest first.
+        static ASIDE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
         /// Where notes go in this crate's own tests, in place of fd 2.
         #[cfg(test)]
         static SINK: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
@@ -563,8 +566,38 @@ mod notes {
         }
     }
 
-    /// Print `line`, or hold it if the program's stream is mid-sequence.
+    /// ssh has the terminal for a prompt (acs-esyy): until [`take_back`],
+    /// notes are held rather than written into the prompt's line. A `-v`
+    /// trace of the network watcher or a dial phase is worth reading, so
+    /// none is dropped; the dial is bounded by its timeout, and so is what
+    /// waits.
+    pub fn hand_over() {
+        ASIDE.with(|a| {
+            a.borrow_mut().get_or_insert_with(Vec::new);
+        });
+    }
+
+    /// The terminal is acs's again: what was held during [`hand_over`] is
+    /// written now, in the order it was raised.
+    pub fn take_back() {
+        let held = ASIDE.with(|a| a.borrow_mut().take()).unwrap_or_default();
+        for line in held {
+            raise(line);
+        }
+    }
+
+    /// Print `line`, or hold it if the program's stream is mid-sequence or
+    /// ssh has the terminal.
     pub fn raise(line: String) {
+        let Some(line) = ASIDE.with(|a| match a.borrow_mut().as_mut() {
+            Some(held) => {
+                held.push(line);
+                None
+            }
+            None => Some(line),
+        }) else {
+            return;
+        };
         let straight_out = GATE.with(|g| {
             let mut g = g.borrow_mut();
             match g.as_mut() {
@@ -858,6 +891,10 @@ impl DialKeys<'_> {
                     let _ = sys::write_all(STDOUT, &off);
                 }
                 notes::stream(&self.state.observer);
+                // Nor do acs's own lines go into the prompt — a `-v`
+                // network trace read `Password: acs: network: …` —
+                // until `finish` has the terminal back (acs-esyy).
+                notes::hand_over();
                 let _ = self.raw.suspend();
                 let _ = sys::tcsetpgrp(STDIN, pid);
                 self.handed = true;
@@ -901,12 +938,14 @@ impl DialKeys<'_> {
     }
 
     /// The terminal back as a dial without the keys leaves it: acs's again,
-    /// and cooked until the `WELCOME`.
+    /// and cooked until the `WELCOME` — and the notes held while ssh had
+    /// it written.
     fn finish(&mut self) {
         if self.handed {
             let _ = sys::tcsetpgrp(STDIN, sys::getpgrp());
         }
         let _ = self.raw.suspend();
+        notes::take_back();
     }
 }
 
@@ -2655,6 +2694,34 @@ mod tests {
         notes::stream(&ModeObserver::new());
         note("plain");
         assert_eq!(notes::written(), ["acs: plain\r\n"]);
+    }
+
+    /// Regression (acs-esyy): while a redial has handed ssh the terminal,
+    /// a note — a `-v` network trace, a dial phase — is held rather than
+    /// written into ssh's prompt, and taking the terminal back writes every
+    /// one of them, in order, with nothing left behind.
+    #[test]
+    fn a_note_waits_while_ssh_has_the_terminal() {
+        notes::capture();
+        note("before");
+        assert_eq!(notes::written(), ["acs: before\r\n"]);
+        notes::hand_over();
+        note("network: 120 bytes from the kernel");
+        note("timing: ready");
+        assert!(notes::written().is_empty(), "written into the prompt");
+        notes::take_back();
+        assert_eq!(
+            notes::written(),
+            [
+                "acs: network: 120 bytes from the kernel\r\n",
+                "acs: timing: ready\r\n"
+            ]
+        );
+        note("after");
+        assert_eq!(notes::written(), ["acs: after\r\n"]);
+        // Taking back a terminal that was never handed over writes nothing.
+        notes::take_back();
+        assert!(notes::written().is_empty());
     }
 
     /// acs-ysx: the knowledge above is only as good as the calls that keep
