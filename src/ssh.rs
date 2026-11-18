@@ -20,10 +20,88 @@ pub const TRANSPORT_OPTS: &[&str] = &["-T", "-e", "none", "-o", "ServerAliveInte
 /// jump host's password. There acs's own dial deadlines bound the dial.
 pub const CONNECT_TIMEOUT_OPTS: &[&str] = &["-o", "ConnectTimeout=10"];
 
-/// How long `ssh -G` may take to say whether a session dial goes through a
-/// proxy ([`Transport::through_proxy`]). It reads files and runs nothing
-/// that touches the network — unless the user's config has a `Match exec`.
+/// How long `ssh -G` may take to say where a session dial goes
+/// ([`Transport::route`]). It reads files and runs nothing that touches
+/// the network — unless the user's config has a `Match exec`.
 const PROXY_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Which addresses ssh connects to: `ssh -G`'s `addressfamily`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// IPv4 and IPv6 alike (`any`, and anything ssh -G does not name).
+    #[default]
+    Any,
+    /// IPv4 only (`inet`).
+    Inet,
+    /// IPv6 only (`inet6`).
+    Inet6,
+}
+
+/// Where ssh dials a destination, as `ssh -G` says with the command line's
+/// options (KNOCK_DESIGN §3.2): the one parse of its output, read by the
+/// proxy check (acs-7sti), `reachability_tcp` (acs-fbes) and the knock.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Route {
+    /// `hostname`: the name or address ssh connects to.
+    pub hostname: Option<String>,
+    /// `port`: the port ssh connects to.
+    pub port: Option<u16>,
+    /// `addressfamily`.
+    pub addressfamily: AddressFamily,
+    /// `bindaddress`: the source address ssh binds, when one is set.
+    pub bindaddress: Option<String>,
+    /// A `proxyjump` or `proxycommand` other than `none` is set: ssh
+    /// reaches the host through another one.
+    pub proxied: bool,
+}
+
+impl Route {
+    /// The route in `ssh -G` output. A line it does not know, or a value
+    /// that does not parse, leaves its field as the default.
+    pub fn parse(out: &str) -> Route {
+        let mut r = Route::default();
+        for line in out.lines() {
+            let Some((key, v)) = line.split_once(' ') else {
+                continue;
+            };
+            let v = v.trim();
+            match key {
+                "hostname" => r.hostname = Some(v.to_string()),
+                "port" => r.port = v.parse().ok(),
+                "addressfamily" => {
+                    r.addressfamily = match v {
+                        "inet" => AddressFamily::Inet,
+                        "inet6" => AddressFamily::Inet6,
+                        _ => AddressFamily::Any,
+                    }
+                }
+                "bindaddress" => r.bindaddress = Some(v.to_string()),
+                "proxyjump" | "proxycommand" if v != "none" => r.proxied = true,
+                _ => {}
+            }
+        }
+        r
+    }
+
+    /// Run `ssh -G` — `ssh`, then `opts`, then `-- dest` — and parse what it
+    /// says, within `deadline`. `None` where it fails, exits non-zero or is
+    /// slower than that.
+    pub fn read(
+        ssh: &OsStr,
+        opts: &[OsString],
+        dest: &str,
+        deadline: std::time::Duration,
+    ) -> Option<Route> {
+        let mut c = Command::new(ssh);
+        c.arg("-G")
+            .args(opts)
+            .args([OsStr::new("--"), OsStr::new(dest)])
+            .stdout(std::process::Stdio::piped());
+        crate::alias::run_until(c, deadline)
+            .filter(|(code, _)| *code == 0)
+            .map(|(_, out)| Route::parse(&String::from_utf8_lossy(&out)))
+    }
+}
 
 /// No multiplexer at all: this connection is its own, and looks at no
 /// control socket — neither the user's nor acs's (DESIGN §3). Every redial
@@ -98,11 +176,11 @@ pub struct Transport {
     /// default, and whatever acs cannot vouch for — dials exactly as §3
     /// always did.
     pub mux: Option<crate::mux::Mux>,
-    /// ssh reaches the destination through a `ProxyJump` or a
-    /// `ProxyCommand`, so the session's calls go without
-    /// [`CONNECT_TIMEOUT_OPTS`] (acs-7sti). Set per dial by
-    /// [`Transport::for_dial`]; `false` keeps the timeout.
-    pub proxied: bool,
+    /// Where ssh dials the destination, as `ssh -G` said for this dial.
+    /// Set per session dial by [`Transport::for_dial`]; `None` — no dial
+    /// yet, a call that does not ask, or an `ssh -G` that failed — reads
+    /// as not proxied, which keeps the connect timeout.
+    pub route: Option<Route>,
 }
 
 /// The ssh program when the command line names none: `ACS_SSH`, else
@@ -121,33 +199,32 @@ impl Transport {
             local_forwards: Vec::new(),
             transport_cmd: None,
             mux: None,
-            proxied: false,
+            route: None,
         }
     }
 
-    /// Whether ssh dials the destination through a `ProxyJump` or a
-    /// `ProxyCommand`, as `ssh -G` says with the user's options — so a `-J`
-    /// or `-o ProxyJump=…` on the command line counts as much as the
-    /// user's ssh_config (acs-7sti). `false` where `ssh -G` fails or is
-    /// slow: the connect timeout then stays, as it always was.
-    pub fn through_proxy(&self) -> bool {
-        let mut c = Command::new(&self.ssh);
-        c.arg("-G")
-            .args(&self.user_opts)
-            .args([OsStr::new("--"), OsStr::new(&self.destination)])
-            .stdout(std::process::Stdio::piped());
-        crate::alias::run_until(c, PROXY_CHECK)
-            .filter(|(code, _)| *code == 0)
-            .is_some_and(|(_, out)| crate::alias::proxied(&String::from_utf8_lossy(&out)))
+    /// Where ssh dials the destination, as `ssh -G` says with the user's
+    /// options — so a `-J` or `-o ProxyJump=…` on the command line counts
+    /// as much as the user's ssh_config (acs-7sti). `None` where `ssh -G`
+    /// fails or takes longer than [`PROXY_CHECK`].
+    pub fn route(&self) -> Option<Route> {
+        Route::read(&self.ssh, &self.user_opts, &self.destination, PROXY_CHECK)
+    }
+
+    /// Whether this dial goes through a `ProxyJump` or a `ProxyCommand`,
+    /// so its session calls go without [`CONNECT_TIMEOUT_OPTS`]. `false`
+    /// without a route: the connect timeout then stays, as it always was.
+    pub fn proxied(&self) -> bool {
+        self.route.as_ref().is_some_and(|r| r.proxied)
     }
 
     /// This transport as a dial of kind `call` uses it: a session's dial,
-    /// made by ssh, learns whether it goes through a proxy now — an alias
-    /// may have moved the destination since the last dial.
+    /// made by ssh, learns where it goes now — an alias may have moved the
+    /// destination since the last dial.
     pub fn for_dial(&self, call: Call) -> Transport {
         let mut tr = self.clone();
         if call.is_session() && self.transport_cmd.is_none() {
-            tr.proxied = self.through_proxy();
+            tr.route = self.route();
         }
         tr
     }
@@ -180,7 +257,7 @@ impl Transport {
             Call::Batch => BATCH_OPTS,
         };
         v.extend(fixed.iter().map(OsString::from));
-        if call.is_session() && !self.proxied {
+        if call.is_session() && !self.proxied() {
             v.extend(CONNECT_TIMEOUT_OPTS.iter().map(OsString::from));
         }
         v.extend(self.control_opts(call));
@@ -667,7 +744,7 @@ mod tests {
             local_forwards: Vec::new(),
             transport_cmd: None,
             mux: None,
-            proxied: false,
+            route: None,
         }
     }
 
@@ -1061,7 +1138,10 @@ mod tests {
     #[test]
     fn a_proxied_session_call_has_no_connect_timeout() {
         let mut tr = t();
-        tr.proxied = true;
+        tr.route = Some(Route {
+            proxied: true,
+            ..Route::default()
+        });
         for call in [Call::Session, Call::Redial] {
             let direct = strs(t().argv(call, "R"));
             let mut want = direct.clone();
@@ -1101,17 +1181,109 @@ mod tests {
             user_opts: opts.iter().map(OsString::from).collect(),
             ..Transport::new(dest)
         };
-        assert!(tr("box", &["-J", "me@bastion"]).through_proxy());
-        assert!(tr("cfg", &[]).through_proxy());
-        assert!(!tr("box", &[]).through_proxy());
-        assert!(!tr("broken", &[]).through_proxy());
+        let proxied = |t: Transport| t.route().is_some_and(|r| r.proxied);
+        assert!(proxied(tr("box", &["-J", "me@bastion"])));
+        assert!(proxied(tr("cfg", &[])));
+        assert!(!proxied(tr("box", &[])));
+        assert_eq!(tr("broken", &[]).route(), None);
         // A session dial learns it; a batch call and the test transport
         // never ask.
-        assert!(tr("cfg", &[]).for_dial(Call::Redial).proxied);
-        assert!(!tr("cfg", &[]).for_dial(Call::Batch).proxied);
+        assert!(tr("cfg", &[]).for_dial(Call::Redial).proxied());
+        assert!(!tr("cfg", &[]).for_dial(Call::Batch).proxied());
+        assert_eq!(tr("cfg", &[]).for_dial(Call::Batch).route, None);
         let mut cmd = tr("cfg", &[]);
         cmd.transport_cmd = Some("sh -c".into());
-        assert!(!cmd.for_dial(Call::Session).proxied);
+        assert!(!cmd.for_dial(Call::Session).proxied());
+        // An ssh -G that fails leaves the dial unproxied, so the connect
+        // timeout stays as it always did.
+        let broken = tr("broken", &[]).for_dial(Call::Session);
+        assert_eq!(broken.route, None);
+        assert!(strs(broken.argv(Call::Session, "R")).contains(&"ConnectTimeout=10".to_string()));
+    }
+
+    /// KNOCK_DESIGN §3.2: each field `Route` reads from `ssh -G`.
+    #[test]
+    fn route_reads_each_field_from_ssh_dash_g() {
+        let out = "user me\nhostname 10.0.0.7\nport 2222\naddressfamily inet6\n\
+                   bindaddress 192.0.2.1\nproxyjump none\nproxycommand none\n";
+        assert_eq!(
+            Route::parse(out),
+            Route {
+                hostname: Some("10.0.0.7".into()),
+                port: Some(2222),
+                addressfamily: AddressFamily::Inet6,
+                bindaddress: Some("192.0.2.1".into()),
+                proxied: false,
+            }
+        );
+        for (v, want) in [
+            ("any", AddressFamily::Any),
+            ("inet", AddressFamily::Inet),
+            ("inet6", AddressFamily::Inet6),
+        ] {
+            let r = Route::parse(&format!("addressfamily {v}\n"));
+            assert_eq!(r.addressfamily, want, "{v}");
+        }
+        // ssh -G names no bindaddress unless one is set.
+        assert_eq!(Route::parse("hostname h\nport 22\n").bindaddress, None);
+        // A port that is not one is no port.
+        assert_eq!(Route::parse("port many\n").port, None);
+        assert_eq!(Route::parse(""), Route::default());
+    }
+
+    /// acs-7sti: a `proxyjump` or `proxycommand` other than `none` is a
+    /// proxied route, and the host and port are still read beside it.
+    #[test]
+    fn route_is_proxied_by_proxyjump_or_proxycommand() {
+        for line in ["proxyjump bastion", "proxycommand nc -X connect %h %p"] {
+            let r = Route::parse(&format!("hostname h\nport 22\n{line}\n"));
+            assert!(r.proxied, "{line}");
+            assert_eq!((r.hostname.as_deref(), r.port), (Some("h"), Some(22)));
+        }
+        assert!(!Route::parse("proxyjump none\nproxycommand none\n").proxied);
+    }
+
+    /// `Route::read` gives `None` for an ssh -G that fails, exits non-zero
+    /// or outlasts its deadline, and the route for one that answers.
+    #[test]
+    fn route_read_fails_on_a_failing_or_slow_ssh_dash_g() {
+        let dir = TempDir::new();
+        let fake = dir.path().join("ssh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nfor d; do :; done\n\
+             case \"$d\" in\n\
+             slow) sleep 5 ;;\n\
+             broken) echo 'hostname h'; exit 255 ;;\n\
+             *) printf 'hostname %s\\nport 22\\n' \"$d\" ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let read = |dest: &str| {
+            Route::read(
+                fake.as_os_str(),
+                &[],
+                dest,
+                std::time::Duration::from_millis(500),
+            )
+        };
+        let ok = read("box").expect("an answering ssh -G");
+        assert_eq!((ok.hostname.as_deref(), ok.port), (Some("box"), Some(22)));
+        assert_eq!(read("broken"), None);
+        let start = std::time::Instant::now();
+        assert_eq!(read("slow"), None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(4));
+        let missing = dir.path().join("no-such-ssh");
+        assert_eq!(
+            Route::read(
+                missing.as_os_str(),
+                &[],
+                "box",
+                std::time::Duration::from_secs(1)
+            ),
+            None
+        );
     }
 
     #[test]
