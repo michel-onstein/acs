@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::alias_memory::Memory;
 use crate::config::{format_timeout, Alias, Config, HostEntry};
+use crate::knock::Knock;
 use crate::netmatch::{self, LocalNet, Network};
 
 /// Whether a host answers a ping within the deadline given. Shared with the
@@ -64,14 +65,17 @@ pub fn resolve(
     log: &mut dyn FnMut(String),
 ) -> Result<Option<HostEntry>, String> {
     let ssh = [crate::ssh::program()];
-    resolve_remembering(name, config, reachable, network, None, &ssh, log)
+    resolve_remembering(name, config, reachable, network, None, &ssh, None, log)
 }
 
 /// [`resolve`], with the entry used last on these networks taken as soon
 /// as it answers its own ping (acs-zpj, DESIGN §7.3): `memory` says which
 /// that was and is told the choice made, for the next time. `ssh` is what
 /// `reachability_tcp`'s `ssh -G` runs: the program, then the command
-/// line's own ssh options (acs-nhrq).
+/// line's own ssh options (acs-nhrq). `knock` is the command line's
+/// `--knock`, which replaces the configured knock that a `reachability_tcp`
+/// probe sends first (KNOCK_DESIGN §6.1).
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_remembering(
     name: &str,
     config: &Config,
@@ -79,6 +83,7 @@ pub fn resolve_remembering(
     network: &dyn Fn() -> Network,
     memory: Option<&Memory>,
     ssh: &[OsString],
+    knock: Option<&Option<Knock>>,
     log: &mut dyn FnMut(String),
 ) -> Result<Option<HostEntry>, String> {
     let (user, alias_name) = split_user(name);
@@ -110,6 +115,7 @@ pub fn resolve_remembering(
             .then(|| ssh.to_vec()),
         locality,
         memory,
+        knock: knock.cloned(),
     };
     pick(name, alias, user, how, log).map(Some)
 }
@@ -132,6 +138,8 @@ struct How {
     tcp: Option<Vec<OsString>>,
     locality: Option<Locality>,
     memory: Option<Remembered>,
+    /// The command line's knock, over every entry's (KNOCK_DESIGN §6.2).
+    knock: Option<Option<Knock>>,
 }
 
 /// Where the choice is remembered, and under which alias name — the alias
@@ -156,8 +164,9 @@ impl Remembered {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum By {
     Ping,
-    /// A TCP connect to this port (`reachability_tcp`).
-    Port(u16),
+    /// A TCP connect to this port (`reachability_tcp`), after this many
+    /// knocks (KNOCK_DESIGN §6.1), or none.
+    Port(u16, usize),
     /// Pinged after all: ssh reaches it through a ProxyJump or a
     /// ProxyCommand, so there is no port of its own to connect to.
     Proxied,
@@ -170,7 +179,8 @@ impl By {
     fn says(self) -> String {
         match self {
             By::Ping => "ping".into(),
-            By::Port(p) => format!("on port {p}"),
+            By::Port(p, 0) => format!("on port {p}"),
+            By::Port(p, n) => format!("on port {p}, knocked first ({n} knocks)"),
             By::Proxied => "ping (ssh reaches it through a proxy)".into(),
             By::NoPort => "on its ssh port (ssh -G named none)".into(),
         }
@@ -217,6 +227,7 @@ fn pick(
         tcp,
         locality,
         memory,
+        knock,
     } = how;
     let entries: Vec<HostEntry> = alias
         .entries
@@ -233,16 +244,30 @@ fn pick(
             ..e.clone()
         })
         .collect();
-    let deadline = Instant::now() + timeout;
+    // What each entry knocks before its TCP probe: the command line's,
+    // else its own (KNOCK_DESIGN §6.1).
+    let knocks: Vec<Option<Knock>> = entries
+        .iter()
+        .map(|e| match &knock {
+            Some(k) => k.clone(),
+            None => e.knock.as_ref().and_then(|s| s.value.clone()),
+        })
+        .collect();
+    // A knocked probe has its knock's delays and wait on top (§4.3).
+    let knocking = match tcp {
+        Some(_) => knocks.iter().flatten().map(Knock::duration).max(),
+        None => None,
+    };
+    let deadline = Instant::now() + timeout + knocking.unwrap_or_default();
     let (tx, rx) = mpsc::channel();
     let ping = |i: usize| {
         let (tx, host, reachable) = (tx.clone(), entries[i].host.clone(), Arc::clone(&reachable));
-        let (tcp, dest) = (tcp.clone(), entries[i].destination());
+        let (tcp, dest, knock) = (tcp.clone(), entries[i].destination(), knocks[i].clone());
         // Not joined: once a host is chosen nobody waits for the others,
         // whose checks give up at the deadline by themselves.
         std::thread::spawn(move || {
             let answer = match &tcp {
-                Some(ssh) => probe_port(ssh, &host, &dest, &*reachable, timeout),
+                Some(ssh) => probe_port(ssh, &host, &dest, knock.as_ref(), &*reachable, timeout),
                 None => (reachable(&host, timeout), By::Ping),
             };
             let _ = tx.send((i, answer));
@@ -701,24 +726,41 @@ pub(crate) fn run_until(mut c: Command, deadline: Duration) -> Option<(i32, Vec<
 /// through a proxy, by `ping`.
 /// `ssh -G`, the name's lookup and the connect all share `deadline`, as
 /// one ping has it (acs-fbes). The connection is closed at once.
+///
+/// With a `knock`, the port is knocked open first, since without it the
+/// probe could never connect (KNOCK_DESIGN §6.1); the dial that follows
+/// within 2 s reuses that knock (§3.4). The knock's own delays and wait
+/// are added to the deadline.
 fn probe_port(
     ssh: &[OsString],
     host: &str,
     dest: &str,
+    knock: Option<&Knock>,
     ping: &Reachable,
     deadline: Duration,
 ) -> Answer {
-    let end = Instant::now() + deadline;
+    let mut end = Instant::now() + deadline;
     match crate::ssh::Route::read(&ssh[0], &ssh[1..], dest, deadline) {
         Some(r) if r.proxied => {
             let left = end.saturating_duration_since(Instant::now());
             (ping(host, left), By::Proxied)
         }
-        Some(crate::ssh::Route {
-            hostname: Some(name),
-            port: Some(port),
-            ..
-        }) => (connects(&name, port, end), By::Port(port)),
+        Some(r) => {
+            let (Some(name), Some(port)) = (&r.hostname, r.port) else {
+                return (false, By::NoPort);
+            };
+            let mut knocks = 0;
+            if let Some(k) = knock {
+                let left = end.saturating_duration_since(Instant::now());
+                let knocked = crate::knock::before_dial(k, dest, Some(&r), left, &mut |_| {});
+                end += k.duration();
+                if knocked.is_err() {
+                    return (false, By::Port(port, 0));
+                }
+                knocks = k.sequence.len();
+            }
+            (connects(name, port, end), By::Port(port, knocks))
+        }
         _ => (false, By::NoPort),
     }
 }
@@ -1288,6 +1330,7 @@ aliases:
             &no_network,
             Some(memory),
             &[crate::ssh::program()],
+            None,
             &mut |m| log.push(m),
         );
         let took = start.elapsed();
@@ -1528,6 +1571,7 @@ aliases:
             &|| on(&["192.168.1.5/24"], HOME_NAMES, 5000),
             Some(&home),
             &[crate::ssh::program()],
+            None,
             &mut |m| log.push(m),
         );
         assert_eq!(r.unwrap().unwrap().destination(), "devbox.example.com");
@@ -2079,6 +2123,7 @@ aliases:
             &no_network,
             memory,
             std::slice::from_ref(ssh),
+            None,
             &mut |m| log.push(m),
         );
         (r.map(|e| e.unwrap().destination()), log, start.elapsed())
@@ -2125,6 +2170,44 @@ aliases:
         let (r, log, _) = probing(&plain, "ab", &fake, &ssh, None);
         assert_eq!(r, Ok("a".into()));
         assert_eq!(log[0], "ab: a answers ping, using a");
+    }
+
+    /// KNOCK_DESIGN §6.1: an entry with a knock and `reachability_tcp` is
+    /// knocked before its probe, since without the knock the probe could
+    /// never connect; the dial after it reuses that knock (§3.4).
+    #[test]
+    fn a_tcp_probe_knocks_first() {
+        let dir = TempDir::new();
+        let (open, closed) = ports();
+        let port = open.local_addr().unwrap().port();
+        let ssh = fake_ssh(&dir, port, closed);
+        let knockd = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let k = knockd.local_addr().unwrap().port();
+        let yaml = format!(
+            "reachability_timeout: 5s\naliases:\n  b:\n    reachability_tcp: true\n    \
+             hosts:\n      - host: b\n        user: me\n        knock: {k}:udp,{k}:udp\n"
+        );
+        let fake = Fake::up(&["b"]);
+        let (r, log, _) = probing(&yaml, "b", &fake, &ssh, None);
+        assert_eq!(r, Ok("me@b".into()));
+        assert_eq!(
+            log,
+            [format!(
+                "b: b answers on port {port}, knocked first (2 knocks), using me@b"
+            )]
+        );
+        knockd
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(knockd.recv(&mut [0u8; 8]).unwrap(), 0, "an empty datagram");
+        }
+        // The dial that follows is within 2 s of it, and is not knocked
+        // again.
+        let seq = Knock::parse(&format!("{k}:udp,{k}:udp")).unwrap();
+        let lo = "127.0.0.1".parse().unwrap();
+        let again = crate::knock::send(&[lo], &seq).unwrap();
+        assert_eq!((again.knocked, again.reused), (vec![], vec![lo]));
     }
 
     #[test]

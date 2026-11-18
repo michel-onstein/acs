@@ -1,10 +1,13 @@
 # acs — port knocking
 
 **Status:** In progress — §12 steps 1 (`ssh::Route`), 2 (`knock.rs`:
-parser, sender, reuse table) and 3 (`knock` in the file, `--knock`,
-`ACS_KNOCK`, carried as `Transport::knock`) built; nothing knocks yet, as
-the dial does not call it (2026-11-18). Work is the epic acs-8l1v, one
-bead per step of §12.
+parser, sender, reuse table), 3 (`knock` in the file, `--knock`,
+`ACS_KNOCK`) and 4 (the dial knocks: `dial_once`, `exec::run`,
+`alias::probe_port`, the proxy refusal, `-v`, the `knocked` phase and the
+hint) built (2026-11-18). Still to do: step 5, `acs config` (acs-8l1v.5);
+step 6, the check against a real knockd on Linux (acs-8l1v.6); and the
+knock bound to ssh's `BindAddress` (§3.3, acs-z8wi). Work is the epic
+acs-8l1v, one bead per step of §12.
 
 Some hosts keep their ssh port closed behind a firewall and open it, for one
 source address and usually for a few seconds, only after that address has
@@ -190,12 +193,14 @@ dial (DESIGN §7.3). `ssh -G` with the command line's options answers all of
 it, and `Transport::for_dial` already runs it before every session dial to
 learn whether the dial is proxied (acs-7sti).
 
-So the two questions become one call. `for_dial` parses `ssh -G` into a
-`Route` — `hostname`, `port`, `addressfamily`, and whether a `proxyjump` or
-`proxycommand` is set — which `through_proxy` and the knock both read, and
-`alias::target` already parses the same lines for `reachability_tcp`. A
-call that had no `ssh -G` before (a side call, `exec::run`) runs it only
-when a knock is configured, so a host without one pays nothing new.
+So the two questions become one call. `for_dial` reads `ssh -G` into a
+`ssh::Route` — `hostname`, `port`, `addressfamily`, `bindaddress`, and
+whether a `proxyjump` or `proxycommand` is set, and which — that
+`Transport::proxied` (the connect timeout's question) and the knock both
+read, and `alias::probe_port` reads the same `Route` for
+`reachability_tcp`. A call that had no `ssh -G` before (a side call, a
+batch call, `exec::run`, the `--transport-cmd` test hook) runs it only
+when it knocks, so a host without a knock pays nothing new.
 
 `ssh -G` failing or taking longer than its 2 s (`PROXY_CHECK`) leaves acs not
 knowing where ssh will connect. With a knock configured that fails the dial
@@ -481,8 +486,9 @@ Nothing acs installs, and nothing beyond a working knockd setup:
   and sequence. The socket calls go through a small trait so that the unit
   tests can record what would be sent, and when.
 - **`ssh::Route`**: what `ssh -G` says about a dial — `hostname`, `port`,
-  `addressfamily`, `bindaddress`, proxied — replacing the boolean
-  `through_proxy` and the `alias::target` parser with one parser.
+  `addressfamily`, `bindaddress`, whether it is proxied and through what —
+  the one parser of `ssh -G`, read by `Transport::proxied`,
+  `alias::probe_port` and the knock.
 - **`Transport::knock: Option<Knock>`**, set from the resolved alias entry
   and `--knock`, carried into every dial as the identity file is.
 - **The dial step**: `client::dial_once` knocks after `for_dial` and before

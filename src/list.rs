@@ -38,13 +38,15 @@ pub(crate) enum Failure {
     /// The proxy answered with something that is not a STATUS reply, or
     /// with an ERROR saying why it could not list.
     BadReply(String),
+    /// A knock that cannot work as configured (KNOCK_DESIGN §5, §8).
+    Refused(String),
 }
 
 impl Failure {
     /// What to tell the user about `host`.
     pub(crate) fn message(&self, host: &str) -> String {
         match self {
-            Failure::Unreachable(e) => e.clone(),
+            Failure::Unreachable(e) | Failure::Refused(e) => e.clone(),
             Failure::BadReply(e) => format!("bad reply from {host}: {e}"),
         }
     }
@@ -53,7 +55,16 @@ impl Failure {
     pub(crate) fn code(&self) -> u8 {
         match self {
             Failure::Unreachable(_) => code::UNREACHABLE,
-            Failure::BadReply(_) => code::ERROR,
+            Failure::BadReply(_) | Failure::Refused(_) => code::ERROR,
+        }
+    }
+
+    /// A dial that did not come up: a knock refused as configured, or no
+    /// connection.
+    pub(crate) fn dial(e: io::Error) -> Failure {
+        match client::knock_refusal(&e) {
+            Some(crate::knock::Refusal::Config(m)) => Failure::Refused(m.clone()),
+            _ => Failure::Unreachable(e.to_string()),
         }
     }
 }
@@ -109,7 +120,9 @@ pub fn run_all(args: &ClientArgs) -> ExitCode {
             }
             Ok(Some(sessions)) => listed.push((alias, sessions)),
             Ok(None) => quiet.push_str(&format!("{}\n", not_installed(alias))),
-            Err(Failure::Unreachable(e)) => failed.push(format!("acs: {alias}: {e}")),
+            Err(Failure::Unreachable(e) | Failure::Refused(e)) => {
+                failed.push(format!("acs: {alias}: {e}"))
+            }
             Err(Failure::BadReply(e)) => failed.push(format!("acs: bad reply from {alias}: {e}")),
         }
     }
@@ -182,7 +195,7 @@ pub(crate) fn query(
         &mut crate::timing::Timing::off(),
         Vec::new(),
     )
-    .map_err(|e| Failure::Unreachable(e.to_string()))?;
+    .map_err(Failure::dial)?;
     let rest = match marker {
         Marker::Ready { rest, .. } => rest,
         Marker::Need { .. } => {

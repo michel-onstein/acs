@@ -143,7 +143,7 @@ fn open_pick(
     let (mut link, marker) = client::dial_watching(
         &args.conn, call, &remote, timeout, timing, first, netwatch, None,
     )
-    .map_err(|e| Failure::Unreachable(e.to_string()))?;
+    .map_err(Failure::dial)?;
     let owed = link.take_pending();
     let rest = match marker {
         Marker::Ready { proto: p, rest } if p == proto::PROTO_VERSION => rest,
@@ -531,7 +531,7 @@ fn to_answer(name: &str, listed: Result<Option<Vec<StatusInfo>>, Failure>) -> An
     match listed {
         Ok(Some(s)) => Answer::Sessions(s),
         Ok(None) => Answer::Line(list::not_installed(name)),
-        Err(Failure::Unreachable(e)) => Answer::Line(format!("{name}: {e}")),
+        Err(Failure::Unreachable(e) | Failure::Refused(e)) => Answer::Line(format!("{name}: {e}")),
         Err(f) => Answer::Line(f.message(name)),
     }
 }

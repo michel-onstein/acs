@@ -53,6 +53,9 @@ pub struct Route {
     /// A `proxyjump` or `proxycommand` other than `none` is set: ssh
     /// reaches the host through another one.
     pub proxied: bool,
+    /// That proxy as messages name it: `ProxyJump <jump host>`, or
+    /// `a ProxyCommand` (KNOCK_DESIGN §5).
+    pub proxy: Option<String>,
 }
 
 impl Route {
@@ -76,7 +79,14 @@ impl Route {
                     }
                 }
                 "bindaddress" => r.bindaddress = Some(v.to_string()),
-                "proxyjump" | "proxycommand" if v != "none" => r.proxied = true,
+                "proxyjump" | "proxycommand" if v != "none" => {
+                    r.proxied = true;
+                    if key == "proxyjump" {
+                        r.proxy = Some(format!("ProxyJump {v}"));
+                    } else if r.proxy.is_none() {
+                        r.proxy = Some("a ProxyCommand".into());
+                    }
+                }
                 _ => {}
             }
         }
@@ -226,9 +236,14 @@ impl Transport {
     /// This transport as a dial of kind `call` uses it: a session's dial,
     /// made by ssh, learns where it goes now — an alias may have moved the
     /// destination since the last dial.
-    pub fn for_dial(&self, call: Call) -> Transport {
+    ///
+    /// `knocking`: this dial knocks first (KNOCK_DESIGN §3.2), and so asks
+    /// whatever the call — a side or batch call, even the test transport —
+    /// since the knock goes where ssh connects. A call that does not knock
+    /// asks nothing new.
+    pub fn for_dial(&self, call: Call, knocking: bool) -> Transport {
         let mut tr = self.clone();
-        if call.is_session() && self.transport_cmd.is_none() {
+        if knocking || (call.is_session() && self.transport_cmd.is_none()) {
             tr.route = self.route();
         }
         tr
@@ -1194,15 +1209,20 @@ mod tests {
         assert_eq!(tr("broken", &[]).route(), None);
         // A session dial learns it; a batch call and the test transport
         // never ask.
-        assert!(tr("cfg", &[]).for_dial(Call::Redial).proxied());
-        assert!(!tr("cfg", &[]).for_dial(Call::Batch).proxied());
-        assert_eq!(tr("cfg", &[]).for_dial(Call::Batch).route, None);
+        assert!(tr("cfg", &[]).for_dial(Call::Redial, false).proxied());
+        assert!(!tr("cfg", &[]).for_dial(Call::Batch, false).proxied());
+        assert_eq!(tr("cfg", &[]).for_dial(Call::Batch, false).route, None);
         let mut cmd = tr("cfg", &[]);
         cmd.transport_cmd = Some("sh -c".into());
-        assert!(!cmd.for_dial(Call::Session).proxied());
+        assert!(!cmd.for_dial(Call::Session, false).proxied());
+        // A dial that knocks asks whatever the call, the test transport
+        // included: the knock goes where ssh connects (KNOCK_DESIGN §3.2).
+        assert!(tr("cfg", &[]).for_dial(Call::Batch, true).proxied());
+        assert!(tr("cfg", &[]).for_dial(Call::Side, true).proxied());
+        assert!(cmd.for_dial(Call::Session, true).proxied());
         // An ssh -G that fails leaves the dial unproxied, so the connect
         // timeout stays as it always did.
-        let broken = tr("broken", &[]).for_dial(Call::Session);
+        let broken = tr("broken", &[]).for_dial(Call::Session, false);
         assert_eq!(broken.route, None);
         assert!(strs(broken.argv(Call::Session, "R")).contains(&"ConnectTimeout=10".to_string()));
     }
@@ -1220,6 +1240,7 @@ mod tests {
                 addressfamily: AddressFamily::Inet6,
                 bindaddress: Some("192.0.2.1".into()),
                 proxied: false,
+                proxy: None,
             }
         );
         for (v, want) in [
@@ -1247,6 +1268,22 @@ mod tests {
             assert_eq!((r.hostname.as_deref(), r.port), (Some("h"), Some(22)));
         }
         assert!(!Route::parse("proxyjump none\nproxycommand none\n").proxied);
+        // Messages name the proxy (KNOCK_DESIGN §5); a jump host over a
+        // command, whichever ssh -G prints first.
+        let proxy = |out: &str| Route::parse(out).proxy;
+        assert_eq!(
+            proxy("proxyjump me@bastion\n").as_deref(),
+            Some("ProxyJump me@bastion")
+        );
+        assert_eq!(
+            proxy("proxycommand nc %h %p\n").as_deref(),
+            Some("a ProxyCommand")
+        );
+        assert_eq!(
+            proxy("proxycommand nc %h %p\nproxyjump b\n").as_deref(),
+            Some("ProxyJump b")
+        );
+        assert_eq!(proxy("proxyjump none\n"), None);
     }
 
     /// `Route::read` gives `None` for an ssh -G that fails, exits non-zero
