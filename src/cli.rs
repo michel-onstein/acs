@@ -15,6 +15,7 @@
 use std::ffi::OsString;
 
 use crate::config::Config;
+use crate::knock::Knock;
 use crate::session;
 use crate::ssh::Transport;
 
@@ -36,6 +37,10 @@ options:
       --force         take over a session attached by someone else
   -v                  verbose: show ssh commands, remote login noise, connect timings
                       and what each network change the kernel reports was worth
+      --knock <spec>  knock before dialling, as knockd expects: ports such as
+                      7000,8000:udp,9000, then optional /delay=50ms /wait=200ms
+                      /host=<host to knock>; replaces the configured knock, and
+                      --knock none drops it (also ACS_KNOCK)
       --ssh <path>    ssh program to run (also ACS_SSH)
   -h, --help          this help
   -V, --version       print the version
@@ -61,7 +66,7 @@ in a session: Ctrl-] Ctrl-] then  d  detach (session keeps running)
               a bell says it waits for the key (off: command_bell: false)
 
 environment: ACS_DEFAULT_SESSION ACS_IDENTITY ACS_ESCAPE_KEY ACS_ESCAPE_TIMEOUT_MS
-             ACS_COMMAND_BELL ACS_PERSIST ACS_SSH ACS_SOCKET_DIR
+             ACS_COMMAND_BELL ACS_PERSIST ACS_SSH ACS_SOCKET_DIR ACS_KNOCK
 
 configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml;
                the <host> of [user@]<host> may be an alias defined there (aliases:)";
@@ -108,6 +113,10 @@ pub struct Connection {
     pub alias: Option<String>,
     /// The index of the alias's entry in use, once one was chosen.
     pub entry: Option<usize>,
+    /// `--knock` (or `ACS_KNOCK`), which replaces the configuration's knock
+    /// on every alias resolution (KNOCK_DESIGN §6.2): `None` when not given,
+    /// a value of `None` for `--knock none`.
+    pub knock: Option<Option<Knock>>,
 }
 
 impl Connection {
@@ -120,7 +129,18 @@ impl Connection {
             config: Config::default(),
             alias: None,
             entry: None,
+            knock: None,
         }
+    }
+
+    /// The command line's knock choice: kept for the alias resolution, and
+    /// the transport's knock until an alias replaces it.
+    pub fn with_knock(mut self, knock: Option<Option<Knock>>) -> Self {
+        if let Some(k) = &knock {
+            self.transport.knock = k.clone();
+        }
+        self.knock = knock;
+        self
     }
 
     /// The host as the user named it: the alias, or the destination.
@@ -165,6 +185,29 @@ pub fn ssh_passthrough(c: char, port: char) -> Option<char> {
         'i' | 'J' | 'F' | 'o' => Some(c),
         _ if c == port => Some('p'),
         _ => None,
+    }
+}
+
+/// `ACS_KNOCK`, when set (KNOCK_DESIGN §6.2).
+pub fn env_knock() -> Option<String> {
+    crate::sys::env_nonempty("ACS_KNOCK").map(|v| v.to_string_lossy().into_owned())
+}
+
+/// The knock the command line chose (KNOCK_DESIGN §6.2): `--knock`'s
+/// spec, else `ACS_KNOCK`'s, `None` when neither is given. Shared by acs,
+/// `acs list` and acscp.
+pub fn knock_choice(
+    flag: Option<&str>,
+    env: Option<&str>,
+) -> Result<Option<Option<Knock>>, String> {
+    match (flag, env) {
+        (Some(f), _) => crate::knock::parse_spec(f)
+            .map(Some)
+            .map_err(|e| format!("--knock: {e}")),
+        (None, Some(e)) => crate::knock::parse_spec(e)
+            .map(Some)
+            .map_err(|e| format!("ACS_KNOCK: {e}")),
+        (None, None) => Ok(None),
     }
 }
 
@@ -217,6 +260,7 @@ where
     let mut command = Vec::new();
     let mut ssh: Option<OsString> = None;
     let mut transport_cmd: Option<String> = None;
+    let mut knock: Option<String> = None;
 
     let text = |v: OsString, what: &str| -> Result<String, String> {
         v.into_string()
@@ -272,6 +316,7 @@ where
             Short('n') => null_stdin = true,
             Short('v') | Long("verbose") => verbose = verbose.saturating_add(1),
             Long("ssh") => ssh = Some(p.value().map_err(|e| e.to_string())?),
+            Long("knock") => knock = Some(text(p.value().map_err(|e| e.to_string())?, "--knock")?),
             Long("transport-cmd") => {
                 transport_cmd = Some(text(
                     p.value().map_err(|e| e.to_string())?,
@@ -336,6 +381,7 @@ where
         return Err("--new picks the session name itself; give either --new or a name".into());
     }
 
+    let knock = knock_choice(knock.as_deref(), env_knock().as_deref())?;
     let one_shot = !command.is_empty() && session.is_none() && !new;
     let target = match session {
         _ if new => Target::New,
@@ -359,7 +405,7 @@ where
     transport.transport_cmd = transport_cmd;
 
     let args = Box::new(ClientArgs {
-        conn: Connection::new(transport, verbose),
+        conn: Connection::new(transport, verbose).with_knock(knock),
         target,
         list,
         reconnect,
@@ -579,6 +625,70 @@ mod tests {
         assert!(e.contains("bad -L"), "{e}");
         let e = run(&["-L", "box"]).unwrap_err();
         assert!(e.contains("bad -L 'box'"), "{e}");
+    }
+
+    /// KNOCK_DESIGN §6.2: `--knock <spec>` and `--knock none`, for acs and
+    /// `acs list` alike; the transport carries the knock until an alias
+    /// resolution replaces it, and the connection keeps the choice for
+    /// that resolution. It is not an ssh option.
+    #[test]
+    fn knock_on_the_command_line() {
+        let k = |s: &str| crate::knock::Knock::parse(s).unwrap();
+        let a = run(&["--knock", "7000,8000:udp,9000", "-p", "2222", "box"]).unwrap();
+        assert_eq!(a.conn.transport.knock, Some(k("7000,8000:udp,9000")));
+        assert_eq!(a.conn.knock, Some(Some(k("7000,8000:udp,9000"))));
+        assert_eq!(opts(&a), ["-p", "2222"]);
+        let a = run(&["--knock=1,2/delay=0/wait=1s/host=gw", "box"]).unwrap();
+        let want = crate::knock::Knock::new(
+            k("1,2").sequence,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+            Some("gw".into()),
+        )
+        .unwrap();
+        assert_eq!(a.conn.transport.knock, Some(want));
+        let a = run(&["--knock", "none", "box"]).unwrap();
+        assert_eq!(a.conn.transport.knock, None);
+        assert_eq!(a.conn.knock, Some(None));
+        if env_knock().is_none() {
+            let a = run(&["box"]).unwrap();
+            assert_eq!((a.conn.knock, a.conn.transport.knock), (None, None));
+        }
+        for args in [&["--knock", "1,2", "box"][..], &["--knock", "1,2"]] {
+            let (Parsed::Run(a) | Parsed::ListAll(a)) = list(args).unwrap() else {
+                panic!("{args:?}")
+            };
+            assert_eq!(a.conn.knock, Some(Some(k("1,2"))), "{args:?}");
+        }
+        assert_eq!(
+            list(&["--knock", "none"]).map(|p| match p {
+                Parsed::ListAll(a) => a.conn.knock,
+                _ => panic!(),
+            }),
+            Ok(Some(None))
+        );
+        let e = run(&["--knock", "1,,2", "box"]).unwrap_err();
+        assert!(e.starts_with("--knock: '1,,2': knock 2 is empty"), "{e}");
+        let e = list(&["--knock", "1/pause=1s"]).unwrap_err();
+        assert!(e.contains("--knock: unknown knock option 'pause'"), "{e}");
+        assert!(run(&["box", "--knock"]).is_err());
+    }
+
+    /// `ACS_KNOCK` is `--knock` for scripts and tests, and `--knock` wins.
+    /// (The process environment is not set here, since tests run in
+    /// parallel: this is the choice the parser makes from both.)
+    #[test]
+    fn acs_knock_is_the_flag_from_the_environment_and_the_flag_wins() {
+        let k = |s: &str| crate::knock::Knock::parse(s).unwrap();
+        assert_eq!(knock_choice(None, None), Ok(None));
+        assert_eq!(knock_choice(None, Some("1,2")), Ok(Some(Some(k("1,2")))));
+        assert_eq!(knock_choice(None, Some("none")), Ok(Some(None)));
+        assert_eq!(knock_choice(Some("3"), Some("1,2")), Ok(Some(Some(k("3")))));
+        assert_eq!(knock_choice(Some("none"), Some("1,2")), Ok(Some(None)));
+        // A bad variable is not looked at when the flag is given.
+        assert_eq!(knock_choice(Some("3"), Some("x")), Ok(Some(Some(k("3")))));
+        let e = knock_choice(None, Some("x")).unwrap_err();
+        assert!(e.starts_with("ACS_KNOCK: "), "{e}");
     }
 
     /// acs-odd: `-L none` names no forward — it says the configuration's

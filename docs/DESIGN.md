@@ -1902,6 +1902,7 @@ aliases:                       # acs devbox tries its hosts in order
       identity_file: ~/.ssh/id_outside # this host's ssh key (-i)
       persist: true            # wait for this host when it is lost (§5.3)
       prefer: true             # used over devbox.lan when both answer (§7.3)
+      knock: 7000,8000:udp,9000 # knock first, as knockd expects (KNOCK_DESIGN)
     - host: devbox.site
       local_networks:          # first when THIS machine is on one of these
         - 172.16.0.0/16
@@ -1915,8 +1916,13 @@ aliases:                       # acs devbox tries its hosts in order
     prefer_local_network: true # hosts on this machine's networks first
     local_forwards:            # over the global list; `none` for no forward
       - 5432:db.internal:5432
+    knock:                     # every entry's knock, unless it sets its own
+      sequence: 7000,8000,9000
+      wait: 500ms              # after the last knock (default 200ms)
     hosts:
       - host: lab.lan
+      - host: lab.example.com
+        knock: none            # this one has no knockd
 ```
 
 - **Merging**: a setting in the local file replaces the global one — an
@@ -1937,14 +1943,14 @@ aliases:                       # acs devbox tries its hosts in order
   the setting came from, and exits with the install-failed code (254).
 - `aliases` is parsed and validated: `host` is required, `user`,
   `identity_file`, `reachability_check` (default `true`), `prefer`
-  (default `false`, §7.3), `persist` and `local_networks` (§7.3) are
-  optional, and one entry may be
+  (default `false`, §7.3), `persist`, `local_networks` (§7.3) and `knock`
+  are optional, and one entry may be
   written without the list. How an alias is resolved is §7.3.
 - **An alias's own settings**: an alias is a list of entries (or one entry,
   a mapping with `host`), or a mapping of its settings — `identity_file`,
   `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`,
-  `persist`, `reachability_interval`, `prefer_local_network` and
-  `local_forwards` —
+  `persist`, `reachability_interval`, `prefer_local_network`,
+  `local_forwards` and `knock` —
   and its `hosts`, that list. The list form
   stays the usual one; the mapping is only needed for a setting shared by
   the entries. A file may give the mapping without
@@ -1972,6 +1978,13 @@ aliases:                       # acs devbox tries its hosts in order
   specs are added to whatever is left. It is never a **host entry's**
   setting: a forward belongs to the session, not to one of the addresses
   the session might be reached at.
+- **`knock`** ([KNOCK_DESIGN](KNOCK_DESIGN.md) §6.1) is a host entry's
+  setting and an alias's, never a global one: a sequence
+  (`7000,8000:udp,9000`), or a mapping of `sequence`, `delay`, `wait` and
+  `host`, where any other key is an error listing those four. The entry's
+  replaces the alias's **whole**, never key by key; `none` drops the
+  alias's, and an empty value sets nothing. `--knock` and `ACS_KNOCK` beat
+  both. Read and checked with the file; not yet sent by the dial.
 - Only the local client reads the files; `_proxy`, `_master` and `_install`
   never do.
 

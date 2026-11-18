@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! acscp [-rpqvC46] [-P port] [-i identity_file] [-J destination] [-F config]
-//!       [-o option=value] [--no-reconnect] [--ssh path] [--] source ... target
+//!       [-o option=value] [--no-reconnect] [--knock spec] [--ssh path]
+//!       [--] source ... target
 //! ```
 //!
 //! `-p` is `scp`'s: preserve. The port is `-P`, and goes to ssh as its `-p`
@@ -17,7 +18,8 @@ use crate::ssh::Transport;
 
 pub const USAGE: &str = "\
 usage: acscp [-rpqvC46] [-P port] [-i identity_file] [-J destination] [-F config]
-             [-o option=value] [--no-reconnect] [--ssh path] [--] source ... target
+             [-o option=value] [--no-reconnect] [--knock spec] [--ssh path]
+             [--] source ... target
        acs cp ...      the same, without the acscp name
 
   an argument is remote when it is [user@]host:[path] with no / before the
@@ -35,12 +37,15 @@ options:
   -i <identity_file>  -J <jump>  -F <config>  -o <option=value>
                       passed to every ssh call acscp makes
       --no-reconnect  end on the first lost link instead of redialling
+      --knock <spec>  knock before dialling, as acs --knock does (see acs --help);
+                      --knock none drops the configured knock (also ACS_KNOCK)
       --ssh <path>    ssh program to run (also ACS_SSH)
   -h, --help          this help
       --version       print the version
   --                  end of options: a source may begin with -
 
-environment: ACS_CP_WINDOW (file headers sent ahead of their data, default 64)";
+environment: ACS_CP_WINDOW (file headers sent ahead of their data, default 64)
+             ACS_KNOCK (as --knock)";
 
 /// A `[user@]host:path` argument (ACSCP_DESIGN §4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +87,9 @@ pub struct CopyArgs {
     pub ssh: Option<OsString>,
     /// `--transport-cmd`, the test hook (DESIGN §9.1).
     pub transport_cmd: Option<String>,
+    /// `--knock` or `ACS_KNOCK` (KNOCK_DESIGN §6.2): `None` when neither is
+    /// given, a value of `None` for `none`.
+    pub knock: Option<Option<crate::knock::Knock>>,
     /// The ssh options, flag and value pairs in the order given, `-P`
     /// already turned into ssh's `-p`.
     pub user_opts: Vec<OsString>,
@@ -100,7 +108,7 @@ impl CopyArgs {
         }
         t.user_opts = self.user_opts.clone();
         t.transport_cmd = self.transport_cmd.clone();
-        Connection::new(t, self.verbose)
+        Connection::new(t, self.verbose).with_knock(self.knock.clone())
     }
 
     /// Whether any argument names a host.
@@ -212,11 +220,13 @@ where
         reconnect: true,
         ssh: None,
         transport_cmd: None,
+        knock: None,
         user_opts: Vec::new(),
         sources: Vec::new(),
         target: Spec::Local(PathBuf::new()),
     };
     let mut positionals = Vec::new();
+    let mut knock: Option<String> = None;
     let ssh_opt = |a: &mut CopyArgs, flag: &str, v: &str| {
         a.user_opts.push(flag.into());
         a.user_opts.push(v.into());
@@ -232,6 +242,13 @@ where
             Short('6') => ssh_opt(&mut a, "-o", "AddressFamily=inet6"),
             Long("no-reconnect") => a.reconnect = false,
             Long("ssh") => a.ssh = Some(p.value().map_err(|e| e.to_string())?),
+            Long("knock") => {
+                let v = p.value().map_err(|e| e.to_string())?;
+                knock = Some(
+                    v.into_string()
+                        .map_err(|_| "--knock is not valid UTF-8".to_string())?,
+                );
+            }
             Long("transport-cmd") => {
                 let v = p.value().map_err(|e| e.to_string())?;
                 a.transport_cmd = Some(
@@ -253,6 +270,7 @@ where
             Long(l) => return Err(format!("unknown option --{l}")),
         }
     }
+    a.knock = cli::knock_choice(knock.as_deref(), cli::env_knock().as_deref())?;
     if positionals.len() < 2 {
         return Err("need a source and a target (see acscp --help)".into());
     }
@@ -398,6 +416,26 @@ mod tests {
         assert!(run(&["-l", "100", "a", "b"]).is_err());
         assert!(run(&["-L", "1:h:2", "a", "b"]).is_err());
         assert!(run(&["--bogus", "a", "b"]).is_err());
+    }
+
+    /// KNOCK_DESIGN §6.2: acscp takes `--knock` as acs does, and every
+    /// host's connection carries it.
+    #[test]
+    fn knock_reaches_every_hosts_connection() {
+        let k = crate::knock::Knock::parse("7000,8000:udp").unwrap();
+        let a = run(&["--knock", "7000,8000:udp", "a:x", "b:y"]).unwrap();
+        assert_eq!(a.knock, Some(Some(k.clone())));
+        for host in ["a", "b"] {
+            let c = a.connection(&remote(None, host, "x").unwrap());
+            assert_eq!(c.transport.knock.as_ref(), Some(&k), "{host}");
+            assert_eq!(c.knock, Some(Some(k.clone())), "{host}");
+        }
+        let a = run(&["--knock", "none", "a:x", "b"]).unwrap();
+        assert_eq!(a.knock, Some(None));
+        let c = a.connection(&remote(None, "a", "x").unwrap());
+        assert_eq!((c.knock, c.transport.knock), (Some(None), None));
+        let e = run(&["--knock", "1/delay=9s", "a:x", "b"]).unwrap_err();
+        assert!(e.starts_with("--knock: delay: "), "{e}");
     }
 
     /// `--` ends the options: a source may begin with `-`.
