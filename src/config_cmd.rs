@@ -806,6 +806,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                     origin: None,
                 }),
                 local_networks: local_networks.clone(),
+                knock: None,
                 origin: config::Origin {
                     file: PathBuf::new(),
                     line: 0,

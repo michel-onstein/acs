@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::knock::Knock;
 use crate::netmatch::LocalNet;
 use crate::yaml::{self, Node, Value};
 
@@ -80,6 +81,9 @@ pub struct HostEntry {
     /// first when one of **this machine's own** addresses is on one of
     /// them. Empty for none.
     pub local_networks: Vec<LocalNet>,
+    /// The host's knock (KNOCK_DESIGN §6.1): `None` leaves it to the
+    /// alias, a value of `None` is `knock: none` and drops the alias's.
+    pub knock: Option<Setting<Option<Knock>>>,
     pub origin: Origin,
 }
 
@@ -123,6 +127,10 @@ pub struct Alias {
     /// leaves it to the global setting, an empty list (`none`) forwards
     /// nothing whatever the global setting says.
     pub local_forwards: Option<Setting<Vec<String>>>,
+    /// The knock of every entry that sets none itself (KNOCK_DESIGN §6.1);
+    /// `None` for no knock, a value of `None` for `knock: none`, which a
+    /// local file sets over a global file's knock.
+    pub knock: Option<Setting<Option<Knock>>>,
     /// Where the alias is first defined.
     pub origin: Origin,
 }
@@ -414,7 +422,12 @@ pub const HOST_KEYS: &[&str] = &[
     "persist",
     "prefer",
     "local_networks",
+    "knock",
 ];
+
+/// The key of a host's knock, on an entry and on an alias (KNOCK_DESIGN
+/// §6.1). Not a row of [`SETTINGS`]: it has no top-level form.
+pub const KNOCK: &str = "knock";
 
 /// The value that spells "no forward at all" wherever a `local_forwards` is
 /// taken — in a file, in `acs config set`, and as `-L none` on the command
@@ -909,6 +922,10 @@ impl Alias {
     /// these, and the settings it sets over these (DESIGN §7.2).
     fn merge(&mut self, mut from: Alias) {
         self.entries.append(&mut from.entries);
+        // Replaced whole, never merged key by key (KNOCK_DESIGN §6.1).
+        if from.knock.is_some() {
+            self.knock = from.knock.take();
+        }
         for f in alias_settings().filter_map(|d| d.alias.as_ref()) {
             if let Some((value, origin)) = (f.get)(&from).get() {
                 (f.get_mut)(self).set(value, origin);
@@ -935,6 +952,12 @@ fn alias_parts(name: &str, node: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<
                     list = Some(v).filter(|v| v.value != Value::Null);
                     continue;
                 }
+                if k == KNOCK {
+                    alias.knock = knock_setting(v, at).map_err(|(line, e)| {
+                        format!("{}: aliases.{name}: {KNOCK}: {e}", Origin { line, ..at(v) })
+                    })?;
+                    continue;
+                }
                 match setting(k).and_then(|d| Some((d, d.alias.as_ref()?))) {
                     Some(_) if v.value == Value::Null => {}
                     Some((d, f)) => {
@@ -946,7 +969,7 @@ fn alias_parts(name: &str, node: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<
                             v,
                             format!(
                                 "unknown key '{k}' (an alias takes {}; a single host entry needs 'host: <name>')",
-                                key_list(alias_settings(), "hosts")
+                                key_list(alias_settings(), "knock, hosts")
                             ),
                         ))
                     }
@@ -1002,6 +1025,7 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
     let mut identity = None;
     let mut persist = None;
     let mut networks = Vec::new();
+    let mut knock = None;
     for (k, v) in fields {
         match k.as_str() {
             "host" => {
@@ -1033,6 +1057,10 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
                 }
             }
             "identity_file" => identity = field(k, v, identity_file(v, at))?,
+            KNOCK => {
+                knock = knock_setting(v, at)
+                    .map_err(|(line, e)| format!("{k}: {e}{}", on_line(line)))?
+            }
             "local_networks" => {
                 if v.value != Value::Null {
                     networks = field(k, v, networks_value(v))?;
@@ -1063,8 +1091,93 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
         identity_file: identity,
         persist,
         local_networks: networks,
+        knock,
         origin: at(item),
     })
+}
+
+/// A `knock` on an entry or an alias (KNOCK_DESIGN §6.1): `None` for an
+/// empty value, which sets nothing; a value of `None` for `none`. An error
+/// comes with the line it is about, an inner key's own in a mapping.
+fn knock_setting(
+    n: &Node,
+    at: &dyn Fn(&Node) -> Origin,
+) -> Result<Option<Setting<Option<Knock>>>, (usize, String)> {
+    if n.value == Value::Null {
+        return Ok(None);
+    }
+    knock_value(n).map(|value| {
+        Some(Setting {
+            value,
+            origin: Some(at(n)),
+        })
+    })
+}
+
+/// A knock's node: `none`, a sequence (the short form, with the default
+/// timing), or a mapping of [`crate::knock::KNOCK_KEYS`] with a `sequence`.
+/// The mapping is the whole knock: what it leaves out is the default, not
+/// another level's (§6.1).
+fn knock_value(n: &Node) -> Result<Option<Knock>, (usize, String)> {
+    use crate::knock::{self, KNOCK_KEYS};
+    let at = |m: &Node| {
+        let line = m.line;
+        move |e: String| (line, e)
+    };
+    let fields = match &n.value {
+        Value::Scalar(s) if s.text.trim().eq_ignore_ascii_case(knock::NO_KNOCK) => return Ok(None),
+        Value::Scalar(s) => return Knock::parse(&s.text).map(Some).map_err(at(n)),
+        Value::Map(m) => m,
+        other => {
+            return Err((
+                n.line,
+                format!(
+                    "expected a sequence such as 7000,8000:udp,9000, or a mapping of {}, found {}",
+                    KNOCK_KEYS.join(", "),
+                    other.kind()
+                ),
+            ))
+        }
+    };
+    let (mut sequence, mut delay, mut wait, mut host) =
+        (None, knock::DEFAULT_DELAY, knock::DEFAULT_WAIT, None);
+    for (k, v) in fields {
+        let scalar = || match &v.value {
+            Value::Scalar(s) => Ok(s.text.as_str()),
+            other => Err((
+                v.line,
+                format!("{k}: expected a value, found {}", other.kind()),
+            )),
+        };
+        let named = |e: String| (v.line, format!("{k}: {e}"));
+        if !KNOCK_KEYS.contains(&k.as_str()) {
+            return Err((
+                v.line,
+                format!(
+                    "unknown key '{k}' (a knock takes {})",
+                    KNOCK_KEYS.join(", ")
+                ),
+            ));
+        }
+        if v.value == Value::Null {
+            continue;
+        }
+        match k.as_str() {
+            "sequence" => sequence = Some(Knock::parse(scalar()?).map_err(named)?.sequence),
+            "delay" => delay = knock::parse_delay(scalar()?).map_err(named)?,
+            "wait" => wait = knock::parse_wait(scalar()?).map_err(named)?,
+            _ => host = Some(knock::parse_host(scalar()?).map_err(named)?),
+        }
+    }
+    let sequence = sequence.ok_or_else(|| {
+        (
+            n.line,
+            "a knock mapping needs 'sequence: <ports>', such as 7000,8000:udp,9000".to_string(),
+        )
+    })?;
+    Knock::new(sequence, delay, wait, host)
+        .map(Some)
+        .map_err(at(n))
 }
 
 #[cfg(test)]
@@ -1367,7 +1480,7 @@ aliases:
             ),
             (
                 "aliases:\n  d:\n    user: me\n",
-                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, hosts; a single host entry needs 'host: <name>')",
+                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, knock, hosts; a single host entry needs 'host: <name>')",
             ),
             (
                 "aliases:\n  d:\n    - host: a\n      identity_file: {k: v}\n",
@@ -1794,6 +1907,171 @@ aliases:
     fn a_bad_global_file_is_an_error_too() {
         let e = load("install_on_remote: nope\n", "").unwrap_err();
         assert!(e.contains("global.yaml:1:"), "{e}");
+    }
+
+    /// An entry's or alias's knock: its sequence and timing, `none` as
+    /// `-`, unset as nothing at all.
+    fn knock_of(k: &Option<Setting<Option<Knock>>>) -> Option<String> {
+        k.as_ref().map(|s| match &s.value {
+            Some(k) => format!(
+                "{k} {}/{}{}",
+                format_timeout(k.delay),
+                format_timeout(k.wait),
+                k.host
+                    .as_ref()
+                    .map(|h| format!(" @{h}"))
+                    .unwrap_or_default()
+            ),
+            None => "-".into(),
+        })
+    }
+
+    const KNOCKS: &str = "\
+aliases:
+  gated:
+    - host: gated.lan
+    - host: gated.example.com
+      knock: 7000,8000:udp,9000
+  lab:
+    knock:
+      sequence: 7000, 8000:udp, 9000
+      delay: 100ms
+      wait: 500ms
+    hosts:
+      - host: lab1.example.com
+      - host: lab2.example.com
+        knock: none
+      - host: lab3.example.com
+        knock:
+          sequence: 1,2
+      - host: lab4.example.com
+        knock:
+  behind-bastion:
+    - host: inner.internal
+      knock:
+        sequence: 7000,8000,9000
+        host: bastion.example.com
+";
+
+    #[test]
+    fn knock_on_entries_and_aliases_in_both_forms() {
+        let c = load("", KNOCKS).unwrap();
+        let gated = c.alias("gated").unwrap();
+        assert_eq!(gated.knock, None);
+        assert_eq!(knock_of(&gated.entries[0].knock), None);
+        assert_eq!(
+            knock_of(&gated.entries[1].knock).as_deref(),
+            Some("7000,8000:udp,9000 50ms/200ms")
+        );
+        let at = gated.entries[1].knock.as_ref().unwrap().origin.clone();
+        assert_eq!(at.unwrap().line, 5);
+        let lab = c.alias("lab").unwrap();
+        assert_eq!(
+            knock_of(&lab.knock).as_deref(),
+            Some("7000,8000:udp,9000 100ms/500ms")
+        );
+        let entries: Vec<_> = lab.entries.iter().map(|e| knock_of(&e.knock)).collect();
+        assert_eq!(
+            entries,
+            [
+                None,
+                Some("-".into()),
+                // Replaced whole: the alias's 100ms and 500ms are not merged in.
+                Some("1,2 50ms/200ms".into()),
+                // An empty value sets nothing: the alias's applies.
+                None,
+            ]
+        );
+        assert_eq!(
+            knock_of(&c.alias("behind-bastion").unwrap().entries[0].knock).as_deref(),
+            Some("7000,8000,9000 50ms/200ms @bastion.example.com")
+        );
+        assert!(HOST_KEYS.contains(&KNOCK));
+        assert!(setting(KNOCK).is_none(), "not a global setting");
+    }
+
+    #[test]
+    fn the_local_files_knock_replaces_the_global_ones() {
+        let g = "aliases:\n  lab:\n    knock: {sequence: \"1,2,3\", wait: 1s}\n    hosts: [{host: lab1}]\n";
+        // Whole, never key by key: the global wait does not survive.
+        let c = load(g, "aliases:\n  lab:\n    knock: {sequence: \"4,5\"}\n").unwrap();
+        let lab = c.alias("lab").unwrap();
+        assert_eq!(knock_of(&lab.knock).as_deref(), Some("4,5 50ms/200ms"));
+        assert!(lab
+            .knock
+            .as_ref()
+            .unwrap()
+            .origin
+            .as_ref()
+            .unwrap()
+            .file
+            .ends_with("local.yaml"));
+        // `none` in the local file drops the global knock.
+        let c = load(g, "aliases:\n  lab:\n    knock: none\n").unwrap();
+        assert_eq!(
+            knock_of(&c.alias("lab").unwrap().knock).as_deref(),
+            Some("-")
+        );
+        // An empty one, or none at all, leaves it.
+        for l in [
+            "aliases:\n  lab:\n    knock:\n",
+            "aliases:\n  lab:\n    persist: true\n",
+        ] {
+            let c = load(g, l).unwrap();
+            assert_eq!(
+                knock_of(&c.alias("lab").unwrap().knock).as_deref(),
+                Some("1,2,3 50ms/1s"),
+                "{l}"
+            );
+        }
+    }
+
+    #[test]
+    fn knock_errors_name_the_file_and_line() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "aliases:\n  d:\n    - host: a\n      knock: 7000,,9000\n",
+                ":3: aliases.d: knock: '7000,,9000': knock 2 is empty (line 4)",
+            ),
+            (
+                "aliases:\n  d:\n    - host: a\n      knock: [7000, 8000]\n",
+                ":3: aliases.d: knock: expected a sequence such as 7000,8000:udp,9000, or a mapping of sequence, delay, wait, host, found a list (line 4)",
+            ),
+            (
+                "aliases:\n  d:\n    - host: a\n      knock:\n        sequence: 7000\n        pause: 1s\n",
+                ":3: aliases.d: knock: unknown key 'pause' (a knock takes sequence, delay, wait, host) (line 6)",
+            ),
+            (
+                "aliases:\n  d:\n    - host: a\n      knock:\n        sequence: 7000\n        delay: 6s\n",
+                ":3: aliases.d: knock: delay: '6s' is too long: at most 5s (line 6)",
+            ),
+            (
+                "aliases:\n  d:\n    - host: a\n      knock:\n        wait: 1s\n",
+                "aliases.d: knock: a knock mapping needs 'sequence: <ports>'",
+            ),
+            (
+                "aliases:\n  d:\n    - host: a\n      knock:\n        sequence: 7000\n        host: me@b\n",
+                ":3: aliases.d: knock: host: bad knock host 'me@b' (a host name or address, no '@') (line 6)",
+            ),
+            (
+                "aliases:\n  d:\n    knock:\n      sequence: 7000:sctp\n    hosts: [a]\n",
+                ":4: aliases.d: knock: sequence: '7000:sctp': 'sctp' is not tcp or udp",
+            ),
+            (
+                "aliases:\n  d:\n    knock: 0\n    hosts: [a]\n",
+                ":3: aliases.d: knock: '0': '0' is not a port from 1 to 65535",
+            ),
+            (
+                "aliases:\n  d:\n    knock:\n      sequence: 1,2,3,4,5\n      delay: 5s\n    hosts: [a]\n",
+                "aliases.d: knock: '1,2,3,4,5': 5 knocks 5s apart take 20s, more than knockd's 15s seq_timeout",
+            ),
+            // Not a global setting (decision 5).
+            ("knock: 7000\n", ":1: unknown setting 'knock'"),
+        ];
+        for (src, want) in cases {
+            let e = load("", src).unwrap_err();
+            assert!(e.contains(want), "{src:?}:\n  got  {e}\n  want {want}");
+        }
     }
 
     #[test]

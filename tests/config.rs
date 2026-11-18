@@ -65,6 +65,59 @@ fn a_malformed_file_is_an_error_naming_file_and_line() {
     assert!(out.stdout.is_empty());
 }
 
+/// KNOCK_DESIGN §6: a bad knock in the file names its file and line, and a
+/// bad `ACS_KNOCK` is a usage error for acs, `acs list` and acscp alike —
+/// unless `--knock` is given, which wins.
+#[test]
+fn a_bad_knock_is_an_error_naming_where_it_is() {
+    let remote = Remote::installed();
+    let cfg = TempDir::new();
+    let env = config_env(
+        cfg.path(),
+        "aliases:\n  devbox:\n    - host: x\n      knock:\n        sequence: 7000\n        pause: 1s\n",
+    );
+    let out = acs_cmd()
+        .envs(env)
+        .args(["list", "--transport-cmd", &remote.transport(), "devbox"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("acs/config.yaml:3: aliases.devbox: knock: unknown key 'pause' (a knock takes sequence, delay, wait, host) (line 6)"),
+        "{err}"
+    );
+
+    for args in [&["devbox"][..], &["list"], &["cp", "a", "devbox:b"]] {
+        let out = acs_cmd()
+            .env("ACS_KNOCK", "7000,x")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("ACS_KNOCK: '7000,x': 'x' is not a port"),
+            "{args:?}: {err}"
+        );
+    }
+    // `--knock` wins, so the variable is never read.
+    let out = acs_cmd()
+        .env("ACS_KNOCK", "7000,x")
+        .args([
+            "list",
+            "--knock",
+            "none",
+            "--transport-cmd",
+            &remote.transport(),
+            "devbox",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("ACS_KNOCK"), "{err}");
+}
+
 /// Regression (acs-qjx): a file whose keys are separated by a tab, behind a
 /// BOM, is read — it used to be "expected settings as 'key: value' lines".
 #[test]

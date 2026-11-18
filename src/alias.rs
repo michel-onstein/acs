@@ -227,6 +227,9 @@ fn pick(
                 .identity_file
                 .clone()
                 .or_else(|| alias.identity_file.clone()),
+            // The entry's knock whole, else the alias's; `none` on the
+            // entry stays, and drops the alias's (KNOCK_DESIGN §6.1).
+            knock: e.knock.clone().or_else(|| alias.knock.clone()),
             ..e.clone()
         })
         .collect();
@@ -998,6 +1001,46 @@ aliases:
             Some("~/.ssh/id_alias:3")
         );
         assert_eq!(key("plain", &["plain.lan"]), None);
+    }
+
+    #[test]
+    fn an_entry_without_a_knock_takes_the_aliass_and_none_drops_it() {
+        let c = config(
+            "\
+aliases:
+  lab:
+    knock:
+      sequence: 1,2,3
+      wait: 1s
+    hosts:
+      - host: lab1
+      - host: lab2
+        knock: none
+      - host: lab3
+        knock: {sequence: \"4,5\"}
+  plain:
+    - host: plain.lan
+",
+        );
+        let knock = |up: &str| {
+            let name = if up == "plain.lan" { "plain" } else { "lab" };
+            resolve(
+                name,
+                &c,
+                Fake::up(&[up]).reachable(),
+                &no_network,
+                &mut |_| {},
+            )
+            .unwrap()
+            .unwrap()
+            .knock
+            .map(|s| s.value.map(|k| format!("{k} {:?}", k.wait)))
+        };
+        assert_eq!(knock("lab1"), Some(Some("1,2,3 1s".into())));
+        assert_eq!(knock("lab2"), Some(None));
+        // The entry's mapping is whole: the alias's 1s wait is not merged.
+        assert_eq!(knock("lab3"), Some(Some("4,5 200ms".into())));
+        assert_eq!(knock("plain.lan"), None);
     }
 
     #[test]

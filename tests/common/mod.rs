@@ -46,7 +46,9 @@ pub fn acs_cmd_as(path: &Path) -> Command {
         .env("XDG_CONFIG_HOME", NO_CONFIG)
         .env("ACS_GLOBAL_CONFIG", format!("{NO_CONFIG}/global.yaml"))
         .env("XDG_STATE_HOME", NO_STATE)
-        .env("ACS_CONTROL_PERSIST", NO_MASTER);
+        .env("ACS_CONTROL_PERSIST", NO_MASTER)
+        // Nor knock because the developer's shell says to.
+        .env_remove("ACS_KNOCK");
     c
 }
 

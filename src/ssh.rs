@@ -181,6 +181,10 @@ pub struct Transport {
     /// yet, a call that does not ask, or an `ssh -G` that failed — reads
     /// as not proxied, which keeps the connect timeout.
     pub route: Option<Route>,
+    /// The knock to send before a dial that opens a connection
+    /// (KNOCK_DESIGN §6): the command line's `--knock` or `ACS_KNOCK`, else
+    /// the resolved alias entry's, else its alias's. `None` knocks nothing.
+    pub knock: Option<crate::knock::Knock>,
 }
 
 /// The ssh program when the command line names none: `ACS_SSH`, else
@@ -200,6 +204,7 @@ impl Transport {
             transport_cmd: None,
             mux: None,
             route: None,
+            knock: None,
         }
     }
 
@@ -745,6 +750,7 @@ mod tests {
             transport_cmd: None,
             mux: None,
             route: None,
+            knock: None,
         }
     }
 

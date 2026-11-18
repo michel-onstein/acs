@@ -137,6 +137,73 @@ impl Knock {
     }
 }
 
+/// The word that drops a configured knock (§6): `knock: none` in the file,
+/// `--knock none` and `ACS_KNOCK=none`.
+pub const NO_KNOCK: &str = "none";
+
+/// The keys of a knock written as a mapping in the file (§6.1), in the
+/// order messages list them.
+pub const KNOCK_KEYS: &[&str] = &["sequence", "delay", "wait", "host"];
+
+/// A knock's `delay` (§4.3): a duration as `reachability_timeout` is
+/// written, from 0 to [`MAX_DELAY`].
+pub fn parse_delay(text: &str) -> Result<Duration, String> {
+    crate::config::parse_duration(text, Duration::ZERO, MAX_DELAY)
+}
+
+/// A knock's `wait` (§4.3): from 0 to [`MAX_WAIT`].
+pub fn parse_wait(text: &str) -> Result<Duration, String> {
+    crate::config::parse_duration(text, Duration::ZERO, MAX_WAIT)
+}
+
+/// A knock's `host` (§5): a host name or address, as an alias entry's
+/// `host` is — no login name, spaces or leading `-`.
+pub fn parse_host(text: &str) -> Result<String, String> {
+    let h = text.trim();
+    if h.is_empty()
+        || h.starts_with('-')
+        || h.contains('@')
+        || h.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "bad knock host '{text}' (a host name or address, no '@')"
+        ));
+    }
+    Ok(h.to_string())
+}
+
+/// A knock as the command line's `--knock` and `ACS_KNOCK` give it (§6.2):
+/// the sequence of [`Knock::parse`], then optionally `/delay=…`, `/wait=…`
+/// and `/host=…`, in any order. `none` is `Ok(None)`: drop the configured
+/// knock for this run.
+pub fn parse_spec(text: &str) -> Result<Option<Knock>, String> {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case(NO_KNOCK) {
+        return Ok(None);
+    }
+    let mut parts = t.split('/');
+    let base = Knock::parse(parts.next().unwrap_or_default())?;
+    let (mut delay, mut wait, mut host) = (base.delay, base.wait, None);
+    for part in parts {
+        let Some((key, value)) = part.split_once('=') else {
+            return Err(format!(
+                "'/{part}': expected /delay=, /wait= or /host= after the sequence"
+            ));
+        };
+        match key.trim() {
+            "delay" => delay = parse_delay(value).map_err(|e| format!("delay: {e}"))?,
+            "wait" => wait = parse_wait(value).map_err(|e| format!("wait: {e}"))?,
+            "host" => host = Some(parse_host(value)?),
+            other => {
+                return Err(format!(
+                    "unknown knock option '{other}' (known: delay, wait, host)"
+                ))
+            }
+        }
+    }
+    Knock::new(base.sequence, delay, wait, host).map(Some)
+}
+
 /// The sequence in knockd's syntax, `:udp` written only where it applies.
 impl fmt::Display for Knock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -392,6 +459,53 @@ mod tests {
 
     fn seq(k: &Knock) -> Vec<(u16, Proto)> {
         k.sequence.clone()
+    }
+
+    #[test]
+    fn the_command_line_spec_takes_timing_and_a_host() {
+        let k = parse_spec("7000,8000:udp,9000").unwrap().unwrap();
+        assert_eq!(k, Knock::parse("7000,8000:udp,9000").unwrap());
+        let k = parse_spec("7000,8000,9000/delay=100ms/wait=0.5s")
+            .unwrap()
+            .unwrap();
+        assert_eq!(k.delay, Duration::from_millis(100));
+        assert_eq!(k.wait, Duration::from_millis(500));
+        assert_eq!(k.host, None);
+        let k = parse_spec("7000/host=bastion.example.com/delay=0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(k.host.as_deref(), Some("bastion.example.com"));
+        assert_eq!(k.delay, Duration::ZERO);
+        assert_eq!(k.wait, DEFAULT_WAIT);
+        for none in ["none", "NONE", " none "] {
+            assert_eq!(parse_spec(none), Ok(None), "{none}");
+        }
+    }
+
+    #[test]
+    fn a_bad_command_line_spec_says_why() {
+        for (spec, want) in [
+            ("", "expected a knock sequence"),
+            ("7000,,9000", "knock 2 is empty"),
+            ("7000/delay", "expected /delay=, /wait= or /host="),
+            (
+                "7000/pause=1s",
+                "unknown knock option 'pause' (known: delay, wait, host)",
+            ),
+            ("7000/delay=6s", "delay: '6s' is too long: at most 5s"),
+            ("7000/wait=11s", "wait: '11s' is too long: at most 10s"),
+            ("7000/wait=soon", "wait: expected a duration"),
+            ("7000/host=", "bad knock host ''"),
+            ("7000/host=me@b", "bad knock host 'me@b'"),
+            ("7000/host=-oProxy", "bad knock host '-oProxy'"),
+            (
+                "7000,8000,9000,9001,9002/delay=5s",
+                "more than knockd's 15s seq_timeout",
+            ),
+        ] {
+            let e = parse_spec(spec).unwrap_err();
+            assert!(e.contains(want), "{spec}: {e}");
+        }
     }
 
     #[test]

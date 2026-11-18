@@ -363,6 +363,7 @@ pub fn resolve_alias(conn: &mut Connection, name: &str) -> Result<(), String> {
             .identity_file
             .as_ref()
             .map(|s| crate::config::expand_home(&s.value));
+        conn.transport.knock = knock_for(conn.knock.as_ref(), &e);
         if let (true, Some(key)) = (verbose, &e.identity_file) {
             let at = key
                 .origin
@@ -380,6 +381,19 @@ pub fn resolve_alias(conn: &mut Connection, name: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The knock a dial to the chosen alias entry sends (KNOCK_DESIGN §6):
+/// the command line's choice, `--knock none` included, over the entry's
+/// own, which [`crate::alias::resolve`] has already put over its alias's.
+fn knock_for(
+    cli: Option<&Option<crate::knock::Knock>>,
+    entry: &crate::config::HostEntry,
+) -> Option<crate::knock::Knock> {
+    match cli {
+        Some(k) => k.clone(),
+        None => entry.knock.as_ref().and_then(|s| s.value.clone()),
+    }
 }
 
 /// Who we are, for the master's takeover decisions (DESIGN §4.5).
@@ -2826,6 +2840,37 @@ mod tests {
         assert!(env_switch(Some(""), true), "empty is unset");
         assert!(!env_switch(Some("0"), true));
         assert!(env_switch(Some("1"), false));
+    }
+
+    /// KNOCK_DESIGN §6: `--knock` (or `ACS_KNOCK`) over the entry's knock,
+    /// which the alias resolution already put over its alias's; `--knock
+    /// none` drops it, and a configured `none` knocks nothing.
+    #[test]
+    fn the_command_lines_knock_wins_over_the_entrys() {
+        use crate::config::{HostEntry, Origin, Setting};
+        use crate::knock::Knock;
+        let entry = |k: Option<Option<&str>>| HostEntry {
+            host: "h".into(),
+            user: None,
+            reachability_check: true,
+            prefer: false,
+            identity_file: None,
+            persist: None,
+            local_networks: Vec::new(),
+            knock: k.map(|k| Setting {
+                value: k.map(|s| Knock::parse(s).unwrap()),
+                origin: None,
+            }),
+            origin: Origin::default(),
+        };
+        let k = |s: &str| Knock::parse(s).unwrap();
+        let cli = Some(k("9,8"));
+        assert_eq!(knock_for(None, &entry(Some(Some("1,2")))), Some(k("1,2")));
+        assert_eq!(knock_for(None, &entry(Some(None))), None);
+        assert_eq!(knock_for(None, &entry(None)), None);
+        assert_eq!(knock_for(Some(&cli), &entry(Some(Some("1,2")))), cli);
+        assert_eq!(knock_for(Some(&cli), &entry(None)), cli);
+        assert_eq!(knock_for(Some(&None), &entry(Some(Some("1,2")))), None);
     }
 
     /// acs-txt: `persist` is the entry in use's, else the alias's, else the
