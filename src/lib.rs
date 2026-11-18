@@ -17,6 +17,7 @@ pub mod cp;
 pub mod exec;
 pub mod install;
 pub mod keys;
+pub mod knock;
 pub mod layout;
 pub mod list;
 pub mod master;
