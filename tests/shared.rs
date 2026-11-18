@@ -7,9 +7,7 @@ use common::*;
 
 const CMD: &[&str] = &[
     "--",
-    "/bin/sh",
-    "-c",
-    "echo up; while read l; do echo got:$l; done",
+    "/bin/sh -c 'echo up; while read l; do echo got:$l; done'",
 ];
 
 /// What the program prints for a line typed after taking over: a takeover
@@ -88,11 +86,8 @@ fn force_skips_the_question() {
 #[test]
 fn default_session_comes_from_the_environment() {
     let remote = Remote::installed();
-    let mut c = Client::start_env(
-        &remote,
-        &["devbox", "--", "/bin/sh", "-c", "echo up; sleep 30"],
-        &[("ACS_DEFAULT_SESSION", "michel")],
-    );
+    remote.login_shell_runs("echo up; sleep 30");
+    let mut c = Client::start_env(&remote, &["devbox"], &[("ACS_DEFAULT_SESSION", "michel")]);
     c.wait_for("new session 'michel' on devbox", T);
 }
 

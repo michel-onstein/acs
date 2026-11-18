@@ -258,7 +258,10 @@ shells).
   under the same name while the socket is gone finds it, prods it to re-bind
   and steps aside (§4.1). It lets go at child exit, with the socket.
 - Child: `$SHELL -l` in `$HOME` by default (`dsh` hardcodes `zsh -l`),
-  overridable with `acs <host> [session] -- <command…>`. Environment gets
+  overridable with `acs <host> [session] -- <command…>`, which runs as
+  `$SHELL -c '<words joined with spaces>'` — as sshd runs a remote
+  command, so quoting, pipes and globs mean what they mean to
+  `ssh host …` (§7.7). Environment gets
   `TERM` and `COLORTERM` from the client's HELLO (ssh `-T` no longer sends
   `TERM`), plus `ACS_SESSION=<name>`.
   - **A session is not a login** (acs-aps). It outlives the ssh connection
@@ -1476,7 +1479,9 @@ that cannot wait, which bytes end the open sequence and which write it again
 
 - Argument parsing matches `dsh`: `acs [ssh options] [user@]<host> [session]
   [--new] [--no-reconnect] [-- command…]` (§4.4, §7.1). `-r` is accepted and
-  ignored, since reconnecting is the default.
+  ignored, since reconnecting is the default. A command with no session
+  named is `ssh host command`'s form, with ssh's `-t`, `-T` and `-n`
+  (§7.7).
 - **Listing is a command**: `acs list [ssh options] [-v] [[user@]<host>]`
   lists one host's sessions, or without a host every alias's (§7.3). `list`
   is a reserved first argument, as `config` and `upgrade` are (§7.4), and
@@ -2551,6 +2556,54 @@ acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
 - **Off** with `ACS_NO_UPDATE_CHECK=1` or `update_check: false` (§7.2). The
   test harness sets the variable, so the suite never contacts GitHub.
 
+### 7.7 Running a command
+
+`ssh host command` runs one command and ends: its output streams back, ssh
+exits with its status (255 when ssh itself fails), and then the connection
+closes. acs does the same, keeping what it adds where that still applies.
+
+| | ssh | acs |
+| --- | --- | --- |
+| Form | `ssh host cmd args…` | `acs host -- cmd args…` — the `--` is needed, since a word after the host names a session |
+| How it runs | the words joined with spaces, read by the login shell (`$SHELL -c`) | the same, for a one-shot command and a named session's command alike (§4.2) |
+| Terminal | none unless `-t`; with `-t`, a pty | on a terminal (stdin and stdout both terminals), a **session of its own**; otherwise, or with `-T` or `-n`, none |
+| Exit status | the command's; 255 for ssh's own failure; 255 when the command dies of a signal | the command's; 255 when the host cannot be reached; **128+n** when it dies of signal n in a session (§7) |
+| After a dropped link | the command loses its terminal and usually dies | in a session: redialled and resumed (§5.2), the command never knew; without a terminal: as ssh |
+
+**On a terminal** — `acs host -- make test` — the command gets a new
+numbered session (`--new`'s, §4.4) that ends with it: no menu, which would
+attach a detached session and drop the command, and no `new session` note
+unless `-v`, so the run reads like ssh's. Everything a session has applies:
+a dropped link is resumed, Ctrl-] Ctrl-] `d` leaves the command running
+(the note names the session to reattach to) and `x` ends it.
+`acs host <name> -- cmd` and `acs host --new -- cmd` are the sessions they
+always were, with the command read by the shell.
+
+**Without a terminal** — `acs host -- cat log > here`,
+`tar c dir | acs host -- tar x`, `acs -T host -- …` — a session is the
+wrong pipe: a pty turns `\n` into `\r\n`, merges stderr into stdout,
+edits what stdin carries and has no end of file to pass on. So the client
+does what ssh does and nothing more: it **execs ssh** (`Call::Side`: `-T`,
+no escape character) with the joined command, over the transport it
+resolved — the alias and its host (§7.3), identity, the `-i`/`-p`/`-J`/
+`-F`/`-o` options and acs's shared master (§3). stdin, stdout, stderr,
+end of file and the exit status are ssh's, so the command's, byte for byte.
+Nothing is installed on the host and there is nothing to resume.
+
+| Option | ssh | acs |
+| --- | --- | --- |
+| `-t` | force a pty | run the command in a session even when stdout is not a terminal (stdin must be one: the session's keys and raw mode come from it) |
+| `-T` | no pty | run it without a terminal, as above; last of `-t` and `-T` wins |
+| `-n` | stdin from `/dev/null` | the same, and implies `-T` (a session reads its keys from stdin) |
+
+Refused, rather than quietly doing something else: `-t`, `-T` or `-n`
+without a command; `-T` or `-n` with a session name or `--new` (a session
+always has a terminal); `-n` with `-t`; and `-L` without a terminal — a
+forward lives on a session's own connection (§7.1), and there is none.
+ssh's `-N` (no command) and `-f` (background) have no counterpart: a
+session is acs's way of keeping something running without a terminal
+attached.
+
 ## 8. Installing the remote binary
 
 The one-line installer (`scripts/install.sh`, published with every release;
@@ -3273,3 +3326,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 16 | Remote wildcards (acs-hofu.7) | Decided 2026-10-28, carrying out ACSCP_DESIGN §5.4 and its decision 4: `acscp 'host:logs/*.gz' .` is expanded by **`acs _cp` itself**, since nothing goes through a shell after the prelude. A path component is a pattern when it holds `*`, `?` or `[`; `*` is any run, `?` one character, `[abc]`/`[a-z]`/`[!…]`/`[^…]` one in or out of a set, `\` takes the next character literally, and a `[` with no `]` is itself. A name beginning with `.` is matched only by a pattern that begins with one, as a shell's glob does. Every component may be a pattern; the far end walks them one directory at a time, in byte order, and a pattern that matches nothing is a `SKIP` saying `no match`. A component with no wildcard is a plain name, compared as it is. **The receiver admits at the top level any name the last component matches** — the check modern `scp` makes — so a far end answering `logs/*.gz` with `.bashrc` is refused as before; nesting is still only by `DIR`. An upload's names are sent to the receiver escaped (`glob::literal`), so a file called `[x]` matches only itself. A wildcard source needs the target to be a directory, as several sources do — checked before the dial for a download, from the target's `WELCOME` for a copy between two hosts, where the source host expands it and the target host's receiver admits by it. A remote path meant literally that holds a wildcard character is written with `\` before it, as for `scp` |
 | 17 | Local and remote sources in one copy, and downloads from several hosts (acs-hofu.14) | Decided 2026-10-28, beyond ACSCP_DESIGN §5.6 and §12, which do not cover the case: `acscp a h1:b dst`, `acscp a h1:b h2:dst` and `acscp h1:a h2:b dir` are **run in parts, with the pieces that already exist** — no new protocol, endpoint or relay mode. The remote sources are grouped by host, in the order the command line first names each; **each host's group goes first, in turn** — a download per host into a local target, a relay per host (decision 15) into a remote one — **then the local sources**: a local copy into a local target, one upload into a remote one. Each part is its own connection (or connections), with its own redial where it has one. **Several sources in all, or a wildcard among them (decision 16), need the target to be a directory, decided once over the whole command line:** a local target is looked at before anything is dialled; a remote one is checked by the first part, a relay, from the target's `WELCOME` before any data goes — which is why the hosts go first: a lone local file uploaded first would be written as the target before the relay could find it is not a directory. The local sources are checked before anything is dialled, as for any copy (ACSCP_DESIGN §4.2); one that fails is reported and skipped, and the rest of the copy goes on. Every part's counts are summed into one report and exit status; **a part that breaks off ends the copy** and the parts after it are not run, so the same command run again finishes it from the parts already written. Chosen over one interleaved stream (a sender that walks local files and relays remote ones on one target link), which would mean a new endpoint for a case taken "when someone misses it" in the copy's last 10 KB of budget (decision 13); the parts cost nothing new — the x86_64 slim build shrank, since the grouping by host became one function the download and the relay share (§8.1) |
 | 18 | `ConnectTimeout` through a proxy (acs-7sti) | Decided 2026-11-05, after a jump host's password typed in more than 10 s gave `Connection timed out during banner exchange` and a fresh dial, every time. OpenSSH applies `ConnectTimeout` to the TCP connect **and** the banner exchange; through a `ProxyJump` or `ProxyCommand` the outer ssh's connect is to the proxy's pipe, so the option bounds nothing but the banner, which waits on the jump host's login. **A session dial through a proxy goes without it**, and acs's own deadlines bound it — 30 s on a redial (`ACS_REDIAL_TIMEOUT_MS`), 120 s on the first connection (`ACS_DIAL_TIMEOUT_MS`) — as they already bound a password asked by the host itself; a dead network is still seen by netwatch (§5.3), and a `ConnectTimeout` the user's own config sets for the jump host still applies to it. Whether a dial is proxied is `ssh -G` with the command line's options, asked before **every** session dial (a few ms) rather than once, because an alias may move the destination between dials; it covers `-J`, `-o ProxyJump`/`ProxyCommand` and ssh_config alike, and where it fails or takes more than 2 s the option stays. Direct dials keep `ConnectTimeout=10`, so a redial into a dead network still fails fast. Chosen over dropping the option everywhere, which would cost that fast failure, and over a longer fixed value, which only moves the cut-off. `acs list` keeps it: it runs in `BatchMode`, where nobody is typing (§3, §7.3) |
+| 19 | Running a command as ssh does (§7.7) | Decided 2026-11-17. `acs host -- cmd` used to fall into the session menu, which could attach a detached session and silently drop the command, and a command was exec'd as an argv, so `acs host s -- 'a \| b'` looked for a program called `a \| b`. Now **a command with no session named is a one-shot**, in a new numbered session that ends with it, and **every command is read by the login shell, its words joined with spaces**, as ssh and `dsh` (which ran through `ssh -t`) both did — one rule for quoting, the one ssh users already know. **Without a terminal, acs execs ssh** rather than carrying a pipe through a session: a pty cannot carry binary data, separate stderr or an end of file, and a resumable pipe needs per-stream offsets and an EOF frame in the protocol (§5.1) — a follow-up, not this change. The price is no resume for a piped command, the same as ssh's |

@@ -10,11 +10,7 @@ use std::time::Duration;
 use common::*;
 
 fn start(remote: &Remote, host: &str, session: &str, env: &[(&str, &str)]) -> Client {
-    let mut c = Client::start_env(
-        remote,
-        &[host, session, "--", "/bin/sh", "-c", REPORTER],
-        env,
-    );
+    let mut c = Client::start_env(remote, &[host, session, "--", &sh_c(REPORTER)], env);
     c.wait_for("ready", T);
     c
 }

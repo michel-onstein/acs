@@ -740,7 +740,7 @@ impl Remote {
              if [ -f '{mute}' ]; then exec 3<&0; dd bs=1 count=1 of='{mute}'.$$ 2>/dev/null <&3; fi\n\
              [ -f '{silent}' ] && {{ cat '{silent}'; exec sleep {silent_secs}; }}\n\
              [ -f '{noise}' ] && cat '{noise}'\n\
-             export HOME='{home}' ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n\
+             export HOME='{home}' SHELL=/bin/sh ACS_SOCKET_DIR='{sock}' PATH='{fake}':\"$PATH\"\n\
              [ -f '{renv}' ] && . '{renv}'\n\
              if [ -f '{mute}' ]; then\n\
              mkfifo '{mute}'.$$.in\n\
@@ -874,6 +874,24 @@ impl Remote {
 
     /// Environment for the remote side only (the proxy and the master),
     /// where the client's own must differ — different liveness timers, say.
+    /// Make the remote's login shell run `program` when it is started as
+    /// one (`$SHELL -l`, a session with no command), and `/bin/sh` for
+    /// anything else (`$SHELL -c`). The transport sets `SHELL=/bin/sh`, as
+    /// sshd sets the login shell, so a session's `-- command` runs under
+    /// `/bin/sh -c` (DESIGN §7.7); this is for the tests that reach a
+    /// session through the menu, where no command can be given.
+    pub fn login_shell_runs(&self, program: &str) {
+        let shell = self.root.path().join("login-shell");
+        write_executable(
+            &shell,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = -l ] && exec /bin/sh -c {}\nexec /bin/sh \"$@\"\n",
+                acs::ssh::sh_single_quote(program)
+            ),
+        );
+        self.remote_env(&[("SHELL", &shell.display().to_string())]);
+    }
+
     pub fn remote_env(&self, vars: &[(&str, &str)]) {
         for (k, v) in vars {
             self.remote_env_line(&format!("export {k}='{v}'"));
@@ -1455,7 +1473,10 @@ pub fn received(c: &Client) -> Vec<String> {
 }
 
 /// The command of a session that says `up` and stays: `-- /bin/sh -c …`.
-pub const UP_CMD: &[&str] = &["--", "/bin/sh", "-c", "echo up; sleep 30"];
+/// The program most tests run: say `up`, then wait.
+pub const UP_SH: &str = "/bin/sh -c 'echo up; sleep 30'";
+
+pub const UP_CMD: &[&str] = &["--", UP_SH];
 
 /// The arguments for session `session` on `devbox` running [`UP_CMD`].
 pub fn up_args(session: &str) -> Vec<&str> {
@@ -1789,4 +1810,12 @@ impl ReleaseServer {
             self.publish_signature("/latest/download/SHA256SUMS", &sums, None);
         }
     }
+}
+
+/// `script` as a session's command (DESIGN §7.7): one word that the remote
+/// login shell reads as `/bin/sh -c '<script>'`, as one would write it for
+/// `ssh host`. The words of a command are joined with spaces, so a script
+/// given as `"/bin/sh", "-c", script` would be split by the remote shell.
+pub fn sh_c(script: &str) -> String {
+    format!("/bin/sh -c {}", acs::ssh::sh_single_quote(script))
 }

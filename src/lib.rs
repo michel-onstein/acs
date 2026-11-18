@@ -14,6 +14,7 @@ pub mod config_cmd;
 // downloads, within the 100 KB of x86_64 slim that ACSCP_DESIGN decision 13
 // gives it (DESIGN §8.1).
 pub mod cp;
+pub mod exec;
 pub mod install;
 pub mod keys;
 pub mod layout;

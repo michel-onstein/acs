@@ -18,7 +18,7 @@ use common::*;
 
 /// A remote command that says when it is up and then stays: nothing here
 /// waits on a shell prompt it does not control.
-const UP: &[&str] = &["--", "/bin/sh", "-c", "echo MUX-UP; exec sleep 300"];
+const UP: &[&str] = &["--", "/bin/sh -c 'echo MUX-UP; exec sleep 300'"];
 
 /// The session whose channel [`Fake::poison_the_channel`] breaks. The name
 /// reaches the fake ssh in the remote command (`_proxy --session …`), which

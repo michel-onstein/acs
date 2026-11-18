@@ -17,9 +17,7 @@ fn session(host: &str, extra: &[&'static str]) -> Vec<&'static str> {
     args.extend([
         "s",
         "--",
-        "/bin/sh",
-        "-c",
-        "echo up; while read l; do echo got:$l; done",
+        "/bin/sh -c 'echo up; while read l; do echo got:$l; done'",
     ]);
     args
 }
@@ -178,7 +176,7 @@ fn a_first_connect_that_fails_is_waited_out_before_any_session() {
     let env = net.env("reachability_interval: 200ms\n");
     let path = flaky.display().to_string();
     let mut args = vec!["--persist", "--ssh", &path];
-    args.extend(["devbox", "s", "--", "/bin/sh", "-c", "echo up; sleep 30"]);
+    args.extend(["devbox", "s", "--", UP_SH]);
     let mut c = Client::spawn(&exe(), &args, &refs(&env));
     // The dial fails; the host answers pings but its ssh is not up yet, so
     // each answer is followed by a dial that fails again — not an exit.

@@ -93,7 +93,17 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     // §7.1) before the master is decided, so a forward that arrives from
     // the configuration hits the same carve-out a `-L` does: a session that
     // forwards anything gets no shared master (acs-9n3).
-    prepare_session(&mut args);
+    // A command run without a terminal is ssh's own (DESIGN §7.7): no
+    // forwards, and no session to pick.
+    let pipe = crate::exec::without_terminal(&args, sys::isatty(STDIN), sys::isatty(STDOUT));
+    if pipe {
+        if let Err(e) = crate::exec::prepare(&mut args) {
+            eprintln!("acs: {e}");
+            return ExitCode::from(code::USAGE);
+        }
+    } else {
+        prepare_session(&mut args);
+    }
     let name = args.conn.transport.destination.clone();
     let mut timing = Timing::start(args.conn.verbose > 0, "first connection");
     if let Err(e) = resolve_alias(&mut args.conn, &name) {
@@ -106,6 +116,9 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     }
     if args.conn.alias.is_some() {
         timing.mark(Phase::AliasResolved);
+    }
+    if pipe {
+        return ExitCode::from(crate::exec::run(&args));
     }
     if args.list && !menu {
         return crate::list::run(&args);
@@ -2127,7 +2140,9 @@ fn serve(
                     if !first && !same {
                         note("the session was restarted");
                     }
-                    if w.created {
+                    // A one-shot command's session is the command's, as
+                    // quiet as `ssh host command` (DESIGN §7.7).
+                    if w.created && (!args.one_shot || args.conn.verbose > 0) {
                         note(&format!("new session '{}' on {}", w.session, state.host));
                     }
                     state.session = Some(w.session.clone());

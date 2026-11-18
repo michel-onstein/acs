@@ -31,12 +31,12 @@ fn lists_attached_detached_and_drops_stale_sockets() {
     let remote = Remote::installed();
     let mut a = Client::start(
         &remote,
-        &["devbox", "main", "--", "/bin/sh", "-c", "echo a; sleep 30"],
+        &["devbox", "main", "--", &sh_c("echo a; sleep 30")],
     );
     a.wait_for("a", T);
     let mut b = Client::start(
         &remote,
-        &["devbox", "work", "--", "/bin/sh", "-c", "echo b; sleep 30"],
+        &["devbox", "work", "--", &sh_c("echo b; sleep 30")],
     );
     b.wait_for("b", T);
     b.send(&command(b'd'));
@@ -52,7 +52,7 @@ fn lists_attached_detached_and_drops_stale_sockets() {
     assert_eq!(row(&out, 0, "work")[1..3], ["detached", "(tester@local)"]);
     assert!(row(&out, 0, "work")
         .join(" ")
-        .ends_with("/bin/sh -c echo b; sleep 30"));
+        .ends_with("/bin/sh -c 'echo b; sleep 30'"));
     assert!(!out.contains("old"), "stale session listed:\n{out}");
     assert!(!stale.exists(), "stale socket not removed");
 }
@@ -182,12 +182,12 @@ fn every_alias_is_listed_and_a_dead_one_gets_a_line() {
     let pi = Remote::new();
     let mut a = Client::start(
         &devbox,
-        &["devbox", "main", "--", "/bin/sh", "-c", "echo a; sleep 30"],
+        &["devbox", "main", "--", &sh_c("echo a; sleep 30")],
     );
     a.wait_for("a", T);
     let mut b = Client::start(
         &devbox,
-        &["devbox", "work", "--", "/bin/sh", "-c", "echo b; sleep 30"],
+        &["devbox", "work", "--", &sh_c("echo b; sleep 30")],
     );
     b.wait_for("b", T);
     b.send(&command(b'd'));

@@ -20,7 +20,7 @@ aliases:
 ";
 
 fn session(host: &str) -> Vec<&str> {
-    vec!["-v", host, "s", "--", "/bin/sh", "-c", "echo up; sleep 30"]
+    vec!["-v", host, "s", "--", UP_SH]
 }
 
 /// The program has started: the session announcement first, then its
@@ -249,7 +249,7 @@ fn redialling(remote: &Remote, net: &Net, name: &str) -> Client {
     }
     let mut c = Client::start_env(
         remote,
-        &[name, "r", "--", "/bin/sh", "-c", "echo up; sleep 30"],
+        &[name, "r", "--", &sh_c("echo up; sleep 30")],
         &refs(&env),
     );
     wait_up(&mut c, "r");
@@ -328,7 +328,7 @@ fn keyed_client(ssh: &Ssh, net: &Net, extra: &[&str], env: &[(&str, &str)]) -> C
         "-v".into(),
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
-    args.extend(["devbox", "k", "--", "/bin/sh", "-c", "echo up; sleep 30"].map(String::from));
+    args.extend(["devbox", "k", "--", &sh_c("echo up; sleep 30")].map(String::from));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut owned = net.env(KEYED);
     owned.push(("HOME".into(), HOME.into()));

@@ -24,10 +24,7 @@ fn dropping_a_remote_leaves_its_installed_binary_until_exit() {
 #[test]
 fn dropping_a_remote_ends_its_sessions() {
     let r = Remote::installed();
-    let mut c = Client::start(
-        &r,
-        &["devbox", "kept", "--", "/bin/sh", "-c", "echo up; sleep 60"],
-    );
+    let mut c = Client::start(&r, &["devbox", "kept", "--", &sh_c("echo up; sleep 60")]);
     c.wait_for("up", T);
     drop(c);
     let sock = r.sockets().join("kept.sock");
