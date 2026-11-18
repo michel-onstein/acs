@@ -345,6 +345,7 @@ pub fn resolve_alias(conn: &mut Connection, name: &str) -> Result<(), String> {
         &crate::netmatch::system,
         memory.as_ref(),
         &ssh,
+        conn.knock.as_ref(),
         &mut |m| {
             if verbose {
                 note(&m)
@@ -1112,7 +1113,16 @@ fn dial_sharing(
             netwatch: w.netwatch,
             keys: w.keys.as_deref_mut(),
         };
-        match dial_once(conn, call, remote, window, timing, first.clone(), joined) {
+        match dial_once(
+            conn,
+            call,
+            remote,
+            window,
+            timing,
+            first.clone(),
+            joined,
+            true,
+        ) {
             Ok(x) => return Ok(x),
             // The master's connection was made from the network that went.
             Err(e) if moved(&e) => {
@@ -1138,10 +1148,97 @@ fn dial_sharing(
             Err(e) => return Err(e),
         }
     }
-    dial_once(conn, call, remote, timeout, timing, first, w)
+    // On a connection of its own — the master was not up, or did not
+    // answer and is gone — so this one knocks (KNOCK_DESIGN §3.1).
+    dial_once(conn, call, remote, timeout, timing, first, w, false)
+}
+
+/// Whether a dial knocks first (KNOCK_DESIGN §3.1): where a knock is
+/// configured and the dial opens a TCP connection of its own — every one
+/// but a dial `joining` acs's master that answered. A redial never joins
+/// one, so it always knocks; a batch call that joins does not, a plain one
+/// does; and the fallback after a failed join is no join, so it knocks.
+pub(crate) fn dial_knocks(tr: &ssh::Transport, joining: bool) -> bool {
+    tr.knock.is_some() && !joining
+}
+
+/// A knock that stopped a dial (KNOCK_DESIGN §8), carried in the dial's
+/// error so that each caller can tell a configuration that cannot work
+/// from a host that cannot be reached.
+pub(crate) fn knock_refusal(e: &io::Error) -> Option<&crate::knock::Refusal> {
+    e.get_ref()?.downcast_ref()
+}
+
+/// Knock before a dial over `tr`, whose route `for_dial` has read: the
+/// host knocked, for the hint of §7, or `None` with no knock configured.
+/// The lookup gets the alias's `reachability_timeout` (§4.3).
+pub(crate) fn knock_before(conn: &Connection, tr: &ssh::Transport) -> io::Result<Option<String>> {
+    let Some(k) = &tr.knock else {
+        return Ok(None);
+    };
+    let lookup = alias_of(conn).map_or(conn.config.reachability_timeout.value, |a| {
+        conn.config.reachability_timeout_for(a).value
+    });
+    let verbose = conn.verbose > 0;
+    let mut log = |l: String| {
+        if verbose {
+            note(&l)
+        }
+    };
+    crate::knock::before_dial(k, &tr.destination, tr.route.as_ref(), lookup, &mut log)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+/// ssh's stderr on a dial that knocked: passed through to ours as it
+/// comes, and watched for the connect failure a knock that did not open
+/// the port ends in (KNOCK_DESIGN §7).
+struct StderrWatch {
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl StderrWatch {
+    fn new(mut pipe: std::process::ChildStderr) -> StderrWatch {
+        use std::io::Read;
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, done) = std::sync::mpsc::channel();
+        let seen = failed.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let mut tail = Vec::new();
+            loop {
+                let n = match pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                let _ = sys::write_all(2, &buf[..n]);
+                tail.extend_from_slice(&buf[..n]);
+                if crate::knock::connect_failed(&String::from_utf8_lossy(&tail)) {
+                    seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                let keep = tail.len().saturating_sub(64);
+                tail.drain(..keep);
+            }
+            drop(tx);
+        });
+        StderrWatch { failed, done }
+    }
+
+    /// Whether ssh, now exited, said it could not connect: its last
+    /// words are waited for, briefly.
+    fn connect_failed(&self) -> bool {
+        let _ = self.done.recv_timeout(REAP_BOUND);
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// One dial; with `w.keys`, one whose command keys are live ([`DialKeys`]).
+/// `joining`: it goes onto acs's master, which answered, and so opens no
+/// connection and does not knock.
+#[allow(clippy::too_many_arguments)]
 fn dial_once(
     conn: &Connection,
     call: Call,
@@ -1150,13 +1247,24 @@ fn dial_once(
     timing: &mut Timing,
     first: Vec<u8>,
     w: Watch,
+    joining: bool,
 ) -> io::Result<(Link, Marker)> {
     let Watch { netwatch, mut keys } = w;
     let deadline = Instant::now() + timeout;
     // Asked on every dial, not once: through a proxy the session goes
     // without ssh's ConnectTimeout, and an alias may have moved the
-    // destination since the last one (acs-7sti, DESIGN §3).
-    let transport = conn.transport.for_dial(call);
+    // destination since the last one (acs-7sti, DESIGN §3). A dial that
+    // knocks asks whatever the call, since the knock goes where ssh
+    // connects (KNOCK_DESIGN §3.2).
+    let knocking = dial_knocks(&conn.transport, joining);
+    let transport = conn.transport.for_dial(call, knocking);
+    let knocked = match knocking {
+        true => knock_before(conn, &transport)?,
+        false => None,
+    };
+    if knocked.is_some() {
+        timing.mark(Phase::Knocked);
+    }
     let mut cmd = transport.command(call, remote);
     if let Some(k) = keys.as_deref_mut() {
         use std::os::unix::process::CommandExt;
@@ -1172,9 +1280,14 @@ fn dial_once(
             16 * crate::safe::MAX_FIELD,
         );
     }
+    // Watched only after a knock, for its hint; otherwise ssh's own.
+    let stderr = match knocked {
+        Some(_) => Stdio::piped(),
+        None => Stdio::inherit(),
+    };
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(stderr);
     let mut child = sys::spawn(&mut cmd).map_err(|e| {
         let argv = transport.argv(call, remote);
         io::Error::new(
@@ -1183,6 +1296,7 @@ fn dial_once(
         )
     })?;
     timing.mark(Phase::SshSpawned);
+    let watch = child.stderr.take().map(StderrWatch::new);
     let to: OwnedFd = child.stdin.take().unwrap().into();
     let from: OwnedFd = child.stdout.take().unwrap().into();
     // The first frames, before anything is read back. Non-blocking, so a
@@ -1283,14 +1397,23 @@ fn dial_once(
             if let Some(noise) = scanner.noise_text().filter(|_| conn.verbose > 0) {
                 note(&format!("remote said: {noise}"));
             }
-            let status = child.wait();
+            let status = child.wait().ok();
             // A Ctrl-C at ssh's prompt reached ssh alone, which had the
             // terminal: it ends acs as it did when they shared a group.
             if let Some(k) = keys.as_deref_mut().filter(|k| k.handed) {
                 use std::os::unix::process::ExitStatusExt;
-                if status.is_ok_and(|s| s.signal() == Some(libc::SIGINT)) {
+                if status.is_some_and(|s| s.signal() == Some(libc::SIGINT)) {
                     k.left = Some(Left::Interrupt);
                     return Err(io::ErrorKind::Interrupted.into());
+                }
+            }
+            // ssh could not connect to a host it was knocked open for: the
+            // one question nothing else would let the user ask (§7). Not
+            // on every redial attempt, which knocks again anyway.
+            if let (Some(target), Some(w)) = (&knocked, &watch) {
+                let own = status.is_some_and(|s| s.code() == Some(255));
+                if own && call != Call::Redial && w.connect_failed() {
+                    note(&crate::knock::hint(target));
                 }
             }
             return Err(io::Error::new(
@@ -1824,6 +1947,16 @@ fn connect_once(
     let (link, marker) = match dialed {
         Ok(x) => x,
         Err(e) => {
+            // A knock that cannot work as configured is final, on a redial
+            // too (KNOCK_DESIGN §8).
+            match knock_refusal(&e) {
+                Some(crate::knock::Refusal::Config(m)) => {
+                    note(m);
+                    return Outcome::Exit(code::ERROR);
+                }
+                Some(r) if resuming && args.conn.verbose > 0 => note(&r.to_string()),
+                _ => {}
+            }
             // The dial itself did not come up: nothing reached the host,
             // so this is the connection, not a channel on one.
             if resuming {
@@ -2840,6 +2973,51 @@ mod tests {
         assert!(env_switch(Some(""), true), "empty is unset");
         assert!(!env_switch(Some("0"), true));
         assert!(env_switch(Some("1"), false));
+    }
+
+    /// KNOCK_DESIGN §3.1: which dials knock. Every one that opens a
+    /// connection of its own; none that joins acs's master; none without
+    /// a knock. A redial can never join (it does not multiplex), so it
+    /// always knocks — and a batch call is given a master only where one
+    /// answers, so it knocks exactly when it dials plainly.
+    #[test]
+    fn a_dial_knocks_when_it_opens_its_own_connection() {
+        let mut tr = ssh::Transport::new("gated");
+        tr.mux = Some(crate::mux::Mux {
+            dir: "/tmp".into(),
+            persist: 300,
+        });
+        assert!(!dial_knocks(&tr, false), "no knock configured");
+        assert!(!dial_knocks(&tr, true), "no knock configured");
+        tr.knock = Some(crate::knock::Knock::parse("7000,8000").unwrap());
+        assert!(dial_knocks(&tr, false), "a connection of its own");
+        assert!(!dial_knocks(&tr, true), "a join of acs's master");
+        // `dial_sharing` only ever joins where `mux::joinable`, which asks
+        // `multiplexes` first: a redial never does, so it always knocks.
+        assert!(!tr.multiplexes(Call::Redial));
+        for call in [Call::Session, Call::Side, Call::Batch] {
+            assert!(
+                tr.multiplexes(call),
+                "{call:?} may join, and then does not knock"
+            );
+        }
+    }
+
+    /// A refused knock travels in the dial's error, so that a caller can
+    /// tell a configuration that cannot work from a host that is down.
+    #[test]
+    fn a_knock_refusal_is_read_back_from_the_dial_error() {
+        use crate::knock::Refusal;
+        let e = io::Error::other(Refusal::Config("knock: no".into()));
+        assert_eq!(
+            knock_refusal(&e),
+            Some(&Refusal::Config("knock: no".into()))
+        );
+        assert_eq!(e.to_string(), "knock: no");
+        let e = io::Error::other(Refusal::Unreachable("knock: down".into()));
+        assert!(matches!(knock_refusal(&e), Some(Refusal::Unreachable(_))));
+        assert_eq!(knock_refusal(&io::Error::other("timeout")), None);
+        assert_eq!(knock_refusal(&io::ErrorKind::TimedOut.into()), None);
     }
 
     /// KNOCK_DESIGN §6: `--knock` (or `ACS_KNOCK`) over the entry's knock,

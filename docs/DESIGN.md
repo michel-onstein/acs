@@ -1607,6 +1607,10 @@ that cannot wait, which bytes end the open sequence and which write it again
     network change (§7), told before the dial made again.
   - `shared ssh master checked` — acs's own master may be joined
     (acs-9n3, §7.1); not told where it may not.
+  - `knocked` — the host was knocked before a dial that opens a
+    connection of its own, or a knock under 2 s old reused
+    ([KNOCK_DESIGN.md](KNOCK_DESIGN.md) §7); not told where there is no
+    knock.
   - `ssh spawned`.
   - `HELLO partly sent` — the transport's pipe took only part of the
     greeting (below).

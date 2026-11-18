@@ -495,7 +495,13 @@ fn dial_cp(
     let (link, marker) =
         match client::dial_watching(conn, call, &remote, timeout, t, first, netwatch, None) {
             Ok(x) => x,
-            Err(e) => return Dialed::Down(e.to_string()),
+            // A knock that cannot work as configured is final (KNOCK_DESIGN §8).
+            Err(e) => match client::knock_refusal(&e) {
+                Some(crate::knock::Refusal::Config(m)) => {
+                    return Dialed::Refused(m.clone(), crate::client::code::ERROR)
+                }
+                _ => return Dialed::Down(e.to_string()),
+            },
         };
     match client::ready_or_install(conn, link, marker, sync, &again, t) {
         Ok((link, rest)) => Dialed::Up(link, rest),

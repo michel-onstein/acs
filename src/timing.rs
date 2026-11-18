@@ -40,6 +40,8 @@ phases! {
     NetworkMoved = "network moved — dialing again",
     /// acs's own ssh master may be joined (acs-9n3).
     MasterChecked = "shared ssh master checked",
+    /// The host was knocked, or a knock reused (KNOCK_DESIGN §7).
+    Knocked = "knocked",
     /// The transport is running.
     SshSpawned = "ssh spawned",
     /// Only part of the greeting went with the dial (acs-ftn).

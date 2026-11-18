@@ -62,6 +62,9 @@ pub fn argv(args: &ClientArgs) -> Vec<std::ffi::OsString> {
 /// could not be started.
 pub fn run(args: &ClientArgs) -> u8 {
     use std::os::unix::process::CommandExt;
+    if let Err(c) = knock(args) {
+        return c;
+    }
     let argv = argv(args);
     if args.conn.verbose > 0 {
         note_max(
@@ -77,6 +80,27 @@ pub fn run(args: &ClientArgs) -> u8 {
     let e = cmd.exec();
     eprintln!("acs: cannot run {}: {e}", argv[0].to_string_lossy());
     code::UNREACHABLE
+}
+
+/// Knock before ssh is exec'd (KNOCK_DESIGN §3.1), unless acs's master is
+/// up for ssh to join. `Err` is the exit code, the reason told: the error
+/// code for a knock that cannot work as configured, else unreachable.
+fn knock(args: &ClientArgs) -> Result<(), u8> {
+    let tr = &args.conn.transport;
+    let joining = tr.knock.is_some() && crate::mux::joinable(tr, Call::Side);
+    if !crate::client::dial_knocks(tr, joining) {
+        return Ok(());
+    }
+    let tr = tr.for_dial(Call::Side, true);
+    let e = match crate::client::knock_before(&args.conn, &tr) {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    crate::client::note(&e.to_string());
+    Err(match crate::client::knock_refusal(&e) {
+        Some(crate::knock::Refusal::Config(_)) => code::ERROR,
+        _ => code::UNREACHABLE,
+    })
 }
 
 #[cfg(test)]

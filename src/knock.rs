@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::format_timeout;
+use crate::ssh::{AddressFamily, Route};
 
 /// How long one knock waits before the next, when nothing sets it.
 pub const DEFAULT_DELAY: Duration = Duration::from_millis(50);
@@ -222,11 +223,13 @@ impl fmt::Display for Knock {
 
 /// What [`send`] did: the addresses it knocked, and those it left alone
 /// because they were knocked with the same sequence less than [`REUSE`]
-/// ago. An address dropped as unreachable is in neither.
+/// ago, with how long ago the latest of those was. An address dropped as
+/// unreachable is in neither.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outcome {
     pub knocked: Vec<IpAddr>,
     pub reused: Vec<IpAddr>,
+    pub ago: Option<Duration>,
 }
 
 /// The socket calls a knock makes, and its sleeps — behind a trait so the
@@ -356,9 +359,17 @@ impl Recent {
     /// Whether `addr` was knocked with `sequence` less than [`REUSE`]
     /// before `now`.
     pub fn fresh(&self, addr: IpAddr, sequence: &[(u16, Proto)], now: Instant) -> bool {
-        self.entries.iter().any(|(a, s, at)| {
-            *a == addr && s == sequence && now.saturating_duration_since(*at) < REUSE
-        })
+        self.age(addr, sequence, now).is_some()
+    }
+
+    /// How long before `now` `addr` was knocked with `sequence`, when that
+    /// is less than [`REUSE`].
+    pub fn age(&self, addr: IpAddr, sequence: &[(u16, Proto)], now: Instant) -> Option<Duration> {
+        self.entries
+            .iter()
+            .filter(|(a, s, _)| *a == addr && s == sequence)
+            .map(|(_, _, at)| now.saturating_duration_since(*at))
+            .find(|age| *age < REUSE)
     }
 
     /// Remember a knock to `addr` with `sequence` at `at`, forgetting those
@@ -394,8 +405,9 @@ pub fn send_with(
         let table = recent.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         for &a in addrs {
-            if table.fresh(a, &knock.sequence, now) {
+            if let Some(age) = table.age(a, &knock.sequence, now) {
                 outcome.reused.push(a);
+                outcome.ago = Some(outcome.ago.map_or(age, |o| o.min(age)));
             } else if !live.contains(&a) {
                 live.push(a);
             }
@@ -422,7 +434,8 @@ pub fn send_with(
             match sent {
                 Ok(()) => kept.push(a),
                 Err(e) if unreachable(&e) => last_drop = Some(format!("{a}: {e}")),
-                Err(e) => return Err(format!("{to}: {e}")),
+                // The address alone: the port is the sequence, never told.
+                Err(e) => return Err(format!("{a}: {e}")),
             }
         }
         live = kept;
@@ -446,6 +459,144 @@ pub fn send_with(
     }
     outcome.knocked = live;
     Ok(outcome)
+}
+
+/// Why a dial cannot knock (§3.2, §5, §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// A configuration that cannot work — a knock on a proxied dial (§5):
+    /// the error code, and a redial does not try it again.
+    Config(String),
+    /// Where to knock is not known, or nothing could be sent to it: as an
+    /// unreachable host, which a redial tries again.
+    Unreachable(String),
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::Config(m) | Refusal::Unreachable(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+impl Knock {
+    /// How long sending it takes: the delays between the knocks, then the
+    /// wait (§4.3).
+    pub fn duration(&self) -> Duration {
+        self.delay * (self.sequence.len() as u32).saturating_sub(1) + self.wait
+    }
+}
+
+/// The host a dial to `dest` knocks (§3.2, §5): `knock.host` when it names
+/// one, whatever the route; else the host `ssh -G` says ssh connects to —
+/// refused when that is through a proxy, and when `ssh -G` could not say.
+pub fn target<'a>(
+    knock: &'a Knock,
+    dest: &str,
+    route: Option<&'a Route>,
+) -> Result<&'a str, Refusal> {
+    if let Some(h) = &knock.host {
+        return Ok(h);
+    }
+    match route {
+        Some(r) if r.proxied => Err(Refusal::Config(format!(
+            "knock: {dest} is reached through {}, so a knock from here would open it to the wrong address; \
+             set knock.host to knock the jump host, or knock from the jump host's ProxyCommand",
+            r.proxy.as_deref().unwrap_or("a proxy")
+        ))),
+        Some(Route {
+            hostname: Some(h), ..
+        }) => Ok(h),
+        _ => Err(Refusal::Unreachable(format!(
+            "knock: cannot tell where ssh connects for {dest} (ssh -G failed)"
+        ))),
+    }
+}
+
+/// The addresses of `addrs` that ssh may connect to with `family` (§3.3).
+pub fn by_family(mut addrs: Vec<IpAddr>, family: AddressFamily) -> Vec<IpAddr> {
+    addrs.retain(|a| match family {
+        AddressFamily::Any => true,
+        AddressFamily::Inet => a.is_ipv4(),
+        AddressFamily::Inet6 => a.is_ipv6(),
+    });
+    addrs
+}
+
+/// The `-v` lines for a knock to `target` (§7): what was knocked and how,
+/// and what was knocked so recently that it was not knocked again. They
+/// name the host, its addresses and the count, **never the ports**.
+pub fn report(target: &str, knock: &Knock, o: &Outcome) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !o.knocked.is_empty() {
+        let addrs: Vec<String> = o.knocked.iter().map(IpAddr::to_string).collect();
+        let n = knock.sequence.len();
+        let mut l = format!(
+            "knocking {target} ({}): {n} knock{}",
+            addrs.join(", "),
+            if n == 1 { "" } else { "s" }
+        );
+        if n > 1 {
+            l.push_str(&format!(", {} ms apart", knock.delay.as_millis()));
+        }
+        l.push_str(&format!(", then {} ms", knock.wait.as_millis()));
+        lines.push(l);
+    }
+    if let Some(ago) = o.ago {
+        lines.push(format!(
+            "{target} was knocked {:.1} s ago — not knocking again",
+            ago.as_secs_f32()
+        ));
+    }
+    lines
+}
+
+/// Knock where a dial to `dest` will connect (§3): the [`target`], its
+/// addresses looked up within `lookup` and kept to the route's address
+/// family, then [`send`]. `log` is given the [`report`] lines. The host
+/// knocked, for the hint of §7.
+pub fn before_dial(
+    knock: &Knock,
+    dest: &str,
+    route: Option<&Route>,
+    lookup: Duration,
+    log: &mut dyn FnMut(String),
+) -> Result<String, Refusal> {
+    let target = self::target(knock, dest, route)?;
+    let family = route.map(|r| r.addressfamily).unwrap_or_default();
+    let addrs = by_family(crate::netmatch::resolve(target, lookup), family);
+    if addrs.is_empty() {
+        return Err(Refusal::Unreachable(format!(
+            "knock: no address for {target}"
+        )));
+    }
+    let outcome =
+        send(&addrs, knock).map_err(|e| Refusal::Unreachable(format!("knock: {target}: {e}")))?;
+    report(target, knock, &outcome).into_iter().for_each(log);
+    Ok(target.to_string())
+}
+
+/// The line §7 adds when ssh could not connect to a host it knocked: the
+/// question a user would otherwise have no way to ask.
+pub fn hint(target: &str) -> String {
+    format!(
+        "{target} was knocked before this dial; if it is up, the sequence or its timing may not match knockd's (see knockd's log)"
+    )
+}
+
+/// Whether ssh's stderr says it could not connect at all — a timeout or a
+/// refusal — which is how a knock that did not open the port ends.
+pub fn connect_failed(stderr: &str) -> bool {
+    [
+        "Connection timed out",
+        "Operation timed out",
+        "Connection refused",
+    ]
+    .iter()
+    .any(|m| stderr.contains(m))
 }
 
 #[cfg(test)]
@@ -752,7 +903,7 @@ mod tests {
         };
         let table = Mutex::new(Recent::new());
         let err = send_with(&mut net, &table, &[V6, V4], &knock("1,2")).unwrap_err();
-        assert!(err.starts_with("192.0.2.1:1: "), "{err}");
+        assert!(err.starts_with("192.0.2.1: "), "{err}");
     }
 
     #[test]
@@ -767,9 +918,11 @@ mod tests {
             out,
             Outcome {
                 knocked: vec![],
-                reused: vec![V4]
+                reused: vec![V4],
+                ago: out.ago,
             }
         );
+        assert!(out.ago.is_some_and(|a| a < REUSE), "{out:?}");
         assert_eq!(net.events.len(), first, "reused, so nothing sent or waited");
         // A new address alongside is knocked; the reused one is not.
         let out = send_with(&mut net, &table, &[V4, V6], &k).unwrap();
@@ -924,5 +1077,143 @@ mod tests {
         while let Some(s) = accept(&l, Duration::from_millis(200)) {
             assert!(closed(s), "a knock socket is still open after send");
         }
+    }
+
+    fn route(out: &str) -> Route {
+        Route::parse(out)
+    }
+
+    /// §3.2, §5: the knock goes where ssh -G says ssh connects; through a
+    /// proxy it is refused unless `knock.host` names the host to knock, and
+    /// an ssh -G that could not say is never guessed at.
+    #[test]
+    fn the_target_is_where_ssh_connects_or_knock_host() {
+        let k = knock("7000,8000");
+        let direct = route("hostname gate.example.com\nport 22\n");
+        assert_eq!(target(&k, "gated", Some(&direct)), Ok("gate.example.com"));
+        let jump = route("hostname inner\nproxyjump bastion\n");
+        assert_eq!(
+            target(&k, "gated", Some(&jump)),
+            Err(Refusal::Config(
+                "knock: gated is reached through ProxyJump bastion, so a knock from here would \
+                 open it to the wrong address; set knock.host to knock the jump host, or knock \
+                 from the jump host's ProxyCommand"
+                    .into()
+            ))
+        );
+        let e = target(&k, "gated", Some(&route("proxycommand nc %h %p\n"))).unwrap_err();
+        assert!(
+            matches!(&e, Refusal::Config(m) if m.contains("through a ProxyCommand")),
+            "{e:?}"
+        );
+        assert_eq!(
+            target(&k, "gated", None),
+            Err(Refusal::Unreachable(
+                "knock: cannot tell where ssh connects for gated (ssh -G failed)".into()
+            ))
+        );
+        // knock.host is sent whether or not the dial is proxied.
+        let mut via = k.clone();
+        via.host = Some("bastion.example.com".into());
+        for r in [Some(&jump), Some(&direct), None] {
+            assert_eq!(target(&via, "inner", r), Ok("bastion.example.com"));
+        }
+    }
+
+    /// §3.3: `addressfamily` keeps the addresses ssh may connect to.
+    #[test]
+    fn the_address_family_keeps_what_ssh_may_dial() {
+        assert_eq!(by_family(vec![V4, V6], AddressFamily::Any), [V4, V6]);
+        assert_eq!(by_family(vec![V4, V6], AddressFamily::Inet), [V4]);
+        assert_eq!(by_family(vec![V4, V6], AddressFamily::Inet6), [V6]);
+    }
+
+    /// §7: `-v` names the host, its addresses and the count — never a
+    /// port — and says when a knock was reused.
+    #[test]
+    fn the_v_lines_never_name_a_port() {
+        let k = knock("7001,8002:udp,9003");
+        let o = Outcome {
+            knocked: vec![V4, V6],
+            reused: vec![],
+            ago: None,
+        };
+        assert_eq!(
+            report("gate", &k, &o),
+            ["knocking gate (192.0.2.1, 2001:db8::1): 3 knocks, 50 ms apart, then 200 ms"]
+        );
+        let o = Outcome {
+            knocked: vec![],
+            reused: vec![V4],
+            ago: Some(Duration::from_millis(120)),
+        };
+        assert_eq!(
+            report("gate", &k, &o),
+            ["gate was knocked 0.1 s ago — not knocking again"]
+        );
+        let one = Knock::new(
+            vec![(7001, Proto::Tcp)],
+            DEFAULT_DELAY,
+            Duration::ZERO,
+            None,
+        )
+        .unwrap();
+        let o = Outcome {
+            knocked: vec![V4],
+            ..Outcome::default()
+        };
+        let lines = report("gate", &one, &o);
+        assert_eq!(lines, ["knocking gate (192.0.2.1): 1 knock, then 0 ms"]);
+        for l in report("gate", &k, &o).iter().chain(&lines) {
+            for port in ["7001", "8002", "9003"] {
+                assert!(!l.contains(port), "{l}");
+            }
+        }
+        assert!(!hint("gate").contains("7001"));
+    }
+
+    /// A knock's own time: its delays, then its wait (§4.3).
+    #[test]
+    fn a_knock_takes_its_delays_and_its_wait() {
+        assert_eq!(knock("1,2,3").duration(), Duration::from_millis(300));
+        assert_eq!(knock("1").duration(), DEFAULT_WAIT);
+    }
+
+    /// The hint follows only ssh's failures to connect at all (§7).
+    #[test]
+    fn the_hint_follows_a_timeout_or_a_refusal() {
+        for said in [
+            "ssh: connect to host gate port 22: Connection timed out",
+            "ssh: connect to host gate port 22: Operation timed out",
+            "ssh: connect to host gate port 22: Connection refused",
+        ] {
+            assert!(connect_failed(said), "{said}");
+        }
+        assert!(!connect_failed("me@gate: Permission denied (publickey)."));
+        assert!(!connect_failed("Could not resolve hostname gate"));
+    }
+
+    /// A send error names the address, never the port (§7).
+    #[test]
+    fn a_send_error_names_no_port() {
+        struct Broken;
+        impl Net for Broken {
+            fn tcp(&mut self, _: SocketAddr) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            }
+            fn udp(&mut self, _: SocketAddr) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            }
+            fn sleep(&mut self, _: Duration) {}
+        }
+        let e = send_with(
+            &mut Broken,
+            &Mutex::new(Recent::new()),
+            &[V4],
+            &knock("7001"),
+        )
+        .unwrap_err();
+        assert!(e.starts_with("192.0.2.1: "), "{e}");
+        assert!(!e.contains("7001"), "{e}");
     }
 }
