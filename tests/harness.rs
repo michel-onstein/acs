@@ -31,7 +31,7 @@ fn remote_chain_is_byte_exact() {
         "stty raw -echo; cat '{}'; printf '\\nEND'",
         data_file.display()
     );
-    let w = c.greet(hello_running("smoke", "me", &["/bin/sh", "-c", &script]));
+    let w = c.greet(hello_running("smoke", "me", &[&sh_c(&script)]));
     assert!(w.created);
     c.wait_output("\nEND", T);
     let out = &c.output;
@@ -69,9 +69,7 @@ fn dropping_a_remote_ends_its_sessions() {
             "devbox",
             "keep",
             "--",
-            "/bin/sh",
-            "-c",
-            "trap '' HUP; echo spinning; while :; do sleep 0.1; done",
+            &sh_c("trap '' HUP; echo spinning; while :; do sleep 0.1; done"),
         ],
     );
     c.wait_for("spinning", T);
@@ -188,9 +186,7 @@ fn waiting_twice_for_the_same_text_needs_it_twice() {
             "devbox",
             "twice",
             "--",
-            "/bin/sh",
-            "-c",
-            "echo tick; sleep 1; echo tick; sleep 30",
+            &sh_c("echo tick; sleep 1; echo tick; sleep 30"),
         ],
     );
     c.wait_for("tick", T);

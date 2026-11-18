@@ -1022,9 +1022,13 @@ impl Master {
             c.arg("-l");
             (c, format!("{shell} -l"))
         } else {
-            let mut c = Command::new(&h.command[0]);
-            c.args(&h.command[1..]);
-            (c, h.command.join(" "))
+            // As ssh runs a remote command (DESIGN §4.2): the words joined
+            // with spaces, read by the login shell — so `acs host -- 'a | b'`
+            // pipes, and `acs host -- ls *.log` globs on the host.
+            let line = crate::ssh::command_line(&h.command);
+            let mut c = Command::new(&shell);
+            c.arg("-c").arg(&line);
+            (c, line)
         };
         let home = std::env::var_os("HOME").unwrap_or_else(|| "/".into());
         cmd.current_dir(&home)

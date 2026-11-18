@@ -14,10 +14,7 @@ use common::*;
 
 /// Start session `name` running [`echo`] and detach from it.
 fn detached(remote: &Remote, name: &str) {
-    let mut c = Client::start(
-        remote,
-        &["devbox", name, "--", "/bin/sh", "-c", &echo(name)],
-    );
+    let mut c = Client::start(remote, &["devbox", name, "--", &sh_c(&echo(name))]);
     c.wait_for(&format!("ready-{name}"), T);
     c.send(&command(b'd'));
     assert_eq!(c.wait(T), 0);
@@ -43,10 +40,8 @@ fn attached_to(c: &mut Client, name: &str) {
 #[test]
 fn with_no_session_it_creates_main() {
     let remote = Remote::installed();
-    let mut c = Client::start(
-        &remote,
-        &["devbox", "--", "/bin/sh", "-c", "echo up; sleep 30"],
-    );
+    remote.login_shell_runs("echo up; sleep 30");
+    let mut c = Client::start(&remote, &["devbox"]);
     c.wait_for("new session 'main' on devbox", T);
     c.wait_for("up", T);
     assert!(!c.text().contains("\x1b[?1049h"), "no menu: {:?}", c.text());
@@ -57,22 +52,17 @@ fn with_no_session_detached_it_creates_one_named_as_free() {
     let remote = Remote::installed();
     let mut a = Client::start(
         &remote,
-        &["devbox", "main", "--", "/bin/sh", "-c", "echo a; sleep 30"],
+        &["devbox", "main", "--", &sh_c("echo a; sleep 30")],
     );
     a.wait_for("a", T);
     // main is attached: the lowest free number, as --new.
-    let mut b = Client::start(
-        &remote,
-        &["devbox", "--", "/bin/sh", "-c", "echo b; sleep 30"],
-    );
+    remote.login_shell_runs("echo b; sleep 30");
+    let mut b = Client::start(&remote, &["devbox"]);
     b.wait_for("new session '1' on devbox", T);
     b.wait_for("b", T);
     // ACS_DEFAULT_SESSION names it while that name is free.
-    let mut c = Client::start_env(
-        &remote,
-        &["devbox", "--", "/bin/sh", "-c", "echo c; sleep 30"],
-        &[("ACS_DEFAULT_SESSION", "mine")],
-    );
+    remote.login_shell_runs("echo c; sleep 30");
+    let mut c = Client::start_env(&remote, &["devbox"], &[("ACS_DEFAULT_SESSION", "mine")]);
     c.wait_for("new session 'mine' on devbox", T);
     for c in [&b, &c] {
         assert!(!c.text().contains("\x1b[?1049h"), "no menu: {:?}", c.text());
@@ -111,10 +101,7 @@ fn the_cursor_and_enter_attach_the_selection() {
 fn dot_shows_attached_sessions_and_takes_one_over_when_confirmed() {
     let remote = Remote::installed();
     detached(&remote, "idle");
-    let mut a = Client::start(
-        &remote,
-        &["devbox", "busy", "--", "/bin/sh", "-c", &echo("busy")],
-    );
+    let mut a = Client::start(&remote, &["devbox", "busy", "--", &sh_c(&echo("busy"))]);
     a.wait_for("ready-busy", T);
     // Someone else: the takeover needs --force, which the menu's yes gives.
     let mut c = Client::start_env(&remote, &["devbox"], &[("ACS_IDENTITY", "other@elsewhere")]);
@@ -276,19 +263,8 @@ fn with_nothing_detached_the_pick_call_attaches_at_once() {
     let remote = Remote::installed();
     let ssh = Ssh::new(&[("devbox", &remote)]);
     let path = ssh.path().display().to_string();
-    let mut c = Client::spawn(
-        &exe(),
-        &[
-            "--ssh",
-            &path,
-            "devbox",
-            "--",
-            "/bin/sh",
-            "-c",
-            &echo("main"),
-        ],
-        &[],
-    );
+    remote.login_shell_runs(&echo("main"));
+    let mut c = Client::spawn(&exe(), &["--ssh", &path, "devbox"], &[]);
     c.wait_for("new session 'main' on devbox", T);
     c.wait_for("ready-main", T);
     c.send(b"hi\r");

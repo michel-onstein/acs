@@ -15,10 +15,7 @@ fn the_hello_goes_out_with_the_dial_not_after_the_marker() {
     let remote = Remote::installed();
     remote.mute_until_greeted();
     remote.login_noise("Welcome to devbox!\nYou have mail.\n");
-    let mut c = Client::start(
-        &remote,
-        &["devbox", "hs", "--", "/bin/sh", "-c", "echo up; sleep 30"],
-    );
+    let mut c = Client::start(&remote, &["devbox", "hs", "--", &sh_c("echo up; sleep 30")]);
     c.wait_for("up", T);
     assert!(!c.text().contains("Welcome to devbox"), "{:?}", c.text());
 }
@@ -32,14 +29,7 @@ fn a_redial_greets_before_the_marker_too() {
     remote.login_noise("motd\n");
     let mut c = Client::start_env(
         &remote,
-        &[
-            "devbox",
-            "hsr",
-            "--",
-            "/bin/sh",
-            "-c",
-            "echo up; read x; echo back",
-        ],
+        &["devbox", "hsr", "--", &sh_c("echo up; read x; echo back")],
         &[("ACS_BACKOFF_MS", "100")],
     );
     c.wait_for("up", T);
@@ -66,9 +56,7 @@ fn a_window_resized_while_the_dial_is_held_reaches_the_program() {
             "devbox",
             "hsz",
             "--",
-            "/bin/sh",
-            "-c",
-            "while :; do stty size; sleep 0.2; done",
+            &sh_c("while :; do stty size; sleep 0.2; done"),
         ],
     );
     // The HELLO was built before the transport was spawned, so by the time

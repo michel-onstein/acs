@@ -59,7 +59,7 @@ fn the_first_connection_and_a_redial_tell_each_phase_in_order() {
     env.extend(FAST.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     let mut c = Client::start_env(
         &remote,
-        &["-v", "devbox", "t", "--", "/bin/sh", "-c", TICKER],
+        &["-v", "devbox", "t", "--", &sh_c(TICKER)],
         &refs(&env),
     );
     c.wait_for("timing: first connection: first output byte", T);
@@ -104,14 +104,7 @@ fn the_menus_connection_tells_the_session_list() {
     let remote = Remote::installed();
     let mut d = Client::start(
         &remote,
-        &[
-            "devbox",
-            "one",
-            "--",
-            "/bin/sh",
-            "-c",
-            "echo ready; sleep 30",
-        ],
+        &["devbox", "one", "--", &sh_c("echo ready; sleep 30")],
     );
     d.wait_for("ready", T);
     d.send(&command(b'd'));
@@ -144,10 +137,8 @@ fn the_menus_connection_tells_the_session_list() {
 #[test]
 fn with_nothing_detached_the_welcome_follows_the_list_without_a_second_hello() {
     let remote = Remote::installed();
-    let mut c = Client::start(
-        &remote,
-        &["-v", "devbox", "--", "/bin/sh", "-c", "echo up; sleep 30"],
-    );
+    remote.login_shell_runs("echo up; sleep 30");
+    let mut c = Client::start(&remote, &["-v", "devbox"]);
     c.wait_for("timing: first connection: first output byte", T);
     assert_eq!(
         phases(&c.text(), "first connection"),
@@ -170,10 +161,7 @@ fn with_nothing_detached_the_welcome_follows_the_list_without_a_second_hello() {
 #[test]
 fn without_v_no_timing_is_told() {
     let remote = Remote::installed();
-    let mut c = Client::start(
-        &remote,
-        &["devbox", "q", "--", "/bin/sh", "-c", "echo up; sleep 30"],
-    );
+    let mut c = Client::start(&remote, &["devbox", "q", "--", &sh_c("echo up; sleep 30")]);
     c.wait_for("up", T);
     assert!(!c.text().contains("timing:"), "{:?}", c.text());
 }
@@ -191,15 +179,7 @@ fn a_greeting_too_big_for_the_pipe_is_told_twice() {
     // Over any pipe buffer acs can be handed: 64 KiB on Linux, at most
     // that on macOS.
     let pad = "p".repeat(1024);
-    let mut argv: Vec<&str> = vec![
-        "-v",
-        "devbox",
-        "big",
-        "--",
-        "/bin/sh",
-        "-c",
-        "echo up; sleep 30",
-    ];
+    let mut argv: Vec<&str> = vec!["-v", "devbox", "big", "--", UP_SH];
     for _ in 0..192 {
         argv.push(&pad);
     }

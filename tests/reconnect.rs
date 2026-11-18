@@ -15,11 +15,7 @@ use common::*;
 const DEAD: Duration = Duration::from_secs(4);
 
 fn start(remote: &Remote, session: &str, cmd: &str, env: &[(&str, &str)]) -> Client {
-    Client::start_env(
-        remote,
-        &["devbox", session, "--", "/bin/sh", "-c", cmd],
-        env,
-    )
+    Client::start_env(remote, &["devbox", session, "--", &sh_c(cmd)], env)
 }
 
 // `numbers`, `assert_consecutive` and `last_number` live in tests/common:
@@ -220,9 +216,7 @@ fn no_reconnect_exits_on_a_drop() {
             "nr",
             "--no-reconnect",
             "--",
-            "/bin/sh",
-            "-c",
-            "echo up; sleep 30",
+            &sh_c("echo up; sleep 30"),
         ],
         &[],
     );
@@ -252,7 +246,7 @@ fn a_link_lost_before_the_welcome_claims_no_session() {
     for session in [&["nw"][..], &["--new"]] {
         let mut args = vec!["--transport-cmd", &script, "devbox"];
         args.extend_from_slice(session);
-        args.extend_from_slice(&["--", "/bin/sh", "-c", "sleep 30"]);
+        args.extend_from_slice(&["--", "/bin/sh -c 'sleep 30'"]);
         let mut c = Client::spawn(&exe(), &args, FAST);
         assert_eq!(c.wait(T), 255, "{session:?}: {}", c.text());
         c.wait_for("connection to devbox lost before the session started", T);
@@ -1073,7 +1067,7 @@ fn a_terminal_stall_during_a_netcheck_is_not_a_dead_link() {
     );
     let mut c = Client::start_env(
         &remote,
-        &["-v", "devbox", "spd", "--", "/bin/sh", "-c", &cmd],
+        &["-v", "devbox", "spd", "--", &sh_c(&cmd)],
         &refs(&env),
     );
     c.wait_for("up", T);
@@ -1171,15 +1165,7 @@ fn under_v_a_hint_that_changed_nothing_says_so_and_still_ends_nothing() {
     env.extend(watch.env());
     let mut c = Client::start_env(
         &remote,
-        &[
-            "-v",
-            "devbox",
-            "vq",
-            "--",
-            "/bin/sh",
-            "-c",
-            "echo up; sleep 60",
-        ],
+        &["-v", "devbox", "vq", "--", &sh_c("echo up; sleep 60")],
         &refs(&env),
     );
     // The session announcement first: this is the one client in this file
@@ -1224,7 +1210,7 @@ fn under_v_a_real_change_names_the_networks_and_still_redials() {
     env.extend(watch.env());
     let mut c = Client::start_env(
         &remote,
-        &["-v", "devbox", "vc", "--", "/bin/sh", "-c", TICKER],
+        &["-v", "devbox", "vc", "--", &sh_c(TICKER)],
         &refs(&env),
     );
     c.wait_for("#10#", T);
@@ -1275,7 +1261,7 @@ fn a_change_the_rate_limit_suppressed_is_offered_again() {
     env.extend(watch.env());
     let mut c = Client::start_env(
         &remote,
-        &["-v", "devbox", "ea", "--", "/bin/sh", "-c", TICKER],
+        &["-v", "devbox", "ea", "--", &sh_c(TICKER)],
         &refs(&env),
     );
     c.wait_session("ea");
@@ -1330,9 +1316,7 @@ fn echoing(name: &str) -> Vec<&str> {
         "devbox",
         name,
         "--",
-        "/bin/sh",
-        "-c",
-        "echo up; while read l; do echo got:$l; done",
+        "/bin/sh -c 'echo up; while read l; do echo got:$l; done'",
     ]
 }
 
@@ -1635,7 +1619,7 @@ fn a_flapping_interface_is_one_redial() {
     env.extend(watch.env());
     let mut c = Client::start_env(
         &remote,
-        &["-v", "devbox", "fl", "--", "/bin/sh", "-c", TICKER],
+        &["-v", "devbox", "fl", "--", &sh_c(TICKER)],
         &refs(&env),
     );
     c.wait_session("fl");

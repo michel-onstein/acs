@@ -9,7 +9,7 @@ use acs::proto::{err, Mode, Msg, PROTO_VERSION};
 use acs::testutil::{hello, hello_running, wait_idle, FrameConn, TempDir};
 
 mod common;
-use common::{exe, T};
+use common::{exe, sh_c, T};
 
 struct Proxy {
     conn: FrameConn,
@@ -51,7 +51,7 @@ fn session(dir: &Path, name: &str) -> Proxy {
 }
 
 fn hello_cmd(name: &str, identity: &str, cmd: &str) -> Msg {
-    Msg::Hello(hello_running(name, identity, &["/bin/sh", "-c", cmd]))
+    Msg::Hello(hello_running(name, identity, &[&sh_c(cmd)]))
 }
 
 /// Regression (acs-wza): after the client's side closes while its input is
@@ -256,7 +256,7 @@ fn new_sessions_get_increasing_numbers() {
         let mut p = proxy(t.path(), &["--new"]);
         // The client does not know the name; the proxy fills it in.
         let mut h = hello("", Mode::Create, "me");
-        h.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        h.command = vec![sh_c("sleep 30")];
         p.conn.send(&Msg::Hello(h));
         let w = p.conn.expect_welcome();
         assert!(w.created);
@@ -408,7 +408,7 @@ fn pick_creates_a_session_by_name_or_a_new_numbered_one() {
     let mut q = proxy(t.path(), &["--pick"]);
     assert_eq!(names(&pick_list(&mut q)), ["main"]);
     let mut h = hello("", Mode::Create, "me");
-    h.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+    h.command = vec![sh_c("sleep 30")];
     q.conn.send(&Msg::Hello(h));
     let w = q.conn.expect_welcome();
     assert_eq!((w.session.as_str(), w.created), ("1", true));

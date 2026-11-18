@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 
 use common::*;
 
-const CMD: &[&str] = &["--", "/bin/sh", "-c", "echo up; sleep 30"];
+const CMD: &[&str] = &["--", UP_SH];
 
 fn args(session: &str) -> Vec<&str> {
     let mut a = vec!["devbox", session];

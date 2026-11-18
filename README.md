@@ -156,7 +156,8 @@ acs [ssh options] [user@]host session    attach, or create
 acs [ssh options] [user@]host --new      create a new numbered session (1, 2, …)
 acs list [ssh options] [user@]host       list sessions on host
 acs list [ssh options]                   list sessions on every host alias
-acs host session -- command args…        run a command instead of the login shell
+acs [ssh options] host -- command args…  run a command and exit with its status, as ssh does
+acs host session -- command args…        a session running a command instead of the login shell
 ```
 
 `list`, `config`, `upgrade` and `cp` are commands when they come first. A
@@ -226,6 +227,40 @@ the middle of a sequence the program is sending. Turn it off with
 A single Ctrl-], or Ctrl-] followed by any other key, goes to the program as
 usual. The command key works in every keyboard encoding a terminal may use
 (including the kitty keyboard protocol) and never triggers inside a paste.
+
+### Running a command
+
+As with `ssh host command`, a command after `--` runs on the host and acs
+exits with its status:
+
+```sh
+acs devbox -- uptime
+acs devbox -- 'journalctl -u nginx | tail -50'
+acs devbox -- make -C src test && echo passed
+acs devbox -- cat /var/log/syslog > syslog          # stdout is a file: no terminal
+tar c project | acs devbox -- tar x -C backup       # stdin is a pipe: no terminal
+```
+
+The words are joined with spaces and read by your login shell on the host,
+exactly as ssh does it: quote what the host's shell should see, so
+`'a | b'` pipes there and `'*.log'` globs there.
+
+In a terminal, the command runs in a session of its own that ends with it,
+so a dropped connection is resumed and the command never notices; Ctrl-]
+Ctrl-] `d` leaves it running (acs says which session to reattach to) and `x`
+ends it. When stdin or stdout is not a terminal, acs runs it as `ssh -T`
+would — stdout, stderr and stdin kept apart and byte-exact, end of file
+passed on — over the same host, alias, key and shared connection, but
+without a session to resume.
+
+| Option | Effect |
+| --- | --- |
+| `-t` | run in a session even when stdout is not a terminal |
+| `-T` | run without a terminal, as `ssh -T` |
+| `-n` | read stdin from `/dev/null`, as `ssh -n` (implies `-T`) |
+
+`acs host session -- command` and `acs host --new -- command` start a
+session running the command, read by the shell the same way.
 
 ### Copying files
 

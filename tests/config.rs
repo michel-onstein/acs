@@ -127,7 +127,7 @@ fn a_configured_forward_goes_to_the_session_ssh_and_no_other_call() {
     // Call::Session — the forward is on it, out of the file, with no -L
     // anywhere on the command line.
     let mut a = vec!["--ssh".to_string(), ssh_path.clone(), "-v".into()];
-    a.extend(["devbox", "s", "--", "/bin/sh", "-c", "echo up; sleep 30"].map(String::from));
+    a.extend(["devbox", "s", "--", &sh_c("echo up; sleep 30")].map(String::from));
     let a: Vec<&str> = a.iter().map(String::as_str).collect();
     let mut c = Client::spawn(&exe(), &a, &refs(&env));
     c.wait_for("devbox: local_forwards 45997:localhost:9 (", T);
@@ -194,7 +194,7 @@ fn an_aliass_own_forwards_replace_the_global_ones() {
     let ssh_path = ssh.path().display().to_string();
     let session = |alias: &str, name: &str| {
         let mut a = vec!["--ssh".to_string(), ssh_path.clone()];
-        a.extend([alias, name, "--", "/bin/sh", "-c", "echo up; sleep 30"].map(String::from));
+        a.extend([alias, name, "--", &sh_c("echo up; sleep 30")].map(String::from));
         let a: Vec<&str> = a.iter().map(String::as_str).collect();
         let mut c = Client::spawn(&exe(), &a, &refs(&env));
         c.wait_session(name);
@@ -229,7 +229,7 @@ fn dash_l_none_drops_the_configured_forwards_and_keeps_the_rest() {
     let session = |extra: &[&str], name: &str| {
         let mut a = vec!["--ssh".to_string(), ssh_path.clone()];
         a.extend(extra.iter().map(|s| s.to_string()));
-        a.extend(["devbox", name, "--", "/bin/sh", "-c", "echo up; sleep 30"].map(String::from));
+        a.extend(["devbox", name, "--", &sh_c("echo up; sleep 30")].map(String::from));
         let a: Vec<&str> = a.iter().map(String::as_str).collect();
         let mut c = Client::spawn(&exe(), &a, &refs(&env));
         c.wait_session(name);

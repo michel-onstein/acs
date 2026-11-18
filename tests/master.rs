@@ -7,7 +7,7 @@ use acs::proto::{AttachKind, Mode, Msg, Resume, Welcome};
 use acs::testutil::{hello, poll, wait_idle, wait_until, FrameConn, TempDir};
 
 mod common;
-use common::{exe, T};
+use common::{exe, sh_c, T};
 
 fn sock(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.sock"))
@@ -89,11 +89,9 @@ fn creates_runs_and_reports_exit_status() {
     let (mut c, w) = start(
         t.path(),
         "s",
-        &[
-            "/bin/sh",
-            "-c",
+        &[&sh_c(
             "echo ready:$ACS_SESSION:$TERM; read line; echo got:$line; exit 7",
-        ],
+        )],
         "me@here",
     );
     assert!(w.created);
@@ -131,7 +129,7 @@ fn concurrent_starts_produce_one_master() {
     // The winner answers; create the session and end it.
     let mut c = FrameConn::connect(&sock(&dir, "race")).unwrap();
     let mut h = hello("race", Mode::AttachOrCreate, "me");
-    h.command = vec!["/bin/sh".into(), "-c".into(), "exit 3".into()];
+    h.command = vec![sh_c("exit 3")];
     c.send(&Msg::Hello(h));
     assert!(matches!(c.recv_control(T), Some(Msg::Welcome(_))));
     assert_eq!(acs::sys::exit_code(wait_exit(&mut c)), 3);
@@ -143,7 +141,7 @@ fn socket_is_rebound_after_deletion() {
     let (mut c, w) = start_env(
         t.path(),
         "rb",
-        &["/bin/sh", "-c", "read x; echo got:$x"],
+        &[&sh_c("read x; echo got:$x")],
         "me",
         &[("ACS_MASTER_REBIND_MS", "100")],
     );
@@ -202,7 +200,7 @@ fn a_reconnect_after_the_socket_is_deleted_finds_the_same_shell() {
     let (mut c, w) = start_env(
         t.path(),
         "lb",
-        &["/bin/sh", "-c", "read x; echo got:$x"],
+        &[&sh_c("read x; echo got:$x")],
         "me",
         &[("ACS_MASTER_REBIND_MS", "3600000")],
     );
@@ -227,7 +225,7 @@ fn a_reconnect_after_the_socket_is_deleted_finds_the_same_shell() {
 #[test]
 fn a_finished_session_frees_its_name() {
     let t = TempDir::new();
-    let (mut c, _) = start(t.path(), "fin", &["/bin/sh", "-c", "exit 0"], "me");
+    let (mut c, _) = start(t.path(), "fin", &[&sh_c("exit 0")], "me");
     wait_exit(&mut c);
     wait_gone(&sock(t.path(), "fin"));
     acs::master::spawn(&exe(), t.path(), "fin").expect("a fresh master");
@@ -240,7 +238,7 @@ fn socket_directory_is_recreated_after_deletion() {
     let (_c, w) = start_env(
         &dir,
         "gone",
-        &["/bin/sh", "-c", "sleep 30"],
+        &[&sh_c("sleep 30")],
         "me",
         &[("ACS_MASTER_REBIND_MS", "100")],
     );
@@ -280,7 +278,7 @@ fn attach_to_a_session_that_is_not_there() {
 #[test]
 fn master_rejects_a_mismatched_protocol() {
     let t = TempDir::new();
-    let (_c, _) = start(t.path(), "pm", &["/bin/sh", "-c", "sleep 30"], "me");
+    let (_c, _) = start(t.path(), "pm", &[&sh_c("sleep 30")], "me");
     let mut c = FrameConn::connect(&sock(t.path(), "pm")).unwrap();
     let mut h = hello("pm", Mode::Attach, "me");
     h.proto = 999;
@@ -318,7 +316,7 @@ fn numbers_leaves_out_a_tick_the_snapshot_cut_in_half() {
 #[test]
 fn resume_replays_exactly_the_missed_bytes() {
     let t = TempDir::new();
-    let (mut a, w) = start(t.path(), "r", &["/bin/sh", "-c", TICKER], "me");
+    let (mut a, w) = start(t.path(), "r", &[&sh_c(TICKER)], "me");
     a.wait_output("#3#\r\n", T);
     let seen = a.next_offset.unwrap();
     let before = a.output.clone();
@@ -361,11 +359,9 @@ fn overwritten_offset_is_a_gap_and_other_instance_is_fresh() {
     let (a, w) = start_env(
         t.path(),
         "g",
-        &[
-            "/bin/sh",
-            "-c",
+        &[&sh_c(
             "head -c 100000 /dev/zero | tr '\\0' x; echo; echo done; sleep 30",
-        ],
+        )],
         "me",
         &[("ACS_RING", "4096")],
     );
@@ -406,7 +402,7 @@ fn overwritten_offset_is_a_gap_and_other_instance_is_fresh() {
 #[test]
 fn takeover_same_identity_is_silent_other_identity_is_busy() {
     let t = TempDir::new();
-    let (mut a, _) = start(t.path(), "tk", &["/bin/sh", "-c", "sleep 30"], "me@one");
+    let (mut a, _) = start(t.path(), "tk", &[&sh_c("sleep 30")], "me@one");
     a.send(&Msg::Ping(42));
     assert!(matches!(a.recv(T), Some(Msg::Pong(42))));
 
@@ -438,7 +434,7 @@ fn kill_escalates_to_sigkill_for_a_group_ignoring_sighup() {
     let (mut a, _) = start(
         t.path(),
         "k",
-        &["/bin/sh", "-c", "trap '' HUP; echo armed; sleep 1000"],
+        &[&sh_c("trap '' HUP; echo armed; sleep 1000")],
         "me",
     );
     a.wait_output("armed", T);
@@ -466,12 +462,7 @@ fn kill_escalates_to_sigkill_for_a_group_ignoring_sighup() {
 #[test]
 fn kill_ends_a_normal_session_quickly() {
     let t = TempDir::new();
-    let (mut a, _) = start(
-        t.path(),
-        "k2",
-        &["/bin/sh", "-c", "echo armed; sleep 1000"],
-        "me",
-    );
+    let (mut a, _) = start(t.path(), "k2", &[&sh_c("echo armed; sleep 1000")], "me");
     a.wait_output("armed", T);
     a.send(&Msg::Kill {
         identity: "me".into(),
@@ -489,7 +480,7 @@ fn backpressure_engages_for_a_stalled_client() {
     let (mut a, _) = start_env(
         t.path(),
         "bp",
-        &["/bin/sh", "-c", &cmd],
+        &[&sh_c(&cmd)],
         "me",
         &[("ACS_RING", "65536")],
     );
@@ -514,7 +505,7 @@ fn no_backpressure_while_detached() {
     let (mut a, _) = start_env(
         t.path(),
         "nb",
-        &["/bin/sh", "-c", &cmd],
+        &[&sh_c(&cmd)],
         "me",
         &[("ACS_RING", "65536")],
     );
@@ -542,7 +533,7 @@ fn a_client_that_vanishes_without_closing_is_dropped() {
     let mut s = std::os::unix::net::UnixStream::connect(sock(t.path(), "gone")).unwrap();
     s.set_read_timeout(Some(T)).unwrap();
     let mut h = hello("gone", Mode::AttachOrCreate, "me");
-    h.command = vec!["/bin/sh".into(), "-c".into(), cmd];
+    h.command = vec![sh_c(&cmd)];
     std::io::Write::write_all(&mut s, &Msg::Hello(h).to_bytes()).unwrap();
     // Never read, never write, never close.
     wait_until(
@@ -569,7 +560,7 @@ fn the_master_pings_and_keeps_a_client_that_answers() {
     let (mut a, w) = start_env(
         t.path(),
         "ping",
-        &["/bin/sh", "-c", "while read l; do echo got:$l; done"],
+        &[&sh_c("while read l; do echo got:$l; done")],
         "me",
         FAST_LIVENESS,
     );
@@ -589,7 +580,7 @@ fn the_master_pings_a_silent_client() {
     acs::master::spawn_with_env(&exe(), t.path(), "p", FAST_LIVENESS).unwrap();
     let mut s = std::os::unix::net::UnixStream::connect(sock(t.path(), "p")).unwrap();
     let mut h = hello("p", Mode::AttachOrCreate, "me");
-    h.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+    h.command = vec![sh_c("sleep 30")];
     std::io::Write::write_all(&mut s, &Msg::Hello(h).to_bytes()).unwrap();
     s.set_read_timeout(Some(T)).unwrap();
     let mut dec = acs::proto::Decoder::new();
@@ -619,11 +610,9 @@ fn input_is_acked_only_as_fast_as_the_pty_takes_it() {
         t.path(),
         "ack",
         // Says it is ready, then closes every descriptor of its terminal.
-        &[
-            "/bin/sh",
-            "-c",
+        &[&sh_c(
             "stty -echo -icanon min 1 time 0; echo ready; sleep 5",
-        ],
+        )],
         "me",
     );
     c.wait_output("ready", T);
@@ -654,12 +643,7 @@ fn input_is_acked_only_as_fast_as_the_pty_takes_it() {
 #[test]
 fn resize_reaches_the_program() {
     let t = TempDir::new();
-    let (mut a, w) = start(
-        t.path(),
-        "rs",
-        &["/bin/sh", "-c", "read x; stty size"],
-        "me",
-    );
+    let (mut a, w) = start(t.path(), "rs", &[&sh_c("read x; stty size")], "me");
     a.send(&Msg::Resize(acs::proto::WinSize {
         cols: 100,
         rows: 30,
@@ -679,11 +663,9 @@ fn fresh_attach_forces_a_redraw() {
     let (mut a, _) = start(
         t.path(),
         "fr",
-        &[
-            "/bin/sh",
-            "-c",
+        &[&sh_c(
             "trap 'echo WINCH' WINCH; echo ready; while :; do sleep 0.1; done",
-        ],
+        )],
         "me",
     );
     a.wait_output("ready", T);
@@ -700,12 +682,7 @@ fn fresh_attach_forces_a_redraw() {
 #[test]
 fn duplicate_input_after_a_resend_is_written_once() {
     let t = TempDir::new();
-    let (mut a, w) = start(
-        t.path(),
-        "in",
-        &["/bin/sh", "-c", "read x; echo got:$x"],
-        "me",
-    );
+    let (mut a, w) = start(t.path(), "in", &[&sh_c("read x; echo got:$x")], "me");
     let s = w.input_seq;
     a.send(&Msg::Input {
         seq: s,
@@ -742,7 +719,7 @@ fn the_last_output_before_exit_is_never_lost() {
                 for i in (lane..RUNS).step_by(LANES) {
                     let t = TempDir::new();
                     let cmd = format!("head -c 30000 /dev/zero | tr '\\0' y; echo last-{i}");
-                    let (mut c, _) = start(t.path(), "e", &["/bin/sh", "-c", &cmd], "me");
+                    let (mut c, _) = start(t.path(), "e", &[&sh_c(&cmd)], "me");
                     let status = wait_exit(&mut c);
                     assert_eq!(acs::sys::exit_code(status), 0, "run {i}");
                     let out = String::from_utf8_lossy(&c.output);
@@ -765,7 +742,7 @@ fn a_hangup_while_the_client_is_stalled_does_not_spin_the_master() {
     let (mut a, _) = start_env(
         t.path(),
         "hs",
-        &["/bin/sh", "-c", "echo PID:$$; exec yes"],
+        &[&sh_c("echo PID:$$; exec yes")],
         "me",
         &[("ACS_RING", "65536")],
     );
@@ -810,9 +787,7 @@ fn a_taken_over_client_is_not_listened_to() {
         t.path(),
         "to",
         &[
-            "/bin/sh",
-            "-c",
-            "stty -echo; sleep 0.3; head -c 400000 /dev/zero | tr '\\0' y; echo; while read l; do echo got:$l; done",
+            &sh_c("stty -echo; sleep 0.3; head -c 400000 /dev/zero | tr '\\0' y; echo; while read l; do echo got:$l; done"),
         ],
         "me@one",
     );
@@ -857,7 +832,7 @@ fn a_kill_from_outside_is_refused_while_someone_else_is_attached() {
     let (mut alice, _) = start(
         t.path(),
         "s",
-        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        &[&sh_c("echo armed; sleep 1000")],
         "alice@laptop",
     );
     alice.wait_output("armed", T);
@@ -905,7 +880,7 @@ fn a_kill_from_outside_goes_through_with_force_or_the_same_identity() {
     let (mut alice, _) = start(
         t.path(),
         "s",
-        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        &[&sh_c("echo armed; sleep 1000")],
         "alice@laptop",
     );
     alice.wait_output("armed", T);
@@ -923,7 +898,7 @@ fn a_kill_from_outside_goes_through_with_force_or_the_same_identity() {
     let (mut me, _) = start(
         t.path(),
         "s2",
-        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        &[&sh_c("echo armed; sleep 1000")],
         "alice@laptop",
     );
     me.wait_output("armed", T);
@@ -944,11 +919,7 @@ fn an_input_sequence_that_cannot_fit_is_refused_and_the_session_lives() {
     let (mut a, _) = start(
         t.path(),
         "ovf",
-        &[
-            "/bin/sh",
-            "-c",
-            "echo armed; while read l; do echo got:$l; done",
-        ],
+        &[&sh_c("echo armed; while read l; do echo got:$l; done")],
         "me",
     );
     a.wait_output("armed", T);
@@ -991,12 +962,7 @@ fn an_input_sequence_that_cannot_fit_is_refused_and_the_session_lives() {
 fn an_empty_identity_does_not_disable_the_takeover_question() {
     let t = TempDir::new();
     // The attached client names nobody.
-    let (mut anon, _) = start(
-        t.path(),
-        "e",
-        &["/bin/sh", "-c", "echo armed; sleep 1000"],
-        "",
-    );
+    let (mut anon, _) = start(t.path(), "e", &[&sh_c("echo armed; sleep 1000")], "");
     anon.wait_output("armed", T);
 
     // Someone else must still be asked.
@@ -1026,7 +992,7 @@ fn every_attach_takeover_and_kill_leaves_a_trace() {
     let (mut alice, _) = start(
         t.path(),
         "tr",
-        &["/bin/sh", "-c", "echo armed; sleep 1000"],
+        &[&sh_c("echo armed; sleep 1000")],
         "alice@laptop",
     );
     alice.wait_output("armed", T);
@@ -1087,11 +1053,9 @@ fn the_session_shell_does_not_inherit_the_creating_logins_environment() {
     let (mut c, w) = start_env(
         t.path(),
         "env",
-        &[
-            "/bin/sh",
-            "-c",
+        &[&sh_c(
             "echo armed; while read l; do eval \"printf 'got:%s\\\\n' \\\"\\$$l\\\"\"; done",
-        ],
+        )],
         "me",
         &env,
     );
@@ -1156,12 +1120,7 @@ fn the_session_shell_does_not_inherit_the_creating_logins_environment() {
 fn the_socket_is_created_private_whatever_the_umask() {
     let t = TempDir::new();
     // Under the ordinary umask of 022 an unguarded bind gives 0755.
-    let (mut c, _) = start(
-        t.path(),
-        "priv",
-        &["/bin/sh", "-c", "echo armed; sleep 1000"],
-        "me",
-    );
+    let (mut c, _) = start(t.path(), "priv", &[&sh_c("echo armed; sleep 1000")], "me");
     c.wait_output("armed", T);
     let mode =
         std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(sock(t.path(), "priv")).unwrap());
@@ -1208,7 +1167,7 @@ fn a_client_answered_busy_may_take_its_time() {
     let (_a, _) = start_env(
         t.path(),
         "slow",
-        &["/bin/sh", "-c", "sleep 30"],
+        &[&sh_c("sleep 30")],
         "me@one",
         &[("ACS_MASTER_HELLO_MS", "200")],
     );

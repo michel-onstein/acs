@@ -8,7 +8,7 @@ use std::time::Duration;
 use common::*;
 
 fn sh(cmd: &str) -> Vec<String> {
-    vec!["--".into(), "/bin/sh".into(), "-c".into(), cmd.into()]
+    vec!["--".into(), sh_c(cmd)]
 }
 
 fn start(remote: &Remote, session: &str, cmd: &str) -> Client {
@@ -234,15 +234,9 @@ fn modes_left_on_are_reset_on_detach() {
 #[test]
 fn new_flag_creates_numbered_sessions() {
     let remote = Remote::installed();
-    let mut a = Client::start(
-        &remote,
-        &["devbox", "--new", "--", "/bin/sh", "-c", "sleep 30"],
-    );
+    let mut a = Client::start(&remote, &["devbox", "--new", "--", &sh_c("sleep 30")]);
     a.wait_for("new session '1' on devbox", T);
-    let mut b = Client::start(
-        &remote,
-        &["devbox", "--new", "--", "/bin/sh", "-c", "sleep 30"],
-    );
+    let mut b = Client::start(&remote, &["devbox", "--new", "--", &sh_c("sleep 30")]);
     b.wait_for("new session '2' on devbox", T);
 }
 
@@ -441,7 +435,7 @@ fn a_verbose_note_lands_at_a_boundary_of_the_programs_output() {
     env.extend(watch.env());
     let mut c = Client::start_env(
         &remote,
-        &["-v", "devbox", "note", "--", "/bin/sh", "-c", &prog],
+        &["-v", "devbox", "note", "--", &sh_c(&prog)],
         &refs(&env),
     );
     // `-v` echoes the whole prelude, so the session announcement anchors
@@ -498,9 +492,7 @@ fn a_note_is_not_swallowed_by_a_session_that_goes_quiet() {
             "devbox",
             "quiet",
             "--",
-            "/bin/sh",
-            "-c",
-            "printf '#1#'; printf '\\033[1;0;0'; sleep 60",
+            &sh_c("printf '#1#'; printf '\\033[1;0;0'; sleep 60"),
         ],
         &refs(&env),
     );
@@ -577,9 +569,7 @@ fn the_verbose_command_line_reaches_the_acs_arguments() {
             "devbox",
             "vline",
             "--",
-            "/bin/sh",
-            "-c",
-            "echo up; sleep 30",
+            &sh_c("echo up; sleep 30"),
         ],
         &[],
     );
@@ -620,9 +610,7 @@ fn a_dial_through_a_jump_host_has_no_ten_second_cutoff() {
             "devbox",
             "jumped",
             "--",
-            "/bin/sh",
-            "-c",
-            "echo up; sleep 30",
+            &sh_c("echo up; sleep 30"),
         ],
         &[],
     );
@@ -654,9 +642,7 @@ fn a_direct_dial_keeps_its_connect_timeout() {
             "devbox",
             "direct",
             "--",
-            "/bin/sh",
-            "-c",
-            "echo up; sleep 30",
+            &sh_c("echo up; sleep 30"),
         ],
         &[],
     );

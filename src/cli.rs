@@ -3,6 +3,7 @@
 //! ```text
 //! acs [ssh options] [user@]<host> [session] [--new]
 //!     [--no-reconnect | --persist] [--force] [-v] [-- command...]
+//! acs [ssh options] [-t | -T] [-n] [user@]<host> -- command...
 //! acs list [ssh options] [-v] [[user@]<host>]
 //! ```
 //!
@@ -21,6 +22,8 @@ pub const USAGE: &str = "\
 usage: acs [ssh options] [user@]<host>             pick a detached session from a menu, or create one
        acs [ssh options] [user@]<host> <session>   attach, or create
        acs [ssh options] [user@]<host> --new       create a new numbered session
+       acs [ssh options] [user@]<host> -- <command...>
+                                                   run a command and exit with its status, as ssh does
        acs list [ssh options] [[user@]<host>]      list sessions on <host>, or on every host alias
        acs config ...                            read and edit the configuration (acs config --help)
        acs upgrade [--version X.Y.Z] [--check]   replace this acs with the latest release
@@ -36,7 +39,14 @@ options:
       --ssh <path>    ssh program to run (also ACS_SSH)
   -h, --help          this help
   -V, --version       print the version
-  -- <command...>     run <command> instead of the login shell (new sessions)
+  -- <command...>     run <command> through the remote login shell, its words joined
+                      with spaces as ssh joins them: in a new numbered session that ends
+                      with it (no session named), or as a new named session's program
+  -t                  run the command on a terminal even when stdout is not one
+  -T                  run the command without a terminal, as ssh -T: stdin, stdout and
+                      stderr kept apart and byte-exact, but no resume after a drop
+                      (the default when stdin or stdout is not a terminal)
+  -n                  read stdin from /dev/null, as ssh -n (implies -T)
 
 ssh options:
   -i <identity_file>  -p <port>  -J <jump>  -F <config>  -o <option=value>
@@ -55,6 +65,17 @@ environment: ACS_DEFAULT_SESSION ACS_IDENTITY ACS_ESCAPE_KEY ACS_ESCAPE_TIMEOUT_
 
 configuration: /etc/acs/config.yaml, then ~/.config/acs/config.yaml;
                the <host> of [user@]<host> may be an alias defined there (aliases:)";
+
+/// Whether a command runs on a terminal (DESIGN §7.7), as ssh's `-t`/`-T`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pty {
+    /// On a terminal when stdin and stdout are both terminals.
+    Auto,
+    /// `-t`: on a terminal, in a session, whatever stdout is.
+    Force,
+    /// `-T` (or `-n`): over plain ssh, with no terminal and no session.
+    Never,
+}
 
 /// Which session the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +141,14 @@ pub struct ClientArgs {
     pub persist: bool,
     pub force: bool,
     pub command: Vec<String>,
+    /// `-t` / `-T`: whether the command gets a terminal (DESIGN §7.7).
+    pub pty: Pty,
+    /// `-n`: the command's stdin is `/dev/null`, as ssh -n.
+    pub null_stdin: bool,
+    /// A command and no session named, nor `--new`: `ssh host command`'s
+    /// form (DESIGN §7.7) — a session of its own that ends with it, and
+    /// says nothing of its own unless asked to (`-v`).
+    pub one_shot: bool,
     /// `-L none`: the configuration's `local_forwards` (§7.2) do not apply
     /// to this session, only the `-L` specs given here (acs-odd).
     pub no_configured_forwards: bool,
@@ -182,6 +211,8 @@ where
     let mut reconnect = true;
     let mut persist = false;
     let mut force = false;
+    let mut pty = Pty::Auto;
+    let mut null_stdin = false;
     let mut verbose = 0u8;
     let mut command = Vec::new();
     let mut ssh: Option<OsString> = None;
@@ -235,6 +266,10 @@ where
             // dsh's redial flag: reconnecting is the default now.
             Short('r') | Long("reconnect") => {}
             Long("force") => force = true,
+            // ssh's -t/-T/-n; the last of -t and -T wins, as in ssh.
+            Short('t') => pty = Pty::Force,
+            Short('T') => pty = Pty::Never,
+            Short('n') => null_stdin = true,
             Short('v') | Long("verbose") => verbose = verbose.saturating_add(1),
             Long("ssh") => ssh = Some(p.value().map_err(|e| e.to_string())?),
             Long("transport-cmd") => {
@@ -277,6 +312,23 @@ where
     if list && !command.is_empty() {
         return Err("acs list takes no command".into());
     }
+    if list && (pty != Pty::Auto || null_stdin) {
+        return Err("acs list takes no -t, -T or -n".into());
+    }
+    if command.is_empty() && (pty != Pty::Auto || null_stdin) {
+        return Err("-t, -T and -n go with a command: acs <host> -- <command…>".into());
+    }
+    if null_stdin && pty == Pty::Force {
+        return Err(
+            "-n reads stdin from /dev/null, and -t needs it to be a terminal: give one".into(),
+        );
+    }
+    if (pty == Pty::Never || null_stdin) && (session.is_some() || new) {
+        return Err(
+            "a session always has a terminal: -T and -n run a command without one, so name no session"
+                .into(),
+        );
+    }
     if persist && !reconnect {
         return Err("--persist keeps reconnecting and --no-reconnect never does: give one".into());
     }
@@ -284,8 +336,13 @@ where
         return Err("--new picks the session name itself; give either --new or a name".into());
     }
 
+    let one_shot = !command.is_empty() && session.is_none() && !new;
     let target = match session {
         _ if new => Target::New,
+        // A command and no session: run it in a session of its own, which
+        // ends with it, as `ssh host command` does (DESIGN §7.7) — never
+        // the menu, whose pick would attach a session and drop the command.
+        None if !command.is_empty() => Target::New,
         Some(name) => {
             session::validate_name(&name)?;
             Target::Named(name)
@@ -309,6 +366,9 @@ where
         persist,
         force,
         command,
+        pty,
+        null_stdin,
+        one_shot,
         no_configured_forwards,
     });
     Ok(match host {
@@ -568,6 +628,61 @@ mod tests {
         assert_eq!(a.target, Target::Named("top".into()));
         assert_eq!(a.command, ["htop", "-d", "10", "--list"]);
         assert!(!a.list);
+    }
+
+    /// DESIGN §7.7: a command and no session is a one-shot run in a new
+    /// numbered session, never the menu (which would attach a detached
+    /// session and drop the command).
+    #[test]
+    fn a_command_without_a_session_runs_in_a_new_one() {
+        let a = run(&["h", "--", "ls", "-l", "*.log"]).unwrap();
+        assert_eq!(a.target, Target::New);
+        assert!(a.one_shot);
+        assert_eq!(a.command, ["ls", "-l", "*.log"]);
+        assert_eq!(a.pty, Pty::Auto);
+        assert!(!a.null_stdin);
+        // A named session keeps its name; --new is the same one-shot.
+        assert_eq!(
+            run(&["h", "s", "--", "top"]).unwrap().target,
+            Target::Named("s".into())
+        );
+        let a = run(&["h", "--new", "--", "top"]).unwrap();
+        assert_eq!(a.target, Target::New);
+        assert!(!a.one_shot, "--new asked for a numbered session");
+        assert!(!run(&["h", "s", "--", "top"]).unwrap().one_shot);
+        assert!(!run(&["h", "--new"]).unwrap().one_shot);
+    }
+
+    #[test]
+    fn ssh_terminal_options() {
+        assert_eq!(run(&["-t", "h", "--", "top"]).unwrap().pty, Pty::Force);
+        assert_eq!(run(&["-T", "h", "--", "cat"]).unwrap().pty, Pty::Never);
+        // The last of -t and -T wins, as in ssh.
+        assert_eq!(run(&["-T", "-t", "h", "--", "x"]).unwrap().pty, Pty::Force);
+        assert_eq!(run(&["-t", "-T", "h", "--", "x"]).unwrap().pty, Pty::Never);
+        let a = run(&["-n", "h", "--", "uptime"]).unwrap();
+        assert!(a.null_stdin);
+        assert_eq!(a.pty, Pty::Auto);
+        // -t goes with a named session, which has a terminal anyway.
+        assert_eq!(run(&["-t", "h", "s", "--", "x"]).unwrap().pty, Pty::Force);
+    }
+
+    #[test]
+    fn ssh_terminal_options_are_refused_where_they_mean_nothing() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["-t", "h"], "go with a command"),
+            (&["-T", "h", "s"], "go with a command"),
+            (&["-n", "h"], "go with a command"),
+            (&["-n", "-t", "h", "--", "x"], "-n reads stdin"),
+            (&["-T", "h", "s", "--", "x"], "name no session"),
+            (&["-n", "h", "--new", "--", "x"], "name no session"),
+        ];
+        for (args, want) in cases {
+            let e = run(args).unwrap_err();
+            assert!(e.contains(want), "{args:?}: {e}");
+        }
+        let e = list(&["-T", "h"]).unwrap_err();
+        assert!(e.contains("no -t, -T or -n"), "{e}");
     }
 
     #[test]

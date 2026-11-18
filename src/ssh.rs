@@ -366,6 +366,14 @@ pub fn check_local_forward(spec: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The command line a remote command's words make, as ssh makes it: joined
+/// with single spaces, for the remote login shell to read — so quoting
+/// meant for the remote must survive the local shell, exactly as with
+/// `ssh host 'a | b'` (DESIGN §4.2, §7.5).
+pub fn command_line(words: &[String]) -> String {
+    words.join(" ")
+}
+
 /// Quote a string for POSIX `sh`: as it is when every byte is one the
 /// shell takes literally, otherwise [`sh_single_quote`]d.
 pub fn sh_quote(s: &str) -> String {

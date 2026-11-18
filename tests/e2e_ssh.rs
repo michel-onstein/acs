@@ -71,7 +71,7 @@ impl Host {
         args.push(format!("{user}@127.0.0.1"));
         args.push(session.into());
         if !cmd.is_empty() {
-            args.extend(["--", "/bin/sh", "-c", cmd].map(String::from));
+            args.extend(["--", &sh_c(cmd)].map(String::from));
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         Client::spawn(std::path::Path::new(&self.client), &args, env)
@@ -369,7 +369,7 @@ fn e2e_10_user_at_alias_logs_in_as_that_user() {
     );
     let mut args = h.ssh_args();
     args.extend(["-v", "dev@box", "alias", "--"].map(String::from));
-    args.extend(["/bin/sh", "-c", "echo \"as-$(id -un)\"; sleep 60"].map(String::from));
+    args.extend([&sh_c("echo \"as-$(id -un)\"; sleep 60")].map(String::from));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let mut c = Client::spawn(std::path::Path::new(&h.client), &args, &env);
@@ -422,18 +422,7 @@ fn e2e_11_identity_file_from_the_configuration() {
         ]
         .map(String::from)
         .to_vec();
-        args.extend(
-            [
-                "-v",
-                alias,
-                "key",
-                "--",
-                "/bin/sh",
-                "-c",
-                "echo key-ok; sleep 60",
-            ]
-            .map(String::from),
-        );
+        args.extend(["-v", alias, "key", "--", &sh_c("echo key-ok; sleep 60")].map(String::from));
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut c = Client::spawn(std::path::Path::new(&h.client), &args, &env);
         c.wait_for(&format!("{alias}: identity_file ~/.ssh/id_box ("), T);
@@ -535,8 +524,8 @@ fn e2e_14_a_local_forward_is_the_session_connections_alone() {
     let spec = format!("{port}:127.0.0.1:22");
     let mut args = vec!["-L".to_string(), spec.clone()];
     args.extend(h.ssh_args());
-    args.extend(["dev@127.0.0.1", "fwd", "--", "/bin/sh", "-c"].map(String::from));
-    args.push(TICKER.to_string());
+    args.extend(["dev@127.0.0.1", "fwd", "--"].map(String::from));
+    args.push(sh_c(TICKER));
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut c = Client::spawn(
         std::path::Path::new(&h.client),
@@ -654,8 +643,8 @@ fn e2e_15_a_shared_master_carries_the_second_connection_and_dies_with_the_link()
     // A first connection: it starts the master.
     let mut args = vec!["-v".to_string()];
     args.extend(h.ssh_args());
-    args.extend(["dev@127.0.0.1", "mux", "--", "/bin/sh", "-c"].map(String::from));
-    args.push(TICKER.to_string());
+    args.extend(["dev@127.0.0.1", "mux", "--"].map(String::from));
+    args.push(sh_c(TICKER));
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut c = Client::spawn(std::path::Path::new(&h.client), &argv, &env);
     c.wait_for("#10#", T);
@@ -1307,4 +1296,44 @@ fn e2e_21_acscp_joins_the_sessions_master() {
         "VERIFIED acscp up and down ride the session's master ({pid}): \
          {before} logins before, {after} after"
     );
+}
+
+/// DESIGN §7.7: `acs -T host -- command` is `ssh -T host command` over
+/// acs's transport — over real ssh the command has no terminal, its stdin
+/// is the client's pipe through to EOF, stderr is apart, and its status is
+/// acs's.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn a_command_without_a_terminal_is_ssh_s_own() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let h = host();
+    let mut args = h.ssh_args();
+    args.extend(
+        [
+            "dev@127.0.0.1",
+            "--",
+            "test -t 0 || echo no-tty >&2; tr a-z A-Z; exit 4",
+        ]
+        .map(String::from),
+    );
+    let mut child = Command::new(&h.client)
+        .args(&args)
+        .env("ACS_NO_UPDATE_CHECK", "1")
+        .env("ACS_CONTROL_PERSIST", NO_MASTER)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"piped\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"PIPED\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no-tty"));
 }

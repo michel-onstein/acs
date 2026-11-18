@@ -45,7 +45,7 @@ fn output_throughput() {
     // count start together, and linger after so the CPU is read before
     // the master exits.
     let cmd = format!("head -c 1 >/dev/null; head -c {total} /dev/zero; sleep 3");
-    h.command = vec!["/bin/sh".into(), "-c".into(), cmd];
+    h.command = vec![common::sh_c(&cmd)];
     s.write_all(&Msg::Hello(h).to_bytes()).unwrap();
     let mut dec = Decoder::new();
     let mut buf = vec![0u8; 256 * 1024];
@@ -106,7 +106,7 @@ fn client_output_throughput() {
     let cmd = format!(
         "stty raw -echo; printf GO; head -c 1 >/dev/null; head -c {total} /dev/zero; sleep 30"
     );
-    let mut c = common::Client::start(&remote, &["devbox", "tp", "--", "/bin/sh", "-c", &cmd]);
+    let mut c = common::Client::start(&remote, &["devbox", "tp", "--", &common::sh_c(&cmd)]);
     c.wait_for("GO", Duration::from_secs(20));
     let base = c.output_len();
     let pid = c.pid() as u32;
