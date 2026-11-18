@@ -1,7 +1,8 @@
 # acs — port knocking
 
-**Status:** Proposed — design only, nothing built (2026-11-18). Work is
-the epic acs-8l1v, one bead per step of §12.
+**Status:** In progress — §12 step 2 built (`knock.rs`: parser, sender,
+reuse table), not yet wired into the dial (2026-11-18). Work is the epic
+acs-8l1v, one bead per step of §12.
 
 Some hosts keep their ssh port closed behind a firewall and open it, for one
 source address and usually for a few seconds, only after that address has
@@ -504,9 +505,13 @@ Nothing acs installs, and nothing beyond a working knockd setup:
   addresses and the delays within a tolerance; the reuse table, including a
   different sequence to the same address not being reused.
 - **Unit, real sockets on loopback**: a TCP listener on each port of a
-  sequence and a UDP socket on another, asserting each saw exactly one
-  connection or datagram, in order. On loopback a TCP knock completes its
-  handshake, which is the "something listens there" case of §4.1.
+  sequence and a UDP socket on another: the UDP socket sees exactly one
+  empty datagram, and a TCP listener at most one connection, already
+  closed. What a TCP listener sees depends on the kernel: Linux completes
+  the loopback handshake inside `connect()` (the "something listens there"
+  case of §4.1), while macOS leaves the socket in `SYN_SENT` and the close
+  discards it before the listener sees anything. Order is asserted through
+  the recording trait, not here.
 - **Unit, `ssh::Route`**: the `ssh -G` lines for each field and for a
   proxied dial; the refusal of §5 and its message; `knock.host` bypassing
   it.
