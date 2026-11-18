@@ -692,41 +692,6 @@ pub(crate) fn run_until(mut c: Command, deadline: Duration) -> Option<(i32, Vec<
     }
 }
 
-/// Where ssh dials a destination, as `ssh -G` says.
-#[derive(Debug, PartialEq, Eq)]
-enum Target {
-    /// A host name or address, and the port.
-    Direct(String, u16),
-    /// Through a ProxyJump or a ProxyCommand: no port of its own to try.
-    Proxied,
-}
-
-/// The [`Target`] in `ssh -G` output: its `hostname` and `port`, unless a
-/// `proxyjump` or `proxycommand` other than `none` is set.
-fn target(out: &str) -> Option<Target> {
-    if proxied(out) {
-        return Some(Target::Proxied);
-    }
-    let (mut host, mut port) = (None, None);
-    for line in out.lines() {
-        match line.split_once(' ') {
-            Some(("hostname", v)) => host = Some(v.trim()),
-            Some(("port", v)) => port = v.trim().parse().ok(),
-            _ => {}
-        }
-    }
-    Some(Target::Direct(host?.to_string(), port?))
-}
-
-/// Whether `ssh -G` output sets a `proxyjump` or `proxycommand` other than
-/// `none`: ssh reaches the host through another one (acs-7sti).
-pub(crate) fn proxied(out: &str) -> bool {
-    out.lines().any(|line| {
-        matches!(line.split_once(' '),
-            Some(("proxyjump" | "proxycommand", v)) if v.trim() != "none")
-    })
-}
-
 /// Check `host` by connecting to the port ssh dials for `dest` (`ssh -G`,
 /// run with `ssh`: the program, then the command line's options, which
 /// change the port as they change the dial) — or, when ssh reaches it
@@ -741,19 +706,17 @@ fn probe_port(
     deadline: Duration,
 ) -> Answer {
     let end = Instant::now() + deadline;
-    let mut c = Command::new(&ssh[0]);
-    c.arg("-G").args(&ssh[1..]).args(["--", dest]);
-    c.stdout(Stdio::piped());
-    let found = run_until(c, deadline)
-        .filter(|(code, _)| *code == 0)
-        .and_then(|(_, out)| target(&String::from_utf8_lossy(&out)));
-    match found {
-        None => (false, By::NoPort),
-        Some(Target::Proxied) => {
+    match crate::ssh::Route::read(&ssh[0], &ssh[1..], dest, deadline) {
+        Some(r) if r.proxied => {
             let left = end.saturating_duration_since(Instant::now());
             (ping(host, left), By::Proxied)
         }
-        Some(Target::Direct(name, port)) => (connects(&name, port, end), By::Port(port)),
+        Some(crate::ssh::Route {
+            hostname: Some(name),
+            port: Some(port),
+            ..
+        }) => (connects(&name, port, end), By::Port(port)),
+        _ => (false, By::NoPort),
     }
 }
 
@@ -2028,22 +1991,6 @@ aliases:
             "{:?}",
             start.elapsed()
         );
-    }
-
-    #[test]
-    fn ssh_g_output_names_the_host_and_port_or_a_proxy() {
-        let direct = "user me\nhostname 10.0.0.7\nport 2222\nproxycommand none\n";
-        assert_eq!(
-            target(direct),
-            Some(Target::Direct("10.0.0.7".into(), 2222))
-        );
-        for proxied in ["proxyjump bastion", "proxycommand nc %h %p"] {
-            let out = format!("hostname h\nport 22\n{proxied}\n");
-            assert_eq!(target(&out), Some(Target::Proxied), "{proxied}");
-        }
-        assert_eq!(target("hostname h\n"), None);
-        assert_eq!(target("port 22\n"), None);
-        assert_eq!(target("hostname h\nport many\n"), None);
     }
 
     /// A listener that is up and a port that is closed, both on 127.0.0.1.

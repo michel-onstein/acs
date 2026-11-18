@@ -1,7 +1,7 @@
 # acs — port knocking
 
-**Status:** Proposed — design only, nothing built (2026-11-18). Work is
-the epic acs-8l1v, one bead per step of §12.
+**Status:** In progress — §12 step 1 (`ssh::Route`) built, no knock yet
+(2026-11-18). Work is the epic acs-8l1v, one bead per step of §12.
 
 Some hosts keep their ssh port closed behind a firewall and open it, for one
 source address and usually for a few seconds, only after that address has
