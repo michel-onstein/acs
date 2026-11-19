@@ -85,7 +85,7 @@ pub struct Menu {
     hosts: Vec<Host>,
     /// Every host alias (`acs list`): a HOST column, no new-session row.
     every: bool,
-    /// Attached sessions are shown too (`.`).
+    /// Attached sessions, and commands on pipes, are shown too (`.`).
     all: bool,
     /// Take over without asking (`--force`).
     force: bool,
@@ -174,14 +174,15 @@ impl Menu {
         }
     }
 
-    /// The shown sessions, host by host — detached only, unless `.` — then
+    /// The shown sessions, host by host — those a terminal may attach
+    /// ([`StatusInfo::offered`]) only, unless `.` — then
     /// a row to create a new session (one host only) and one to leave.
     fn rows(&self) -> Vec<Row> {
         let mut rows: Vec<Row> = Vec::new();
         for h in 0..self.hosts.len() {
             rows.extend(
                 (self.sessions(h).iter().enumerate())
-                    .filter(|(_, s)| self.all || !s.attached)
+                    .filter(|(_, s)| self.all || s.offered())
                     .map(|(i, _)| Row::Session(h, i)),
             );
         }
@@ -359,6 +360,15 @@ impl Menu {
             Row::Session(h, i) => (h, i),
         };
         let s = self.sessions(h)[i].clone();
+        if s.pipe {
+            // As the master would refuse it (DESIGN §5.5), without the dial.
+            self.note = format!(
+                "session '{}'{} runs without a terminal and cannot be attached",
+                s.name,
+                self.on(h)
+            );
+            return None;
+        }
         if !s.attached || self.force {
             return Some(Choice::Attach {
                 host: h,
@@ -482,8 +492,11 @@ impl Menu {
         let mut keys: Vec<String> = Vec::new();
         match rows[self.cursor] {
             // Every key acts here, so the bar reads as it always has.
-            Row::Session(..) => {
-                keys.push("1-9, or ↑↓ jk and Enter: attach".into());
+            Row::Session(h, i) => {
+                keys.push(match self.sessions(h)[i].pipe {
+                    true => "↑↓ jk: move".into(),
+                    false => "1-9, or ↑↓ jk and Enter: attach".into(),
+                });
                 keys.push(format!(".: {shown}"));
                 keys.push("x: end".into());
                 keys.push(format!("n: new{}", self.there()));
@@ -537,9 +550,13 @@ impl Menu {
                 Answer::Sessions(s) if s.is_empty() => {
                     lines.push(format!("no sessions on {}", h.name))
                 }
-                Answer::Sessions(s) if !self.all && s.iter().all(|s| s.attached) => {
+                Answer::Sessions(s) if !self.all && !s.iter().any(StatusInfo::offered) => {
+                    let what = match s.iter().any(|s| s.pipe) {
+                        true => "attached or piped",
+                        false => "attached",
+                    };
                     lines.push(format!(
-                        "no detached sessions on {} ({} attached: . shows them)",
+                        "no detached sessions on {} ({} {what}: . shows them)",
                         h.name,
                         s.len()
                     ))
@@ -817,6 +834,55 @@ mod tests {
         // `.` again hides them.
         m.feed(b".", 0);
         assert_eq!(m.feed(b"2", 0), attach("work"));
+    }
+
+    /// acs-km7x: a command on pipes (DESIGN §5.5) is no terminal's to
+    /// attach. It hides with the attached sessions, `.` shows it marked
+    /// "piped", and choosing it says why it is not attached — `--force` or
+    /// not — while `x` still ends it.
+    #[test]
+    fn a_piped_session_is_hidden_marked_and_never_attached() {
+        let piped = StatusInfo {
+            pipe: true,
+            ..info("1", false)
+        };
+        let mut m = Menu::new(vec![piped.clone(), info("main", false)], true);
+        // Hidden: the first row is main.
+        assert_eq!(m.feed(b"1", 0), attach("main"));
+        let mut m = Menu::new(vec![piped, info("main", false)], true);
+        // Shown, the cursor still on main; up onto it.
+        m.feed(b".k", 0);
+        let lines = shown(&m);
+        assert!(lines[3].starts_with("> 1  1     piped"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("↑↓ jk: move")),
+            "{lines:?}"
+        );
+        assert_eq!(m.feed(b"1", 0), None);
+        assert_eq!(
+            m.note,
+            "session '1' runs without a terminal and cannot be attached"
+        );
+        assert_eq!(m.feed(b"\r", 0), None);
+        assert_eq!(
+            m.feed(b"xy", 0),
+            Some(Choice::Kill {
+                host: 0,
+                name: "1".into()
+            })
+        );
+        // In the menu of every host, a host with only it says so.
+        let mut m = every();
+        m.set_answer(
+            0,
+            Answer::Sessions(vec![StatusInfo {
+                pipe: true,
+                ..info("1", false)
+            }]),
+        );
+        assert!(shown(&m).contains(
+            &"     no detached sessions on devbox (1 attached or piped: . shows them)".to_string()
+        ));
     }
 
     #[test]

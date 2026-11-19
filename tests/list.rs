@@ -57,6 +57,17 @@ fn lists_attached_detached_and_drops_stale_sockets() {
     assert!(!stale.exists(), "stale socket not removed");
 }
 
+/// acs-km7x: a command on pipes (DESIGN §5.5) is listed as "piped", not as
+/// a detached session a terminal could attach.
+#[test]
+fn a_piped_commands_session_is_listed_as_piped() {
+    let remote = Remote::installed();
+    remote.piped_detached("1");
+    let (code, out) = list(&remote);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(row(&out, 0, "1")[1..3], ["piped", "(tester@local)"]);
+}
+
 #[test]
 fn empty_and_not_installed() {
     let remote = Remote::installed();

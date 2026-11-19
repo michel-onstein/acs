@@ -325,7 +325,8 @@ arrived after that HELLO goes to the master ahead of the splice — complete
 frames re-encoded, and the bytes of a frame that had only half arrived as
 they are, so the master's decoder never sees a frame without its head. `acs _proxy
 --list` enumerates `<dir>/*.sock`, sends each master `STATUS`, and prints name,
-attached/detached, the client identity attached (or last attached), created-at,
+attached/detached, whether the command runs on pipes (§5.5), the client
+identity attached (or last attached), created-at,
 idle time, child command, and size. Sockets that
 refuse connections are reported stale and removed — no `ps` parsing.
 If the directory cannot be read, an `ERROR` ends the list, and `acs list`
@@ -416,6 +417,12 @@ the session, where a separate `_proxy --list` side call used to cost a second
 - **No session detached** (none at all, or all attached elsewhere): a new
   session, without a menu — named `main` (or `$ACS_DEFAULT_SESSION`) if no
   session has that name, otherwise the lowest free number, as `--new`.
+  A command running on pipes (§5.5) does not count as detached: no
+  terminal can attach it, so it is *piped* in the STATE column, whether its
+  client is linked or not, and the menu hides it with the attached
+  sessions — `.` shows it, Enter on it says it cannot be attached, and `x`
+  ends it (acs-km7x). `StatusInfo::offered` is the one test, used by the
+  client and by `_proxy --pick --eager` alike.
   It costs no round trip after the list (acs-xvg): the `HELLO` for it went
   ahead with the dial, and `_proxy --pick --eager` attached it on finding
   nothing detached (§4.3), so the list and the `WELCOME` arrive together.
@@ -461,7 +468,7 @@ the session, where a separate `_proxy --list` side call used to cost a second
 | ↑ ↓, `k` `j` | move the cursor (it stops at the ends); a short screen scrolls to keep it in view |
 | Enter | attach the session under the cursor; on *new session*, create one (named as above); on *exit*, leave |
 | `n` | create a new session — on a session row (its host, in the menu of every host), or on *new session*. Elsewhere it does nothing but say where it acts |
-| `.` | show attached sessions too, or hide them again. Picking an attached session asks `session 'x' is attached from alice@laptop — take over? [y/N]`; `y` attaches with `force`, the `--force` path of §4.5 (and `--force` on the command line skips the question) |
+| `.` | show attached sessions too, and commands on pipes (*piped*, which cannot be attached), or hide them again. Picking an attached session asks `session 'x' is attached from alice@laptop — take over? [y/N]`; `y` attaches with `force`, the `--force` path of §4.5 (and `--force` on the command line skips the question) |
 | `x` | end the session under the cursor, after `end session 'x'? y (or x) ends it`: `END_SESSION` on the menu's connection (§4.3), then the menu shows the sessions left and what happened. Off a session row it does nothing but say what it ends |
 | Esc | leave, exit status 0 — at any point, a question pending or not. A lone ESC waits 100 ms for the rest of an arrow key's sequence (as the session's input does for an incomplete sequence, §6.3), so it is never taken for one |
 | Ctrl-C | leave, exit status 130 |
@@ -603,7 +610,7 @@ Length-prefixed, same format on the ssh leg and the unix-socket leg:
 | `KILL` | c→m | identity, `force` (acs-fbo). From the attached client, or from the proxy for the menu's `END_SESSION` before any HELLO; either way a session another identity is attached to answers `BUSY` unless `force`, and the master holds an outside killer's connection until it exits (§4.3) |
 | `EXIT` | m→c | child wait status |
 | `TAKEOVER` | m→c | — (another client attached) |
-| `STATUS` / `STATUS_REPLY` | proxy↔m, proxy→c | session metadata for `acs list` and the session menu |
+| `STATUS` / `STATUS_REPLY` | proxy↔m, proxy→c | session metadata for `acs list` and the session menu; `pipe` (a trailing byte, only when set: the command runs on pipes, §5.5) |
 | `ERROR` | m→c | code, message |
 | `END_SESSION` | c→proxy | session name: end it, then list again (`_proxy --pick`, §4.3) |
 | `LIST_END` | proxy→c | — the `STATUS_REPLY` frames before it are the whole list (`_proxy --pick`) |
@@ -1368,8 +1375,9 @@ sequenceDiagram
   client's `DETACH`**, which says the EXIT arrived, before it unlinks its
   socket and ends. A link lost before it gets the DETACH is resumed like any
   other, and the resume is sent what was left and the EXIT again. A master
-  whose client never comes back stays, like a detached session, until it is
-  ended from `acs <host>`'s menu (a bound on that is acs-f1sp).
+  whose client never comes back stays until it is ended from `acs <host>`'s
+  menu (a bound on that is acs-f1sp), where it is listed as *piped* rather
+  than *detached* and is not offered for attaching (§4.4, acs-km7x).
 - **Ending it early.** `SIGINT`, `SIGTERM` or `SIGHUP` to the client — Ctrl-C
   on `acs host -- tail -f log | grep x` — sends `KILL` (§4.2) and waits for
   the EXIT, so acs leaves with the command's status (129, its `SIGHUP`)
@@ -1388,8 +1396,12 @@ sequenceDiagram
   (§8), so its proxy and any master its proxy starts speak its protocol; a
   piped command's session is always created by that master, and a resume
   only ever reaches it. A master of another version never sees a pipe HELLO
-  — and if it did, would refuse it as a malformed frame, not misread it. No
-  frame changed for any other session, so `PROTO_VERSION` stays 1.
+  — and if it did, would refuse it as a malformed frame, not misread it.
+  Its `STATUS_REPLY` carries the same trailing `pipe` byte (acs-km7x); an
+  older acs listing the host fails to decode that one reply and leaves the
+  session out of its list, as it does any socket that answers oddly, rather
+  than offering it. No frame changed for any other session, so
+  `PROTO_VERSION` stays 1.
 
 ## 6. Command mode
 
@@ -3326,6 +3338,13 @@ the derived `Debug` of `Msg` and everything in it; they name the frame with
 `Msg::kind` now, which acs-1cco added for the master because a DATA's
 `Debug` runs to megabytes. That leaves 6,456 B of slim room and 6,517 B of
 complete room on x86_64 Linux.
+
+**Piped sessions marked in the menu and `acs list`** (§4.4, acs-km7x),
+against e2575da: +872 B slim and +1,616 B complete on x86_64 Linux
+(1,174,416 B and 2,355,099 B), +744 B and +1,488 B on aarch64 Linux,
++0 B and +16 B on aarch64 macOS, and +4,096 B and +4,128 B on x86_64 macOS
+(a page boundary). That leaves 5,584 B of slim room and 4,901 B of complete
+room on x86_64 Linux.
 
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by

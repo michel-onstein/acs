@@ -240,7 +240,9 @@ fn pick(dir: &SocketDir, eager: bool) -> Result<ExitCode, String> {
                 )
             }
         };
-        if !sessions.iter().any(|s| !s.attached) {
+        // Nothing a terminal may attach (a command on pipes is not one,
+        // DESIGN §5.5): as `pick.rs` decides from the same list.
+        if !sessions.iter().any(proto::StatusInfo::offered) {
             if sessions.iter().any(|s| s.name == hello.session) {
                 hello.session.clear();
                 hello.mode = Mode::Create;

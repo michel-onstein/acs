@@ -47,6 +47,21 @@ fn with_no_session_it_creates_main() {
     assert!(!c.text().contains("\x1b[?1049h"), "no menu: {:?}", c.text());
 }
 
+/// acs-km7x: a command on pipes between links is no terminal's to attach,
+/// so it brings no menu up: `acs <host>` makes a session as with nothing
+/// detached — `main`, its name being free.
+#[test]
+fn a_detached_piped_command_brings_no_menu_up() {
+    let remote = Remote::installed();
+    remote.piped_detached("1");
+    remote.login_shell_runs("echo up; sleep 30");
+    let mut c = Client::start(&remote, &["devbox"]);
+    c.wait_for("new session 'main' on devbox", T);
+    c.wait_for("up", T);
+    assert!(!c.text().contains("\x1b[?1049h"), "no menu: {:?}", c.text());
+    assert!(remote.session_exists("1"), "the piped session goes on");
+}
+
 #[test]
 fn with_no_session_detached_it_creates_one_named_as_free() {
     let remote = Remote::installed();
