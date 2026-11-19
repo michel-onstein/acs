@@ -667,8 +667,10 @@ fn knock_node(k: &Option<Knock>) -> Node {
     if let Some(h) = &k.host {
         m.push(("host".to_string(), Node::string(h)));
     }
-    match m.as_slice() {
-        [(_, seq)] => seq.clone(),
+    // The sequence moved out, not cloned: nothing else clones a `Node`
+    // (acs-fode).
+    match m.len() {
+        1 => m.swap_remove(0).1,
         _ => Node::new(Value::Map(m)),
     }
 }

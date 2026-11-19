@@ -200,15 +200,14 @@ pub fn knock_choice(
     flag: Option<&str>,
     env: Option<&str>,
 ) -> Result<Option<Option<Knock>>, String> {
-    match (flag, env) {
-        (Some(f), _) => crate::knock::parse_spec(f)
-            .map(Some)
-            .map_err(|e| format!("--knock: {e}")),
-        (None, Some(e)) => crate::knock::parse_spec(e)
-            .map(Some)
-            .map_err(|e| format!("ACS_KNOCK: {e}")),
-        (None, None) => Ok(None),
-    }
+    let (spec, from) = match (flag, env) {
+        (Some(f), _) => (f, "--knock"),
+        (None, Some(e)) => (e, "ACS_KNOCK"),
+        (None, None) => return Ok(None),
+    };
+    crate::knock::parse_spec(spec)
+        .map(Some)
+        .map_err(|e| format!("{from}: {e}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

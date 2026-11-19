@@ -9,7 +9,7 @@
 //! 3. complete Linux builds: slim + appended blob;
 //! 4. complete macOS builds: rebuilt with `--features embed-payloads`, then
 //!    ad-hoc signed;
-//! 5. a size report, failing over budget (slim 1.15 MB, complete 2.3 MB);
+//! 5. a size report, failing over budget (slim 1.18 MB, complete 2.36 MB);
 //! 6. `source.stamp`, the fingerprint of the sources it built from
 //!    (`scripts/source_stamp.sh`), which `scripts/e2e_ssh.sh --no-build`
 //!    checks before it reuses the binaries (acs-gb4), and `channel.stamp`,
@@ -44,10 +44,12 @@ const MAC: &[&str] = &["aarch64-apple-darwin", "x86_64-apple-darwin"];
 // Linux build and, carried again in both Linux payloads, about 125 KB to the
 // complete one, trimmed to 50 KB and 100 KB since (acs-hofu.10); with phase 2
 // it ships at about 57 KB and 115 KB, within the copy's own 100 KB of slim
-// (DESIGN decision 13, acs-hofu.11). DESIGN goal 2 and §8.1 state the same
-// figures.
-const SLIM_BUDGET: u64 = 1_150_000;
-const COMPLETE_BUDGET: u64 = 2_300_000;
+// (DESIGN decision 13, acs-hofu.11). Raised again from 1.15 MB / 2.3 MB for
+// port knocking (acs-fode, DESIGN decision 20): trimmed, it measured
+// 1,172,624 B slim and 2,351,876 B complete on x86_64 Linux. DESIGN goal 2
+// and §8.1 state the same figures.
+const SLIM_BUDGET: u64 = 1_180_000;
+const COMPLETE_BUDGET: u64 = 2_360_000;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

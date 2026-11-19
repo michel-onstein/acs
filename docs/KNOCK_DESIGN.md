@@ -104,8 +104,9 @@ its dials (DESIGN §3). But it costs more than it should:
    the default timing (§4.3), and nothing to a dial that joins the master.
 5. **`-v` accounts for it**: one line per knock, a timing phase, and a hint
    when ssh then cannot connect. It never prints the sequence.
-6. **It stays small**: under 10 KB of the x86_64 musl slim build, inside the
-   budget of DESIGN §8.1.
+6. **It stays small**: 29,416 B of the x86_64 musl slim build, measured
+   and trimmed (§11.3), inside the budget of DESIGN §8.1 as raised for it
+   (DESIGN decision 20). It was meant to be under 10 KB.
 
 ### Non-goals
 
@@ -543,9 +544,23 @@ Nothing acs installs, and nothing beyond a working knockd setup:
 ### 11.3 Size
 
 `knock.rs` is a few hundred lines of socket calls and parsing, with no
-dependency: `libc` is already in. Expected under 10 KB of the slim build,
-measured on the x86_64 musl release profile as DESIGN §8.1 measures
-everything, and stated in the PR that adds it.
+dependency: `libc` is already in. It was expected to cost under 10 KB of
+the slim build; measured with `cargo xtask dist` on the x86_64 musl
+release profile, as DESIGN §8.1 measures everything, steps 2–5 cost
+34,344 B against 0.21.0 (slim 1,143,208 B to 1,177,552 B), which took the
+build past DESIGN's 1.15 MB budget. The cost is spread thin: the parser and
+the configuration were 15,232 B, the dial's knock 14,992 B (about 2.9 KB of
+it the stderr watch behind the hint of §7), `acs config` 4,120 B, and each
+of those is mostly the code that reads `knock` and `--knock` in its own
+place, plus unwind tables, rather than one large piece.
+
+Trimmed without dropping anything this document promises (acs-fode), the
+knock costs **29,416 B** of x86_64 slim, 23,808 B of aarch64 Linux slim
+and 58,035 B of x86_64 Linux complete, which carries it in both payloads;
+the trims, each measured, are in DESIGN §8.1. The maintainer then raised
+the overall budget to 1.18 MB slim and 2.36 MB complete (DESIGN decision
+20) rather than drop the hint, the `-v` lines, the proxy refusal or the
+reuse table.
 
 ## 12. Implementation plan
 
