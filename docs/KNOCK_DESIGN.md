@@ -2,10 +2,11 @@
 
 **Status:** In progress — §12 steps 1 (`ssh::Route`), 2 (`knock.rs`:
 parser, sender, reuse table), 3 (`knock` in the file, `--knock`,
-`ACS_KNOCK`) and 4 (the dial knocks: `dial_once`, `exec::run`,
+`ACS_KNOCK`), 4 (the dial knocks: `dial_once`, `exec::run`,
 `alias::probe_port`, the proxy refusal, `-v`, the `knocked` phase and the
-hint) built (2026-11-18). Still to do: step 5, `acs config` (acs-8l1v.5);
-step 6, the check against a real knockd on Linux (acs-8l1v.6); and the
+hint) and 5 (`acs config`: `host set|unset <alias> knock`, `host add
+--knock`, the `knock: N knocks` in `host list`) built (2026-11-18). Still
+to do: step 6, the check against a real knockd on Linux (acs-8l1v.6); and the
 knock bound to ssh's `BindAddress` (§3.3, acs-z8wi). Work is the epic
 acs-8l1v, one bead per step of §12.
 

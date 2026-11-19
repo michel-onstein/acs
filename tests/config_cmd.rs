@@ -885,3 +885,56 @@ fn every_setting_in_the_table_round_trips() {
         );
     }
 }
+
+/// acs-8l1v.5: a knock through the real binary — added to an entry, set on
+/// an alias over a comment, listed as a count without its ports, and
+/// refused when the spec is bad.
+#[test]
+fn a_knock_is_added_set_listed_and_unset() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    std::fs::write(
+        h.local(),
+        "# my hosts\naliases:\n  # the gated box\n  gated:\n    - host: gated.lan\n",
+    )
+    .unwrap();
+    h.ok(&[
+        "config",
+        "host",
+        "add",
+        "gated",
+        "gated.example.com",
+        "--knock",
+        "7000,8000:udp,9000",
+    ]);
+    h.ok(&["config", "host", "set", "gated", "knock", "1,2/wait=1s"]);
+    let file = std::fs::read_to_string(h.local()).unwrap();
+    assert_eq!(
+        file,
+        "# my hosts\naliases:\n  # the gated box\n  gated:\n    knock:\n      sequence: 1,2\n      wait: 1s\n    hosts:\n      - host: gated.lan\n      - host: gated.example.com\n        knock: 7000,8000:udp,9000\n"
+    );
+    // The list says how many, never which.
+    let list = h.ok(&["config", "host", "list"]);
+    assert!(list.contains("ping knock: 2 knocks"), "{list}");
+    assert!(list.contains("ping knock: 3 knocks"), "{list}");
+    assert!(!list.contains("7000") && !list.contains("1,2"), "{list}");
+    // `show` prints the sequence.
+    let show = h.ok(&["config", "show"]);
+    assert!(show.contains("knock: 7000,8000:udp,9000\n"), "{show}");
+    // A bad spec is refused and changes nothing.
+    h.fails(
+        &["config", "host", "set", "gated", "knock", "7000,,9000"],
+        2,
+        "knock: ",
+    );
+    h.fails(
+        &["config", "host", "add", "g", "h", "--knock", "nope"],
+        2,
+        "--knock: ",
+    );
+    assert_eq!(std::fs::read_to_string(h.local()).unwrap(), file);
+    h.ok(&["config", "host", "unset", "gated", "knock"]);
+    let after = std::fs::read_to_string(h.local()).unwrap();
+    assert!(!after.contains("sequence"), "{after}");
+    assert!(after.contains("# the gated box") && after.contains("# my hosts"));
+}

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::config::{self, Config, HostEntry};
+use crate::knock::{self, Knock};
 use crate::netmatch::LocalNet;
 use crate::yaml::{self, Document, Node, Value};
 
@@ -21,7 +22,7 @@ usage: acs config show                 the merged configuration and where each v
        acs config host list            every alias and its hosts
        acs config host add <alias> <host> [--user <login>] [--identity-file <key>]
                            [--no-reachability-check] [--prefer] [--persist]
-                           [--local-networks <net>,<net>]
+                           [--local-networks <net>,<net>] [--knock <spec>]
                                        add a host to an alias (after its other hosts)
        acs config host remove <alias> [<host>]
                                        remove one host, or the whole alias
@@ -48,10 +49,13 @@ alias settings: identity_file <key> (the ssh key of its hosts that name none),
                 redraw_on_reconnect, persist, prefer_local_network,
                 reachability_tcp (true|false, over the global setting),
                 reachability_timeout, reachability_interval,
-                local_forwards (over the global setting; none for no forward)
+                local_forwards (over the global setting; none for no forward),
+                knock (7000,8000:udp,9000, with /delay=100ms /wait=1s /host=<jump>
+                after it for the timing and target; none for no knock)
 host settings: --local-networks lists the networks that make a host the local
                one: it is tried first when this machine is on one of them
                (172.16.0.0/16, fd00::/48; acs config host add)
+               --knock <spec> gives a host its own knock (an alias setting too)
 precedence of the ssh key: -i, then the host's identity_file, then the alias's";
 
 /// The top-level setting `key`, which `get`/`set`/`unset` know.
@@ -164,6 +168,7 @@ pub enum Cmd {
         prefer: bool,
         persist: bool,
         local_networks: Vec<LocalNet>,
+        knock: Option<Option<Knock>>,
     },
     HostRemove {
         alias: String,
@@ -190,6 +195,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
     let mut persist = false;
     let mut prefer = false;
     let mut networks: Option<String> = None;
+    let mut knock = None;
     let mut words = Vec::new();
     let mut it = args.iter().map(|a| a.to_string_lossy().into_owned());
     while let Some(a) = it.next() {
@@ -206,7 +212,11 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
             "--local-networks" => {
                 networks = Some(it.next().ok_or("--local-networks needs a network")?)
             }
+            "--knock" => {
+                knock = Some(it.next().ok_or("--knock needs a sequence, or none")?);
+            }
             "-h" | "--help" => return Ok((Cmd::Help, global)),
+            s if s.starts_with("--knock=") => knock = Some(s["--knock=".len()..].to_string()),
             s if s.starts_with("--user=") => user = Some(s["--user=".len()..].to_string()),
             s if s.starts_with("--identity-file=") => {
                 identity = Some(s["--identity-file=".len()..].to_string())
@@ -234,12 +244,16 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
         }
         None => Vec::new(),
     };
+    let knock = match &knock {
+        Some(spec) => Some(knock::parse_spec(spec).map_err(|e| format!("--knock: {e}"))?),
+        None => None,
+    };
     let w: Vec<&str> = words.iter().map(String::as_str).collect();
     if let ["host", "set" | "unset", _, key, ..] = w.as_slice() {
-        if !config::alias_settings().any(|d| d.key == *key) {
+        if *key != config::KNOCK && !config::alias_settings().any(|d| d.key == *key) {
             return Err(format!(
                 "unknown alias setting '{key}' (settings: {})",
-                config::key_list(config::alias_settings(), "")
+                config::key_list(config::alias_settings(), config::KNOCK)
             ));
         }
     }
@@ -248,7 +262,8 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
         || identity.is_some()
         || persist
         || prefer
-        || networks.is_some();
+        || networks.is_some()
+        || knock.is_some();
     let cmd = match w.as_slice() {
         ["show"] => Cmd::Show,
         ["path"] => Cmd::Path,
@@ -266,6 +281,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
             prefer,
             persist,
             local_networks,
+            knock,
         },
         ["host", "remove" | "rm", alias] => Cmd::HostRemove {
             alias: alias.to_string(),
@@ -296,7 +312,7 @@ pub fn parse(args: &[OsString]) -> Result<(Cmd, bool), String> {
     };
     if host_opts && !matches!(cmd, Cmd::HostAdd { .. }) {
         return Err(
-            "--user, --identity-file, --local-networks and --[no-]reachability-check go with acs config host add"
+            "--user, --identity-file, --local-networks, --knock and --[no-]reachability-check go with acs config host add"
                 .into(),
         );
     }
@@ -553,6 +569,15 @@ pub fn show(c: &Config, files: &[PathBuf; 2]) -> String {
                 ));
             }
         }
+        if let Some(k) = &a.knock {
+            settings.push((
+                config::KNOCK.to_string(),
+                Node {
+                    comment: Some(from(&k.origin)),
+                    ..knock_node(&k.value)
+                },
+            ));
+        }
         let node = if settings.is_empty() {
             list
         } else {
@@ -617,7 +642,35 @@ fn entry_node(e: &HostEntry) -> Node {
             networks_node(&e.local_networks),
         ));
     }
+    if let Some(k) = &e.knock {
+        m.push((config::KNOCK.to_string(), knock_node(&k.value)));
+    }
     Node::new(Value::Map(m))
+}
+
+/// A knock as the file spells it (KNOCK_DESIGN §6.1): `none`, the bare
+/// sequence when the timing is the default, else a mapping that leaves the
+/// default keys out.
+fn knock_node(k: &Option<Knock>) -> Node {
+    let Some(k) = k else {
+        return Node::string(knock::NO_KNOCK);
+    };
+    let mut m = vec![("sequence".to_string(), Node::string(&k.to_string()))];
+    for (key, v, default) in [
+        ("delay", k.delay, knock::DEFAULT_DELAY),
+        ("wait", k.wait, knock::DEFAULT_WAIT),
+    ] {
+        if v != default {
+            m.push((key.to_string(), Node::string(&config::format_timeout(v))));
+        }
+    }
+    if let Some(h) = &k.host {
+        m.push(("host".to_string(), Node::string(h)));
+    }
+    match m.as_slice() {
+        [(_, seq)] => seq.clone(),
+        _ => Node::new(Value::Map(m)),
+    }
 }
 
 /// Every alias and its hosts, in the order they are tried, each with the
@@ -641,15 +694,24 @@ pub fn host_list(c: &Config) -> String {
             false => "ping",
         };
         for e in crate::alias::ranked(&a.entries) {
-            let check = if e.reachability_check { probe } else { "none" };
+            let mut check = (if e.reachability_check { probe } else { "none" }).to_string();
+            if e.prefer {
+                check.push_str(" prefer");
+            }
+            // The count, never the ports: those are for `acs config show`.
+            let knocks = e.knock.as_ref().or(a.knock.as_ref());
+            if let Some(k) = knocks.and_then(|k| k.value.as_ref()) {
+                let n = k.sequence.len();
+                check.push_str(&format!(
+                    " knock: {n} knock{}",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
             rows.push([
                 a.name.clone(),
                 e.host.clone(),
                 e.user.clone().unwrap_or_else(|| "-".into()),
-                match e.prefer {
-                    true => format!("{check} prefer"),
-                    false => check.into(),
-                },
+                check,
                 e.identity_file
                     .as_ref()
                     .or(a.identity_file.as_ref())
@@ -790,6 +852,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
             prefer,
             persist,
             local_networks,
+            knock,
         } => {
             config::validate_alias(alias)?;
             let entry = HostEntry {
@@ -806,7 +869,10 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                     origin: None,
                 }),
                 local_networks: local_networks.clone(),
-                knock: None,
+                knock: knock.clone().map(|value| config::Setting {
+                    value,
+                    origin: None,
+                }),
                 origin: config::Origin {
                     file: PathBuf::new(),
                     line: 0,
@@ -832,8 +898,17 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
         }
         Cmd::HostSet { alias, key, value } => {
             config::validate_alias(alias)?;
-            let new = typed(key, value)?;
-            let shown = value_text(&new);
+            let new = if key == config::KNOCK {
+                knock::parse_spec(value)
+                    .map(|k| knock_node(&k))
+                    .map_err(|e| format!("{key}: {e}"))?
+            } else {
+                typed(key, value)?
+            };
+            let shown = match &new.value {
+                Value::Map(_) => value.to_string(),
+                _ => value_text(&new),
+            };
             let settings = alias_form(alias_node(aliases_mut(doc)?, alias));
             match settings.iter_mut().find(|(k, _)| k == key) {
                 Some((_, n)) => {
@@ -1181,6 +1256,97 @@ mod tests {
         assert_eq!(mode & 0o777, 0o640, "the file's own mode was not kept");
     }
 
+    /// acs-8l1v.5: an alias's knock is written as the scalar when the
+    /// timing is the default, as a mapping of what differs otherwise, in
+    /// place over its comment, and `unset` takes it out again.
+    #[test]
+    fn a_knock_is_set_and_unset_on_an_alias() {
+        let src = "aliases:\n  lab:\n    - host: a\n";
+        assert_eq!(
+            apply(src, "host set lab knock 7000,8000:udp,9000").unwrap(),
+            "aliases:\n  lab:\n    knock: 7000,8000:udp,9000\n    hosts:\n      - host: a\n"
+        );
+        let mapped = apply(src, "host set lab knock 1,2/delay=100ms/wait=1s/host=jump").unwrap();
+        assert_eq!(
+            mapped,
+            "aliases:\n  lab:\n    knock:\n      sequence: 1,2\n      delay: 100ms\n      wait: 1s\n      host: jump\n    hosts:\n      - host: a\n"
+        );
+        let dir = crate::testutil::TempDir::new();
+        let f = dir.path().join("c.yaml");
+        std::fs::write(&f, &mapped).unwrap();
+        let c = Config::load_files(std::slice::from_ref(&f)).unwrap();
+        let k = c
+            .alias("lab")
+            .unwrap()
+            .knock
+            .clone()
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(k.wait, std::time::Duration::from_secs(1));
+        assert_eq!(k.host.as_deref(), Some("jump"));
+        // In place, keeping the comment; the default timing is the scalar.
+        let commented = "aliases:\n  lab:\n    knock: 1,2 # old\n    hosts:\n      - host: a\n";
+        assert_eq!(
+            apply(commented, "host set lab knock 3,4").unwrap(),
+            commented.replace("1,2", "3,4")
+        );
+        assert_eq!(
+            apply(commented, "host set lab knock none").unwrap(),
+            commented.replace("1,2", "none")
+        );
+        assert_eq!(
+            apply(commented, "host unset lab knock").unwrap(),
+            "aliases:\n  lab:\n    - host: a\n"
+        );
+    }
+
+    #[test]
+    fn a_bad_knock_is_refused_by_name() {
+        let e = apply("", "host set lab knock 7000,,9000").unwrap_err();
+        assert!(e.starts_with("knock: "), "{e}");
+        assert!(apply("", "host set lab knock 1/wait=1h").is_err());
+        let e = parse(&args("host add a h --knock x")).unwrap_err();
+        assert!(e.starts_with("--knock: "), "{e}");
+        let e = parse(&args("host list --knock 1,2")).unwrap_err();
+        assert!(e.contains("--knock"), "{e}");
+        // Not a top-level setting.
+        assert!(apply("", "set knock 1,2").is_err());
+    }
+
+    #[test]
+    fn host_add_knock_writes_the_entry_and_list_counts_without_ports() {
+        assert_eq!(
+            apply("", "host add g h --knock 7000,8000:udp,9000").unwrap(),
+            "aliases:\n  g:\n    - host: h\n      knock: 7000,8000:udp,9000\n"
+        );
+        assert_eq!(
+            apply("", "host add g h --knock none").unwrap(),
+            "aliases:\n  g:\n    - host: h\n      knock: none\n"
+        );
+        assert_eq!(
+            apply("", "host add g h --knock 1,2/wait=1s").unwrap(),
+            "aliases:\n  g:\n    - host: h\n      knock:\n        sequence: 1,2\n        wait: 1s\n"
+        );
+        let dir = crate::testutil::TempDir::new();
+        let f = dir.path().join("c.yaml");
+        std::fs::write(
+            &f,
+            "aliases:\n  g:\n    knock: 5,6\n    hosts:\n      - host: a\n      - host: b\n        knock: none\n      - host: c\n        prefer: true\n        knock: 1,2,3\n",
+        )
+        .unwrap();
+        let c = Config::load_files(std::slice::from_ref(&f)).unwrap();
+        let out = host_list(&c);
+        assert!(out.contains("ping prefer knock: 3 knocks"), "{out}");
+        assert!(out.contains("ping knock: 2 knocks"), "{out}");
+        assert_eq!(out.matches("knock").count(), 4, "{out}");
+        assert!(!out.contains("5,6") && !out.contains("1,2,3"), "{out}");
+        // `show` prints the file's knocks, the alias's and the entry's.
+        let shown = show(&c, &[f.clone(), f]);
+        assert!(shown.contains("    knock: 5,6 # "), "{shown}");
+        assert!(shown.contains("knock: 1,2,3\n"), "{shown}");
+    }
+
     /// acs-gydj: the help names every setting of the table, at each level
     /// it has one, so a new row cannot go undocumented.
     #[test]
@@ -1272,7 +1438,8 @@ aliases:
                 identity_file: None,
                 prefer: false,
                 persist: false,
-                local_networks: Vec::new()
+                local_networks: Vec::new(),
+                knock: None
             }
         );
         assert_eq!(
@@ -1285,7 +1452,8 @@ aliases:
                 identity_file: Some("~/k".into()),
                 prefer: false,
                 persist: false,
-                local_networks: Vec::new()
+                local_networks: Vec::new(),
+                knock: None
             }
         );
         assert_eq!(
@@ -1298,7 +1466,8 @@ aliases:
                 identity_file: Some("/keys/k".into()),
                 prefer: false,
                 persist: true,
-                local_networks: Vec::new()
+                local_networks: Vec::new(),
+                knock: None
             }
         );
         // acs-9yv: the networks that make this entry the local one.
@@ -1315,7 +1484,8 @@ aliases:
                 local_networks: vec![
                     LocalNet::parse("172.16.8.2/16").unwrap(),
                     LocalNet::parse("fd00::/48").unwrap(),
-                ]
+                ],
+                knock: None
             }
         );
         for (line, want) in [
@@ -1608,7 +1778,7 @@ aliases:
         );
         let e = parse(&args("host set d command_bell false")).unwrap_err();
         assert!(
-            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards)"),
+            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, knock)"),
             "{e}"
         );
     }
