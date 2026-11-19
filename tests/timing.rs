@@ -176,13 +176,13 @@ fn without_v_no_timing_is_told() {
 #[test]
 fn a_greeting_too_big_for_the_pipe_is_told_twice() {
     let remote = Remote::installed();
+    let argv = padded_command("big", BIG_PADS);
+    let line: usize = argv[4..].iter().map(|w| w.len() + 1).sum();
     // Over any pipe buffer acs can be handed: 64 KiB on Linux, at most
-    // that on macOS.
-    let pad = "p".repeat(1024);
-    let mut argv: Vec<&str> = vec!["-v", "devbox", "big", "--", UP_SH];
-    for _ in 0..192 {
-        argv.push(&pad);
-    }
+    // that on macOS — and under the 128 KiB the session's shell can be
+    // handed as its one `-c` argument on Linux (acs-5jok).
+    assert!((64 << 10..128 << 10).contains(&line), "{line}");
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let mut c = Client::start(&remote, &argv);
     c.wait_for("timing: first connection: first output byte", T);
     assert_eq!(
@@ -198,4 +198,32 @@ fn a_greeting_too_big_for_the_pipe_is_told_twice() {
         "{:?}",
         c.text()
     );
+}
+
+/// 1 KiB words after [`UP_SH`] in [`a_greeting_too_big_for_the_pipe_is_told_twice`].
+const BIG_PADS: usize = 100;
+
+/// `-v devbox <session> -- UP_SH` followed by `pads` words of 1 KiB.
+fn padded_command(session: &str, pads: usize) -> Vec<String> {
+    let mut argv: Vec<String> = ["-v", "devbox", session, "--", UP_SH]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    argv.extend(vec!["p".repeat(1024); pads]);
+    argv
+}
+
+/// Regression (acs-5jok): Linux execs no single argument of 128 KiB or
+/// more, and the command is the shell's one `-c` argument. Such a command
+/// is refused with what was too long and what to do, not a bare
+/// "Argument list too long".
+#[cfg(target_os = "linux")]
+#[test]
+fn a_command_too_long_for_one_exec_argument_says_so() {
+    let remote = Remote::installed();
+    let argv = padded_command("huge", 192);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut c = Client::start(&remote, &argv);
+    c.wait_for("too long for this host to run as one shell command line", T);
+    assert!(c.text().contains("put it in a script"), "{:?}", c.text());
 }

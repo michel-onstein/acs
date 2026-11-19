@@ -261,7 +261,10 @@ shells).
   overridable with `acs <host> [session] -- <command…>`, which runs as
   `$SHELL -c '<words joined with spaces>'` — as sshd runs a remote
   command, so quoting, pipes and globs mean what they mean to
-  `ssh host …` (§7.7). Environment gets
+  `ssh host …` (§7.7). That one `-c` argument is bounded as ssh's is:
+  Linux execs no argument of 128 KiB or more, and a longer command is
+  refused with its length and "put it in a script" rather than a bare
+  "Argument list too long" (acs-5jok). Environment gets
   `TERM` and `COLORTERM` from the client's HELLO (ssh `-T` no longer sends
   `TERM`), plus `ACS_SESSION=<name>`.
   - **A session is not a login** (acs-aps). It outlives the ssh connection
