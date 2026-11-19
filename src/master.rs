@@ -1112,7 +1112,7 @@ impl Master {
                 Ok(())
             });
         }
-        let child = cmd.spawn()?;
+        let child = cmd.spawn().map_err(|e| too_long(e, &desc))?;
         drop(slave);
         sys::set_nonblocking(pty.as_raw_fd(), true)?;
         mlog!("started '{desc}' as pid {}", child.id());
@@ -1419,9 +1419,40 @@ impl Master {
     }
 }
 
+/// acs-5jok: the command reaches the shell as one `-c` argument (as ssh's
+/// own remote command does), and Linux execs no single argument of
+/// 128 KiB or more (`MAX_ARG_STRLEN`) — whatever `ARG_MAX` says. Bare,
+/// that is "Argument list too long" about a list of three, so say which
+/// argument, how long it is, and what to do instead.
+fn too_long(e: io::Error, line: &str) -> io::Error {
+    if e.raw_os_error() != Some(libc::E2BIG) {
+        return e;
+    }
+    io::Error::other(format!(
+        "the command is {} bytes, too long for this host to run as one \
+         shell command line ({e}); put it in a script on the host and run that",
+        line.len()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (acs-5jok): an exec refused for its size says it was
+    /// the command, how long, and what to do; other errors pass as they are.
+    #[test]
+    fn a_command_too_long_to_exec_says_so() {
+        let line = "x".repeat(200_000);
+        let e = too_long(io::Error::from_raw_os_error(libc::E2BIG), &line).to_string();
+        assert!(
+            e.starts_with("the command is 200000 bytes, too long"),
+            "{e}"
+        );
+        assert!(e.contains("put it in a script"), "{e}");
+        let other = too_long(io::Error::from_raw_os_error(libc::ENOENT), &line);
+        assert_eq!(other.raw_os_error(), Some(libc::ENOENT));
+    }
 
     /// Regression (acs-u3c): output the child wrote just before exiting is
     /// seen by the drain check even though an earlier poll saw nothing —
