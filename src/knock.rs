@@ -238,21 +238,29 @@ pub struct Outcome {
 /// The socket calls a knock makes, and its sleeps — behind a trait so the
 /// tests can record them instead.
 pub trait Net {
-    fn tcp(&mut self, to: SocketAddr) -> io::Result<()>;
-    fn udp(&mut self, to: SocketAddr) -> io::Result<()>;
+    fn tcp(&mut self, to: SocketAddr, bind: &Bind) -> io::Result<()>;
+    fn udp(&mut self, to: SocketAddr, bind: &Bind) -> io::Result<()>;
     fn sleep(&mut self, d: Duration);
+}
+
+/// Where a knock comes from, as ssh's `BindAddress` and `BindInterface`
+/// say (§3.3): the kernel's choice where neither is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Bind {
+    pub addr: Option<IpAddr>,
+    pub iface: Option<String>,
 }
 
 /// The real sockets.
 pub struct Sockets;
 
 impl Net for Sockets {
-    fn tcp(&mut self, to: SocketAddr) -> io::Result<()> {
-        knock_one(to, Proto::Tcp)
+    fn tcp(&mut self, to: SocketAddr, bind: &Bind) -> io::Result<()> {
+        knock_one(to, Proto::Tcp, bind)
     }
 
-    fn udp(&mut self, to: SocketAddr) -> io::Result<()> {
-        knock_one(to, Proto::Udp)
+    fn udp(&mut self, to: SocketAddr, bind: &Bind) -> io::Result<()> {
+        knock_one(to, Proto::Udp, bind)
     }
 
     fn sleep(&mut self, d: Duration) {
@@ -263,7 +271,7 @@ impl Net for Sockets {
 /// One knock from a socket closed before this returns: for TCP a
 /// non-blocking connect, for UDP an empty datagram. The same socket calls
 /// for both, rather than std's `UdpSocket` beside them (acs-fode).
-fn knock_one(to: SocketAddr, proto: Proto) -> io::Result<()> {
+fn knock_one(to: SocketAddr, proto: Proto, bind: &Bind) -> io::Result<()> {
     let family = match to {
         SocketAddr::V4(_) => libc::AF_INET,
         SocketAddr::V6(_) => libc::AF_INET6,
@@ -277,6 +285,7 @@ fn knock_one(to: SocketAddr, proto: Proto) -> io::Result<()> {
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     crate::sys::set_cloexec(raw)?;
     crate::sys::set_nonblocking(raw, true)?;
+    bind_source(raw, to, bind)?;
     let (storage, len) = sockaddr(to);
     let at = &storage as *const libc::sockaddr_storage as *const libc::sockaddr;
     let r = unsafe {
@@ -297,6 +306,59 @@ fn knock_one(to: SocketAddr, proto: Proto) -> io::Result<()> {
         // Completed at once: something listens there, or the datagram went.
         None => Ok(()),
     }
+}
+
+/// Bind socket `fd`, about to knock `to`, to `bind`'s interface and address.
+/// A failure says what was bound: it is no "unreachable" to drop quietly.
+fn bind_source(fd: libc::c_int, to: SocketAddr, bind: &Bind) -> io::Result<()> {
+    if let Some(name) = &bind.iface {
+        let named = |e: io::Error| io::Error::other(format!("cannot bind to {name}: {e}"));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let _ = to;
+            crate::sys::cvt(unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    name.as_ptr().cast(),
+                    name.len() as libc::socklen_t,
+                )
+            })
+            .map_err(named)?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let c = std::ffi::CString::new(name.as_str()).map_err(io::Error::other)?;
+            let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
+            if idx == 0 {
+                return Err(named(io::Error::last_os_error()));
+            }
+            let (level, opt) = match to {
+                SocketAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_BOUND_IF),
+                SocketAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF),
+            };
+            crate::sys::cvt(unsafe {
+                libc::setsockopt(
+                    fd,
+                    level,
+                    opt,
+                    (&idx as *const libc::c_uint).cast(),
+                    std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                )
+            })
+            .map_err(named)?;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        let _ = (fd, to, named);
+    }
+    if let Some(a) = bind.addr {
+        let (storage, len) = sockaddr(SocketAddr::new(a, 0));
+        let at = &storage as *const libc::sockaddr_storage as *const libc::sockaddr;
+        crate::sys::cvt(unsafe { libc::bind(fd, at, len) })
+            .map_err(|e| io::Error::other(format!("cannot bind {a}: {e}")))?;
+    }
+    Ok(())
 }
 
 /// `to` as the kernel takes it.
@@ -392,8 +454,8 @@ static RECENT: Mutex<Recent> = Mutex::new(Recent::new());
 /// them in turn, then the delay before the next; after the last, the wait.
 /// An address knocked with the same sequence in the last [`REUSE`] is left
 /// alone, and when all are, nothing is sent and nothing waited for.
-pub fn send(addrs: &[IpAddr], knock: &Knock) -> Result<Outcome, String> {
-    send_with(&mut Sockets, &RECENT, addrs, knock)
+pub fn send(addrs: &[IpAddr], knock: &Knock, bind: &Bind) -> Result<Outcome, String> {
+    send_with(&mut Sockets, &RECENT, addrs, knock, bind)
 }
 
 /// [`send`] over `net`, with `recent` for its reuse table.
@@ -402,6 +464,7 @@ pub fn send_with(
     recent: &Mutex<Recent>,
     addrs: &[IpAddr],
     knock: &Knock,
+    bind: &Bind,
 ) -> Result<Outcome, String> {
     let mut outcome = Outcome::default();
     let mut live = Vec::new();
@@ -409,6 +472,10 @@ pub fn send_with(
         let table = recent.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         for &a in addrs {
+            // A source address knocks only destinations of its own family.
+            if bind.addr.is_some_and(|b| b.is_ipv4() != a.is_ipv4()) {
+                continue;
+            }
             if let Some(age) = table.age(a, &knock.sequence, now) {
                 outcome.reused.push(a);
                 outcome.ago = Some(outcome.ago.map_or(age, |o| o.min(age)));
@@ -419,6 +486,9 @@ pub fn send_with(
     }
     if live.is_empty() {
         if outcome.reused.is_empty() {
+            if let (Some(b), false) = (bind.addr, addrs.is_empty()) {
+                return Err(format!("no address of BindAddress {b}'s family to knock"));
+            }
             return Err("no address to knock".into());
         }
         return Ok(outcome);
@@ -432,8 +502,8 @@ pub fn send_with(
         for &a in &live {
             let to = SocketAddr::new(a, port);
             let sent = match proto {
-                Proto::Tcp => net.tcp(to),
-                Proto::Udp => net.udp(to),
+                Proto::Tcp => net.tcp(to, bind),
+                Proto::Udp => net.udp(to, bind),
             };
             match sent {
                 Ok(()) => kept.push(a),
@@ -562,6 +632,21 @@ pub fn report(target: &str, knock: &Knock, o: &Outcome, log: &mut dyn FnMut(Stri
     }
 }
 
+/// The source ssh's `BindAddress` and `BindInterface` name (§3.3).
+fn bind_of(r: &Route) -> Result<Bind, String> {
+    let addr = match r.bindaddress.as_deref() {
+        None => None,
+        Some(a) => Some(
+            a.parse()
+                .map_err(|_| format!("knock: BindAddress {a} is not an address"))?,
+        ),
+    };
+    Ok(Bind {
+        addr,
+        iface: r.bindinterface.clone(),
+    })
+}
+
 /// Knock where a dial to `dest` will connect (§3): the [`target`], its
 /// addresses looked up within `lookup` and kept to the route's address
 /// family, then [`send`]. `log` is given the [`report`] lines. The host
@@ -581,8 +666,17 @@ pub fn before_dial(
             "knock: no address for {target}"
         )));
     }
-    let outcome =
-        send(&addrs, knock).map_err(|e| Refusal::Unreachable(format!("knock: {target}: {e}")))?;
+    let bind = route
+        .map_or(Ok(Bind::default()), bind_of)
+        .map_err(Refusal::Unreachable)?;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    if let Some(i) = &bind.iface {
+        log(format!(
+            "BindInterface {i}: not supported here, knocking without it"
+        ));
+    }
+    let outcome = send(&addrs, knock, &bind)
+        .map_err(|e| Refusal::Unreachable(format!("knock: {target}: {e}")))?;
     report(target, knock, &outcome, log);
     Ok(target.to_string())
 }
@@ -790,6 +884,8 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         events: Vec<Event>,
+        /// The bind each socket was given.
+        binds: Vec<Bind>,
         /// Addresses that answer every send with this errno.
         fail: Vec<(IpAddr, i32)>,
     }
@@ -804,11 +900,13 @@ mod tests {
     }
 
     impl Net for Recorder {
-        fn tcp(&mut self, to: SocketAddr) -> io::Result<()> {
+        fn tcp(&mut self, to: SocketAddr, bind: &Bind) -> io::Result<()> {
+            self.binds.push(bind.clone());
             self.events.push(Event::Tcp(to));
             self.result(to)
         }
-        fn udp(&mut self, to: SocketAddr) -> io::Result<()> {
+        fn udp(&mut self, to: SocketAddr, bind: &Bind) -> io::Result<()> {
+            self.binds.push(bind.clone());
             self.events.push(Event::Udp(to));
             self.result(to)
         }
@@ -825,7 +923,14 @@ mod tests {
     fn knocks_every_address_per_knock_with_the_delay_between() {
         let mut net = Recorder::default();
         let table = Mutex::new(Recent::new());
-        let out = send_with(&mut net, &table, &[V4, V6], &knock("7000,8000:udp,9000")).unwrap();
+        let out = send_with(
+            &mut net,
+            &table,
+            &[V4, V6],
+            &knock("7000,8000:udp,9000"),
+            &Bind::default(),
+        )
+        .unwrap();
         assert_eq!(out.knocked, [V4, V6]);
         assert!(out.reused.is_empty());
         let s = |a, p| SocketAddr::new(a, p);
@@ -851,7 +956,7 @@ mod tests {
         let mut net = Recorder::default();
         let table = Mutex::new(Recent::new());
         let k = Knock::new(knock("1,2").sequence, Duration::ZERO, Duration::ZERO, None).unwrap();
-        send_with(&mut net, &table, &[V4, V4], &k).unwrap();
+        send_with(&mut net, &table, &[V4, V4], &k, &Bind::default()).unwrap();
         let s = |p| Event::Tcp(SocketAddr::new(V4, p));
         // A repeated address is knocked once.
         assert_eq!(net.events, [s(1), s(2)]);
@@ -865,7 +970,7 @@ mod tests {
         };
         let table = Mutex::new(Recent::new());
         let k = Knock::new(knock("1,2").sequence, Duration::ZERO, Duration::ZERO, None).unwrap();
-        let out = send_with(&mut net, &table, &[V6, V4], &k).unwrap();
+        let out = send_with(&mut net, &table, &[V6, V4], &k, &Bind::default()).unwrap();
         assert_eq!(out.knocked, [V4]);
         use Event::Tcp;
         assert_eq!(
@@ -893,7 +998,8 @@ mod tests {
                 ..Recorder::default()
             };
             let table = Mutex::new(Recent::new());
-            let err = send_with(&mut net, &table, &[V4, V6], &knock("1,2")).unwrap_err();
+            let err = send_with(&mut net, &table, &[V4, V6], &knock("1,2"), &Bind::default())
+                .unwrap_err();
             assert!(
                 err.starts_with("no address can be reached (2001:db8::1: "),
                 "{err}"
@@ -904,7 +1010,7 @@ mod tests {
         let mut net = Recorder::default();
         let table = Mutex::new(Recent::new());
         assert_eq!(
-            send_with(&mut net, &table, &[], &knock("1")).unwrap_err(),
+            send_with(&mut net, &table, &[], &knock("1"), &Bind::default()).unwrap_err(),
             "no address to knock"
         );
     }
@@ -916,7 +1022,8 @@ mod tests {
             ..Recorder::default()
         };
         let table = Mutex::new(Recent::new());
-        let err = send_with(&mut net, &table, &[V6, V4], &knock("1,2")).unwrap_err();
+        let err =
+            send_with(&mut net, &table, &[V6, V4], &knock("1,2"), &Bind::default()).unwrap_err();
         assert!(err.starts_with("192.0.2.1: "), "{err}");
     }
 
@@ -925,9 +1032,9 @@ mod tests {
         let mut net = Recorder::default();
         let table = Mutex::new(Recent::new());
         let k = knock("7000,8000");
-        send_with(&mut net, &table, &[V4], &k).unwrap();
+        send_with(&mut net, &table, &[V4], &k, &Bind::default()).unwrap();
         let first = net.events.len();
-        let out = send_with(&mut net, &table, &[V4], &k).unwrap();
+        let out = send_with(&mut net, &table, &[V4], &k, &Bind::default()).unwrap();
         assert_eq!(
             out,
             Outcome {
@@ -939,11 +1046,18 @@ mod tests {
         assert!(out.ago.is_some_and(|a| a < REUSE), "{out:?}");
         assert_eq!(net.events.len(), first, "reused, so nothing sent or waited");
         // A new address alongside is knocked; the reused one is not.
-        let out = send_with(&mut net, &table, &[V4, V6], &k).unwrap();
+        let out = send_with(&mut net, &table, &[V4, V6], &k, &Bind::default()).unwrap();
         assert_eq!(out.knocked, [V6]);
         assert_eq!(out.reused, [V4]);
         // A different sequence to the same address is not reused.
-        let out = send_with(&mut net, &table, &[V4], &knock("7000,8001")).unwrap();
+        let out = send_with(
+            &mut net,
+            &table,
+            &[V4],
+            &knock("7000,8001"),
+            &Bind::default(),
+        )
+        .unwrap();
         assert_eq!(out.knocked, [V4]);
     }
 
@@ -1025,7 +1139,7 @@ mod tests {
         let (p1, p2, pu) = (
             port(t1.local_addr().unwrap()),
             port(t2.local_addr().unwrap()),
-            port(u.local_addr().unwrap()),
+            u.local_addr().unwrap().port(),
         );
         let k = Knock::new(
             vec![(p1, Proto::Tcp), (pu, Proto::Udp), (p2, Proto::Tcp)],
@@ -1036,7 +1150,7 @@ mod tests {
         .unwrap();
         let table = Mutex::new(Recent::new());
         let started = Instant::now();
-        let out = send_with(&mut Sockets, &table, &[lo], &k).unwrap();
+        let out = send_with(&mut Sockets, &table, &[lo], &k, &Bind::default()).unwrap();
         let took = started.elapsed();
         assert_eq!(out.knocked, [lo]);
         // Two delays and the wait, with room for a slow machine.
@@ -1057,6 +1171,101 @@ mod tests {
         );
     }
 
+    /// acs-z8wi: the bind reaches every socket of every knock, TCP and UDP.
+    #[test]
+    fn the_bind_reaches_every_knock_socket() {
+        let bind = Bind {
+            addr: Some(Ipv4Addr::new(192, 0, 2, 9).into()),
+            iface: Some("eth1".into()),
+        };
+        let mut net = Recorder::default();
+        let out = send_with(
+            &mut net,
+            &Mutex::new(Recent::new()),
+            &[V4],
+            &knock("7000,8000:udp,9000"),
+            &bind,
+        )
+        .unwrap();
+        assert_eq!(out.knocked, [V4]);
+        assert_eq!(net.binds, [bind.clone(), bind.clone(), bind]);
+    }
+
+    /// A source address knocks only destinations of its own family; with
+    /// none of that family the knock fails and says so.
+    #[test]
+    fn a_bind_address_skips_the_other_family() {
+        let bind = Bind {
+            addr: Some(Ipv4Addr::new(192, 0, 2, 9).into()),
+            iface: None,
+        };
+        let mut net = Recorder::default();
+        let table = Mutex::new(Recent::new());
+        let out = send_with(&mut net, &table, &[V6, V4], &knock("7000"), &bind).unwrap();
+        assert_eq!(out.knocked, [V4]);
+        assert_eq!(net.events[0], Event::Tcp(SocketAddr::new(V4, 7000)));
+        let mut net = Recorder::default();
+        let e = send_with(&mut net, &table, &[V6], &knock("7000"), &bind).unwrap_err();
+        assert!(e.contains("BindAddress 192.0.2.9"), "{e}");
+        assert!(net.events.is_empty());
+    }
+
+    /// Loopback: a UDP knock bound to 127.0.0.1 arrives from it (UDP, since
+    /// macOS never shows a TCP knock to a loopback listener).
+    #[test]
+    fn a_bound_udp_knock_arrives_from_the_bind_address() {
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let u = UdpSocket::bind((lo, 0)).unwrap();
+        u.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let k = Knock::new(
+            vec![(u.local_addr().unwrap().port(), Proto::Udp)],
+            Duration::ZERO,
+            Duration::ZERO,
+            None,
+        )
+        .unwrap();
+        let bind = Bind {
+            addr: Some(lo),
+            iface: None,
+        };
+        send_with(&mut Sockets, &Mutex::new(Recent::new()), &[lo], &k, &bind).unwrap();
+        let mut buf = [0u8; 4];
+        let (n, from) = u.recv_from(&mut buf).unwrap();
+        assert_eq!((n, from.ip()), (0, lo));
+    }
+
+    /// Where the kernel would pick 127.0.0.1, 127.0.0.2 shows the bind
+    /// took effect (all of 127/8 is loopback on Linux).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bound_udp_knock_leaves_from_another_loopback_address() {
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let src = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let u = UdpSocket::bind((lo, 0)).unwrap();
+        u.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let bind = Bind {
+            addr: Some(src),
+            iface: Some("lo".into()),
+        };
+        Sockets.udp(u.local_addr().unwrap(), &bind).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(u.recv_from(&mut buf).unwrap().1.ip(), src);
+    }
+
+    /// An address that is not ours fails the knock with what was bound.
+    #[test]
+    fn an_unbindable_address_fails_the_knock_saying_so() {
+        let bind = Bind {
+            addr: Some(Ipv4Addr::new(192, 0, 2, 9).into()),
+            iface: None,
+        };
+        let e = Sockets
+            .udp(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9), &bind)
+            .unwrap_err();
+        assert!(e.to_string().contains("cannot bind 192.0.2.9"), "{e}");
+        assert!(!unreachable(&e));
+    }
+
     #[test]
     fn a_closed_port_on_loopback_is_still_a_knock() {
         // Bound and dropped, so nothing listens there: refused, which means
@@ -1067,8 +1276,12 @@ mod tests {
             .unwrap()
             .port();
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert!(Sockets.tcp(SocketAddr::new(lo, port)).is_ok());
-        assert!(Sockets.udp(SocketAddr::new(lo, port)).is_ok());
+        assert!(Sockets
+            .tcp(SocketAddr::new(lo, port), &Bind::default())
+            .is_ok());
+        assert!(Sockets
+            .udp(SocketAddr::new(lo, port), &Bind::default())
+            .is_ok());
     }
 
     /// Regression guard for §4.1's load-bearing close: a knock socket left
@@ -1087,7 +1300,14 @@ mod tests {
             None,
         )
         .unwrap();
-        send_with(&mut Sockets, &Mutex::new(Recent::new()), &[lo], &k).unwrap();
+        send_with(
+            &mut Sockets,
+            &Mutex::new(Recent::new()),
+            &[lo],
+            &k,
+            &Bind::default(),
+        )
+        .unwrap();
         while let Some(s) = accept(&l, Duration::from_millis(200)) {
             assert!(closed(s), "a knock socket is still open after send");
         }
@@ -1217,10 +1437,10 @@ mod tests {
     fn a_send_error_names_no_port() {
         struct Broken;
         impl Net for Broken {
-            fn tcp(&mut self, _: SocketAddr) -> io::Result<()> {
+            fn tcp(&mut self, _: SocketAddr, _: &Bind) -> io::Result<()> {
                 Err(io::Error::from_raw_os_error(libc::EACCES))
             }
-            fn udp(&mut self, _: SocketAddr) -> io::Result<()> {
+            fn udp(&mut self, _: SocketAddr, _: &Bind) -> io::Result<()> {
                 Err(io::Error::from_raw_os_error(libc::EACCES))
             }
             fn sleep(&mut self, _: Duration) {}
@@ -1230,6 +1450,7 @@ mod tests {
             &Mutex::new(Recent::new()),
             &[V4],
             &knock("7001"),
+            &Bind::default(),
         )
         .unwrap_err();
         assert!(e.starts_with("192.0.2.1: "), "{e}");

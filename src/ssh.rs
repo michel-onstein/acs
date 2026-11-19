@@ -50,6 +50,8 @@ pub struct Route {
     pub addressfamily: AddressFamily,
     /// `bindaddress`: the source address ssh binds, when one is set.
     pub bindaddress: Option<String>,
+    /// `bindinterface`: the interface ssh binds, when one is set.
+    pub bindinterface: Option<String>,
     /// A `proxyjump` or `proxycommand` other than `none` is set: ssh
     /// reaches the host through another one.
     pub proxied: bool,
@@ -79,6 +81,7 @@ impl Route {
                     }
                 }
                 "bindaddress" => r.bindaddress = Some(v.to_string()),
+                "bindinterface" => r.bindinterface = Some(v.to_string()),
                 "proxyjump" | "proxycommand" if v != "none" => {
                     r.proxied = true;
                     if key == "proxyjump" {
@@ -1231,7 +1234,7 @@ mod tests {
     #[test]
     fn route_reads_each_field_from_ssh_dash_g() {
         let out = "user me\nhostname 10.0.0.7\nport 2222\naddressfamily inet6\n\
-                   bindaddress 192.0.2.1\nproxyjump none\nproxycommand none\n";
+                   bindaddress 192.0.2.1\nbindinterface eth1\nproxyjump none\nproxycommand none\n";
         assert_eq!(
             Route::parse(out),
             Route {
@@ -1239,6 +1242,7 @@ mod tests {
                 port: Some(2222),
                 addressfamily: AddressFamily::Inet6,
                 bindaddress: Some("192.0.2.1".into()),
+                bindinterface: Some("eth1".into()),
                 proxied: false,
                 proxy: None,
             }
@@ -1252,7 +1256,8 @@ mod tests {
             assert_eq!(r.addressfamily, want, "{v}");
         }
         // ssh -G names no bindaddress unless one is set.
-        assert_eq!(Route::parse("hostname h\nport 22\n").bindaddress, None);
+        let none = Route::parse("hostname h\nport 22\n");
+        assert_eq!((none.bindaddress, none.bindinterface), (None, None));
         // A port that is not one is no port.
         assert_eq!(Route::parse("port many\n").port, None);
         assert_eq!(Route::parse(""), Route::default());
