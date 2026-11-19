@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Mutex;
 use std::thread;
@@ -90,8 +90,10 @@ impl Knock {
     }
 
     /// A knock from its parts, refused when the sequence is empty or longer
-    /// than [`MAX_KNOCKS`], a duration is out of range, or the delays add
-    /// up to more than knockd's `seq_timeout` (§4.3).
+    /// than [`MAX_KNOCKS`], or the delays add up to more than knockd's
+    /// `seq_timeout` (§4.3). The delay and the wait come bounded from
+    /// [`parse_delay`] and [`parse_wait`], whose messages name the value as
+    /// written, so they are not checked twice (acs-fode).
     pub fn new(
         sequence: Vec<(u16, Proto)>,
         delay: Duration,
@@ -104,37 +106,43 @@ impl Knock {
             wait,
             host,
         };
-        let n = knock.sequence.len();
+        knock.check().map(|()| knock)
+    }
+
+    fn check(&self) -> Result<(), String> {
+        let n = self.sequence.len();
         if n == 0 {
             return Err("a knock sequence needs at least one port".into());
         }
-        if n > MAX_KNOCKS {
-            return Err(format!("'{knock}': {n} knocks, at most {MAX_KNOCKS}"));
-        }
-        if delay > MAX_DELAY {
-            return Err(format!(
-                "a knock delay of {} is too long: at most {}",
-                format_timeout(delay),
-                format_timeout(MAX_DELAY)
-            ));
-        }
-        if wait > MAX_WAIT {
-            return Err(format!(
-                "a knock wait of {} is too long: at most {}",
-                format_timeout(wait),
-                format_timeout(MAX_WAIT)
-            ));
-        }
-        let total = delay * (n as u32 - 1);
-        if total > MAX_SEQUENCE_TIME {
-            return Err(format!(
-                "'{knock}': {n} knocks {} apart take {}, more than knockd's {} seq_timeout",
-                format_timeout(delay),
+        let total = self.delay * (n as u32 - 1);
+        let why = if n > MAX_KNOCKS {
+            format!("{n} knocks, at most {MAX_KNOCKS}")
+        } else if total > MAX_SEQUENCE_TIME {
+            format!(
+                "{n} knocks {} apart take {}, more than knockd's {} seq_timeout",
+                format_timeout(self.delay),
                 format_timeout(total),
                 format_timeout(MAX_SEQUENCE_TIME)
-            ));
+            )
+        } else {
+            return Ok(());
+        };
+        Err(format!("'{self}': {why}"))
+    }
+
+    /// Set the timing key `key` — `delay`, `wait` or `host` — from `value`,
+    /// for the file's mapping and the command line's `/key=value` alike
+    /// (§6): `Ok(false)` for a key it does not know, an error naming the
+    /// key for a bad value.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<bool, String> {
+        match key {
+            "delay" => parse_delay(value).map(|d| self.delay = d),
+            "wait" => parse_wait(value).map(|w| self.wait = w),
+            "host" => parse_host(value).map(|h| self.host = Some(h)),
+            _ => return Ok(false),
         }
-        Ok(knock)
+        .map(|()| true)
+        .map_err(|e| format!("{key}: {e}"))
     }
 }
 
@@ -142,9 +150,9 @@ impl Knock {
 /// `--knock none` and `ACS_KNOCK=none`.
 pub const NO_KNOCK: &str = "none";
 
-/// The keys of a knock written as a mapping in the file (§6.1), in the
-/// order messages list them.
-pub const KNOCK_KEYS: &[&str] = &["sequence", "delay", "wait", "host"];
+/// The keys of a knock written as a mapping in the file (§6.1), as
+/// messages list them: `sequence`, then those [`Knock::set`] takes.
+pub const KNOCK_KEYS: &str = "sequence, delay, wait, host";
 
 /// A knock's `delay` (§4.3): a duration as `reachability_timeout` is
 /// written, from 0 to [`MAX_DELAY`].
@@ -183,26 +191,21 @@ pub fn parse_spec(text: &str) -> Result<Option<Knock>, String> {
         return Ok(None);
     }
     let mut parts = t.split('/');
-    let base = Knock::parse(parts.next().unwrap_or_default())?;
-    let (mut delay, mut wait, mut host) = (base.delay, base.wait, None);
+    let mut knock = Knock::parse(parts.next().unwrap_or_default())?;
     for part in parts {
         let Some((key, value)) = part.split_once('=') else {
             return Err(format!(
                 "'/{part}': expected /delay=, /wait= or /host= after the sequence"
             ));
         };
-        match key.trim() {
-            "delay" => delay = parse_delay(value).map_err(|e| format!("delay: {e}"))?,
-            "wait" => wait = parse_wait(value).map_err(|e| format!("wait: {e}"))?,
-            "host" => host = Some(parse_host(value)?),
-            other => {
-                return Err(format!(
-                    "unknown knock option '{other}' (known: delay, wait, host)"
-                ))
-            }
+        let key = key.trim();
+        if !knock.set(key, value)? {
+            return Err(format!(
+                "unknown knock option '{key}' (known: delay, wait, host)"
+            ));
         }
     }
-    Knock::new(base.sequence, delay, wait, host).map(Some)
+    knock.check().map(|()| Some(knock))
 }
 
 /// The sequence in knockd's syntax, `:udp` written only where it applies.
@@ -245,17 +248,11 @@ pub struct Sockets;
 
 impl Net for Sockets {
     fn tcp(&mut self, to: SocketAddr) -> io::Result<()> {
-        tcp_knock(to)
+        knock_one(to, Proto::Tcp)
     }
 
     fn udp(&mut self, to: SocketAddr) -> io::Result<()> {
-        let local: IpAddr = match to {
-            SocketAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
-            SocketAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
-        };
-        // Dropped, and so closed, on return: an ICMP unreachable that comes
-        // back is never read.
-        UdpSocket::bind((local, 0))?.send_to(&[], to).map(drop)
+        knock_one(to, Proto::Udp)
     }
 
     fn sleep(&mut self, d: Duration) {
@@ -263,34 +260,41 @@ impl Net for Sockets {
     }
 }
 
-/// One TCP knock: a non-blocking connect, closed before this returns.
-fn tcp_knock(to: SocketAddr) -> io::Result<()> {
+/// One knock from a socket closed before this returns: for TCP a
+/// non-blocking connect, for UDP an empty datagram. The same socket calls
+/// for both, rather than std's `UdpSocket` beside them (acs-fode).
+fn knock_one(to: SocketAddr, proto: Proto) -> io::Result<()> {
     let family = match to {
         SocketAddr::V4(_) => libc::AF_INET,
         SocketAddr::V6(_) => libc::AF_INET6,
     };
-    let raw = crate::sys::cvt(unsafe { libc::socket(family, libc::SOCK_STREAM, 0) })?;
+    let kind = match proto {
+        Proto::Tcp => libc::SOCK_STREAM,
+        Proto::Udp => libc::SOCK_DGRAM,
+    };
+    let raw = crate::sys::cvt(unsafe { libc::socket(family, kind, 0) })?;
     // Owned from here on, so every path out closes it.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     crate::sys::set_cloexec(raw)?;
     crate::sys::set_nonblocking(raw, true)?;
     let (storage, len) = sockaddr(to);
+    let at = &storage as *const libc::sockaddr_storage as *const libc::sockaddr;
     let r = unsafe {
-        libc::connect(
-            raw,
-            &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
-            len,
-        )
+        match proto {
+            Proto::Tcp => libc::connect(raw, at, len) as isize,
+            Proto::Udp => libc::sendto(raw, std::ptr::null(), 0, 0, at, len),
+        }
     };
-    let err = (r != 0).then(io::Error::last_os_error);
+    let err = (r < 0).then(io::Error::last_os_error);
     // Closed at once: in SYN_SENT this discards the socket before it can
-    // retransmit (§4.1).
+    // retransmit (§4.1); an ICMP unreachable a datagram brings back is
+    // never read.
     drop(fd);
     match err.as_ref().and_then(io::Error::raw_os_error) {
         // Sent, and still on its way; or sent and refused.
         Some(libc::EINPROGRESS) | Some(libc::ECONNREFUSED) => Ok(()),
         Some(_) => Err(err.unwrap()),
-        // Completed at once: something listens there.
+        // Completed at once: something listens there, or the datagram went.
         None => Ok(()),
     }
 }
@@ -419,7 +423,7 @@ pub fn send_with(
         }
         return Ok(outcome);
     }
-    let mut last_drop: Option<String> = None;
+    let mut last_drop = String::new();
     for (i, &(port, proto)) in knock.sequence.iter().enumerate() {
         if i > 0 && !knock.delay.is_zero() {
             net.sleep(knock.delay);
@@ -433,18 +437,19 @@ pub fn send_with(
             };
             match sent {
                 Ok(()) => kept.push(a),
-                Err(e) if unreachable(&e) => last_drop = Some(format!("{a}: {e}")),
-                // The address alone: the port is the sequence, never told.
-                Err(e) => return Err(format!("{a}: {e}")),
+                Err(e) => {
+                    // The address alone: the port is the sequence, never told.
+                    last_drop = format!("{a}: {e}");
+                    if !unreachable(&e) {
+                        return Err(last_drop);
+                    }
+                }
             }
         }
         live = kept;
         if live.is_empty() {
             // Only reached through a drop, so `last_drop` is set.
-            return Err(format!(
-                "no address can be reached ({})",
-                last_drop.unwrap_or_default()
-            ));
+            return Err(format!("no address can be reached ({last_drop})"));
         }
     }
     let done = Instant::now();
@@ -528,30 +533,33 @@ pub fn by_family(mut addrs: Vec<IpAddr>, family: AddressFamily) -> Vec<IpAddr> {
 
 /// The `-v` lines for a knock to `target` (§7): what was knocked and how,
 /// and what was knocked so recently that it was not knocked again. They
-/// name the host, its addresses and the count, **never the ports**.
-pub fn report(target: &str, knock: &Knock, o: &Outcome) -> Vec<String> {
-    let mut lines = Vec::new();
+/// name the host, its addresses and the count, **never the ports**. Each
+/// goes to `log` as it is made.
+pub fn report(target: &str, knock: &Knock, o: &Outcome, log: &mut dyn FnMut(String)) {
+    use fmt::Write;
     if !o.knocked.is_empty() {
-        let addrs: Vec<String> = o.knocked.iter().map(IpAddr::to_string).collect();
+        // One string written into, not a `format!` per part (acs-fode).
         let n = knock.sequence.len();
-        let mut l = format!(
-            "knocking {target} ({}): {n} knock{}",
-            addrs.join(", "),
-            if n == 1 { "" } else { "s" }
-        );
-        if n > 1 {
-            l.push_str(&format!(", {} ms apart", knock.delay.as_millis()));
+        let mut l = format!("knocking {target} (");
+        for (i, a) in o.knocked.iter().enumerate() {
+            let _ = write!(l, "{}{a}", if i > 0 { ", " } else { "" });
         }
-        l.push_str(&format!(", then {} ms", knock.wait.as_millis()));
-        lines.push(l);
+        let _ = write!(l, "): {n} knock{}", if n == 1 { "" } else { "s" });
+        if n > 1 {
+            let _ = write!(l, ", {} ms apart", knock.delay.as_millis() as u64);
+        }
+        let _ = write!(l, ", then {} ms", knock.wait.as_millis() as u64);
+        log(l);
     }
     if let Some(ago) = o.ago {
-        lines.push(format!(
-            "{target} was knocked {:.1} s ago — not knocking again",
-            ago.as_secs_f32()
+        // Tenths, rounded, as `{:.1}` of the seconds would.
+        let t = (ago.as_millis() as u64 + 50) / 100;
+        log(format!(
+            "{target} was knocked {}.{} s ago — not knocking again",
+            t / 10,
+            t % 10
         ));
     }
-    lines
 }
 
 /// Knock where a dial to `dest` will connect (§3): the [`target`], its
@@ -575,7 +583,7 @@ pub fn before_dial(
     }
     let outcome =
         send(&addrs, knock).map_err(|e| Refusal::Unreachable(format!("knock: {target}: {e}")))?;
-    report(target, knock, &outcome).into_iter().for_each(log);
+    report(target, knock, &outcome, log);
     Ok(target.to_string())
 }
 
@@ -589,21 +597,22 @@ pub fn hint(target: &str) -> String {
 
 /// Whether ssh's stderr says it could not connect at all — a timeout or a
 /// refusal — which is how a knock that did not open the port ends.
-pub fn connect_failed(stderr: &str) -> bool {
+/// Bytes, not text: ssh's stderr is read as it comes (acs-fode).
+pub fn connect_failed(stderr: &[u8]) -> bool {
     [
-        "Connection timed out",
-        "Operation timed out",
-        "Connection refused",
+        &b"Connection timed out"[..],
+        b"Operation timed out",
+        b"Connection refused",
     ]
     .iter()
-    .any(|m| stderr.contains(m))
+    .any(|m| stderr.windows(m.len()).any(|w| w == *m))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
 
     const V4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
     const V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
@@ -744,14 +753,19 @@ mod tests {
         };
         assert!(new(0, 0).is_ok());
         assert!(new(5000, 10_000).is_ok());
+        // The delay and the wait are bounded where they are read.
+        let mut k = new(0, 0).unwrap();
+        assert_eq!(k.set("delay", "5s"), Ok(true));
         assert_eq!(
-            new(5001, 0).unwrap_err(),
-            "a knock delay of 5001ms is too long: at most 5s"
+            k.set("delay", "5001ms").unwrap_err(),
+            "delay: '5001ms' is too long: at most 5s"
         );
         assert_eq!(
-            new(0, 10_001).unwrap_err(),
-            "a knock wait of 10001ms is too long: at most 10s"
+            k.set("wait", "10001ms").unwrap_err(),
+            "wait: '10001ms' is too long: at most 10s"
         );
+        assert_eq!(k.set("pause", "1s"), Ok(false));
+        assert_eq!((k.delay, k.wait), (MAX_DELAY, Duration::ZERO));
         // Sixteen knocks a second apart take 15 s: the limit, accepted.
         let ports = |n: u16| (1..=n).map(|p| (p, Proto::Tcp)).collect::<Vec<_>>();
         let second = Duration::from_secs(1);
@@ -1132,6 +1146,11 @@ mod tests {
     /// port — and says when a knock was reused.
     #[test]
     fn the_v_lines_never_name_a_port() {
+        let report = |target: &str, k: &Knock, o: &Outcome| {
+            let mut lines = Vec::new();
+            report(target, k, o, &mut |l| lines.push(l));
+            lines
+        };
         let k = knock("7001,8002:udp,9003");
         let o = Outcome {
             knocked: vec![V4, V6],
@@ -1187,10 +1206,10 @@ mod tests {
             "ssh: connect to host gate port 22: Operation timed out",
             "ssh: connect to host gate port 22: Connection refused",
         ] {
-            assert!(connect_failed(said), "{said}");
+            assert!(connect_failed(said.as_bytes()), "{said}");
         }
-        assert!(!connect_failed("me@gate: Permission denied (publickey)."));
-        assert!(!connect_failed("Could not resolve hostname gate"));
+        assert!(!connect_failed(b"me@gate: Permission denied (publickey)."));
+        assert!(!connect_failed(b"Could not resolve hostname gate"));
     }
 
     /// A send error names the address, never the port (§7).

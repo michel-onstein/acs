@@ -94,7 +94,7 @@ flowchart LR
    protocols, and terminal queries/replies all work as if you had run `ssh -t`.
 2. **One binary** for both sides and for both client platforms (macOS and
    Linux), statically linked on Linux, that can install itself on a remote
-   (§8). Slim build < 1.15 MB; with the embedded Linux payloads < 2.3 MB.
+   (§8). Slim build < 1.18 MB; with the embedded Linux payloads < 2.36 MB.
 3. **Survive network interruption** with no lost output, and detect a dead link
    in seconds rather than a minute.
 4. **Command mode** on a double-tap of Ctrl-] (§6): `d` detach, `x` exit.
@@ -2918,18 +2918,17 @@ affected by someone else's install.
 
 | Target | Slim | Complete |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 1135 KB | 2.28 MB |
-| `aarch64-unknown-linux-musl` | 1009 KB | 2.15 MB |
-| `aarch64-apple-darwin` | 841 KB | 1.99 MB |
-| `x86_64-apple-darwin` | 932 KB | 2.09 MB |
+| `x86_64-unknown-linux-musl` | 1173 KB | 2.35 MB |
+| `aarch64-unknown-linux-musl` | 1040 KB | 2.22 MB |
+| `aarch64-apple-darwin` | 874 KB | 2.05 MB |
+| `x86_64-apple-darwin` | 969 KB | 2.16 MB |
 
-The payload set (both Linux builds, gzip'd) is 1142 KB. Measured 2026-10-28
-with the copy's phases 1–5 (`src/cp`: the local copy, `acs _cp`, resume and
-redial; the `acscp` link; the relay between two hosts and remote wildcards),
-the part's lock (acs-hofu.13) and mixed sources (acs-hofu.14) in release
-builds. The
-budget `cargo xtask dist` enforces is slim ≤ 1.15 MB and complete ≤ 2.3 MB
-(goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them, and
+The payload set (both Linux builds, gzip'd) is 1179 KB. Measured 2026-11-18
+with the copy (`src/cp`, below) and port knocking
+([KNOCK_DESIGN.md](KNOCK_DESIGN.md), trimmed: below) in release builds. The
+budget `cargo xtask dist` enforces is slim ≤ 1.18 MB and complete ≤ 2.36 MB
+(goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them,
+from 1.15 MB / 2.3 MB for port knocking (decision 20), and
 from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9): built into a
 release at that same commit, the copy's phase 1 took x86_64 Linux to 1110 KB
 slim and 2.22 MB complete — 64 KB and 125 KB more, since the complete build
@@ -3108,6 +3107,61 @@ download, the relay, the local copy and the upload it already had, in
 turn, and the grouping of sources by host that the relay had inlined is
 one function now, called by the download as well — which is what made
 x86_64 smaller, not larger.
+
+**Port knocking** (KNOCK_DESIGN, acs-8l1v; trimmed and budgeted by
+acs-fode, decision 20), measured with `cargo xtask dist` against 85a590e,
+the 0.21.0 release without it, at 85748e8 (the knock's steps 2–5 built)
+and after the trims:
+
+| Target | 0.21.0 slim | Slim, at 85748e8 | Slim, trimmed | Knock | 0.21.0 complete | Complete, at 85748e8 | Complete, trimmed | Knock |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `x86_64-unknown-linux-musl` | 1,143,208 B | 1,177,552 B | 1,172,624 B | +29,416 B | 2,293,841 B | 2,360,963 B | 2,351,876 B | +58,035 B |
+| `aarch64-unknown-linux-musl` | 1,016,152 B | 1,043,704 B | 1,039,960 B | +23,808 B | 2,166,785 B | 2,227,115 B | 2,219,212 B | +52,427 B |
+| `aarch64-apple-darwin` | 857,376 B | 874,112 B | 874,080 B | +16,704 B | 2,001,616 B | 2,051,088 B | 2,051,056 B | +49,440 B |
+| `x86_64-apple-darwin` | 939,752 B | 972,680 B | 968,568 B | +28,816 B | 2,103,216 B | 2,173,568 B | 2,157,024 B | +53,808 B |
+
+KNOCK_DESIGN goal 6 expected under 10 KB of x86_64 slim; it measured
+34,344 B before the trims and 29,416 B after. Steps 2 and 3 (the parser
+and the configuration, with the sender still unlinked) were +15,232 B;
+step 4, the dial's knock, +14,992 B more, of which about 2.9 KB was the
+watch on ssh's stderr behind the hint; step 5 (`acs config`) +4,120 B.
+By `nm` on unstripped builds, about 27 KB of the cost is code — the dial's
+knock with the sender, reuse table and `-v` lines inlined (4.3 KB), the
+file's `knock` key (1.7 KB) and its share of `Config::apply` (1.6 KB), the
+`--knock` parsing in `acs`, `acscp` and `acs config` (about 3 KB), the
+alias resolution and the dial — and about 4 KB more unwind tables. The
+trims, each without a change of behaviour, by what each saved of x86_64
+slim:
+
+- **The stderr watch**, 1,592 B: its thread signalled through an
+  `Arc<AtomicBool>` and a `()` channel, a channel instance of its own; it
+  sets two bits of one `AtomicU8`, which the dial polls for at most 100 ms
+  as `Link::eof` polls ssh, and looks for ssh's words in the bytes rather
+  than a lossy string. (A `bool` channel, the one the TCP probe already
+  links, grew the build by 1,048 B: its inlining moved.)
+- **One key setter**, 1,632 B: `--knock`'s `/delay=`, `/wait=` and
+  `/host=` and the file mapping's keys go through `Knock::set`; the knock
+  keys are one string rather than a list joined at each message; and
+  `Knock::new` no longer checks the delay and wait a second time, as
+  `parse_delay` and `parse_wait` already bound them where they are read.
+- **The UDP knock through the TCP knock's socket calls**, 616 B: one
+  `socket`, then `connect` or an empty `sendto`, rather than std's
+  `UdpSocket` beside it.
+- **No `Node` clone**, 688 B: `acs config` moves a lone sequence out of
+  the mapping it built rather than cloning it, the only `Node` clone in the
+  binary.
+- **Fewer `format!`s**, 400 B: the `-v` lines are written into one string
+  and handed to the log as made, the sender's errors are formatted once,
+  and `--knock`/`ACS_KNOCK` share one parse call.
+
+Not cut: the hint's watch itself (a thread copying ssh's stderr, about
+1.3 KB), since without it the hint would follow any exit 255, an
+authentication failure included; the `-v` lines; the proxy refusal and the
+`Refusal` type that tells it from an unreachable host (a few hundred
+bytes); and the reuse table, which compares whole sequences rather than a
+hash of them. With the trims the budget was raised to 1.18 MB / 2.36 MB
+(decision 20), leaving 7,376 B of slim room and 8,124 B of complete room
+on x86_64 Linux.
 
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
@@ -3344,3 +3398,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 17 | Local and remote sources in one copy, and downloads from several hosts (acs-hofu.14) | Decided 2026-10-28, beyond ACSCP_DESIGN §5.6 and §12, which do not cover the case: `acscp a h1:b dst`, `acscp a h1:b h2:dst` and `acscp h1:a h2:b dir` are **run in parts, with the pieces that already exist** — no new protocol, endpoint or relay mode. The remote sources are grouped by host, in the order the command line first names each; **each host's group goes first, in turn** — a download per host into a local target, a relay per host (decision 15) into a remote one — **then the local sources**: a local copy into a local target, one upload into a remote one. Each part is its own connection (or connections), with its own redial where it has one. **Several sources in all, or a wildcard among them (decision 16), need the target to be a directory, decided once over the whole command line:** a local target is looked at before anything is dialled; a remote one is checked by the first part, a relay, from the target's `WELCOME` before any data goes — which is why the hosts go first: a lone local file uploaded first would be written as the target before the relay could find it is not a directory. The local sources are checked before anything is dialled, as for any copy (ACSCP_DESIGN §4.2); one that fails is reported and skipped, and the rest of the copy goes on. Every part's counts are summed into one report and exit status; **a part that breaks off ends the copy** and the parts after it are not run, so the same command run again finishes it from the parts already written. Chosen over one interleaved stream (a sender that walks local files and relays remote ones on one target link), which would mean a new endpoint for a case taken "when someone misses it" in the copy's last 10 KB of budget (decision 13); the parts cost nothing new — the x86_64 slim build shrank, since the grouping by host became one function the download and the relay share (§8.1) |
 | 18 | `ConnectTimeout` through a proxy (acs-7sti) | Decided 2026-11-05, after a jump host's password typed in more than 10 s gave `Connection timed out during banner exchange` and a fresh dial, every time. OpenSSH applies `ConnectTimeout` to the TCP connect **and** the banner exchange; through a `ProxyJump` or `ProxyCommand` the outer ssh's connect is to the proxy's pipe, so the option bounds nothing but the banner, which waits on the jump host's login. **A session dial through a proxy goes without it**, and acs's own deadlines bound it — 30 s on a redial (`ACS_REDIAL_TIMEOUT_MS`), 120 s on the first connection (`ACS_DIAL_TIMEOUT_MS`) — as they already bound a password asked by the host itself; a dead network is still seen by netwatch (§5.3), and a `ConnectTimeout` the user's own config sets for the jump host still applies to it. Whether a dial is proxied is `ssh -G` with the command line's options, asked before **every** session dial (a few ms) rather than once, because an alias may move the destination between dials; it covers `-J`, `-o ProxyJump`/`ProxyCommand` and ssh_config alike, and where it fails or takes more than 2 s the option stays. Direct dials keep `ConnectTimeout=10`, so a redial into a dead network still fails fast. Chosen over dropping the option everywhere, which would cost that fast failure, and over a longer fixed value, which only moves the cut-off. `acs list` keeps it: it runs in `BatchMode`, where nobody is typing (§3, §7.3) |
 | 19 | Running a command as ssh does (§7.7) | Decided 2026-11-17. `acs host -- cmd` used to fall into the session menu, which could attach a detached session and silently drop the command, and a command was exec'd as an argv, so `acs host s -- 'a \| b'` looked for a program called `a \| b`. Now **a command with no session named is a one-shot**, in a new numbered session that ends with it, and **every command is read by the login shell, its words joined with spaces**, as ssh and `dsh` (which ran through `ssh -t`) both did — one rule for quoting, the one ssh users already know. **Without a terminal, acs execs ssh** rather than carrying a pipe through a session: a pty cannot carry binary data, separate stderr or an end of file, and a resumable pipe needs per-stream offsets and an EOF frame in the protocol (§5.1) — a follow-up, not this change. The price is no resume for a piped command, the same as ssh's |
+| 20 | Port knocking's size budget (acs-fode) | Decided by the maintainer 2026-11-18: **trim, then raise**. Port knocking (KNOCK_DESIGN goal 6, §11.3) was expected to cost under 10 KB of the x86_64 musl slim build and measured 34,344 B against 0.21.0, taking slim to 1,177,552 B and complete to 2,360,963 B — past the 1.15 MB / 2.3 MB budget, so `cargo xtask dist` (and with it a release) failed. Trimmed first, without dropping anything the design promises: the stderr watch behind the hint (1,592 B), one key setter for `--knock` and the file's mapping (1,632 B), the UDP knock through the TCP knock's socket calls (616 B), no `Node` clone in `acs config` (688 B) and fewer `format!`s (400 B) — 4,928 B in all, leaving the knock at 29,416 B (§8.1 has every target and each cut). Then the overall budget was **raised to slim ≤ 1.18 MB and complete ≤ 2.36 MB** (goal 2), just above what remains — x86_64 Linux 1,172,624 B slim and 2,351,876 B complete; aarch64 Linux 1,039,960 B and 2,219,212 B; aarch64 macOS 874,080 B and 2,051,056 B; x86_64 macOS 968,568 B and 2,157,024 B — with 7,376 B and 8,124 B of x86_64 Linux room. The copy's own 100 KB (decision 13) is unchanged |

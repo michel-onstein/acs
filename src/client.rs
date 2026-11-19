@@ -1192,46 +1192,48 @@ pub(crate) fn knock_before(conn: &Connection, tr: &ssh::Transport) -> io::Result
 
 /// ssh's stderr on a dial that knocked: passed through to ours as it
 /// comes, and watched for the connect failure a knock that did not open
-/// the port ends in (KNOCK_DESIGN §7).
-struct StderrWatch {
-    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    done: std::sync::mpsc::Receiver<()>,
-}
+/// the port ends in (KNOCK_DESIGN §7). One shared state, [`SEEN`] and
+/// [`DONE`] bits, polled at the end as [`Link::eof`] polls ssh: a channel
+/// cost a kilobyte more of the slim build (acs-fode).
+struct StderrWatch(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+/// [`StderrWatch`]'s bits: ssh said it could not connect; its stderr ended.
+const SEEN: u8 = 1;
+const DONE: u8 = 2;
 
 impl StderrWatch {
-    fn new(mut pipe: std::process::ChildStderr) -> StderrWatch {
-        use std::io::Read;
-        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (tx, done) = std::sync::mpsc::channel();
-        let seen = failed.clone();
+    fn new(pipe: std::process::ChildStderr) -> StderrWatch {
+        use std::sync::atomic::Ordering::Relaxed;
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let seen = state.clone();
+        let fd = OwnedFd::from(pipe);
         std::thread::spawn(move || {
             let mut buf = [0u8; 1024];
             let mut tail = Vec::new();
-            loop {
-                let n = match pipe.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                };
+            while let Ok(n @ 1..) = sys::read(fd.as_raw_fd(), &mut buf) {
                 let _ = sys::write_all(2, &buf[..n]);
                 tail.extend_from_slice(&buf[..n]);
-                if crate::knock::connect_failed(&String::from_utf8_lossy(&tail)) {
-                    seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                if crate::knock::connect_failed(&tail) {
+                    seen.fetch_or(SEEN, Relaxed);
                 }
-                let keep = tail.len().saturating_sub(64);
-                tail.drain(..keep);
+                tail.drain(..tail.len().saturating_sub(64));
             }
-            drop(tx);
+            seen.fetch_or(DONE, Relaxed);
         });
-        StderrWatch { failed, done }
+        StderrWatch(state)
     }
 
     /// Whether ssh, now exited, said it could not connect: its last
     /// words are waited for, briefly.
     fn connect_failed(&self) -> bool {
-        let _ = self.done.recv_timeout(REAP_BOUND);
-        self.failed.load(std::sync::atomic::Ordering::Relaxed)
+        let until = Instant::now() + REAP_BOUND;
+        loop {
+            let s = self.0.load(std::sync::atomic::Ordering::Relaxed);
+            if s & DONE != 0 || Instant::now() >= until {
+                return s & SEEN != 0;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -3001,6 +3003,32 @@ mod tests {
                 "{call:?} may join, and then does not knock"
             );
         }
+    }
+
+    /// acs-fode: the stderr watch behind the hint (KNOCK_DESIGN §7), now
+    /// two bits of one atomic rather than a channel, still tells a failure
+    /// to connect from any other last words, split across reads or not, and
+    /// is not fooled by an ssh that said nothing.
+    #[test]
+    fn the_stderr_watch_sees_a_failure_to_connect() {
+        let watch = |script: &str| {
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", script])
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let w = StderrWatch::new(child.stderr.take().unwrap());
+            child.wait().unwrap();
+            w.connect_failed()
+        };
+        assert!(watch(
+            "echo 'ssh: connect to host g port 22: Connection refused' >&2"
+        ));
+        assert!(watch(
+            "printf 'ssh: connect to host g port 22: Connection ti' >&2; sleep 0.05; echo 'med out' >&2"
+        ));
+        assert!(!watch("echo 'me@g: Permission denied (publickey).' >&2"));
+        assert!(!watch("true"));
     }
 
     /// A refused knock travels in the dial's error, so that a caller can

@@ -1132,50 +1132,55 @@ fn knock_value(n: &Node) -> Result<Option<Knock>, (usize, String)> {
             return Err((
                 n.line,
                 format!(
-                    "expected a sequence such as 7000,8000:udp,9000, or a mapping of {}, found {}",
-                    KNOCK_KEYS.join(", "),
+                    "expected a sequence such as 7000,8000:udp,9000, or a mapping of {KNOCK_KEYS}, found {}",
                     other.kind()
                 ),
             ))
         }
     };
-    let (mut sequence, mut delay, mut wait, mut host) =
-        (None, knock::DEFAULT_DELAY, knock::DEFAULT_WAIT, None);
+    // The default timing, each key in turn set over it; no sequence until
+    // its key gives one.
+    let mut knock = Knock {
+        sequence: Vec::new(),
+        delay: knock::DEFAULT_DELAY,
+        wait: knock::DEFAULT_WAIT,
+        host: None,
+    };
+    let mut sequenced = false;
     for (k, v) in fields {
-        let scalar = || match &v.value {
-            Value::Scalar(s) => Ok(s.text.as_str()),
-            other => Err((
-                v.line,
-                format!("{k}: expected a value, found {}", other.kind()),
-            )),
-        };
-        let named = |e: String| (v.line, format!("{k}: {e}"));
-        if !KNOCK_KEYS.contains(&k.as_str()) {
+        let known = k == "sequence" || matches!(k.as_str(), "delay" | "wait" | "host");
+        if !known {
             return Err((
                 v.line,
-                format!(
-                    "unknown key '{k}' (a knock takes {})",
-                    KNOCK_KEYS.join(", ")
-                ),
+                format!("unknown key '{k}' (a knock takes {KNOCK_KEYS})"),
             ));
         }
-        if v.value == Value::Null {
-            continue;
-        }
-        match k.as_str() {
-            "sequence" => sequence = Some(Knock::parse(scalar()?).map_err(named)?.sequence),
-            "delay" => delay = knock::parse_delay(scalar()?).map_err(named)?,
-            "wait" => wait = knock::parse_wait(scalar()?).map_err(named)?,
-            _ => host = Some(knock::parse_host(scalar()?).map_err(named)?),
-        }
+        let text = match &v.value {
+            Value::Null => continue,
+            Value::Scalar(s) => s.text.as_str(),
+            other => {
+                return Err((
+                    v.line,
+                    format!("{k}: expected a value, found {}", other.kind()),
+                ))
+            }
+        };
+        let set = match k.as_str() {
+            "sequence" => Knock::parse(text)
+                .map(|s| knock.sequence = s.sequence)
+                .map_err(|e| format!("{k}: {e}")),
+            _ => knock.set(k, text).map(drop),
+        };
+        set.map_err(|e| (v.line, e))?;
+        sequenced |= k == "sequence";
     }
-    let sequence = sequence.ok_or_else(|| {
-        (
+    if !sequenced {
+        return Err((
             n.line,
             "a knock mapping needs 'sequence: <ports>', such as 7000,8000:udp,9000".to_string(),
-        )
-    })?;
-    Knock::new(sequence, delay, wait, host)
+        ));
+    }
+    Knock::new(knock.sequence, knock.delay, knock.wait, knock.host)
         .map(Some)
         .map_err(at(n))
 }
