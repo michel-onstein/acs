@@ -468,3 +468,37 @@ fn a_forward_without_a_terminal_is_refused() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("-L"));
 }
+
+/// acs-f1sp, DESIGN §5.5: a piped command's client away for longer than
+/// the host keeps an ended command for it (`ACS_PIPE_UNCLAIMED_MS`) comes
+/// back to a clear message and acs's no-session status — not a hang, and
+/// not someone else's session under the freed number.
+#[test]
+fn a_piped_client_back_after_the_unclaimed_bound_is_told_the_session_ended() {
+    let remote = Remote::installed();
+    remote.remote_env(&[("ACS_PIPE_UNCLAIMED_MS", "300")]);
+    let go = remote.home().join("go");
+    let cmd = format!(
+        "echo first; while [ ! -f '{}' ]; do sleep 0.05; done; echo second",
+        go.display()
+    );
+    let mut p = Piped::start(&remote, &["-T", "devbox", "--", &cmd]);
+    p.wait_stdout(b"first\n");
+    // The client stays away: its redial is held short of the host.
+    remote.hold_dial();
+    remote.cut_link();
+    std::fs::write(&go, "").unwrap();
+    wait_until(
+        T,
+        || !remote.session_exists("1"),
+        || "the ended command's session outlived its bound",
+    );
+    remote.release_dial();
+    assert_eq!(p.wait(), 4, "{}", p.stderr());
+    assert!(
+        p.stderr().contains("the command's session has ended"),
+        "{}",
+        p.stderr()
+    );
+    assert_eq!(p.stdout(), b"first\n");
+}

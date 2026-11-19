@@ -42,6 +42,13 @@ fn hello_within() -> Duration {
 fn orphan_after() -> Duration {
     sys::env_ms("ACS_MASTER_ORPHAN_MS", 30_000)
 }
+/// How long a command on pipes that has ended waits, with nobody attached,
+/// for its client to come back for the rest (DESIGN §5.5, decision 22): a
+/// week, which outlasts a laptop asleep over a weekend.
+/// `ACS_PIPE_UNCLAIMED_MS` changes it.
+fn unclaimed_after() -> Duration {
+    sys::env_ms("ACS_PIPE_UNCLAIMED_MS", 7 * 24 * 3600 * 1000)
+}
 /// Stop filling a client's buffer beyond this; the rest waits in the ring.
 const OUT_HIGH_WATER: usize = 64 * 1024;
 /// Stop reading a client's input while this much is waiting for the pty.
@@ -369,6 +376,9 @@ struct Master {
     /// Asked to end the session: on pipes too, it ends with the child, as
     /// a session on a pty does, without waiting for a DETACH.
     ending: bool,
+    /// On pipes, once the command has ended and nobody is attached: when
+    /// the master stops waiting for its client (acs-f1sp).
+    unclaimed_by: Option<Instant>,
 }
 
 /// `<dir>/<session>.master`, flocked by the live master for as long as it
@@ -511,6 +521,7 @@ impl Master {
             out_acked: 0,
             eof_at: None,
             ending: false,
+            unclaimed_by: None,
         })
     }
 
@@ -606,6 +617,25 @@ impl Master {
                 }
             }
             self.conns.retain(|c| !c.dead);
+            // A command on pipes that has ended waits for its client only
+            // so long with nobody attached: one killed or gone for good
+            // would otherwise leave it, ring and all, until someone ends it
+            // from the menu (DESIGN §5.5, acs-f1sp).
+            let ended = self.pipe
+                && self
+                    .child
+                    .as_ref()
+                    .is_some_and(|c| c.status.is_some() && !c.pty_open);
+            if !ended || self.active().is_some() {
+                self.unclaimed_by = None;
+            } else if *self
+                .unclaimed_by
+                .get_or_insert_with(|| Instant::now() + unclaimed_after())
+                <= Instant::now()
+            {
+                mlog!("nobody came back for the command's end; exiting");
+                return self.finish();
+            }
 
             let mut fds = vec![
                 sys::pollfd(self.listener.as_raw_fd(), libc::POLLIN),
@@ -643,7 +673,10 @@ impl Master {
 
             let now = Instant::now();
             let mut timeout = self.next_rebind.saturating_duration_since(now);
-            if let Some(d) = self.kill_deadline {
+            for d in [self.kill_deadline, self.unclaimed_by]
+                .into_iter()
+                .flatten()
+            {
                 timeout = timeout.min(d.saturating_duration_since(now));
             }
             for c in &self.conns {
@@ -1004,6 +1037,13 @@ impl Master {
         if h.session != self.session {
             let msg = format!("this is session '{}', not '{}'", self.session, h.session);
             return reject(&mut self.conns[i], err::BAD_REQUEST, msg);
+        }
+        // A command on pipes resumes only its own instance: this master is
+        // a later session under a freed name (acs-f1sp), not one to attach
+        // to — nor to take over from its own client.
+        if h.pipe && h.resume.is_some_and(|r| r.instance != self.instance) {
+            let msg = format!("no session '{}'", self.session);
+            return reject(&mut self.conns[i], err::NO_SESSION, msg);
         }
         let exists = self.child.is_some();
         if exists && h.pipe != self.pipe {
