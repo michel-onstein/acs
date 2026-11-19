@@ -68,6 +68,11 @@ pub struct Hello {
     pub resume: Option<Resume>,
     /// Command to run when the session is created; empty means `$SHELL -l`.
     pub command: Vec<String>,
+    /// Run the command without a terminal, on pipes (DESIGN §5.5): its
+    /// output arrives as stream records, and an empty INPUT ends its stdin.
+    /// Sent as a trailing byte only when set, so every other HELLO is
+    /// byte for byte what it was.
+    pub pipe: bool,
 }
 
 /// How the master is serving this attach (DESIGN §5.2).
@@ -401,6 +406,9 @@ impl Msg {
                     for a in &h.command {
                         w.str(a);
                     }
+                    if h.pipe {
+                        w.u8(1);
+                    }
                     ty::HELLO
                 }
                 Msg::Welcome(x) => {
@@ -563,6 +571,7 @@ impl Msg {
                 for _ in 0..n {
                     command.push(r.str("argv")?);
                 }
+                let pipe = r.pos < p.len() && r.bool("pipe")?;
                 Msg::Hello(Hello {
                     proto,
                     session,
@@ -574,6 +583,7 @@ impl Msg {
                     size,
                     resume,
                     command,
+                    pipe,
                 })
             }
             ty::WELCOME => Msg::Welcome(Welcome {
@@ -938,6 +948,7 @@ mod tests {
                     offset: 48210,
                 }),
                 command: vec!["htop".into(), "-d".into(), "10".into()],
+                pipe: false,
             }),
             Msg::Hello(Hello {
                 proto: 7,
@@ -950,6 +961,7 @@ mod tests {
                 size: WinSize::default(),
                 resume: None,
                 command: vec![],
+                pipe: true,
             }),
             Msg::Welcome(Welcome {
                 proto: 1,
@@ -1040,6 +1052,28 @@ mod tests {
             assert_eq!(d.next_msg().unwrap(), None);
             assert_eq!(d.pending(), 0);
         }
+    }
+
+    /// acs-182f: a HELLO on pipes is the HELLO it always was plus one
+    /// trailing byte, so every other HELLO — and a master or proxy that
+    /// never heard of pipes — reads exactly as before; any other byte there
+    /// is refused.
+    #[test]
+    fn the_pipe_flag_is_one_trailing_byte_only_when_set() {
+        let Msg::Hello(mut h) = samples().remove(0) else {
+            unreachable!()
+        };
+        let plain = Msg::Hello(h.clone()).to_bytes();
+        h.pipe = true;
+        let piped = Msg::Hello(h).to_bytes();
+        assert_eq!(piped.len(), plain.len() + 1);
+        assert_eq!(&piped[HEADER..plain.len()], &plain[HEADER..]);
+        assert_eq!(piped.last(), Some(&1));
+        let mut bad = piped.clone();
+        *bad.last_mut().unwrap() = 2;
+        let mut d = Decoder::new();
+        d.push(&bad);
+        assert_eq!(d.next_msg(), Err(ProtoError::BadValue("pipe")));
     }
 
     #[test]

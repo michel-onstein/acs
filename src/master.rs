@@ -295,6 +295,9 @@ struct Conn {
     /// (acs-3anc). Cleared by the first message, so a client answered BUSY
     /// may take its time deciding whether to take over.
     first_by: Option<Instant>,
+    /// A command on pipes has ended and this connection was sent its
+    /// EXIT (DESIGN §5.5).
+    exited: bool,
 }
 
 impl Conn {
@@ -312,10 +315,22 @@ impl Conn {
 
 struct Child {
     pid: i32,
-    pty: OwnedFd,
+    /// The pty, or on pipes the command's stdin, `None` once that is
+    /// closed (DESIGN §5.5).
+    pty: Option<OwnedFd>,
     command: String,
     status: Option<i32>,
+    /// Output may still come: the pty, or on pipes either of `outs`.
     pty_open: bool,
+    /// On pipes, the command's stdout and stderr, each with its record
+    /// tag; a stream is dropped at its end of file.
+    outs: Vec<(u8, OwnedFd)>,
+}
+
+impl Child {
+    fn fd(&self) -> RawFd {
+        self.pty.as_ref().map_or(-1, |f| f.as_raw_fd())
+    }
 }
 
 struct Master {
@@ -343,6 +358,17 @@ struct Master {
     /// `<dir>/<session>.master`, see [`MasterFile`].
     master_path: PathBuf,
     master_file: Option<MasterFile>,
+    /// The command runs on pipes, not a pty (DESIGN §5.5).
+    pipe: bool,
+    /// On pipes, the output offset the client has written out: the ring
+    /// never overwrites past it, attached or not.
+    out_acked: u64,
+    /// On pipes, where the client's input ended: stdin is closed once
+    /// everything before it is written.
+    eof_at: Option<u64>,
+    /// Asked to end the session: on pipes too, it ends with the child, as
+    /// a session on a pty does, without waiting for a DETACH.
+    ending: bool,
 }
 
 /// `<dir>/<session>.master`, flocked by the live master for as long as it
@@ -481,6 +507,10 @@ impl Master {
             next_touch: Instant::now() + TOUCH_EVERY,
             master_path,
             master_file: Some(master_file),
+            pipe: false,
+            out_acked: 0,
+            eof_at: None,
+            ending: false,
         })
     }
 
@@ -493,6 +523,10 @@ impl Master {
     /// How much more the ring takes before it overwrites what the active
     /// client has not been sent; unbounded with no active client.
     fn ring_room(&self) -> usize {
+        // Once asked to end, nobody waits for the rest: let it drain.
+        if self.pipe && !self.ending {
+            return self.ring.room_before_overwrite(self.out_acked);
+        }
         match self.active().map(|i| &self.conns[i].state) {
             Some(ConnState::Active { next }) => self.ring.room_before_overwrite(*next),
             _ => usize::MAX,
@@ -520,7 +554,7 @@ impl Master {
                 return Ok(());
             }
             if let Some(ch) = &self.child {
-                if ch.status.is_some() && !ch.pty_open {
+                if ch.status.is_some() && !ch.pty_open && (!self.pipe || self.ending) {
                     return self.finish();
                 }
             }
@@ -534,6 +568,25 @@ impl Master {
                 c.flush();
             }
             self.pump_output(OUT_HIGH_WATER);
+            // On pipes the session ends when its client has the end: EXIT
+            // once all output is sent, then a DETACH says it arrived
+            // (DESIGN §5.5).
+            if let Some(Child {
+                status: Some(status),
+                pty_open: false,
+                ..
+            }) = &self.child
+            {
+                let done = ConnState::Active {
+                    next: self.ring.end(),
+                };
+                for c in &mut self.conns {
+                    if c.state == done && !c.exited {
+                        c.exited = true;
+                        c.send(&Msg::Exit { status: *status });
+                    }
+                }
+            }
 
             // Ping the attached client after silence, and give up one that
             // stays silent: a client that vanished without closing (a laptop
@@ -560,16 +613,21 @@ impl Master {
             ];
             let pty_idx = fds.len();
             let mut pty_events = 0;
+            let room = self.ring_room();
             if let Some(ch) = &self.child {
-                if ch.pty_open {
-                    if self.ring_room() > 0 {
+                if ch.pty_open || self.pipe {
+                    if room > 0 && !self.pipe {
                         pty_events |= libc::POLLIN;
                     }
                     if !self.pty_in.is_empty() {
                         pty_events |= libc::POLLOUT;
                     }
                 }
-                fds.push(sys::wait_for(ch.pty.as_raw_fd(), pty_events));
+                fds.push(sys::wait_for(ch.fd(), pty_events));
+                for (_, f) in &ch.outs {
+                    let ev = if room > 3 { libc::POLLIN } else { 0 };
+                    fds.push(sys::wait_for(f.as_raw_fd(), ev));
+                }
             }
             let conn_base = fds.len();
             for c in &self.conns {
@@ -603,7 +661,11 @@ impl Master {
                 timeout = timeout.min(Duration::from_millis(ms));
             }
             // While the child is gone but the pty still drains, poll quickly.
-            if self.child.as_ref().is_some_and(|c| c.status.is_some()) {
+            if self
+                .child
+                .as_ref()
+                .is_some_and(|c| c.status.is_some() && c.pty_open)
+            {
                 timeout = timeout.min(Duration::from_millis(50));
             }
             sys::poll(&mut fds, sys::poll_timeout(timeout))?;
@@ -635,10 +697,13 @@ impl Master {
 
             if self.child.is_some() && pty_idx < fds.len() && conn_base > pty_idx {
                 let re = fds[pty_idx].revents;
-                if re & libc::POLLOUT != 0 {
+                // On pipes an error is the reader gone: the write says so.
+                if re & libc::POLLOUT != 0 || (self.pipe && re != 0) {
                     self.write_pty();
                 }
-                if re & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                if self.pipe {
+                    self.read_outs(&fds[pty_idx + 1..conn_base], &mut buf);
+                } else if re & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                     self.read_pty(&mut buf);
                 }
                 // A dead child and nothing more to read although we asked:
@@ -651,7 +716,7 @@ impl Master {
                         && ch.pty_open
                         && asked
                         && re & libc::POLLIN == 0
-                        && pty_drained(ch.pty.as_raw_fd())
+                        && pty_drained(ch.fd())
                     {
                         ch.pty_open = false;
                     }
@@ -672,7 +737,7 @@ impl Master {
                 }
             }
             self.conns.retain(|c| !c.dead);
-            if !self.pty_in.is_empty() {
+            if !self.pty_in.is_empty() || self.pipe {
                 self.write_pty();
             }
             self.ack_written();
@@ -707,6 +772,7 @@ impl Master {
                         live: Liveness::new(),
                         answered: 0,
                         first_by: Some(Instant::now() + hello_within()),
+                        exited: false,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -820,6 +886,10 @@ impl Master {
                 });
                 c.state = ConnState::Closing;
             }
+            // On pipes: an empty INPUT is the end of input at `seq`, and an
+            // ACK is how much output the client has written out (§5.5).
+            Msg::Input { seq, bytes } if self.pipe && bytes.is_empty() => self.eof_at = Some(seq),
+            Msg::Ack { seq } if self.pipe => self.out_acked = self.out_acked.max(seq),
             Msg::Input { seq, bytes } => {
                 // A sequence whose end does not fit in a u64 is not a
                 // sequence: treat the frame as malformed (acs-hpf).
@@ -852,6 +922,11 @@ impl Master {
                     "the client answered ping {} on this link",
                     self.conns[i].answered
                 );
+            }
+            // The client has the EXIT of a command on pipes: done.
+            Msg::Detach if self.pipe && self.child.as_ref().is_some_and(|c| c.status.is_some()) => {
+                self.cleanup();
+                std::process::exit(0);
             }
             Msg::Detach => {
                 mlog!("client detached");
@@ -931,6 +1006,14 @@ impl Master {
             return reject(&mut self.conns[i], err::BAD_REQUEST, msg);
         }
         let exists = self.child.is_some();
+        if exists && h.pipe != self.pipe {
+            let msg = format!(
+                "session '{}' {} a terminal and cannot be attached",
+                self.session,
+                if self.pipe { "runs without" } else { "has" }
+            );
+            return reject(&mut self.conns[i], err::BAD_REQUEST, msg);
+        }
         match (h.mode, exists) {
             (Mode::Attach, false) => {
                 let msg = format!("no session '{}'", self.session);
@@ -982,6 +1065,10 @@ impl Master {
         };
         // A new session starts at offset 0 so the first prompt is not lost.
         let next = if created { 0 } else { next };
+        // The client has written out what it resumes from (DESIGN §5.5).
+        if kind == AttachKind::Resumed {
+            self.out_acked = self.out_acked.max(next);
+        }
 
         let input_seq = self.written_to_pty();
         let c = &mut self.conns[i];
@@ -1008,8 +1095,13 @@ impl Master {
     }
 
     fn start_child(&mut self, h: &Hello) -> io::Result<()> {
-        let (pty, slave) = sys::openpty()?;
-        if h.size.cols > 0 && h.size.rows > 0 {
+        let pipe = h.pipe;
+        let (pty, slave) = match pipe {
+            // On pipes the "pty" is the command's stdin (DESIGN §5.5).
+            true => sys::pipe().map(|(r, w)| (w, r))?,
+            false => sys::openpty()?,
+        };
+        if h.size.cols > 0 && h.size.rows > 0 && !pipe {
             sys::set_winsize(slave.as_raw_fd(), &h.size)?;
             self.size = h.size;
         }
@@ -1081,17 +1173,29 @@ impl Master {
             cmd.env("COLORTERM", &h.colorterm);
         }
         let stdio = |fd: &OwnedFd| -> io::Result<Stdio> { Ok(Stdio::from(fd.try_clone()?)) };
-        cmd.stdin(stdio(&slave)?)
-            .stdout(stdio(&slave)?)
-            .stderr(stdio(&slave)?);
+        let mut outs = Vec::new();
+        cmd.stdin(stdio(&slave)?);
+        if pipe {
+            for tag in [1, 2] {
+                let (r, w) = sys::pipe()?;
+                sys::set_nonblocking(r.as_raw_fd(), true)?;
+                outs.push((tag, r));
+                match tag {
+                    1 => cmd.stdout(w),
+                    _ => cmd.stderr(w),
+                };
+            }
+        } else {
+            cmd.stdout(stdio(&slave)?).stderr(stdio(&slave)?);
+        }
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 // Make the pty (now fd 0) our controlling terminal.
-                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                if !pipe && libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 for s in [
@@ -1113,15 +1217,20 @@ impl Master {
             });
         }
         let child = cmd.spawn().map_err(|e| too_long(e, &desc))?;
+        // The command's ends of its pipes, held by `cmd` too: closed here,
+        // so the command's end of file is its own.
+        drop(cmd);
         drop(slave);
         sys::set_nonblocking(pty.as_raw_fd(), true)?;
         mlog!("started '{desc}' as pid {}", child.id());
+        self.pipe = pipe;
         self.child = Some(Child {
             pid: child.id() as i32,
-            pty,
+            pty: Some(pty),
             command: desc,
             status: None,
             pty_open: true,
+            outs,
         });
         // Dropping std's handle neither waits nor kills; we reap on SIGCHLD.
         drop(child);
@@ -1131,10 +1240,10 @@ impl Master {
     fn resize(&mut self, s: WinSize, force_redraw: bool) {
         let Some(ch) = &self.child else { return };
         if s.cols > 0 && s.rows > 0 && s != self.size {
-            let _ = sys::set_winsize(ch.pty.as_raw_fd(), &s);
+            let _ = sys::set_winsize(ch.fd(), &s);
             self.size = s;
         } else if force_redraw {
-            let pgrp = fg_pgrp(ch.pty.as_raw_fd()).unwrap_or(ch.pid);
+            let pgrp = fg_pgrp(ch.fd()).unwrap_or(ch.pid);
             let _ = sys::kill(-pgrp, libc::SIGWINCH);
         }
     }
@@ -1148,7 +1257,7 @@ impl Master {
         if want == 0 {
             return;
         }
-        match sys::read(ch.pty.as_raw_fd(), &mut buf[..want]) {
+        match sys::read(ch.fd(), &mut buf[..want]) {
             Ok(0) => ch.pty_open = false,
             Ok(n) => {
                 self.ring.push(&buf[..n]);
@@ -1187,21 +1296,59 @@ impl Master {
     }
 
     fn write_pty(&mut self) {
-        let Some(ch) = &self.child else { return };
-        if !ch.pty_open {
+        let Some(ch) = &mut self.child else { return };
+        if !ch.pty_open && !self.pipe {
             self.drop_queued_input();
             return;
         }
         while !self.pty_in.is_empty() {
-            match sys::write(ch.pty.as_raw_fd(), &self.pty_in) {
+            match sys::write(ch.fd(), &self.pty_in) {
                 Ok(0) => break,
                 Ok(n) => {
                     self.pty_in.drain(..n);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                // A command that closed its stdin reads no more: what it
+                // was sent is discarded, as ssh discards it (DESIGN §5.5).
+                Err(_) if self.pipe => {
+                    ch.pty = None;
+                    self.pty_in.clear();
+                }
                 Err(_) => {
-                    self.drop_queued_input();
-                    break;
+                    self.input.rewind(self.pty_in.len());
+                    self.pty_in.clear();
+                }
+            }
+        }
+        // The client's input ended here, and all of it is written.
+        if self.pipe && self.pty_in.is_empty() && self.eof_at == Some(self.input.written()) {
+            ch.pty = None;
+        }
+    }
+
+    /// On pipes: read the command's stdout and stderr into the ring, each
+    /// read one record — its tag, its length (`u16` BE), its bytes — so
+    /// the one ring and its one offset carry both streams (DESIGN §5.5).
+    /// `polled` are their poll entries, in `outs`' order.
+    fn read_outs(&mut self, polled: &[libc::pollfd], buf: &mut [u8]) {
+        for k in (0..polled.len()).rev() {
+            let want = buf.len().min(self.ring_room());
+            let Some(ch) = &mut self.child else { return };
+            if polled[k].revents == 0 || want <= 3 {
+                continue;
+            }
+            let (tag, fd) = &ch.outs[k];
+            match sys::read(fd.as_raw_fd(), &mut buf[3..want]) {
+                Ok(n) if n > 0 => {
+                    buf[0] = *tag;
+                    buf[1..3].copy_from_slice(&(n as u16).to_be_bytes());
+                    self.ring.push(&buf[..3 + n]);
+                    self.last_activity = Instant::now();
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                _ => {
+                    ch.outs.remove(k);
+                    ch.pty_open = !ch.outs.is_empty();
                 }
             }
         }
@@ -1248,10 +1395,11 @@ impl Master {
             self.cleanup();
             std::process::exit(0);
         };
+        self.ending = true;
         if ch.status.is_some() {
             return;
         }
-        let pgrp = fg_pgrp(ch.pty.as_raw_fd());
+        let pgrp = fg_pgrp(ch.fd());
         let _ = sys::kill(-ch.pid, libc::SIGHUP);
         if let Some(p) = pgrp.filter(|&p| p != ch.pid) {
             let _ = sys::kill(-p, libc::SIGHUP);
@@ -1266,7 +1414,7 @@ impl Master {
         if let Some(ch) = &self.child {
             if ch.status.is_none() {
                 mlog!("child ignored SIGHUP: SIGKILL");
-                if let Some(p) = fg_pgrp(ch.pty.as_raw_fd()) {
+                if let Some(p) = fg_pgrp(ch.fd()) {
                     let _ = sys::kill(-p, libc::SIGKILL);
                 }
                 let _ = sys::kill(-ch.pid, libc::SIGKILL);

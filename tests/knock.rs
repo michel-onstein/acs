@@ -334,7 +334,7 @@ fn no_knock_is_sent_to_a_guess() {
     assert_eq!(k.hits(), 0);
 }
 
-/// §3.1: a command run without a terminal execs ssh, and knocks before it.
+/// §3.1: a command run without a terminal knocks before its dial too.
 #[test]
 fn a_command_without_a_terminal_knocks_first() {
     let k = Knockd::new();

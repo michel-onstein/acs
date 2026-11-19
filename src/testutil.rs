@@ -268,6 +268,7 @@ pub fn hello(session: &str, mode: Mode, identity: &str) -> Hello {
         },
         resume: None,
         command: Vec::new(),
+        pipe: false,
     }
 }
 

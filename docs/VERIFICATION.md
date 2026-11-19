@@ -66,6 +66,7 @@ those tests ran.
 | Kitty keyboard protocol | program pushes kitty flags; client sends Ctrl-] Ctrl-] d as `CSI 93;5u` | Pass — detaches; the pushed flags are popped on the way out |
 | Mouse reports | program enables mode 1000; client sends an X10 report | Pass — program receives `1b 5b 4d 20 21 21` |
 | Killed connection | the host's `sshd-session` for the connection is killed mid-stream | Pass — reconnect, numbered output consecutive, nothing lost or repeated |
+| A piped command after a killed connection | `scripts/e2e_ssh.sh` (`e2e_23`, 2026-11-19, acs-182f): `acs dev@127.0.0.1 -- 'echo first; …; seq 1 200000; echo last-err >&2; exit 3'` into a pipe, the host's `sshd-session` killed after `first` and before the `seq` | Pass — redialled and resumed on pipes (DESIGN §5.5): stdout byte for byte, `last-err` once on stderr, exit status 3 |
 | Frozen host | `docker pause` for 4 s beyond the dead-link timeout | Pass — dead link detected in 3.0 s (`ACS_DEAD_MS=3000`), resumed with no loss |
 | `acs list <host>` | over ssh after the sessions above | Pass — sessions listed |
 | `acs list` on every alias | no host; aliases `box` (the container) and `gone` (192.0.2.1, answers no ping); ssh in `BatchMode` | Pass — `box` sessions under a HOST column, one stderr line for `gone`, exit 255 |

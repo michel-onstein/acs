@@ -257,7 +257,8 @@ shells).
   `flock(<dir>/<session>.master)`, with its pid inside, so a master starting
   under the same name while the socket is gone finds it, prods it to re-bind
   and steps aside (§4.1). It lets go at child exit, with the socket.
-- Child: `$SHELL -l` in `$HOME` by default (`dsh` hardcodes `zsh -l`),
+- Child: on the pty, or for a command without a terminal on pipes
+  (§5.5). `$SHELL -l` in `$HOME` by default (`dsh` hardcodes `zsh -l`),
   overridable with `acs <host> [session] -- <command…>`, which runs as
   `$SHELL -c '<words joined with spaces>'` — as sshd runs a remote
   command, so quoting, pipes and globs mean what they mean to
@@ -590,15 +591,15 @@ Length-prefixed, same format on the ssh leg and the unix-socket leg:
 
 | Type | Dir | Payload |
 | --- | --- | --- |
-| `HELLO` | c→m | proto version, session, mode (`attach`/`create`/`attach-or-create`), client identity, `force` flag, `TERM`, `COLORTERM`, cols, rows, xpixel, ypixel, optional `resume{instance, output_offset}` |
+| `HELLO` | c→m | proto version, session, mode (`attach`/`create`/`attach-or-create`), client identity, `force` flag, `TERM`, `COLORTERM`, cols, rows, xpixel, ypixel, optional `resume{instance, output_offset}`, `pipe` (a trailing byte, only when set: the command runs on pipes, §5.5) |
 | `BUSY` | m→c | identity attached and since when; the client may retry `HELLO` with `force` (§4.5) |
 | `WELCOME` | m→c | proto version, instance id, current output offset, `created` flag, `resumed` / `gap` / `fresh`, input sequence (bytes written to the pty so far — input sequence numbers count in the master's stream, so clients taking turns never collide) |
-| `DATA` | m→c | `u64` offset of first byte, then raw pty bytes |
-| `INPUT` | c→m | `u64` sequence of first byte, then raw bytes for the pty |
-| `ACK` | m→c | highest input sequence written to the pty |
+| `DATA` | m→c | `u64` offset of first byte, then raw pty bytes — on pipes, the ring's stream records (§5.5) |
+| `INPUT` | c→m | `u64` sequence of first byte, then raw bytes for the pty; on pipes, no bytes is the end of input at that sequence (§5.5) |
+| `ACK` | both | m→c: highest input sequence written to the pty; c→m, on pipes only: the output offset written out (§5.5) |
 | `RESIZE` | c→m | cols, rows, xpixel, ypixel |
 | `PING` / `PONG` | both | `u64` nonce |
-| `DETACH` | c→m | — |
+| `DETACH` | c→m | — (on pipes, after `EXIT`: the EXIT arrived, §5.5) |
 | `KILL` | c→m | identity, `force` (acs-fbo). From the attached client, or from the proxy for the menu's `END_SESSION` before any HELLO; either way a session another identity is attached to answers `BUSY` unless `force`, and the master holds an outside killer's connection until it exits (§4.3) |
 | `EXIT` | m→c | child wait status |
 | `TAKEOVER` | m→c | — (another client attached) |
@@ -1267,6 +1268,128 @@ lossless resume will not repaint it. So:
    the same detector, which outlives both the wait and the link (§6.1), so a
    press held when a backoff expires into a redial is still held when the
    wait comes back.
+
+### 5.5 A command on pipes
+
+`acs host -- cmd` without a terminal (§7.7) — `tar c dir | acs host -- tar
+x`, `acs host -- cat log > here` — is a session whose program has **pipes
+instead of a pty**: a stdin, a stdout and a stderr of its own, as sshd gives
+a command without `-t` (acs-182f, decision 21). Everything else is a
+session's: the one-shot numbered name (`--new`'s, §4.4) that ends with the
+command, the master, the ring, the input sequence, liveness, redial and
+resume (§5.2, §5.3). What is different is all on the far side of the frames
+the session already has; there is one new flag and no new frame type.
+
+```mermaid
+sequenceDiagram
+    participant C as client (stdin, stdout, stderr)
+    participant M as master
+    participant P as command (pipes)
+    C->>M: HELLO(pipe, create)
+    M->>P: $SHELL -c cmd, stdin/stdout/stderr on pipes
+    C->>M: INPUT(0, bytes…) … INPUT(n, empty) = end of input after n
+    P-->>M: stdout bytes / stderr bytes
+    M-->>C: DATA(offset, [1 len bytes][2 len bytes]…)
+    C->>M: ACK(offset written out)
+    Note over C,M: link drops: the command runs on, its output kept in the ring
+    C->>M: HELLO(pipe, resume offset) then unacked INPUT, the empty INPUT again
+    M-->>C: WELCOME(resumed), DATA from that offset
+    P-->>M: exits, both outputs at end of file
+    M-->>C: EXIT(status), once all output is sent
+    C->>M: DETACH (the EXIT arrived) — the master ends
+```
+
+- **HELLO** carries `pipe`, a trailing byte written only when set, so every
+  other HELLO is byte for byte what it was. The master runs the command on
+  pipes when it creates the session, and **refuses a HELLO whose `pipe`
+  differs from the session's** (`BAD_REQUEST`, "runs without a terminal
+  and cannot be attached"): a terminal attached to a stream of records
+  would show the records, and a pipe client attached to a pty would get a
+  screen. The session menu still lists a piped command whose client is
+  between links, as it lists any session nobody is attached to; choosing it
+  says the above (marking it there is acs-km7x).
+- **The master** creates three pipes, closes-on-exec its own ends, and
+  starts the command as it starts any (§4.2): `$SHELL -c`, `setsid`, the
+  same environment — without `TIOCSCTTY`, since there is no terminal. Its
+  stdin's write end stands where the pty was, so the input queue, its
+  high-water mark and the `ACK`s that count what the program has taken
+  (§5.2) are the pty's code unchanged. Resizes have nothing to resize and
+  fail harmlessly; a kill signals the command's process group, as it does
+  without a foreground group.
+- **One ring, one offset, both streams.** Each read from stdout or stderr is
+  one **record** in the ring: a tag (`1` stdout, `2` stderr), its length as
+  a `u16` BE, its bytes. DATA, resume and `WELCOME`'s offset are the
+  session's unchanged — offsets count ring bytes, records and all — and the
+  client splits the records back out to its own stdout and stderr, keeping
+  across DATA frames, and across links, the record it is in the middle of. A
+  tag other than 1 or 2 is a protocol error: nothing but the two streams is
+  ever written. Chosen over a DATA per stream with a ring and an offset each
+  (decision 21): that is a second ring, a second resume offset in HELLO and
+  WELCOME, and a second backpressure rule, for the one thing records give up
+  — a chatty stderr takes ring room from stdout, which backpressure makes a
+  matter of speed, not of loss. Records also keep the order the master read
+  the two streams in, which per-stream offsets would not.
+- **Output is kept until it is written out.** A pty session lets the ring
+  wrap while nobody is attached (§4.2) and repaints over a gap; a pipe has
+  no screen to repaint. So on pipes the client **ACKs output** — `ACK`
+  c→m, the offset it has written to its stdout and stderr, once per pass of
+  its loop that wrote any — and the master never overwrites past the last
+  ACK, attached or not, reading the command's output only while the ring
+  has room for a record (more than its 3-byte header). A resume's offset
+  counts as an ACK. The command therefore blocks on a full pipe while the
+  link is down, as it would on a slow reader, and loses nothing. A resume
+  that is not lossless (`gap`, or `fresh` into a session it did not create)
+  cannot happen to an honest master, and the client ends with "the
+  command's output was lost" rather than write past the hole. Throughput is
+  bounded by the ring per round trip (1 MiB by default, `ACS_RING`).
+- **End of input is an empty INPUT** at the sequence where stdin ended — a
+  frame a pty session never sends, since a terminal has no end of file to
+  pass and an INPUT with no bytes encodes to nothing (`encode_input`). The
+  master records it and closes the command's stdin once every byte before it
+  has been written, so the end comes in its place, after all the input. The
+  client sends it when stdin reaches end of file (at once for `-n`), and
+  again after every `WELCOME`, behind the unacked bytes it resends; the
+  master closes stdin once, and an empty INPUT after that changes nothing,
+  so a link lost on either side of it neither loses the end nor delivers it
+  twice. It needs no acknowledgement of its own: the input sequence places
+  it, and resending is free.
+- **Input the master did not acknowledge** is resent on resume and written
+  once (§5.2): the client keeps every byte until an `ACK` says the
+  command's stdin took it, and stops reading stdin while 1 MiB is unacked or
+  queued for the link, so a fast `tar c` waits for a slow link rather than
+  filling memory. A command that closes its stdin early reads no more: what
+  it was sent is discarded and acknowledged — what ssh does with input for
+  a closed channel — rather than queued for ever.
+- **EXIT waits for both streams.** The command's end is its exit status and
+  end of file on both stdout and stderr, as sshd waits for: a background job
+  that keeps stdout open keeps the session, as it keeps an ssh channel. Then
+  the master sends `EXIT` to an attached client once all output has been
+  sent to it — so it arrives behind the last DATA — and **waits for that
+  client's `DETACH`**, which says the EXIT arrived, before it unlinks its
+  socket and ends. A link lost before it gets the DETACH is resumed like any
+  other, and the resume is sent what was left and the EXIT again. A master
+  whose client never comes back stays, like a detached session, until it is
+  ended from `acs <host>`'s menu (a bound on that is acs-f1sp).
+- **Ending it early.** `SIGINT`, `SIGTERM` or `SIGHUP` to the client — Ctrl-C
+  on `acs host -- tail -f log | grep x` — sends `KILL` (§4.2) and waits for
+  the EXIT, so acs leaves with the command's status (129, its `SIGHUP`)
+  rather than leaving it running for a client that is not coming back. The
+  same Ctrl-C usually kills the link's ssh too, which shares the terminal's
+  process group, so the request is kept and sent again by the next link;
+  while no link is up a second signal gives up waiting, leaving the session
+  running. A stdout that no longer takes writes (`| head`) sends `KILL` and
+  leaves at once. A session asked to end stops on pipes as on a pty: with
+  the child, without waiting for a DETACH.
+- **Nothing of acs's on the streams.** No status line (§5.4), no Ctrl-L
+  (§5.2), no raw mode; the offline wait reads no stdin, which is the
+  command's input, and no command keys. Notes still go to stderr as for a
+  session, which `-v` makes many of.
+- **Versions.** The client always runs the remote acs of its own version
+  (§8), so its proxy and any master its proxy starts speak its protocol; a
+  piped command's session is always created by that master, and a resume
+  only ever reaches it. A master of another version never sees a pipe HELLO
+  — and if it did, would refuse it as a malformed frame, not misread it. No
+  frame changed for any other session, so `PROTO_VERSION` stays 1.
 
 ## 6. Command mode
 
@@ -2593,9 +2716,9 @@ closes. acs does the same, keeping what it adds where that still applies.
 | --- | --- | --- |
 | Form | `ssh host cmd args…` | `acs host -- cmd args…` — the `--` is needed, since a word after the host names a session |
 | How it runs | the words joined with spaces, read by the login shell (`$SHELL -c`) | the same, for a one-shot command and a named session's command alike (§4.2) |
-| Terminal | none unless `-t`; with `-t`, a pty | on a terminal (stdin and stdout both terminals), a **session of its own**; otherwise, or with `-T` or `-n`, none |
+| Terminal | none unless `-t`; with `-t`, a pty | on a terminal (stdin and stdout both terminals), a **session of its own** on a pty; otherwise, or with `-T` or `-n`, a session of its own on pipes (§5.5) |
 | Exit status | the command's; 255 for ssh's own failure; 255 when the command dies of a signal | the command's; 255 when the host cannot be reached; **128+n** when it dies of signal n in a session (§7) |
-| After a dropped link | the command loses its terminal and usually dies | in a session: redialled and resumed (§5.2), the command never knew; without a terminal: as ssh |
+| After a dropped link | the command loses its terminal, or its pipes, and usually dies | redialled and resumed (§5.2), the command never knew — on a terminal and, since acs-182f, without one (§5.5) |
 
 **On a terminal** — `acs host -- make test` — the command gets a new
 numbered session (`--new`'s, §4.4) that ends with it: no menu, which would
@@ -2607,26 +2730,33 @@ a dropped link is resumed, Ctrl-] Ctrl-] `d` leaves the command running
 always were, with the command read by the shell.
 
 **Without a terminal** — `acs host -- cat log > here`,
-`tar c dir | acs host -- tar x`, `acs -T host -- …` — a session is the
-wrong pipe: a pty turns `\n` into `\r\n`, merges stderr into stdout,
-edits what stdin carries and has no end of file to pass on. So the client
-does what ssh does and nothing more: it **execs ssh** (`Call::Side`: `-T`,
-no escape character) with the joined command, over the transport it
+`tar c dir | acs host -- tar x`, `acs -T host -- …` — a pty is the wrong
+pipe: it turns `\n` into `\r\n`, merges stderr into stdout, edits what
+stdin carries and has no end of file to pass on. So the command gets a
+numbered session of its own as on a terminal, but **on pipes** (§5.5): its
+stdin is acs's stdin through to end of file, its stdout and stderr are
+acs's, byte for byte and apart, and acs exits with its status — what
+`ssh -T host cmd` gives — and a dropped link is redialled and resumed as a
+session's is, so a long `tar` survives a flaky link. No status line, no
+Ctrl-L, no menu and no command keys: stdout and stdin are the command's.
+Ctrl-C ends the command on the host and acs with its status; a reader that
+stops (`| head`) ends it too. It runs over the transport the client
 resolved — the alias and its host (§7.3), identity, the `-i`/`-p`/`-J`/
-`-F`/`-o` options and acs's shared master (§3). stdin, stdout, stderr,
-end of file and the exit status are ssh's, so the command's, byte for byte.
-Nothing is installed on the host and there is nothing to resume.
+`-F`/`-o` options, acs's shared master (§3), a knock — and, being a
+session, needs acs on the host, installed as for any session (§8). Until
+acs-182f the client exec'd `ssh -T` here instead, which needed nothing on
+the host and resumed nothing (decision 19).
 
 | Option | ssh | acs |
 | --- | --- | --- |
-| `-t` | force a pty | run the command in a session even when stdout is not a terminal (stdin must be one: the session's keys and raw mode come from it) |
-| `-T` | no pty | run it without a terminal, as above; last of `-t` and `-T` wins |
-| `-n` | stdin from `/dev/null` | the same, and implies `-T` (a session reads its keys from stdin) |
+| `-t` | force a pty | run the command on a pty even when stdout is not a terminal (stdin must be one: the session's keys and raw mode come from it) |
+| `-T` | no pty | run it on pipes, as above; last of `-t` and `-T` wins |
+| `-n` | stdin from `/dev/null` | the same, and implies `-T` (a session on a pty reads its keys from stdin) |
 
 Refused, rather than quietly doing something else: `-t`, `-T` or `-n`
-without a command; `-T` or `-n` with a session name or `--new` (a session
-always has a terminal); `-n` with `-t`; and `-L` without a terminal — a
-forward lives on a session's own connection (§7.1), and there is none.
+without a command; `-T` or `-n` with a session name or `--new` (a named
+session has a terminal); `-n` with `-t`; and `-L` without a terminal — a
+forward is a terminal session's (§7.1).
 ssh's `-N` (no command) and `-f` (background) have no counterpart: a
 session is acs's way of keeping something running without a terminal
 attached.
@@ -2928,14 +3058,15 @@ affected by someone else's install.
 
 | Target | Slim | Complete |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 1173 KB | 2.35 MB |
-| `aarch64-unknown-linux-musl` | 1040 KB | 2.22 MB |
+| `x86_64-unknown-linux-musl` | 1174 KB | 2.35 MB |
+| `aarch64-unknown-linux-musl` | 1039 KB | 2.22 MB |
 | `aarch64-apple-darwin` | 874 KB | 2.05 MB |
-| `x86_64-apple-darwin` | 969 KB | 2.16 MB |
+| `x86_64-apple-darwin` | 964 KB | 2.16 MB |
 
-The payload set (both Linux builds, gzip'd) is 1179 KB. Measured 2026-11-18
-with the copy (`src/cp`, below) and port knocking
-([KNOCK_DESIGN.md](KNOCK_DESIGN.md), trimmed: below) in release builds. The
+The payload set (both Linux builds, gzip'd) is 1180 KB. Measured 2026-11-19
+with the copy (`src/cp`, below), port knocking
+([KNOCK_DESIGN.md](KNOCK_DESIGN.md), trimmed: below) and commands on pipes
+(§5.5, below) in release builds. The
 budget `cargo xtask dist` enforces is slim ≤ 1.18 MB and complete ≤ 2.36 MB
 (goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them,
 from 1.15 MB / 2.3 MB for port knocking (decision 20), and
@@ -3173,6 +3304,29 @@ hash of them. With the trims the budget was raised to 1.18 MB / 2.36 MB
 (decision 20), leaving 7,376 B of slim room and 8,124 B of complete room
 on x86_64 Linux.
 
+**Commands on pipes** (§5.5, acs-182f, decision 21), measured with
+`cargo xtask dist` against 3a08859, the `main` it was built on:
+
+| Target | Slim before | Slim after | Change | Complete before | Complete after | Change |
+| --- | --- | --- | --- | --- | --- | --- |
+| `x86_64-unknown-linux-musl` | 1,175,776 B | 1,173,544 B | −2,232 B | 2,357,144 B | 2,353,483 B | −3,661 B |
+| `aarch64-unknown-linux-musl` | 1,042,168 B | 1,039,200 B | −2,968 B | 2,223,536 B | 2,219,139 B | −4,397 B |
+| `aarch64-apple-darwin` | 874,192 B | 874,128 B | −64 B | 2,051,168 B | 2,051,104 B | −64 B |
+| `x86_64-apple-darwin` | 972,736 B | 964,496 B | −8,240 B | 2,169,504 B | 2,161,184 B | −8,320 B |
+
+The feature itself is about 4.1 KB of x86_64 slim (1,179,920 B with it and
+nothing else, 80 B under the slim budget and 4,955 B over the complete
+one): the master's pipes and records, the client's record splitter, ACKs and
+end of input, and the guards that keep the status line, raw mode and the
+offline wait's reads off the streams — less the `ssh -T` exec it replaces.
+It fits because of one trim, 6,376 B of x86_64 slim: the session client's
+`-v` note for an unexpected frame and `acs list`'s "unexpected" reply
+printed the frame with `{:?}`, and those two were the only runtime users of
+the derived `Debug` of `Msg` and everything in it; they name the frame with
+`Msg::kind` now, which acs-1cco added for the master because a DATA's
+`Debug` runs to megabytes. That leaves 6,456 B of slim room and 6,517 B of
+complete room on x86_64 Linux.
+
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
 appending the trailer and the macOS builds by rebuilding with
@@ -3407,5 +3561,6 @@ and **Remote self-install** make it a `dsh` replacement.
 | 16 | Remote wildcards (acs-hofu.7) | Decided 2026-10-28, carrying out ACSCP_DESIGN §5.4 and its decision 4: `acscp 'host:logs/*.gz' .` is expanded by **`acs _cp` itself**, since nothing goes through a shell after the prelude. A path component is a pattern when it holds `*`, `?` or `[`; `*` is any run, `?` one character, `[abc]`/`[a-z]`/`[!…]`/`[^…]` one in or out of a set, `\` takes the next character literally, and a `[` with no `]` is itself. A name beginning with `.` is matched only by a pattern that begins with one, as a shell's glob does. Every component may be a pattern; the far end walks them one directory at a time, in byte order, and a pattern that matches nothing is a `SKIP` saying `no match`. A component with no wildcard is a plain name, compared as it is. **The receiver admits at the top level any name the last component matches** — the check modern `scp` makes — so a far end answering `logs/*.gz` with `.bashrc` is refused as before; nesting is still only by `DIR`. An upload's names are sent to the receiver escaped (`glob::literal`), so a file called `[x]` matches only itself. A wildcard source needs the target to be a directory, as several sources do — checked before the dial for a download, from the target's `WELCOME` for a copy between two hosts, where the source host expands it and the target host's receiver admits by it. A remote path meant literally that holds a wildcard character is written with `\` before it, as for `scp` |
 | 17 | Local and remote sources in one copy, and downloads from several hosts (acs-hofu.14) | Decided 2026-10-28, beyond ACSCP_DESIGN §5.6 and §12, which do not cover the case: `acscp a h1:b dst`, `acscp a h1:b h2:dst` and `acscp h1:a h2:b dir` are **run in parts, with the pieces that already exist** — no new protocol, endpoint or relay mode. The remote sources are grouped by host, in the order the command line first names each; **each host's group goes first, in turn** — a download per host into a local target, a relay per host (decision 15) into a remote one — **then the local sources**: a local copy into a local target, one upload into a remote one. Each part is its own connection (or connections), with its own redial where it has one. **Several sources in all, or a wildcard among them (decision 16), need the target to be a directory, decided once over the whole command line:** a local target is looked at before anything is dialled; a remote one is checked by the first part, a relay, from the target's `WELCOME` before any data goes — which is why the hosts go first: a lone local file uploaded first would be written as the target before the relay could find it is not a directory. The local sources are checked before anything is dialled, as for any copy (ACSCP_DESIGN §4.2); one that fails is reported and skipped, and the rest of the copy goes on. Every part's counts are summed into one report and exit status; **a part that breaks off ends the copy** and the parts after it are not run, so the same command run again finishes it from the parts already written. Chosen over one interleaved stream (a sender that walks local files and relays remote ones on one target link), which would mean a new endpoint for a case taken "when someone misses it" in the copy's last 10 KB of budget (decision 13); the parts cost nothing new — the x86_64 slim build shrank, since the grouping by host became one function the download and the relay share (§8.1) |
 | 18 | `ConnectTimeout` through a proxy (acs-7sti) | Decided 2026-11-05, after a jump host's password typed in more than 10 s gave `Connection timed out during banner exchange` and a fresh dial, every time. OpenSSH applies `ConnectTimeout` to the TCP connect **and** the banner exchange; through a `ProxyJump` or `ProxyCommand` the outer ssh's connect is to the proxy's pipe, so the option bounds nothing but the banner, which waits on the jump host's login. **A session dial through a proxy goes without it**, and acs's own deadlines bound it — 30 s on a redial (`ACS_REDIAL_TIMEOUT_MS`), 120 s on the first connection (`ACS_DIAL_TIMEOUT_MS`) — as they already bound a password asked by the host itself; a dead network is still seen by netwatch (§5.3), and a `ConnectTimeout` the user's own config sets for the jump host still applies to it. Whether a dial is proxied is `ssh -G` with the command line's options, asked before **every** session dial (a few ms) rather than once, because an alias may move the destination between dials; it covers `-J`, `-o ProxyJump`/`ProxyCommand` and ssh_config alike, and where it fails or takes more than 2 s the option stays. Direct dials keep `ConnectTimeout=10`, so a redial into a dead network still fails fast. Chosen over dropping the option everywhere, which would cost that fast failure, and over a longer fixed value, which only moves the cut-off. `acs list` keeps it: it runs in `BatchMode`, where nobody is typing (§3, §7.3) |
-| 19 | Running a command as ssh does (§7.7) | Decided 2026-11-17. `acs host -- cmd` used to fall into the session menu, which could attach a detached session and silently drop the command, and a command was exec'd as an argv, so `acs host s -- 'a \| b'` looked for a program called `a \| b`. Now **a command with no session named is a one-shot**, in a new numbered session that ends with it, and **every command is read by the login shell, its words joined with spaces**, as ssh and `dsh` (which ran through `ssh -t`) both did — one rule for quoting, the one ssh users already know. **Without a terminal, acs execs ssh** rather than carrying a pipe through a session: a pty cannot carry binary data, separate stderr or an end of file, and a resumable pipe needs per-stream offsets and an EOF frame in the protocol (§5.1) — a follow-up, not this change. The price is no resume for a piped command, the same as ssh's |
+| 19 | Running a command as ssh does (§7.7) | Decided 2026-11-17. `acs host -- cmd` used to fall into the session menu, which could attach a detached session and silently drop the command, and a command was exec'd as an argv, so `acs host s -- 'a \| b'` looked for a program called `a \| b`. Now **a command with no session named is a one-shot**, in a new numbered session that ends with it, and **every command is read by the login shell, its words joined with spaces**, as ssh and `dsh` (which ran through `ssh -t`) both did — one rule for quoting, the one ssh users already know. **Without a terminal, acs execs ssh** rather than carrying a pipe through a session: a pty cannot carry binary data, separate stderr or an end of file, and a resumable pipe needs per-stream offsets and an EOF frame in the protocol (§5.1) — a follow-up, not this change. The price is no resume for a piped command, the same as ssh's. **Superseded by decision 21** (acs-182f): a command without a terminal now runs on pipes in a session of its own, and resumes |
 | 20 | Port knocking's size budget (acs-fode) | Decided by the maintainer 2026-11-18: **trim, then raise**. Port knocking (KNOCK_DESIGN goal 6, §11.3) was expected to cost under 10 KB of the x86_64 musl slim build and measured 34,344 B against 0.21.0, taking slim to 1,177,552 B and complete to 2,360,963 B — past the 1.15 MB / 2.3 MB budget, so `cargo xtask dist` (and with it a release) failed. Trimmed first, without dropping anything the design promises: the stderr watch behind the hint (1,592 B), one key setter for `--knock` and the file's mapping (1,632 B), the UDP knock through the TCP knock's socket calls (616 B), no `Node` clone in `acs config` (688 B) and fewer `format!`s (400 B) — 4,928 B in all, leaving the knock at 29,416 B (§8.1 has every target and each cut). Then the overall budget was **raised to slim ≤ 1.18 MB and complete ≤ 2.36 MB** (goal 2), just above what remains — x86_64 Linux 1,172,624 B slim and 2,351,876 B complete; aarch64 Linux 1,039,960 B and 2,219,212 B; aarch64 macOS 874,080 B and 2,051,056 B; x86_64 macOS 968,568 B and 2,157,024 B — with 7,376 B and 8,124 B of x86_64 Linux room. The copy's own 100 KB (decision 13) is unchanged |
+| 21 | A command without a terminal, resumable (acs-182f, §5.5) | Decided 2026-11-19, carrying out decision 19's follow-up. `acs host -- cmd` without a terminal **runs on pipes in a session of its own** instead of exec'ing `ssh -T`: byte-exact, stderr apart, end of file passed and the exit status kept, as before, and now a dropped link resumes — a long `tar c \| acs host -- tar x` over a flaky link was the case. **Both streams share the one ring as records** (a tag, a `u16` length, the bytes) under its one offset, rather than a DATA per stream with a ring and an offset each, so HELLO, WELCOME, DATA and resume are unchanged and the client demultiplexes; **the client ACKs the output it has written out** and the master never overwrites past that ACK, attached or not, since a pipe has no screen to repaint a gap; **an empty INPUT is the end of input** at its sequence, resent after every WELCOME and applied once; **EXIT goes once all output is sent, and the master waits for the client's DETACH** before it ends, so an EXIT lost with a link is sent again on the resume. One trailing HELLO byte (`pipe`), no new frame type, `PROTO_VERSION` unchanged: only a master of the client's own version ever sees it. What it costs: acs on the host (installed as for any session), and a command whose client never returns stays until ended from the menu, like a detached session. It fit the size budget (decision 20) with a trim: about 4.1 KB of x86_64 slim for the feature, and 6.4 KB saved by dropping the derived `Debug` of `Msg` from the two runtime messages that printed a whole frame — what acs-1cco's `Msg::kind` is for (§8.1) |

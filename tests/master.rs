@@ -1179,3 +1179,91 @@ fn a_client_answered_busy_may_take_its_time() {
     b.send(&Msg::Hello(h));
     assert!(matches!(b.recv_control(T), Some(Msg::Welcome(_))));
 }
+
+/// The records of a command on pipes, split back into stdout and stderr:
+/// each a tag (1 or 2), a `u16` BE length and that many bytes (§5.5).
+fn split_records(mut ring: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    while let [tag, hi, lo, rest @ ..] = ring {
+        let n = u16::from_be_bytes([*hi, *lo]) as usize;
+        match tag {
+            1 => out.extend_from_slice(&rest[..n]),
+            2 => err.extend_from_slice(&rest[..n]),
+            t => panic!("record tag {t}"),
+        }
+        ring = &rest[n..];
+    }
+    assert!(ring.is_empty(), "a record cut short");
+    (out, err)
+}
+
+/// acs-182f, DESIGN §5.5: a command on pipes. Its stdin ends at the empty
+/// INPUT; its stdout and stderr come as records in the one ring; output
+/// nobody has acknowledged is kept although nobody is attached — five
+/// times the ring's size, so a ring that wrapped would show as a gap —
+/// EXIT comes after the last of it, and the session ends at the DETACH
+/// that says the EXIT arrived.
+#[test]
+fn a_command_on_pipes_keeps_unacknowledged_output_and_ends_on_detach() {
+    let dir = TempDir::new();
+    let name = "p";
+    acs::master::spawn_with_env(&exe(), dir.path(), name, &[("ACS_RING", "4096")]).unwrap();
+    let mut c = FrameConn::connect(&sock(dir.path(), name)).unwrap();
+    let mut h = acs::testutil::hello_running(
+        name,
+        "me",
+        &["cat; echo err >&2; head -c 20000 /dev/zero; exit 3"],
+    );
+    h.pipe = true;
+    let w = c.greet(h);
+    c.send(&Msg::Input {
+        seq: 0,
+        bytes: b"in\n".to_vec(),
+    });
+    c.send(&Msg::Input {
+        seq: 3,
+        bytes: vec![],
+    });
+    // Gone without a word, having acknowledged nothing.
+    drop(c);
+    let mut c = FrameConn::connect(&sock(dir.path(), name)).unwrap();
+    let mut h = hello(name, Mode::Attach, "me");
+    h.pipe = true;
+    h.resume = Some(Resume {
+        instance: w.instance,
+        offset: 0,
+    });
+    c.send(&Msg::Hello(h));
+    let m = c.recv(T);
+    let Some(Msg::Welcome(w2)) = m else {
+        panic!("{m:?}")
+    };
+    assert_eq!(w2.kind, AttachKind::Resumed, "the ring kept it all");
+    // A terminal client's HELLO is refused: the stream is records.
+    let (_, refused) = attach(dir.path(), name, "me", None);
+    assert!(
+        matches!(&refused, Msg::Error { message, .. } if message.contains("runs without a terminal")),
+        "{refused:?}"
+    );
+    let status = loop {
+        match c.recv(T).expect("the session's output") {
+            Msg::Data { offset, bytes } => {
+                c.send(&Msg::Ack {
+                    seq: offset + bytes.len() as u64,
+                });
+            }
+            Msg::Exit { status } => break status,
+            _ => {}
+        }
+    };
+    assert_eq!(status >> 8, 3, "the command's status");
+    let (out, err) = split_records(&c.output);
+    let mut want = b"in\n".to_vec();
+    want.extend(std::iter::repeat(0).take(20000));
+    assert!(out == want, "stdout: {} bytes", out.len());
+    assert_eq!(err, b"err\n");
+    assert!(sock(dir.path(), name).exists(), "it waits for the DETACH");
+    c.send(&Msg::Detach);
+    assert!(c.closed(T), "the master ends at the DETACH");
+    assert!(!sock(dir.path(), name).exists());
+}
