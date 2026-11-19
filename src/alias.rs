@@ -2248,7 +2248,7 @@ aliases:
         // again.
         let seq = Knock::parse(&format!("{k}:udp,{k}:udp")).unwrap();
         let lo = "127.0.0.1".parse().unwrap();
-        let again = crate::knock::send(&[lo], &seq).unwrap();
+        let again = crate::knock::send(&[lo], &seq, &Default::default()).unwrap();
         assert_eq!((again.knocked, again.reused), (vec![], vec![lo]));
     }
 

@@ -5,8 +5,8 @@ Checked against a real knockd, iptables and sshd on Linux
 (`tests/knockd.rs`, `scripts/test_linux.sh --only knockd`): the right
 sequence connects, a wrong one fails with the hint, and a session outlives
 `cmd_timeout` on the `ESTABLISHED,RELATED` rule — results in
-[VERIFICATION.md](VERIFICATION.md). Not built: the knock bound to ssh's
-`BindAddress` (§3.3, acs-z8wi).
+[VERIFICATION.md](VERIFICATION.md). The knock is bound to ssh's
+`BindAddress` and `BindInterface` (§3.3).
 
 Some hosts keep their ssh port closed behind a firewall and open it, for one
 source address and usually for a few seconds, only after that address has
@@ -221,11 +221,16 @@ interleaved is two independent sequences, and a host with one knockd behind
 both sees each complete.
 
 The source address is the kernel's choice for each destination, the same
-choice it makes for ssh's connect a moment later. acs does not bind a
-source. A user whose ssh config sets `BindAddress` or `BindInterface` is
-meant to get the knock bound the same way, read from the same `ssh -G`;
-that is **not built yet** (acs-z8wi): `ssh::Route` reads `bindaddress`, but
-the knock's sockets still take the kernel's choice.
+choice it makes for ssh's connect a moment later, unless ssh's config sets
+`BindAddress` or `BindInterface`: the knock is then bound the same way, read
+from the same `ssh -G` (`Route::bindaddress`, `Route::bindinterface`). Every
+knock socket, TCP and UDP, is bound to the address before it connects or
+sends. A destination of the other address family is not knocked, and when
+none is of the address's family the knock fails saying so. The interface is
+bound with `SO_BINDTODEVICE` on Linux and `IP_BOUND_IF` / `IPV6_BOUND_IF` on
+macOS; elsewhere `-v` says it is not supported and the knock goes without. A
+bind that fails, an address that is not the host's own, fails the knock with
+what it tried to bind.
 
 ### 3.4 Knocking twice
 
