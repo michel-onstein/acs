@@ -1988,7 +1988,9 @@ aliases:                       # acs devbox tries its hosts in order
   `host`, where any other key is an error listing those four. The entry's
   replaces the alias's **whole**, never key by key; `none` drops the
   alias's, and an empty value sets nothing. `--knock` and `ACS_KNOCK` beat
-  both. Read and checked with the file; not yet sent by the dial.
+  both. Checked when the file is read, and knocked before every dial that
+  opens a connection (KNOCK_DESIGN §3.1); checked against a real knockd in
+  `tests/knockd.rs` (VERIFICATION).
 - Only the local client reads the files; `_proxy`, `_master` and `_install`
   never do.
 

@@ -1,16 +1,17 @@
 #!/bin/sh
 # Run the whole test suite on Linux (musl, in a container), then the
 # multi-user isolation tests as root with two real users (DESIGN §4.5), then
-# the network watcher against the real kernel (acs-4i2).
+# the network watcher against the real kernel (acs-4i2), then port knocking
+# against a real knockd, firewall and sshd (acs-8l1v.6).
 #
 #   scripts/test_linux.sh [--platform linux/amd64] [--only NAME [-- ARGS...]]
 #
-# --only NAME runs one test target instead of all three steps: NAME is a
-# file under tests/ without `.rs` (`netns`, `multiuser`, `client`, ...), or
-# `lib` for the unit tests. It is the same container, volumes and flags as the
-# full run — `multiuser` and `netns` still get the environment and
-# `--include-ignored` their steps use — so a result from it is a result from
-# the real thing (acs-pjk). ARGS after `--` go to the test harness: a name
+# --only NAME runs one test target instead of all four steps: NAME is a
+# file under tests/ without `.rs` (`netns`, `knockd`, `multiuser`, `client`,
+# ...), or `lib` for the unit tests. It is the same container, volumes and
+# flags as the full run — `multiuser`, `netns` and `knockd` still get the
+# environment, packages and `--include-ignored` their steps use — so a
+# result from it is a result from the real thing (acs-pjk). ARGS after `--` go to the test harness: a name
 # filter, `--nocapture`, `--exact`. There is no image to build, and the
 # volumes are reused either way, so --only saves the rest of the suite and
 # nothing else.
@@ -24,8 +25,11 @@
 # namespace of its own, so with that capability an interface can genuinely
 # be created, addressed and torn down inside it, which is what makes the
 # kernel emit the NETLINK_ROUTE messages netwatch.rs subscribes to. Nothing
-# reaches the host's network — the namespace is the isolation — and no
-# other step uses it.
+# reaches the host's network — the namespace is the isolation. The knockd
+# step (tests/knockd.rs) needs it too: it puts iptables rules on the
+# container's loopback that drop port 22 until knockd opens it, and runs
+# knockd and sshd there, all inside the same namespace. No other step uses
+# it.
 set -eu
 cd "$(dirname "$0")/.."
 root=$(pwd)
@@ -74,7 +78,7 @@ if [ -n "$only" ] && [ "$only" != lib ]; then
         exit 2
     fi
 fi
-# Three steps with different flags have no one harness to hand them to.
+# Four steps with different flags have no one harness to hand them to.
 if [ $# -gt 0 ] && [ -z "$only" ]; then
     echo "test_linux.sh: arguments after -- need --only" >&2
     exit 2
@@ -109,6 +113,16 @@ exec docker run --rm $platform \
             ACS_NETNS_TEST=1 cargo test -p acs --test netns -- \
                 --include-ignored --test-threads=1 --nocapture "$@"
         }
+        # A real knockd, iptables and sshd on the loopback, which the test
+        # sets up itself (KNOCK_DESIGN §9, §11.2). Only this step installs
+        # them: sshd on port 22 and a firewall dropping it are nothing any
+        # other test should run beside.
+        knockd() {
+            apk add --no-cache knock iptables openssh-server \
+                openssh-client >/dev/null
+            ACS_KNOCKD_TEST=1 cargo test -p acs --test knockd -- \
+                --include-ignored --test-threads=1 "$@"
+        }
         case $ACS_LINUX_ONLY in
             "")
                 echo "== cargo test (root)"
@@ -121,6 +135,9 @@ exec docker run --rm $platform \
                 # holds still.
                 echo "== the kernel drives the network watcher"
                 netns
+                # Last: it leaves sshd, knockd and the firewall up.
+                echo "== port knocking against a real knockd"
+                knockd
                 ;;
             multiuser)
                 echo "== multi-user isolation"
@@ -129,6 +146,10 @@ exec docker run --rm $platform \
             netns)
                 echo "== the kernel drives the network watcher"
                 netns "$@"
+                ;;
+            knockd)
+                echo "== port knocking against a real knockd"
+                knockd "$@"
                 ;;
             lib)
                 echo "== cargo test --lib (root)"

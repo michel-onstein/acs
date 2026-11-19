@@ -4,20 +4,23 @@
 suite, `scripts/test_install.sh`, back from stale on 2026-10-27, acs-t8t;
 acscp's over real ssh and across accounts on 2026-10-28, acs-hofu.8;
 acscp's by-hand checks, a closed lid and an `scp -r` timing, on 2026-11-05,
-acs-hofu.15);
+acs-hofu.15; port knocking against a real knockd on 2026-11-18,
+acs-8l1v.6);
 the checks that need a person at a real terminal are listed at the end, not
 yet done.
 
 What the unit and integration tests cannot show is checked here: acs over a
 real ssh connection, against a real host, with real terminal programs and
 real interruptions. `scripts/e2e_ssh.sh` automates everything that can be
-automated; `scripts/test_linux.sh` covers Linux, multi-user isolation, and
-the network watcher against the real kernel. `scripts/test_linux.sh --only
-netns` (or `multiuser`, or any file under `tests/`) runs one of those with the
+automated; `scripts/test_linux.sh` covers Linux, multi-user isolation, the
+network watcher against the real kernel, and port knocking against a real
+knockd. `scripts/test_linux.sh --only netns` (or `multiuser`, `knockd`, or
+any file under `tests/`) runs one of those with the
 same container and flags, which is the way to iterate on it (acs-pjk).
 
 The tests behind those two scripts — `tests/e2e_ssh.rs`,
-`tests/multiuser.rs` and `tests/netns.rs` — are `#[ignore]`, and the scripts
+`tests/multiuser.rs`, `tests/netns.rs` and `tests/knockd.rs` — are
+`#[ignore]`, and the scripts
 ask for them with `--include-ignored`. A plain `cargo test`, and so
 `scripts/verify.sh` on a Mac, counts them as ignored in each binary's
 summary instead of passing them unrun, and `scripts/verify.sh` ends its test
@@ -73,6 +76,7 @@ those tests ran.
 | The prelude's check of the binary it execs | `ssh::tests` on macOS (BSD `ls`) and in `rust:alpine` (busybox `ls`), plus the shell walked by hand against GNU coreutils 9.1 in Debian (2026-09-24, acs-gov): a real binary and a symlinked one, each with a safe and an unsafe target, and a relative link, a chain of links, a link into a world-writable directory, a link *in* one, and a dangling link | Pass on both platforms — the mode and owner examined are the target's, and every directory the link passes through is checked. Shown red first by putting the old check back: it refused the safe symlink on Linux (with a message about permissions that were not the problem) and ran the world-writable one on macOS without a word. `ls -ldnL` follows the link identically on busybox 1.36.1, coreutils 9.1 and BSD `ls`; the three differ only on a dangling link, which `[ -x ]` rejects before the mode is ever read |
 | The system-wide install path, really populated by root | `tests/multiuser.rs` under `scripts/test_linux.sh` (2026-09-24, acs-6w9): root writes `/usr/local/lib/acs/<version>/acs` and alice and bob run the prelude against it; then the directory made `0777` and `0775`, the binary made `0775`, the file chowned to bob, and the directory chowned to bob; and the same owners tried at the `$HOME` candidate | Pass — both users exec root's binary, and every loosening is refused by name: the writable cases say "is writable by others" with the mode, the third-uid cases say "is owned by uid N, not by you or root", and each prints `ACS-NEED` so the client installs instead. Shown red first by putting acs-08m's `= $acs_u` back alone: root's binary was refused to alice at both paths, which is the defect |
 | The network watcher's platform half, Linux netlink | `tests/netns.rs` under `scripts/test_linux.sh` (2026-09-24, acs-4i2): a dummy interface created, brought up, addressed with `192.0.2.7/24` and torn down again in the container's own network namespace (`--cap-add NET_ADMIN`), against a real `NETLINK_ROUTE` watcher | Pass — the descriptor becomes readable after each `ip` command, and the test never writes to it, so the message is the kernel's own multicast; a bare interface is a message and not a change, an addressed one is both, and the address going away is a change again. Since acs-0n8 it also puts the address back and drops the answer without acting on it, and the interface going away again is then *not* a change — the networks held move where a caller acts and nowhere else. Shown red both ways first: subscribed to no netlink group, the kernel "said nothing about an interface appearing"; with acs-6p8's comparison removed, "an interface with no address is not a change" failed |
+| Port knocking against a real knockd | `tests/knockd.rs` under `scripts/test_linux.sh --only knockd` (2026-11-18, acs-8l1v.6): in `rust:alpine` with `--cap-add NET_ADMIN`, Alpine's `knock` 0.8.2 (`Interface = lo`), `iptables` 1.8.13 (nf_tables) and OpenSSH's sshd on the container's loopback. Port 22 dropped on `lo` except `ESTABLISHED,RELATED`; knockd opens it on `7000,8000:udp,9000` with `iptables -I INPUT -s %IP% …` and `cmd_timeout = 3`. Loopback rather than a second namespace, which needs `CAP_SYS_ADMIN`; it is the same `INPUT` chain, conntrack and libpcap. Three checks over real ssh, as user `knocker` with acs pre-installed: (1) plain ssh times out, then `acs --knock 7000,8000:udp,9000 -v knocker@127.0.0.1` comes up; (2) `--knock 7001,8001:udp,9001`; (3) an alias from the configuration file with the mapping form (`delay: 100ms`, `wait: 300ms`), a session kept past knockd's `stop_command` and 2 s more | Pass, 3 of 3 in 22 s. (1) knockd logs `OPEN SESAME` for 127.0.0.1 from acs's TCP SYN and UDP knocks, `-v` says `knocking 127.0.0.1 (127.0.0.1): 3 knocks, 50 ms apart, then 200 ms` and a `knocked` phase, no port printed. (2) knockd opens nothing, ssh's connect times out, acs exits 255 with the hint. (3) After `command timeout` the rule is gone and plain ssh is refused, yet the session echoes a line typed then, with one knock and no redial. Shown red first by leaving the `ESTABLISHED,RELATED` rule out: the session lost its connection at `cmd_timeout`, acs knocked and redialled, and came back (KNOCK_DESIGN §9 says exactly that), so the test failed on the second knock |
 | Full test suite on Linux | `scripts/test_linux.sh` (2026-09-24, acs-cu8) | Pass, 36 tests back from red — found and fixed two Linux-only bugs first (a master stall under backpressure; a replaced binary breaking master start), and later 36 failures that were the *harness* being platform dependent: `ssh-keygen` is not in `rust:alpine` (25), and the fake remote's acs was a symlink, whose mode is `lrwxrwxrwx` on Linux, so the prelude's safety check refused it and every one of those remotes looked uninstalled (11) |
 | Multi-user isolation | squatted and symlinked socket directories, foreign peer uid, per-user `main`, and (acs-9n3) a control-socket directory alice created before bob | Pass — bob refuses alice's directory by name and dials with no control path at all; his own comes up `0700` and his, and alice cannot list it (`rust:alpine` as root, `cargo test --test multiuser`, 2026-09-23) |
 | Static Linux binaries run | `dist/*-linux-musl/acs --version` in Alpine (aarch64 native, x86_64 emulated) | Pass |

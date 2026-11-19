@@ -1,21 +1,20 @@
 # acs — port knocking
 
-**Status:** In progress — §12 steps 1 (`ssh::Route`), 2 (`knock.rs`:
-parser, sender, reuse table), 3 (`knock` in the file, `--knock`,
-`ACS_KNOCK`), 4 (the dial knocks: `dial_once`, `exec::run`,
-`alias::probe_port`, the proxy refusal, `-v`, the `knocked` phase and the
-hint) and 5 (`acs config`: `host set|unset <alias> knock`, `host add
---knock`, the `knock: N knocks` in `host list`) built (2026-11-18). Still
-to do: step 6, the check against a real knockd on Linux (acs-8l1v.6); and the
-knock bound to ssh's `BindAddress` (§3.3, acs-z8wi). Work is the epic
-acs-8l1v, one bead per step of §12.
+**Status:** Built (2026-11-18) — every step of §12, the epic acs-8l1v.
+Checked against a real knockd, iptables and sshd on Linux
+(`tests/knockd.rs`, `scripts/test_linux.sh --only knockd`): the right
+sequence connects, a wrong one fails with the hint, and a session outlives
+`cmd_timeout` on the `ESTABLISHED,RELATED` rule — results in
+[VERIFICATION.md](VERIFICATION.md). Not built: the knock bound to ssh's
+`BindAddress` (§3.3, acs-z8wi).
 
 Some hosts keep their ssh port closed behind a firewall and open it, for one
 source address and usually for a few seconds, only after that address has
 "knocked": sent packets to a secret sequence of other ports, in order, within
 a time limit. [knockd](https://github.com/jvinet/knock) is the common server
-for this. Today acs cannot reach such a host by itself: the ssh dial gets
-`Connection timed out` because nothing knocked first. This document is how
+for this. Without a knock of its own acs cannot reach such a host by
+itself: the ssh dial gets `Connection timed out` because nothing knocked
+first. This document is how
 acs knocks before it dials, on the first connection, on every redial, and
 for every other call that opens a connection of its own.
 
@@ -223,8 +222,10 @@ both sees each complete.
 
 The source address is the kernel's choice for each destination, the same
 choice it makes for ssh's connect a moment later. acs does not bind a
-source. A user whose ssh config sets `BindAddress` or `BindInterface` gets
-the knock bound the same way, read from the same `ssh -G`.
+source. A user whose ssh config sets `BindAddress` or `BindInterface` is
+meant to get the knock bound the same way, read from the same `ssh -G`;
+that is **not built yet** (acs-z8wi): `ssh::Route` reads `bindaddress`, but
+the knock's sockets still take the kernel's choice.
 
 ### 3.4 Knocking twice
 
@@ -533,10 +534,18 @@ Nothing acs installs, and nothing beyond a working knockd setup:
   and only then lets the fake transport answer. Asserts that the first
   connection knocks, that a redial knocks again, that a dial joining acs's
   master does not, and that `-v` and the timings say so without the ports.
-- **Linux, `scripts/test_linux.sh`**: a container with real `knockd` and
-  `iptables` dropping port 22, needing `CAP_NET_ADMIN` as `tests/netns.rs`
-  does. acs connects with the right sequence, fails with the hint of §7 with
-  a wrong one, and survives a `cmd_timeout` shorter than the session (§9).
+- **Linux, `tests/knockd.rs`** (`scripts/test_linux.sh --only knockd`, and
+  the last step of a full run): real `knockd`, `iptables` and sshd in the
+  container, needing `CAP_NET_ADMIN` as `tests/netns.rs` does. They run on
+  the container's loopback, since a second network namespace would need
+  `CAP_SYS_ADMIN` too; loopback traffic still goes through the `INPUT`
+  chain, conntrack and knockd's libpcap. Port 22 is dropped except for
+  `ESTABLISHED,RELATED` and the source knockd opens it to. acs connects
+  with the right sequence (TCP and UDP knocks, knockd logs `OPEN SESAME`),
+  fails with the hint of §7 with a wrong one, and a session configured from
+  the file outlives a 3 s `cmd_timeout` with no redial (§9). Without the
+  `ESTABLISHED` rule the same session redials, knocking again, at
+  `cmd_timeout`.
 - **Regression guard**: a test asserting a knock socket is closed before
   its retransmission could leave — that `send` returns with no knock
   socket open — since keeping one open is the bug §4.1 calls load-bearing.

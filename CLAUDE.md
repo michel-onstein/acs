@@ -15,8 +15,9 @@ Work is tracked as beads (`br`, prefix `acs`): start with `bv --robot-triage`.
   Linux build (needs `zig`).
 - `cargo xtask dist` — every target plus the embedded payloads (DESIGN §8.1).
 - `scripts/test_linux.sh` — the suite on Linux in a container, plus
-  multi-user isolation as root and the network watcher against the real
-  kernel (`tests/netns.rs`, needs `CAP_NET_ADMIN`); `--only NAME` runs one.
+  multi-user isolation as root, the network watcher against the real
+  kernel (`tests/netns.rs`) and port knocking against a real knockd
+  (`tests/knockd.rs`), both needing `CAP_NET_ADMIN`; `--only NAME` runs one.
 - `scripts/e2e_ssh.sh` — end to end over real ssh against a container host.
 - `scripts/test_install.sh` — the one-line installer against the real
   releases, locally and in Alpine and Ubuntu containers.
@@ -44,6 +45,6 @@ updates the Homebrew tap (`michel-onstein/homebrew-acs`). Rules in
 | [README.md](README.md) | Install, usage, command keys, environment | Current |
 | [DESIGN.md](docs/DESIGN.md) | Architecture, protocol, command mode, remote install | Built |
 | [ACSCP_DESIGN.md](docs/ACSCP_DESIGN.md) | acscp / `acs cp`: scp-style copies over acs's dial, resume, relay, wildcards (epic acs-hofu) | Built; by-hand checks pass |
-| [KNOCK_DESIGN.md](docs/KNOCK_DESIGN.md) | Port knocking (knockd) before every dial that opens a connection: sequence, timing, proxies, configuration (epic acs-8l1v) | In progress: steps 1–5 built (the dial knocks, `acs config` sets knocks); the Linux knockd check still to do |
+| [KNOCK_DESIGN.md](docs/KNOCK_DESIGN.md) | Port knocking (knockd) before every dial that opens a connection: sequence, timing, proxies, configuration (epic acs-8l1v) | Built; checked against a real knockd on Linux |
 | [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning, release tags (bare from 0.19.0), release binaries on GitHub, the Homebrew tap, what a fork must point at itself | Built |
 | [VERIFICATION.md](docs/VERIFICATION.md) | End-to-end results over real ssh; checks still to do by hand | Automated checks pass |
