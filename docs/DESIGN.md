@@ -1912,6 +1912,7 @@ aliases:                       # acs devbox tries its hosts in order
         - 172.16.0.0/16
   lab:                         # an alias with settings of its own
     identity_file: ~/.ssh/id_lab # the key of every host naming none
+    user: svc                  # the login name of every host naming none
     redraw_on_reconnect: false # over the global setting, for this alias
     reachability_timeout: 2s   # so is this
     reachability_tcp: true     # its hosts drop pings: try their ssh port
@@ -1952,7 +1953,7 @@ aliases:                       # acs devbox tries its hosts in order
   written without the list. How an alias is resolved is §7.3.
 - **An alias's own settings**: an alias is a list of entries (or one entry,
   a mapping with `host`), or a mapping of its settings — `identity_file`,
-  `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`,
+  `user`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`,
   `persist`, `reachability_interval`, `prefer_local_network`,
   `local_forwards` and `knock` —
   and its `hosts`, that list. The list form
@@ -2237,13 +2238,17 @@ one of the alias's entries instead of `<name>`:
   - It is for an alias's entries only. A plain host waited for with
     `persist` (§5.3) is still pinged.
 - The chosen entry becomes the ssh destination: `user@host` if it has a
-  `user`, otherwise `host`, so `~/.ssh/config` decides the login name.
+  `user` — its own, else the alias's `user` (acs-h4p4) — otherwise `host`,
+  so `~/.ssh/config` decides the login name. The destination's login name
+  is the one ssh uses over a `-o User` of the user's, so the order is:
+  `user@<alias>` on the command line, the entry's `user`, the alias's
+  `user`, then `-o User` and `~/.ssh/config`.
 - **`user@<alias>`** goes through the alias the same way — same order, same
   pings, same fallback — and logs in as `user` on whichever entry is chosen,
-  replacing the entry's own `user`. The destination is split at its **last**
-  `@`, as ssh splits it (`a@b@devbox` is user `a@b`); an alias cannot
-  contain `@` (§7.2), so the split is never ambiguous. `-v` says the login
-  name came from the command line.
+  replacing the entry's own `user` and the alias's. The destination is
+  split at its **last** `@`, as ssh splits it (`a@b@devbox` is user
+  `a@b`); an alias cannot contain `@` (§7.2), so the split is never
+  ambiguous. `-v` says the login name came from the command line.
 - **The ssh key** is the first of: a key on the command line (`-i` or
   `-o IdentityFile`, §7.1), the chosen entry's `identity_file`, the alias's
   `identity_file`. Only that one is passed; with none, ssh chooses as usual
@@ -2374,10 +2379,10 @@ their YAML shape:
 | --- | --- |
 | `show` | the merged configuration as YAML, each value commented with its file and line (or `default`) |
 | `get <key>` / `set <key> <value>` / `unset <key>` | one setting (`install_on_remote`, `update_check`, `command_bell`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`); `set` checks the type |
-| `host list` | every alias and its hosts, in the order they are tried, with the key each is reached with (its own or the alias's) and where each is defined |
+| `host list` | every alias and its hosts, in the order they are tried, with the user and key each is reached with (its own or the alias's) and where each is defined |
 | `host add <alias> <host> [--user U] [--identity-file K] [--no-reachability-check] [--prefer] [--persist] [--local-networks N,N] [--knock SPEC]` | append an entry, so repeated adds give an alias its fallback hosts in order. `--local-networks` is checked as the file form is (§7.3) and written back masked; `--knock` takes the spec of KNOCK_DESIGN §6.2 and is written as the scalar form when the timing is the default |
 | `host remove <alias> [<host>]` | remove one host (the alias goes with its last one, settings and all), or the alias |
-| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `reachability_tcp true\|false`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false`, `local_forwards <spec>,<spec>\|none`, `knock <spec>\|none` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
+| `host set <alias> <setting> <value>` / `host unset <alias> <setting>` | one of the alias's own settings (§7.2, §7.3): `identity_file <K>`, `user <login>`, `redraw_on_reconnect true\|false`, `reachability_timeout <duration>`, `reachability_tcp true\|false`, `persist true\|false`, `reachability_interval <duration>`, `prefer_local_network true\|false`, `local_forwards <spec>,<spec>\|none`, `knock <spec>\|none` (checked); `set` rewrites a list-form alias as the mapping of its settings and `hosts`, `unset` of its last setting turns it back into a list |
 | `path` | the two files and whether they exist |
 
 - A setting that is a **list** — `local_forwards` (§7.1) — is given to `set`

@@ -518,6 +518,7 @@ aliases:
       reachability_check: false   # it drops pings: use it unchecked
   lab:                     # an alias with settings of its own
     identity_file: ~/.ssh/id_lab  # the key for every host below…
+    user: svc                     # …and the login name, unless a host has its own
     redraw_on_reconnect: false    # no Ctrl-L after reconnecting to lab
     reachability_timeout: 2s      # a slow link: wait longer for its pings
     hosts:
@@ -546,7 +547,7 @@ into it (`host unset` of its last setting turns it back into a list).
 | `reachability_interval` | how often a lost host is pinged while persisting, after the first 30 pings a second apart: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
 | `local_forwards` | ports every session forwards, as `-L` spells them: a list, or one value with commas (`8080:localhost:80,5432:db:5432`); `none` for no forward (default). An alias's own list replaces the global one, and `-L` on the command line adds to it |
-| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist`, `local_networks` and `knock` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`, `knock`) and its `hosts` |
+| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist`, `local_networks` and `knock` — or to a mapping of the alias's own settings (`identity_file`, `user`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`, `knock`) and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -737,6 +738,19 @@ key. ssh still offers its other keys after this one unless you set
 `IdentitiesOnly yes`. Your own file can set just the key of an alias whose
 hosts are in the global file (`lab: {identity_file: ~/.ssh/mine}`).
 
+### Which login name
+
+`user` names the login name, for one host entry or for a whole alias. The
+first of these wins:
+
+1. `user@<alias>` on the command line;
+2. the chosen host entry's `user`;
+3. the alias's `user`;
+4. `~/.ssh/config` (and `-o User=`, which ssh weighs below the others).
+
+Like the key, the login name follows the entry. Your own file's `user` for
+an alias replaces the global file's.
+
 ### Sessions on every host
 
 `acs list` without a host shows the sessions on every alias at once. In a
@@ -772,12 +786,14 @@ acs config host add nas nas.lan --no-reachability-check
 acs config host add lab lab.lan --identity-file ~/.ssh/id_lab_home
 acs config host set lab identity_file ~/.ssh/id_lab   # the alias's key
 acs config host unset lab identity_file
+acs config host set lab user svc                      # the login name of lab's hosts
+acs config host unset lab user
 acs config host set lab redraw_on_reconnect false     # no Ctrl-L for lab
 acs config host set lab reachability_timeout 2s       # lab's hosts may take 2 s
 acs config host set lab persist true                  # never give up on lab
 acs config host add nas nas.lan --persist             # nor on this host of nas
 acs config host add devbox devbox.vpn --prefer        # devbox.vpn first when it answers
-acs config host list                                  # aliases, hosts and keys
+acs config host list                                  # aliases, hosts, users and keys
 acs config host remove devbox devbox.lan              # one host, or the alias
 acs config set install_on_remote false
 acs config set update_check false                     # no weekly release check

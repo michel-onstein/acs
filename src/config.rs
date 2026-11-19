@@ -105,6 +105,8 @@ pub struct Alias {
     pub entries: Vec<HostEntry>,
     /// The ssh key of every entry that names none itself.
     pub identity_file: Option<Setting<String>>,
+    /// The login name of every entry that names none itself.
+    pub user: Option<Setting<String>>,
     /// Send Ctrl-L after reconnecting; `None` leaves it to the global
     /// setting.
     pub redraw_on_reconnect: Option<Setting<bool>>,
@@ -200,6 +202,8 @@ pub enum Kind {
     Forwards,
     /// A file path, kept as written.
     Path,
+    /// A login name, held as a [`Val::Path`]: see [`name_value`].
+    Name,
 }
 
 /// A setting's value, of whichever [`Kind`].
@@ -309,6 +313,12 @@ pub const SETTINGS: &[Def] = &[
         alias: field!(identity_file),
     },
     Def {
+        key: "user",
+        kind: Kind::Name,
+        global: None,
+        alias: field!(user),
+    },
+    Def {
         key: "install_on_remote",
         kind: Kind::Bool,
         global: field!(install_on_remote),
@@ -409,6 +419,7 @@ impl Def {
             Kind::Duration { min, max } => duration_value(n, min, max).map(Val::Duration),
             Kind::Forwards => forwards_value(n).map(Val::Forwards),
             Kind::Path => path_value(n).map(Val::Path),
+            Kind::Name => name_value(n).map(Val::Path),
         }
     }
 }
@@ -871,6 +882,18 @@ pub fn parse_forwards(text: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// A login name: see [`plain_name`].
+pub fn login_name(u: &str) -> Result<String, String> {
+    match plain_name(u) {
+        true => Ok(u.to_string()),
+        false => Err(format!("bad login name '{u}'")),
+    }
+}
+
+fn name_value(n: &Node) -> Result<String, String> {
+    string_value(n).and_then(|u| login_name(&u))
+}
+
 fn string_value(n: &Node) -> Result<String, String> {
     match &n.value {
         Value::Scalar(s) if !s.text.is_empty() => Ok(s.text.clone()),
@@ -1039,11 +1062,7 @@ fn host_entry(item: &Node, at: &dyn Fn(&Node) -> Origin) -> Result<HostEntry, St
             }
             "user" => {
                 if v.value != Value::Null {
-                    let u = field(k, v, string_value(v))?;
-                    if !plain_name(&u) {
-                        return Err(format!("user: bad login name '{u}'"));
-                    }
-                    user = Some(u);
+                    user = Some(field(k, v, name_value(v))?);
                 }
             }
             "reachability_check" => {
@@ -1421,6 +1440,30 @@ aliases:
         );
     }
 
+    /// acs-h4p4: an alias's `user`, parsed like an entry's, replaced by the
+    /// local file's, and refused when it is no login name.
+    #[test]
+    fn an_alias_user_is_read_and_the_local_one_replaces_the_global() {
+        let g = "aliases:\n  d:\n    user: svc\n    hosts:\n      - host: a\n";
+        let c = load(g, "aliases:\n  d:\n    user: me\n").unwrap();
+        let d = c.alias("d").unwrap();
+        assert_eq!(identity(&d.user).as_deref(), Some("me@local.yaml:3"));
+        // The entry itself keeps no user: the alias's is applied on resolve.
+        assert_eq!(d.entries[0].user, None);
+        assert_eq!(
+            identity(&load(g, "").unwrap().alias("d").unwrap().user).as_deref(),
+            Some("svc@global.yaml:3")
+        );
+        for src in [
+            "aliases:\n  d:\n    user: \"m\\u0001e\"\n    hosts: [{host: a}]\n",
+            "aliases:\n  d:\n    user: \"m e\"\n    hosts: [{host: a}]\n",
+            "aliases:\n  d:\n    user: [me]\n    hosts: [{host: a}]\n",
+        ] {
+            let e = load("", src).unwrap_err();
+            assert!(e.contains("user: "), "{src:?}: {e}");
+        }
+    }
+
     #[test]
     fn the_local_alias_identity_replaces_the_global_one() {
         let g = "aliases:\n  devbox:\n    identity_file: /etc/key\n    hosts:\n      - host: devbox.lan\n";
@@ -1484,8 +1527,8 @@ aliases:
                 ":3: aliases.d: identity_file: expected a file path, found an empty string",
             ),
             (
-                "aliases:\n  d:\n    user: me\n",
-                ":3: aliases.d: unknown key 'user' (an alias takes identity_file, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, knock, hosts; a single host entry needs 'host: <name>')",
+                "aliases:\n  d:\n    port: 22\n",
+                ":3: aliases.d: unknown key 'port' (an alias takes identity_file, user, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, knock, hosts; a single host entry needs 'host: <name>')",
             ),
             (
                 "aliases:\n  d:\n    - host: a\n      identity_file: {k: v}\n",

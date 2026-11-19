@@ -848,6 +848,7 @@ fn every_setting_in_the_table_round_trips() {
             Kind::Duration { .. } => "1500ms",
             Kind::Forwards => "8080:localhost:80",
             Kind::Path => "~/.ssh/k",
+            Kind::Name => "svc",
         };
         if d.global.is_some() {
             let before = h.ok(&["config", "get", d.key]);

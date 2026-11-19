@@ -46,6 +46,7 @@ settings: install_on_remote, update_check, command_bell, redraw_on_reconnect,
           local_forwards (ports every session forwards, as -L spells them:
           8080:localhost:80,5432:db:5432 — or none)
 alias settings: identity_file <key> (the ssh key of its hosts that name none),
+                user <login> (the login name of its hosts that name none),
                 redraw_on_reconnect, persist, prefer_local_network,
                 reachability_tcp (true|false, over the global setting),
                 reachability_timeout, reachability_interval,
@@ -56,7 +57,8 @@ host settings: --local-networks lists the networks that make a host the local
                one: it is tried first when this machine is on one of them
                (172.16.0.0/16, fd00::/48; acs config host add)
                --knock <spec> gives a host its own knock (an alias setting too)
-precedence of the ssh key: -i, then the host's identity_file, then the alias's";
+precedence of the ssh key: -i, then the host's identity_file, then the alias's
+precedence of the login name: user@host, then the host's user, then the alias's";
 
 /// The top-level setting `key`, which `get`/`set`/`unset` know.
 fn global(key: &str) -> Option<&'static config::Def> {
@@ -128,6 +130,10 @@ fn typed(key: &str, value: &str) -> Result<Node, String> {
             ))
         }
         config::Kind::Path => config::Val::Path(value.to_string()),
+        // The one rule of a login name (and so an empty one is refused too).
+        config::Kind::Name => config::login_name(value)
+            .map(config::Val::Path)
+            .map_err(|e| format!("{key}: {e}"))?,
     };
     Ok(val_node(v))
 }
@@ -712,7 +718,10 @@ pub fn host_list(c: &Config) -> String {
             rows.push([
                 a.name.clone(),
                 e.host.clone(),
-                e.user.clone().unwrap_or_else(|| "-".into()),
+                e.user
+                    .as_ref()
+                    .or(a.user.as_ref().map(|u| &u.value))
+                    .map_or_else(|| "-".into(), Clone::clone),
                 check,
                 e.identity_file
                     .as_ref()
@@ -1353,8 +1362,10 @@ mod tests {
     /// it has one, so a new row cannot go undocumented.
     #[test]
     fn the_usage_names_every_setting() {
+        // The commands above the settings name `--user` and the like.
         let (globals, aliases) = USAGE
-            .split_once("alias settings:")
+            .split_once("\nsettings:")
+            .and_then(|(_, rest)| rest.split_once("alias settings:"))
             .expect("an alias settings section");
         let aliases = aliases.split_once("host settings:").unwrap().0;
         for d in config::SETTINGS {
@@ -1558,7 +1569,7 @@ aliases:
                 "go with acs config host add",
             ),
             ("host set a port 22", "unknown alias setting 'port'"),
-            ("host unset a user", "unknown alias setting 'user'"),
+            ("host unset a port", "unknown alias setting 'port'"),
             ("host set a identity_file", "bad arguments"),
         ] {
             let e = parse(&args(a)).unwrap_err();
@@ -1780,7 +1791,7 @@ aliases:
         );
         let e = parse(&args("host set d command_bell false")).unwrap_err();
         assert!(
-            e.contains("unknown alias setting 'command_bell' (settings: identity_file, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, knock)"),
+            e.contains("unknown alias setting 'command_bell' (settings: identity_file, user, redraw_on_reconnect, reachability_timeout, reachability_tcp, persist, reachability_interval, prefer_local_network, local_forwards, knock)"),
             "{e}"
         );
     }
@@ -1854,6 +1865,36 @@ aliases:
             host_list(&Config::default()),
             "no host aliases (add one with: acs config host add <alias> <host>)\n"
         );
+    }
+
+    /// acs-h4p4: an alias's `user` is set and unset like its key, checked
+    /// as a login name, and listed for the hosts that name none.
+    #[test]
+    fn an_alias_user_is_set_unset_checked_and_listed() {
+        let src = "aliases:\n  d:\n    - host: a\n    - host: b\n      user: me\n";
+        let set = apply(src, "host set d user svc").unwrap();
+        assert_eq!(
+            set,
+            "aliases:\n  d:\n    user: svc\n    hosts:\n      - host: a\n      - host: b\n        user: me\n"
+        );
+        assert_eq!(apply(&set, "host unset d user").unwrap(), src);
+        for bad in ["", "a b", "a@b"] {
+            let e = typed("user", bad).unwrap_err();
+            assert!(e.contains("user: bad login name"), "{bad:?}: {e}");
+        }
+        let e = apply(src, "host set d user a@b").unwrap_err();
+        assert!(e.contains("user: bad login name"), "{e}");
+        let dir = crate::testutil::TempDir::new();
+        let f = dir.path().join("c.yaml");
+        std::fs::write(&f, &set).unwrap();
+        let c = Config::load_files(std::slice::from_ref(&f)).unwrap();
+        let out = host_list(&c);
+        let users: Vec<&str> = out
+            .lines()
+            .skip(1)
+            .map(|l| l.split_whitespace().nth(2).unwrap())
+            .collect();
+        assert_eq!(users, ["svc", "me"], "{out}");
     }
 
     /// acs-fbes: `reachability_tcp`, global and per alias, is what the
