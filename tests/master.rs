@@ -1267,3 +1267,124 @@ fn a_command_on_pipes_keeps_unacknowledged_output_and_ends_on_detach() {
     assert!(c.closed(T), "the master ends at the DETACH");
     assert!(!sock(dir.path(), name).exists());
 }
+
+/// Create session `name` running `command` on pipes, with the master's
+/// environment `env`, its stdin already at its end.
+fn start_piped(
+    dir: &Path,
+    name: &str,
+    command: &str,
+    env: &[(&str, &str)],
+) -> (FrameConn, Welcome) {
+    acs::master::spawn_with_env(&exe(), dir, name, env).unwrap();
+    let mut c = FrameConn::connect(&sock(dir, name)).unwrap();
+    let mut h = acs::testutil::hello_running(name, "me", &[command]);
+    h.pipe = true;
+    let w = c.greet(h);
+    c.send(&Msg::Input {
+        seq: 0,
+        bytes: vec![],
+    });
+    (c, w)
+}
+
+/// acs-f1sp, DESIGN §5.5: a command on pipes that has ended, whose client
+/// took its EXIT and was then killed before its DETACH, is not kept for
+/// ever: with nobody attached the master ends `ACS_PIPE_UNCLAIMED_MS`
+/// later — and not at once, since a returning client would still be sent
+/// the EXIT again.
+#[test]
+fn an_ended_command_on_pipes_nobody_comes_back_for_ends_after_its_bound() {
+    let dir = TempDir::new();
+    let path = sock(dir.path(), "u");
+    let (mut c, _) = start_piped(
+        dir.path(),
+        "u",
+        "echo hi",
+        &[("ACS_PIPE_UNCLAIMED_MS", "1500")],
+    );
+    assert_eq!(wait_exit(&mut c), 0);
+    // Killed between the EXIT and the DETACH.
+    drop(c);
+    let gone_at = Instant::now();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(path.exists(), "it ended before its bound");
+    wait_gone(&path);
+    assert!(
+        gone_at.elapsed() >= Duration::from_millis(1400),
+        "{:?}",
+        gone_at.elapsed()
+    );
+}
+
+/// acs-f1sp: the bound runs only once nobody is attached and the command
+/// has ended. A client that has its EXIT and stays keeps the session; a
+/// command whose output fills the ring while nobody is attached has not
+/// ended, so it waits — and its client, back after the bound, collects
+/// every byte.
+#[test]
+fn the_unclaimed_bound_spares_an_attached_client_and_output_still_to_come() {
+    let dir = TempDir::new();
+    let env = [("ACS_PIPE_UNCLAIMED_MS", "200"), ("ACS_RING", "4096")];
+    let (mut c, _) = start_piped(dir.path(), "a", "echo hi", &env);
+    assert_eq!(wait_exit(&mut c), 0);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(sock(dir.path(), "a").exists(), "ended under its client");
+    c.send(&Msg::Detach);
+    assert!(c.closed(T), "the master ends at the DETACH");
+
+    let (c, w) = start_piped(dir.path(), "b", "head -c 20000 /dev/zero", &env);
+    // Gone having acknowledged nothing: the command blocks on a full ring.
+    drop(c);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(sock(dir.path(), "b").exists(), "ended with output unsent");
+    let mut c = FrameConn::connect(&sock(dir.path(), "b")).unwrap();
+    let mut h = hello("b", Mode::Attach, "me");
+    h.pipe = true;
+    h.resume = Some(Resume {
+        instance: w.instance,
+        offset: 0,
+    });
+    assert_eq!(c.greet(h).kind, AttachKind::Resumed);
+    loop {
+        match c.recv(T).expect("the session's output") {
+            Msg::Data { offset, bytes } => c.send(&Msg::Ack {
+                seq: offset + bytes.len() as u64,
+            }),
+            Msg::Exit { status } => break assert_eq!(status, 0),
+            _ => {}
+        }
+    }
+    assert_eq!(split_records(&c.output).0.len(), 20000);
+    c.send(&Msg::Detach);
+    assert!(c.closed(T));
+}
+
+/// acs-f1sp: once its session has ended, a piped command's client resuming
+/// it is told there is no session — also when a later session took the
+/// freed name, which it neither attaches nor takes over.
+#[test]
+fn a_piped_resume_of_an_ended_session_is_no_session_even_under_a_reused_name() {
+    let dir = TempDir::new();
+    let env = [("ACS_PIPE_UNCLAIMED_MS", "100")];
+    let (mut c, old) = start_piped(dir.path(), "n", "echo hi", &env);
+    wait_exit(&mut c);
+    drop(c);
+    wait_gone(&sock(dir.path(), "n"));
+    let (mut later, _) = start_piped(dir.path(), "n", "sleep 30", &env);
+    let mut c = FrameConn::connect(&sock(dir.path(), "n")).unwrap();
+    let mut h = hello("n", Mode::Attach, "me");
+    h.pipe = true;
+    h.resume = Some(Resume {
+        instance: old.instance,
+        offset: 0,
+    });
+    c.send(&Msg::Hello(h));
+    let m = c.recv_control(T);
+    assert!(
+        matches!(&m, Some(Msg::Error { code, .. }) if *code == acs::proto::err::NO_SESSION),
+        "{m:?}"
+    );
+    // The later session's own client was not taken over.
+    assert!(later.recv_control(Duration::from_millis(300)).is_none());
+}

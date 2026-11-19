@@ -2457,8 +2457,14 @@ fn serve(
                     link.close();
                     let exit = match c {
                         proto::err::NO_SESSION => {
+                            // A command on pipes ended while this client was
+                            // away: ended from the menu, or left unclaimed
+                            // past its bound (DESIGN §5.5, acs-f1sp).
                             if state.instance.is_some() {
-                                note("the session has ended");
+                                note(match state.pipe {
+                                    Some(_) => "the command's session has ended: its exit status and any output not written here are lost",
+                                    None => "the session has ended",
+                                });
                             }
                             code::NO_SESSION
                         }
