@@ -546,7 +546,7 @@ into it (`host unset` of its last setting turns it back into a list).
 | `reachability_interval` | how often a lost host is pinged while persisting, after the first 30 pings a second apart: `100ms` to `3600s` (default `5s`); an alias's own value wins |
 | `prefer_local_network` | try first an alias's hosts that are on a network this machine is on, IPv4 or IPv6 (default `false`); an alias's own value wins |
 | `local_forwards` | ports every session forwards, as `-L` spells them: a list, or one value with commas (`8080:localhost:80,5432:db:5432`); `none` for no forward (default). An alias's own list replaces the global one, and `-L` on the command line adds to it |
-| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist` and `local_networks` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`) and its `hosts` |
+| `aliases` | each alias name maps to a list of `host` entries, with an optional `user`, `identity_file`, `reachability_check` (default `true`), `prefer`, `persist`, `local_networks` and `knock` — or to a mapping of the alias's own settings (`identity_file`, `redraw_on_reconnect`, `reachability_timeout`, `reachability_tcp`, `persist`, `reachability_interval`, `prefer_local_network`, `local_forwards`, `knock`) and its `hosts` |
 
 A mistake in a file stops acs with the file and line, for example
 `~/.config/acs/config.yaml:2: install_on_remote: expected true or false`.
@@ -642,6 +642,85 @@ on whichever host is chosen (instead of `michel` on the fallback), and keeps
 `user@`, is used as given. To reach a machine whose name is also an alias,
 use its full name or address (`acs devbox.example.com`).
 
+### Port knocking
+
+A host behind [knockd](https://github.com/jvinet/knock) keeps its ssh port
+closed until this machine has sent packets to a secret sequence of other
+ports, in order. acs knocks by itself, with no `knock` or `nc` installed and
+no `ProxyCommand`: give the host entry, or a whole alias, a `knock`:
+
+```yaml
+aliases:
+  gated:
+    - host: gated.lan            # at home: no firewall, no knock
+    - host: gated.example.com
+      knock: 7000,8000:udp,9000  # the sequence, as knockd.conf writes it
+  lab:
+    knock:                       # every lab host knocks the same way
+      sequence: 7000, 8000:udp, 9000
+      delay: 100ms               # between knocks (default 50ms)
+      wait: 500ms                # after the last one, before ssh (default 200ms)
+    hosts:
+      - host: lab1.example.com
+      - host: lab2.example.com
+        knock: none              # this one has no knockd
+  inner:
+    - host: inner.internal       # reached through ProxyJump bastion
+      knock:
+        sequence: 7000,8000,9000
+        host: bastion.example.com # knock the jump host instead
+```
+
+A sequence is ports separated by commas, each TCP unless it says `:udp`
+(1 to 32 of them). The short form takes the default timing; the mapping
+has `sequence`, `delay`, `wait` and `host`. An entry's `knock` replaces the
+alias's whole — its own sequence with no `wait` gets the default, not the
+alias's — and `none` drops it. It is never a global setting: a sequence
+belongs to a host.
+
+On the command line, `--knock` gives any host a knock, or replaces the
+configured one for this run, with the timing and target after slashes;
+`--knock none` drops it. `ACS_KNOCK` is the same, and `acs list` and
+`acs cp` take it too:
+
+```sh
+acs --knock 7000,8000:udp,9000 me@gated.example.com
+acs --knock 7000,8000,9000/delay=100ms/wait=0.5s gated
+acs --knock 7000,8000,9000/host=bastion.example.com inner
+acs config host add gated gated.example.com --knock 7000,8000:udp,9000
+acs config host set lab knock 7000,8000,9000/wait=500ms
+```
+
+acs knocks before every dial that opens a connection: the first one, every
+reconnect (the port has usually closed again by then), and `acs list`,
+`acs cp` and a command. A call that rides on acs's shared ssh master opens
+no connection and does not knock. It knocks every address the name has,
+from the address ssh will connect from, so a dial ssh makes through a
+`ProxyJump` or `ProxyCommand` is refused unless the knock names its own
+`host`. With `reachability_tcp`, the port check knocks first, and the dial
+right after it reuses that knock. `-v` says whom it knocked and how many
+times, and times it as `knocked`, but never prints the ports; and when ssh
+then cannot connect, acs says the sequence or its timing may not match
+knockd's.
+
+The host needs a working knockd setup and nothing from acs:
+
+- **a rule keeping established connections**, ahead of the drop —
+  `iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT`
+  or nftables' equivalent. Without it, knockd's `cmd_timeout` closes the
+  port under the session, and acs reconnects (knocking again) every time;
+- **a `seq_timeout`** longer than the knock (100 ms for three knocks with
+  the default delay);
+- **`tcpflags = syn`**, or none: acs sends a TCP knock as a plain
+  `connect()`, one SYN, and no raw packets.
+
+**A knock is not authentication.** The sequence crosses the network in
+plain text, and anyone who sees it can replay it from the same address. It
+keeps scanners off the ssh port; ssh's own authentication is what protects
+the host. acs keeps the sequence out of its messages, but does not treat it
+as a secret. One-time sequences, fwknop's Single Packet Authorization and a
+closing sequence are not supported.
+
 ### Which ssh key
 
 `identity_file` picks the key acs passes to ssh as `-i`, for one host entry
@@ -713,6 +792,8 @@ acs config set local_forwards 8080:localhost:80       # every session forwards i
 acs config host set db local_forwards 5432:db.internal:5432,8080:localhost:80
                                                       # db's own, over the global list
 acs config host set quiet local_forwards none         # quiet forwards nothing
+acs config host set lab knock 7000,8000:udp,9000      # knock lab's hosts first
+acs config host add gated gated.example.com --knock 7000,8000,9000
 acs config get install_on_remote
 acs config unset install_on_remote                    # back to the default
 acs config show                                       # everything, and where it is from
@@ -734,6 +815,7 @@ reached as `user@config`.
 | `ACS_ESCAPE_TIMEOUT_MS` | window for the double press (default 400), and the window to then choose the command key — that one never shorter than 2 s |
 | `ACS_COMMAND_BELL` | `0`: no bell when command mode arms; `1`: a bell even if the configuration turns it off |
 | `ACS_REDRAW_ON_RECONNECT` | `0`: no Ctrl-L after reconnecting; `1`: a Ctrl-L even if the configuration (global or the alias's) turns it off |
+| `ACS_KNOCK` | a knock for this run, as `--knock` takes it (`7000,8000:udp,9000/wait=0.5s`, or `none`); `--knock` wins |
 | `ACS_PERSIST` | `1`: never give up on a lost host (as `--persist`); `0`: give up as by default, whatever the configuration says |
 | `ACS_SSH` | ssh program (default `ssh`; also `--ssh`) |
 | `ACS_SOCKET_DIR` | remote socket directory (default `/tmp/acs-<uid>`); a relative path is taken from the remote login directory, normally home |
@@ -755,7 +837,7 @@ reached as `user@config`.
 
 ```sh
 scripts/verify.sh       # fmt, clippy (macOS and Linux targets), tests, markdownlint
-scripts/test_linux.sh   # the suite on Linux in a container, plus multi-user isolation
+scripts/test_linux.sh   # the suite on Linux in a container, plus multi-user isolation and a real knockd
 scripts/e2e_ssh.sh      # end to end over real ssh against a container host
 scripts/test_install.sh # install.sh against the real releases, here and in containers
 scripts/version-bump.sh # release the next version and publish its binaries

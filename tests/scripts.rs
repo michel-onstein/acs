@@ -179,7 +179,7 @@ impl LinuxRun {
 }
 
 const LOGGER: &str = r#"#!/bin/sh
-echo "$(basename "$0") $* [mu=${ACS_MULTIUSER_TEST:-} ns=${ACS_NETNS_TEST:-}]" >>"$FAKE_LOG"
+echo "$(basename "$0") $* [mu=${ACS_MULTIUSER_TEST:-} ns=${ACS_NETNS_TEST:-} kn=${ACS_KNOCKD_TEST:-}]" >>"$FAKE_LOG"
 "#;
 
 /// `test_linux.sh args` against a docker that only keeps its argv; `Err`
@@ -278,19 +278,39 @@ const MULTIUSER: &str = "cargo test -p acs --test multiuser -- --include-ignored
     --skip peer_helper --test-threads=1";
 const NETNS: &str = "cargo test -p acs --test netns -- --include-ignored \
     --test-threads=1 --nocapture";
+const KNOCKD: &str = "cargo test -p acs --test knockd -- --include-ignored \
+    --test-threads=1";
 
 #[test]
-fn test_linux_with_no_arguments_runs_all_three_steps() {
+fn test_linux_with_no_arguments_runs_all_four_steps() {
     let dir = TempDir::new();
     let root = linux_checkout(dir.path(), &[]);
     assert_eq!(
         linux_run(dir.path(), &root, &[]).cargo,
         [
-            "cargo test -p acs [mu= ns=]".to_string(),
-            format!("{MULTIUSER} [mu=1 ns=]"),
-            format!("{NETNS} [mu= ns=1]"),
+            "cargo test -p acs [mu= ns= kn=]".to_string(),
+            format!("{MULTIUSER} [mu=1 ns= kn=]"),
+            format!("{NETNS} [mu= ns=1 kn=]"),
+            format!("{KNOCKD} [mu= ns= kn=1]"),
         ]
     );
+}
+
+/// acs-8l1v.6: the knockd step installs knockd, iptables and both halves
+/// of OpenSSH, which only it needs, before its test.
+#[test]
+fn test_linux_installs_knockd_for_its_step_alone() {
+    let dir = TempDir::new();
+    let root = linux_checkout(dir.path(), &["knockd", "netns"]);
+    let log = |args: &[&str]| {
+        linux_run(dir.path(), &root, args);
+        std::fs::read_to_string(dir.path().join("linux-log")).unwrap()
+    };
+    let packages = "knock iptables openssh-server openssh-client";
+    let knockd = log(&["--only", "knockd"]);
+    let apk = knockd.find(packages).expect(&knockd);
+    assert!(apk < knockd.find("--test knockd").unwrap(), "{knockd}");
+    assert!(!log(&["--only", "netns"]).contains(packages));
 }
 
 /// acs-pjk: `--only` runs one test target, in the same container with the
@@ -299,22 +319,26 @@ fn test_linux_with_no_arguments_runs_all_three_steps() {
 #[test]
 fn test_linux_only_runs_one_target_as_the_full_run_would() {
     let dir = TempDir::new();
-    let root = linux_checkout(dir.path(), &["netns", "multiuser", "client"]);
+    let root = linux_checkout(dir.path(), &["netns", "multiuser", "knockd", "client"]);
     let full = linux_run(dir.path(), &root, &[]);
-    let cases: [(&[&str], String); 5] = [
-        (&["--only", "netns"], format!("{NETNS} [mu= ns=1]")),
+    let cases: [(&[&str], String); 6] = [
+        (&["--only", "netns"], format!("{NETNS} [mu= ns=1 kn=]")),
         (
             &["--only", "netns", "--", "address"],
-            format!("{NETNS} address [mu= ns=1]"),
+            format!("{NETNS} address [mu= ns=1 kn=]"),
         ),
-        (&["--only", "multiuser"], format!("{MULTIUSER} [mu=1 ns=]")),
+        (
+            &["--only", "multiuser"],
+            format!("{MULTIUSER} [mu=1 ns= kn=]"),
+        ),
+        (&["--only", "knockd"], format!("{KNOCKD} [mu= ns= kn=1]")),
         (
             &["--only", "client", "--", "--exact", "a b"],
-            "cargo test -p acs --test client -- --exact a b [mu= ns=]".to_string(),
+            "cargo test -p acs --test client -- --exact a b [mu= ns= kn=]".to_string(),
         ),
         (
             &["--platform", "linux/amd64", "--only", "lib"],
-            "cargo test -p acs --lib -- [mu= ns=]".to_string(),
+            "cargo test -p acs --lib -- [mu= ns= kn=]".to_string(),
         ),
     ];
     for (args, want) in cases {
@@ -346,7 +370,7 @@ fn test_linux_refuses_a_bad_selection_before_starting_docker() {
     }
 }
 
-/// acs-hdj4: the multi-user, netns and e2e tests are `#[ignore]`, so a plain
+/// acs-hdj4: the multi-user, netns, knockd and e2e tests are `#[ignore]`, so a plain
 /// `cargo test` counts them rather than passing them unrun. The scripts that
 /// can run them have to ask for them, or they go dark there too — counted as
 /// ignored in the one place they were meant to run.
@@ -358,6 +382,7 @@ fn the_container_scripts_run_the_ignored_tests() {
     for step in [
         "--test multiuser -- --include-ignored --skip peer_helper",
         "--test netns -- --include-ignored",
+        "--test knockd -- --include-ignored",
     ] {
         assert!(
             linux.contains(step),
