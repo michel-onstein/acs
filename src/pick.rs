@@ -79,7 +79,7 @@ pub fn choose(
                 return Ok(None);
             }
         };
-    if !always && !sessions.iter().any(|s| !s.attached) {
+    if !always && !sessions.iter().any(StatusInfo::offered) {
         // The proxy has attached the HELLO that went ahead, named as
         // `new_session` names it here (`_proxy --pick --eager`).
         args.target = new_session(&sessions, &default);

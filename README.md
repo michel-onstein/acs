@@ -166,7 +166,9 @@ before it (`acs -p 22 list`), or listed as `acs list list`.
 
 A plain `acs host` looks at the host's sessions first. With none
 detached, it creates one — `main`, or the lowest free number if `main` is
-taken. With some detached, it shows them:
+taken. A command run without a terminal is *piped* in the STATE column and
+does not count as detached, since no terminal can attach it. With some
+detached, it shows them:
 
 ```text
 acs: detached sessions on devbox
@@ -185,7 +187,7 @@ acs: detached sessions on devbox
 | `1`–`9` | attach that session (more than nine: the rest by cursor) |
 | ↑ ↓ or `k` `j`, then Enter | attach the session under the cursor, or pick *new session* or *exit* |
 | `n` | create a new session (on a session row, or on *new session*) |
-| `.` | show attached sessions too; taking one over asks first (`--force` does not) |
+| `.` | show attached sessions too, and *piped* ones (a command run without a terminal, which cannot be attached); taking one over asks first (`--force` does not) |
 | `x` | end the session under the cursor, after a `y` (or a second `x`) |
 | Esc | leave the menu (Ctrl-C too) |
 

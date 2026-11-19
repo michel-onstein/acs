@@ -115,6 +115,18 @@ pub struct StatusInfo {
     pub size: WinSize,
     pub version: String,
     pub pid: u32,
+    /// The command runs on pipes (DESIGN §5.5): no terminal can attach it.
+    /// A trailing byte only when set, as in HELLO, so every other reply is
+    /// byte for byte what it was.
+    pub pipe: bool,
+}
+
+impl StatusInfo {
+    /// The menu offers it, and a plain `acs <host>` shows the menu for
+    /// it (§4.4): detached, and a terminal's to attach.
+    pub fn offered(&self) -> bool {
+        !self.attached && !self.pipe
+    }
 }
 
 /// Error codes carried by [`Msg::Error`].
@@ -479,6 +491,9 @@ impl Msg {
                     w.size(&s.size);
                     w.str(&s.version);
                     w.u32(s.pid);
+                    if s.pipe {
+                        w.u8(1);
+                    }
                     ty::STATUS_REPLY
                 }
                 Msg::Error { code, message } => {
@@ -640,6 +655,7 @@ impl Msg {
                 size: r.size()?,
                 version: r.str("version")?,
                 pid: r.u32("pid")?,
+                pipe: r.pos < p.len() && r.bool("pipe")?,
             }),
             ty::ERROR => Msg::Error {
                 code: r.u16("code")?,
@@ -1011,6 +1027,7 @@ mod tests {
                 size: size(),
                 version: "0.1.0".into(),
                 pid: 4242,
+                pipe: false,
             }),
             Msg::Error {
                 code: err::PROTO_MISMATCH,
@@ -1074,6 +1091,39 @@ mod tests {
         let mut d = Decoder::new();
         d.push(&bad);
         assert_eq!(d.next_msg(), Err(ProtoError::BadValue("pipe")));
+    }
+
+    /// acs-km7x: a STATUS_REPLY marks a session on pipes the same way — one
+    /// trailing byte, only when set — so the reply of every other session,
+    /// and of a master that never heard of pipes, is what it always was.
+    #[test]
+    fn a_status_reply_marks_a_piped_session_with_one_trailing_byte() {
+        let Some(Msg::StatusReply(mut s)) = samples()
+            .into_iter()
+            .find(|m| matches!(m, Msg::StatusReply(_)))
+        else {
+            unreachable!()
+        };
+        let plain = Msg::StatusReply(s.clone()).to_bytes();
+        s.pipe = true;
+        let piped = Msg::StatusReply(s.clone()).to_bytes();
+        assert_eq!(piped.len(), plain.len() + 1);
+        assert_eq!(&piped[HEADER..plain.len()], &plain[HEADER..]);
+        let mut d = Decoder::new();
+        d.push(&piped);
+        assert_eq!(d.next_msg(), Ok(Some(Msg::StatusReply(s.clone()))));
+        let mut bad = piped;
+        *bad.last_mut().unwrap() = 2;
+        let mut d = Decoder::new();
+        d.push(&bad);
+        assert_eq!(d.next_msg(), Err(ProtoError::BadValue("pipe")));
+        // Offered by the menu only when detached and not on pipes.
+        s.attached = false;
+        assert!(!s.offered());
+        s.pipe = false;
+        assert!(s.offered());
+        s.attached = true;
+        assert!(!s.offered());
     }
 
     #[test]
@@ -1403,6 +1453,7 @@ mod tests {
             size: WinSize::default(),
             version: String::new(),
             pid: 1,
+            pipe: false,
         };
         let mut d = Decoder::new();
         d.push(&Msg::StatusReply(s.clone()).to_bytes());

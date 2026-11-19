@@ -1523,6 +1523,7 @@ impl Master {
             size: self.size,
             version: crate::VERSION.to_string(),
             pid: sys::getpid(),
+            pipe: self.pipe,
         }
     }
 

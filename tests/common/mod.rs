@@ -1066,6 +1066,17 @@ impl Remote {
     pub fn session_exists(&self, name: &str) -> bool {
         std::os::unix::net::UnixStream::connect(self.sockets().join(format!("{name}.sock"))).is_ok()
     }
+
+    /// Session `name` running `sleep 30` on pipes (DESIGN §5.5), its client
+    /// gone: what a piped command is between links.
+    pub fn piped_detached(&self, name: &str) {
+        acs::master::spawn(&exe(), &self.sockets(), name).unwrap();
+        let sock = self.sockets().join(format!("{name}.sock"));
+        let mut c = acs::testutil::FrameConn::connect(&sock).unwrap();
+        let mut h = acs::testutil::hello_running(name, "tester@local", &["sleep 30"]);
+        h.pipe = true;
+        c.greet(h);
+    }
 }
 
 /// The acs client running on a pty, as a user would run it.

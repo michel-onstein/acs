@@ -329,7 +329,14 @@ fn cells(s: &StatusInfo, now: u64) -> Vec<String> {
     let safe = crate::safe::display;
     vec![
         safe(&s.name),
-        if s.attached { "attached" } else { "detached" }.to_string(),
+        // A command on pipes is no terminal's to attach (§5.5), linked or
+        // not: WHO's parentheses still say which.
+        match (s.pipe, s.attached) {
+            (true, _) => "piped",
+            (_, true) => "attached",
+            _ => "detached",
+        }
+        .to_string(),
         if s.identity.is_empty() {
             "-".to_string()
         } else if s.attached {
@@ -555,6 +562,7 @@ mod tests {
             size: Default::default(),
             version: "0.1.0".into(),
             pid: 1,
+            pipe: false,
         }
     }
 
@@ -576,15 +584,27 @@ mod tests {
                 info("main", true, "michel@mbp", 3, now - 7200, "/bin/zsh -l"),
                 info("2", false, "alice@laptop", 900, now - 60, "htop"),
                 info("x", false, "", 0, now, "sh"),
+                StatusInfo {
+                    pipe: true,
+                    ..info("3", false, "al@x", 5, now - 60, "tar x")
+                },
+                StatusInfo {
+                    pipe: true,
+                    ..info("4", true, "al@x", 0, now, "cat")
+                },
             ],
             now,
         );
+        // acs-km7x: a command on pipes is "piped", whether its client is
+        // linked or not.
         assert_eq!(
             t,
             "NAME  STATE     WHO             IDLE  AGE  COMMAND\n\
              main  attached  michel@mbp      3s    2h   /bin/zsh -l\n\
              2     detached  (alice@laptop)  15m   1m   htop\n\
-             x     detached  -               0s    0s   sh\n"
+             x     detached  -               0s    0s   sh\n\
+             3     piped     (al@x)          5s    1m   tar x\n\
+             4     piped     al@x            0s    0s   cat\n"
         );
         assert_eq!(render("h", &[], now), "no sessions on h\n");
     }
