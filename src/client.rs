@@ -93,8 +93,8 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     // §7.1) before the master is decided, so a forward that arrives from
     // the configuration hits the same carve-out a `-L` does: a session that
     // forwards anything gets no shared master (acs-9n3).
-    // A command run without a terminal is ssh's own (DESIGN §7.7): no
-    // forwards, and no session to pick.
+    // A command run without a terminal runs on pipes (DESIGN §7.7, §5.5):
+    // no forwards, and no session to pick.
     let pipe = crate::exec::without_terminal(&args, sys::isatty(STDIN), sys::isatty(STDOUT));
     if pipe {
         if let Err(e) = crate::exec::prepare(&mut args) {
@@ -117,18 +117,19 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     if args.conn.alias.is_some() {
         timing.mark(Phase::AliasResolved);
     }
-    if pipe {
-        return ExitCode::from(crate::exec::run(&args));
-    }
     if args.list && !menu {
         return crate::list::run(&args);
+    }
+    // Made before the first dial, so a change while it waits is seen
+    // (acs-xo1), and the one watcher the whole client keeps.
+    let netwatch = crate::netwatch::NetWatch::new(args.conn.verbose > 0);
+    // On pipes there is no menu: a session of its own (DESIGN §5.5).
+    if pipe {
+        return ExitCode::from(run(args, None, timing, netwatch));
     }
     // No session named: pick one on the host just resolved (DESIGN §4.4),
     // over the connection the session then uses.
     let always = args.list;
-    // Made before the first dial, so a change while it waits is seen
-    // (acs-xo1), and the one watcher the whole client keeps.
-    let netwatch = crate::netwatch::NetWatch::new(args.conn.verbose > 0);
     loop {
         match crate::pick::choose(&mut args, always, &mut timing, netwatch.as_ref()) {
             Ok(picked) => return ExitCode::from(run(args, picked, timing, netwatch)),
@@ -1503,6 +1504,8 @@ pub struct State {
     /// — measured from here — so a dial that spent its whole timeout
     /// waiting on a silent host never counts as a connection that lasted.
     pub welcomed_at: Option<std::time::Instant>,
+    /// A command on pipes, not a terminal (DESIGN §5.5).
+    pub pipe: Option<crate::exec::Pipe>,
 }
 
 /// Why a link ended, so far as this side can tell (acs-n1m). It decides
@@ -1615,6 +1618,7 @@ fn hello(args: &ClientArgs, state: &State, force: bool) -> Hello {
         instance,
         offset: state.offset,
     });
+    h.pipe = state.pipe.is_some();
     h
 }
 
@@ -1638,6 +1642,7 @@ fn fresh_hello(
         size: sys::get_winsize(STDIN).unwrap_or_default(),
         resume: None,
         command: args.command.clone(),
+        pipe: false,
     }
 }
 
@@ -1667,7 +1672,8 @@ pub fn run(
     timing: Timing,
     netwatch: Option<crate::netwatch::NetWatch>,
 ) -> u8 {
-    if !sys::isatty(STDIN) {
+    let pipe = crate::exec::without_terminal(&args, sys::isatty(STDIN), sys::isatty(STDOUT));
+    if !pipe && !sys::isatty(STDIN) {
         eprintln!("acs: stdin is not a terminal");
         return code::USAGE;
     }
@@ -1675,7 +1681,9 @@ pub fn run(
         eprintln!("acs: {e}");
         return code::ERROR;
     }
-    let signals = match sys::signals::install(&[libc::SIGWINCH]) {
+    // On pipes the signals that end acs end the command first (§5.5).
+    let ends = [libc::SIGWINCH, libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+    let signals = match sys::signals::install(&ends[..if pipe { 4 } else { 1 }]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("acs: {e}");
@@ -1699,7 +1707,7 @@ pub fn run(
         status_drawn: (Vec::new(), 0),
         command_bell: command_bell(&args.conn.config),
         bell_pending: false,
-        redraw_on_reconnect: redraw_on_reconnect(&args),
+        redraw_on_reconnect: redraw_on_reconnect(&args) && !pipe,
         paste: keys::PasteTracker::default(),
         detector: Detector::new(escape_config()),
         force_next: args.force,
@@ -1708,6 +1716,7 @@ pub fn run(
             .filter(|p| p.link.muxed)
             .map(|_| args.conn.transport.clone()),
         welcomed_at: None,
+        pipe: pipe.then(|| crate::exec::Pipe::new(args.null_stdin)),
     };
     let mut raw: Option<RawMode> = None;
     let result = crate::reconnect::run(
@@ -2256,10 +2265,20 @@ fn serve(
                         // Time blocked on a terminal that is not reading is
                         // not the host's to answer for (acs-spd).
                         let began = sys::now_ms();
-                        let wrote = write_output(state, &bytes[skip..]);
+                        let wrote = match &mut state.pipe {
+                            Some(p) => p.write(&bytes[skip..], sys::write_all),
+                            None => write_output(state, &bytes[skip..]),
+                        };
                         liveness.wrote_for(sys::now_ms().saturating_sub(began));
                         if wrote.is_err() {
-                            link.close();
+                            // Nowhere for its output: end the command, as
+                            // a closed ssh channel would (DESIGN §5.5).
+                            if state.pipe.is_some() {
+                                kill(&mut out);
+                                hang_up(&mut out, link);
+                            } else {
+                                link.close();
+                            }
                             return Outcome::Exit(code::ERROR);
                         }
                         state.offset = end;
@@ -2294,6 +2313,13 @@ fn serve(
                     if w.created && (!args.one_shot || args.conn.verbose > 0) {
                         note(&format!("new session '{}' on {}", w.session, state.host));
                     }
+                    // On pipes only a lossless resume carries on: there is
+                    // no screen to repaint what a gap lost (DESIGN §5.5).
+                    if state.pipe.is_some() && !w.created && w.kind != AttachKind::Resumed {
+                        note("the command's output was lost");
+                        link.close();
+                        return Outcome::Exit(code::ERROR);
+                    }
                     state.session = Some(w.session.clone());
                     state.instance = Some(w.instance);
                     state.unacked.rebase(w.input_seq, same);
@@ -2301,7 +2327,7 @@ fn serve(
                         // Another program's input: no paste of ours is open.
                         state.paste = keys::PasteTracker::default();
                     }
-                    if raw.is_none() {
+                    if raw.is_none() && state.pipe.is_none() {
                         match RawMode::enter(STDIN) {
                             Ok(r) => *raw = Some(r),
                             Err(e) => {
@@ -2376,6 +2402,17 @@ fn serve(
                         let (seq, bytes) = state.unacked.pending();
                         proto::encode_input(seq, &bytes, out.tail());
                     }
+                    // Then the end of input, and the kill, where either was
+                    // asked for: the master takes each once (DESIGN §5.5).
+                    if let Some(p) = &state.pipe {
+                        if p.eof {
+                            end_input(state.unacked.next_seq(), out.tail());
+                        }
+                        if p.kill {
+                            kill(&mut out);
+                            exiting = true;
+                        }
+                    }
                     // Then Ctrl-L, so the program repaints (DESIGN §5.2):
                     // after what was typed before the drop, before anything
                     // typed now, and as input, so a later resume resends it
@@ -2437,7 +2474,13 @@ fn serve(
                 // The master checks on us too (DESIGN §5.3, acs-ode).
                 Msg::Ping(n) => Msg::Pong(n).encode(out.tail()),
                 Msg::Exit { status } => {
-                    link.close();
+                    // On pipes the master waits to hear the EXIT arrived.
+                    if state.pipe.is_some() {
+                        Msg::Detach.encode(out.tail());
+                        hang_up(&mut out, link);
+                    } else {
+                        link.close();
+                    }
                     return Outcome::Exit(sys::exit_code(status));
                 }
                 Msg::Takeover => {
@@ -2453,12 +2496,19 @@ fn serve(
                 }
                 other => {
                     if args.conn.verbose > 0 {
-                        note(&format!("ignoring {other:?}"));
+                        note(&format!("ignoring {}", other.kind()));
                     }
                 }
             }
         }
 
+        // On pipes the master keeps output until it is written out here.
+        if let Some(p) = &mut state.pipe {
+            if p.acked != state.offset {
+                p.acked = state.offset;
+                Msg::Ack { seq: p.acked }.encode(out.tail());
+            }
+        }
         let before = out.len();
         if !out.flush(to) {
             return lost(link, LinkEnd::Transport);
@@ -2494,9 +2544,17 @@ fn serve(
         let mut fds = [
             sys::pollfd(from, libc::POLLIN),
             sys::pollfd(signals.as_raw_fd(), libc::POLLIN),
-            sys::pollfd(
+            // Not polled at all when not wanted: a pipe's writer gone is a
+            // POLLHUP for ever, which would read the end again and again.
+            sys::wait_for(
                 STDIN,
-                if welcomed && !exiting {
+                // On pipes, not past its end, nor faster than the host takes it.
+                if welcomed
+                    && !exiting
+                    && state.pipe.as_ref().map_or(true, |p| {
+                        !p.eof && state.unacked.len() < PIPE_UNACKED && out.len() < PIPE_UNACKED
+                    })
+                {
                     libc::POLLIN
                 } else {
                     0
@@ -2515,6 +2573,14 @@ fn serve(
                     if let Ok(s) = sys::get_winsize(STDIN) {
                         Msg::Resize(s).encode(out.tail());
                     }
+                } else if let Some(p) = state.pipe.as_mut().filter(|_| sig != libc::SIGWINCH) {
+                    // Kept, so a redial that the same signal's ssh forced
+                    // still delivers it (DESIGN §5.5).
+                    p.kill = true;
+                    if welcomed {
+                        kill(&mut out);
+                    }
+                    exiting = true;
                 }
             }
         }
@@ -2554,6 +2620,16 @@ fn serve(
         let mut action = None;
         if fds[2].revents != 0 {
             match sys::read(STDIN, &mut buf) {
+                // On pipes, stdin's bytes as they are, and its end passed on.
+                r if state.pipe.is_some() => match r.unwrap_or(0) {
+                    0 => {
+                        if let Some(p) = &mut state.pipe {
+                            p.eof = true;
+                        }
+                        end_input(state.unacked.next_seq(), out.tail());
+                    }
+                    n => queue_input(state, out.tail(), &buf[..n]),
+                },
                 Ok(0) | Err(_) => {
                     // The terminal went away: leave the session running.
                     Msg::Detach.encode(out.tail());
@@ -2588,26 +2664,12 @@ fn serve(
         match action {
             Some(Action::Detach) => {
                 Msg::Detach.encode(out.tail());
-                let deadline = Instant::now() + Duration::from_millis(500);
-                while !out.is_empty() && Instant::now() < deadline {
-                    if !out.flush(to) {
-                        break;
-                    }
-                    let mut p = [sys::pollfd(to, libc::POLLOUT)];
-                    let _ = sys::poll(&mut p, 50);
-                }
+                flush_briefly(&mut out, to);
                 link.close();
                 return detached(state, raw);
             }
             Some(Action::Exit) => {
-                // This connection is the attached one, so the master lets
-                // the kill through on that ground; the identity goes along
-                // to name who asked (acs-fbo).
-                Msg::Kill {
-                    identity: identity(),
-                    force: true,
-                }
-                .encode(out.tail());
+                kill(&mut out);
                 exiting = true;
             }
             None => {}
@@ -2654,6 +2716,59 @@ fn serve(
             return Outcome::Exit(code::UNREACHABLE);
         }
     }
+}
+
+/// How much input a command on pipes may have in flight, unacknowledged
+/// or not yet written to the link, before stdin waits (DESIGN §5.5).
+const PIPE_UNACKED: usize = 1 << 20;
+
+/// The empty INPUT that ends a command's stdin after `seq` bytes (§5.5).
+fn end_input(seq: u64, out: &mut Vec<u8>) {
+    Msg::Input { seq, bytes: vec![] }.encode(out);
+}
+
+/// Ask the master to end the session. This connection is the attached
+/// one, so the master lets the kill through on that ground; the identity
+/// goes along to name who asked (acs-fbo).
+fn kill(out: &mut OutQueue) {
+    Msg::Kill {
+        identity: identity(),
+        force: true,
+    }
+    .encode(out.tail());
+}
+
+/// Write what is queued for the link, for at most half a second: the last
+/// word before the link is closed.
+fn flush_briefly(out: &mut OutQueue, to: RawFd) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !out.is_empty() && Instant::now() < deadline {
+        if !out.flush(to) {
+            break;
+        }
+        let mut p = [sys::pollfd(to, libc::POLLOUT)];
+        let _ = sys::poll(&mut p, 50);
+    }
+}
+
+/// The last word on a link: written, then the host given a second to hang
+/// up, which says it was read — closing the link kills ssh, and with it
+/// whatever ssh had not sent yet.
+fn hang_up(out: &mut OutQueue, link: Link) {
+    flush_briefly(out, link.to.as_raw_fd());
+    let from = link.from.as_raw_fd();
+    let until = sys::now_ms() + 1000;
+    let mut buf = [0u8; 4096];
+    while sys::now_ms() < until {
+        let mut p = [sys::pollfd(from, libc::POLLIN)];
+        let _ = sys::poll(&mut p, 50);
+        match sys::read(from, &mut buf) {
+            Ok(0) => break,
+            Err(e) if e.kind() != io::ErrorKind::WouldBlock => break,
+            _ => {}
+        }
+    }
+    link.close();
 }
 
 /// Where a DATA frame at `offset` with `len` bytes stands against the
@@ -2965,6 +3080,7 @@ mod tests {
             force_next: false,
             master: None,
             welcomed_at: None,
+            pipe: None,
         }
     }
 

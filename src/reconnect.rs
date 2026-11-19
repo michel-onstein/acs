@@ -398,7 +398,12 @@ fn offline(
     if let Some(r) = raw.as_mut() {
         let _ = r.resume();
     }
-    show_status(state, msg);
+    // On pipes stdout is the command's and stdin its input: no status
+    // line, and nothing read (DESIGN §5.5).
+    let pipe = state.pipe.is_some();
+    if !pipe {
+        show_status(state, msg);
+    }
     let deadline = Instant::now() + wait;
     let mut buf = [0u8; 4096];
     loop {
@@ -411,13 +416,24 @@ fn offline(
             timeout = timeout.min(Duration::from_millis(d.saturating_sub(sys::now_ms())));
         }
         let mut fds = [
-            sys::pollfd(0, libc::POLLIN),
+            sys::pollfd(if pipe { -1 } else { 0 }, libc::POLLIN),
             sys::pollfd(signals.as_raw_fd(), libc::POLLIN),
             sys::pollfd(netwatch.map(|w| w.fd()).unwrap_or(-1), libc::POLLIN),
         ];
         let _ = sys::poll(&mut fds, sys::poll_timeout(timeout));
-        if fds[1].revents != 0 {
-            sys::signals::drain(signals.as_raw_fd());
+        // On pipes a signal that ends acs is kept for the next link to
+        // deliver as KILL; a second gives up waiting (DESIGN §5.5).
+        if fds[1].revents != 0
+            && sys::signals::drain(signals.as_raw_fd())
+                .iter()
+                .any(|&s| s != libc::SIGWINCH)
+        {
+            if let Some(p) = &mut state.pipe {
+                if p.kill {
+                    return Offline::Detach;
+                }
+                p.kill = true;
+            }
         }
         if fds[2].revents != 0 {
             if let Some(change) = netwatch.and_then(|w| w.changed()) {

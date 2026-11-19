@@ -277,7 +277,9 @@ pub(crate) fn read_listing(
             }
             Ok(Some(Msg::ListEnd)) if until == Until::End => return Ok(answer),
             Ok(Some(_)) if until == Until::Eof => continue,
-            Ok(Some(other)) => return Err(Failure::BadReply(format!("unexpected {other:?}"))),
+            Ok(Some(other)) => {
+                return Err(Failure::BadReply(format!("unexpected {}", other.kind())))
+            }
             Ok(None) => {}
             Err(e) => return Err(Failure::BadReply(e.to_string())),
         }

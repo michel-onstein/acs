@@ -1298,13 +1298,15 @@ fn e2e_21_acscp_joins_the_sessions_master() {
     );
 }
 
-/// DESIGN §7.7: `acs -T host -- command` is `ssh -T host command` over
-/// acs's transport — over real ssh the command has no terminal, its stdin
-/// is the client's pipe through to EOF, stderr is apart, and its status is
-/// acs's.
+/// DESIGN §7.7, §5.5: `acs host -- command` into a pipe gives what
+/// `ssh -T host command` gives — over real ssh the command has no terminal,
+/// its stdin is the client's pipe through to EOF, stderr is apart, and its
+/// status is acs's — on pipes in a session of its own. Numbered to run
+/// after e2e_01: being a session, it installs acs, which e2e_01's first
+/// contact must find not done (the suite runs in name order).
 #[test]
 #[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
-fn a_command_without_a_terminal_is_ssh_s_own() {
+fn e2e_22_a_command_without_a_terminal_runs_on_pipes() {
     use std::io::Write as _;
     use std::process::Stdio;
     let h = host();
@@ -1336,4 +1338,71 @@ fn a_command_without_a_terminal_is_ssh_s_own() {
     );
     assert_eq!(out.stdout, b"PIPED\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("no-tty"));
+}
+
+/// DESIGN §5.5 (acs-182f): a piped command over real ssh survives the
+/// host's `sshd-session` killed in the middle of its output — stdout byte
+/// for byte, stderr apart, its status kept.
+#[test]
+#[ignore = "needs the container host: run by scripts/e2e_ssh.sh"]
+fn e2e_23_a_piped_command_resumes_after_a_killed_connection() {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let h = host();
+    h.root_sh("rm -f /tmp/acs-pipe-go");
+    let mut args = h.ssh_args();
+    args.extend(
+        [
+            "dev@127.0.0.1",
+            "--",
+            "echo first; while [ ! -f /tmp/acs-pipe-go ]; do sleep 0.05; done; \
+             seq 1 200000; echo last-err >&2; exit 3",
+        ]
+        .map(String::from),
+    );
+    let mut child = Command::new(&h.client)
+        .args(&args)
+        .env("ACS_NO_UPDATE_CHECK", "1")
+        .env("ACS_CONTROL_PERSIST", NO_MASTER)
+        .env("ACS_BACKOFF_MS", "300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let mut first = [0u8; 6];
+    out.read_exact(&mut first).unwrap();
+    assert_eq!(&first, b"first\n");
+    h.docker(&[
+        "exec",
+        &h.container,
+        "sh",
+        "-c",
+        "pkill -f '[s]shd-session: dev@' || pkill -f '[s]shd: dev@'",
+    ]);
+    h.root_sh("touch /tmp/acs-pipe-go");
+    let mut rest = Vec::new();
+    out.read_to_end(&mut rest).unwrap();
+    let done = child.wait_with_output().unwrap();
+    let mut want = Vec::new();
+    for i in 1..=200000 {
+        want.extend_from_slice(format!("{i}\n").as_bytes());
+    }
+    assert_eq!(
+        done.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&done.stderr)
+    );
+    assert!(
+        rest == want,
+        "stdout differs: {} bytes of {}",
+        rest.len(),
+        want.len()
+    );
+    // ssh may say something of its own there; the command's line is once.
+    let err = String::from_utf8_lossy(&done.stderr);
+    assert_eq!(err.matches("last-err\n").count(), 1, "{err}");
+    eprintln!("VERIFIED a piped command resumed after a killed connection, byte for byte");
 }

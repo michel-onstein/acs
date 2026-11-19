@@ -137,6 +137,11 @@ impl Unacked {
         self.buf.is_empty()
     }
 
+    /// How many bytes are unacknowledged.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Everything unacknowledged, with the sequence of its first byte.
     pub fn pending(&self) -> (u64, Vec<u8>) {
         (self.base, self.buf.iter().copied().collect())

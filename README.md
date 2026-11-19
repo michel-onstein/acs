@@ -248,15 +248,17 @@ exactly as ssh does it: quote what the host's shell should see, so
 In a terminal, the command runs in a session of its own that ends with it,
 so a dropped connection is resumed and the command never notices; Ctrl-]
 Ctrl-] `d` leaves it running (acs says which session to reattach to) and `x`
-ends it. When stdin or stdout is not a terminal, acs runs it as `ssh -T`
-would — stdout, stderr and stdin kept apart and byte-exact, end of file
-passed on — over the same host, alias, key and shared connection, but
-without a session to resume.
+ends it. When stdin or stdout is not a terminal, the command gets a session
+of its own too, but on pipes rather than a terminal, so it behaves as with
+`ssh -T` — stdout, stderr and stdin kept apart and byte-exact, end of file
+passed on, acs exiting with its status — and a dropped connection is
+resumed as well, so a long `tar` survives a flaky link. Ctrl-C ends the
+command on the host.
 
 | Option | Effect |
 | --- | --- |
-| `-t` | run in a session even when stdout is not a terminal |
-| `-T` | run without a terminal, as `ssh -T` |
+| `-t` | run on a terminal even when stdout is not one |
+| `-T` | run without a terminal, on pipes, as `ssh -T` |
 | `-n` | read stdin from `/dev/null`, as `ssh -n` (implies `-T`) |
 
 `acs host session -- command` and `acs host --new -- command` start a
