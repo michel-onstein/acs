@@ -52,8 +52,8 @@ struct Locality {
 /// entry otherwise, and an error naming every host tried when none answers.
 ///
 /// `user@<alias>` goes through the alias as that user: the chosen entry's
-/// `user` is the given one, whatever the entry says. An entry without an
-/// `identity_file` takes the alias's. `reachable` pings one host; `network`
+/// `user` is the given one, whatever the entry says. An entry without a
+/// `user` or an `identity_file` takes the alias's. `reachable` pings one host; `network`
 /// gives this machine's networks and a resolver, asked only when the alias
 /// has `prefer_local_network` or one of its entries has `local_networks`;
 /// `log` receives why each entry was taken or skipped.
@@ -233,7 +233,11 @@ fn pick(
         .entries
         .iter()
         .map(|e| HostEntry {
-            user: user.map(String::from).or_else(|| e.user.clone()),
+            // The command line's, else the entry's, else the alias's.
+            user: user
+                .map(String::from)
+                .or_else(|| e.user.clone())
+                .or_else(|| alias.user.as_ref().map(|u| u.value.clone())),
             identity_file: e
                 .identity_file
                 .clone()
@@ -1043,6 +1047,44 @@ aliases:
             Some("~/.ssh/id_alias:3")
         );
         assert_eq!(key("plain", &["plain.lan"]), None);
+    }
+
+    /// acs-h4p4: `user@alias` over the entry's `user` over the alias's.
+    #[test]
+    fn an_entry_without_a_user_takes_the_aliass() {
+        let c = config(
+            "\
+aliases:
+  devbox:
+    user: svc
+    hosts:
+      - host: devbox.lan
+        user: me
+      - host: devbox.example.com
+  plain:
+    - host: plain.lan
+",
+        );
+        let dest = |name: &str, up: &[&str]| {
+            let f = Fake::up(up).reachable();
+            let e = resolve(name, &c, f, &no_network, &mut |_| {});
+            e.unwrap().unwrap().destination()
+        };
+        // The entry's own user beats the alias's.
+        assert_eq!(dest("devbox", &["devbox.lan"]), "me@devbox.lan");
+        // The fallback names none and takes the alias's.
+        assert_eq!(
+            dest("devbox", &["devbox.example.com"]),
+            "svc@devbox.example.com"
+        );
+        // The command line's beats both.
+        assert_eq!(dest("you@devbox", &["devbox.lan"]), "you@devbox.lan");
+        assert_eq!(
+            dest("you@devbox", &["devbox.example.com"]),
+            "you@devbox.example.com"
+        );
+        // Without any, ssh's own configuration decides.
+        assert_eq!(dest("plain", &["plain.lan"]), "plain.lan");
     }
 
     #[test]

@@ -201,6 +201,34 @@ fn user_at_alias_logs_in_as_that_user_on_every_host() {
     c.wait(T);
 }
 
+/// acs-h4p4: an alias's `user` is the login name of the entries naming none;
+/// an entry's own, and `user@alias`, win.
+#[test]
+fn an_alias_user_is_the_default_login_name() {
+    let remote = Remote::installed();
+    let net = Net::new(&["devbox.lan"]);
+    let env = net.env(
+        "aliases:\n  devbox:\n    user: svc\n    hosts:\n      - host: devbox.lan\n      \
+         - host: devbox.example.com\n        user: me\n",
+    );
+    for (name, up, want) in [
+        ("devbox", "devbox.lan", "using svc@devbox.lan"),
+        (
+            "devbox",
+            "devbox.example.com",
+            "using me@devbox.example.com",
+        ),
+        ("you@devbox", "devbox.lan", "using you@devbox.lan"),
+    ] {
+        net.set_up(&[up]);
+        let mut c = Client::start_env(&remote, &session(name), &refs(&env));
+        c.wait_for(want, T);
+        wait_up(&mut c, "s");
+        c.send(&command(b'x'));
+        c.wait(T);
+    }
+}
+
 #[test]
 fn other_names_are_not_resolved() {
     let remote = Remote::installed();
