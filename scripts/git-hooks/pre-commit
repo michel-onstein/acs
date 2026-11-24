@@ -13,6 +13,6 @@ here="$(cd "$(git rev-parse --git-dir)" && pwd -P)"
 common="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
 if [ "$here" = "$common" ] && [ "$(git branch --show-current)" = main ]; then
     echo "pre-commit: refusing to commit on main in the shared checkout." >&2
-    echo "  Work in a worktree under .claude/worktrees/ (AGENTS.md, Landing a change)." >&2
+    echo "  Work in a worktree under .claude/worktrees/, as the repository's landing rules say." >&2
     exit 1
 fi
