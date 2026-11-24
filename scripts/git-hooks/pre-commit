@@ -1,0 +1,18 @@
+#!/bin/sh
+# Copyright (c) 2026 Q-Jam B.V. All rights reserved.
+# After of1's guard-shared-tree.sh: no commit on main in the checkout every session shares. A linked worktree's git
+# dir is not the common one, so commits there pass straight through.
+#
+# ACS_ALLOW_MAIN_COMMIT=1 lets one deliberate commit through, for a script whose job is to commit on main there,
+# such as a release that must tag main itself. Set it on that one command, never in a shell's environment.
+
+if [ "${ACS_ALLOW_MAIN_COMMIT:-}" = 1 ]; then
+    exit 0
+fi
+here="$(cd "$(git rev-parse --git-dir)" && pwd -P)"
+common="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+if [ "$here" = "$common" ] && [ "$(git branch --show-current)" = main ]; then
+    echo "pre-commit: refusing to commit on main in the shared checkout." >&2
+    echo "  Work in a worktree under .claude/worktrees/ (AGENTS.md, Landing a change)." >&2
+    exit 1
+fi

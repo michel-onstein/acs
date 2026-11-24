@@ -1,6 +1,27 @@
 {
+  // Project markdown lint configuration. Run with:
+  //   scripts/markdownlint.sh
   "config": {
-    "MD013": { "tables": false, "code_blocks": false }
+    // Prose is hand-wrapped at ~120; tables and code blocks are exempt.
+    "MD013": {
+      "line_length": 120,
+      "tables": false,
+      "code_blocks": false,
+      "headings": false
+    },
+    // Table pipes are written compactly (|---|---|); do not enforce padding.
+    "MD060": false,
+    // Bullets are dashes. Stated rather than left to MD004's "consistent"
+    // default, which takes whichever style a file happens to open with (md1-d1x).
+    "MD004": { "style": "dash" },
+    // Duplicate headings are fine when nested under different parents.
+    "MD024": { "siblings_only": true },
+    // Inline HTML is not used, but keep the escape hatch open.
+    "MD033": false
   },
-  "ignores": [".claude/**", "target/**"]
+  // Skip what git ignores — every .gitignore in the tree, such as the `*` a Python venv
+  // writes into itself — so a local run counts the files CI's clean checkout does (m1-16tm).
+  "gitignore": true,
+  "globs": ["**/*.md"],
+  "ignores": [".claude/**", "node_modules/**", "build/**"]
 }
