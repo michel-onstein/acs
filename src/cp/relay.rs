@@ -314,8 +314,9 @@ impl Relay {
                     return Err(side.lost("the link closed before the copy finished"));
                 }
             }
+            let jammed = r.out.len() >= HIGH && s.out.len() >= HIGH;
             for (side, held) in [(&mut *s, !s_in), (&mut *r, !r_in)] {
-                if held {
+                if excused(held, jammed) {
                     side.live.heard();
                 }
                 if !side.eof && side.live.tick(side.out.tail()) == Health::Dead {
@@ -324,6 +325,13 @@ impl Relay {
             }
         }
     }
+}
+
+/// Whether a side that is not being read is excused as heard. Not when both
+/// queues are at `HIGH`: each side then holds the other back, and excusing
+/// both would keep either from ever being declared dead (acs-cykd).
+fn excused(held: bool, jammed: bool) -> bool {
+    held && !jammed
 }
 
 /// `acscp h1:a h2:b`: the target on a host, and each source host's sources
@@ -365,4 +373,18 @@ pub(super) fn copy(
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::excused;
+
+    #[test]
+    fn a_held_side_is_excused_unless_both_directions_are_jammed() {
+        assert!(excused(true, false));
+        assert!(!excused(false, false));
+        // Both queues at HIGH: neither side may be excused, or neither is
+        // ever declared dead (acs-cykd).
+        assert!(!excused(true, true));
+    }
 }
