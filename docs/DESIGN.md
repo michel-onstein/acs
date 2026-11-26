@@ -94,7 +94,7 @@ flowchart LR
    protocols, and terminal queries/replies all work as if you had run `ssh -t`.
 2. **One binary** for both sides and for both client platforms (macOS and
    Linux), statically linked on Linux, that can install itself on a remote
-   (§8). Slim build < 1.18 MB; with the embedded Linux payloads < 2.36 MB.
+   (§8). Slim build < 1.2 MB; with the embedded Linux payloads < 2.4 MB.
 3. **Survive network interruption** with no lost output, and detect a dead link
    in seconds rather than a minute.
 4. **Command mode** on a double-tap of Ctrl-] (§6): `d` detach, `x` exit.
@@ -3142,17 +3142,18 @@ affected by someone else's install.
 
 | Target | Slim | Complete |
 | --- | --- | --- |
-| `x86_64-unknown-linux-musl` | 1174 KB | 2.35 MB |
-| `aarch64-unknown-linux-musl` | 1039 KB | 2.22 MB |
-| `aarch64-apple-darwin` | 874 KB | 2.05 MB |
-| `x86_64-apple-darwin` | 964 KB | 2.16 MB |
+| `x86_64-unknown-linux-musl` | 1188 KB | 2.38 MB |
+| `aarch64-unknown-linux-musl` | 1052 KB | 2.25 MB |
+| `aarch64-apple-darwin` | 874 KB | 2.07 MB |
+| `x86_64-apple-darwin` | 977 KB | 2.19 MB |
 
-The payload set (both Linux builds, gzip'd) is 1180 KB. Measured 2026-11-19
+The payload set (both Linux builds, gzip'd) is 1194 KB. Measured 2026-11-26
 with the copy (`src/cp`, below), port knocking
-([KNOCK_DESIGN.md](KNOCK_DESIGN.md), trimmed: below) and commands on pipes
-(§5.5, below) in release builds. The
-budget `cargo xtask dist` enforces is slim ≤ 1.18 MB and complete ≤ 2.36 MB
+([KNOCK_DESIGN.md](KNOCK_DESIGN.md), trimmed: below), commands on pipes
+(§5.5, below) and the fixes of 0.24.0 (trimmed: below) in release builds. The
+budget `cargo xtask dist` enforces is slim ≤ 1.2 MB and complete ≤ 2.4 MB
 (goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them,
+from 1.18 MB / 2.36 MB for the fixes of 0.24.0 (decision 23),
 from 1.15 MB / 2.3 MB for port knocking (decision 20), and
 from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9): built into a
 release at that same commit, the copy's phase 1 took x86_64 Linux to 1110 KB
@@ -3425,6 +3426,44 @@ Linux (1,174,664 B and 2,355,763 B); aarch64 Linux is 1,040,768 B and
 968,592 B and 2,165,312 B. That leaves 5,336 B of slim room and 4,237 B of
 complete room on x86_64 Linux.
 
+**The fixes of 0.24.0** (decision 23): the 36 fixes between 0.23.0 and
+0.24.0 — locks on the configuration and update-check files, durable
+renames, the socket directory's symlink walk, the copy receiver's part
+locks and more — took x86_64 Linux to 1,192,856 B slim and 2,392,626 B
+complete, past the 1.18 MB / 2.36 MB budget, so `cargo xtask dist` failed
+and 0.24.0 was tagged but never published. By `nm --size-sort` on
+unstripped builds of the two tags, the growth is about 14.5 KB of code,
+2.3 KB of unwind tables and 0.6 KB of strings, spread over the fixes rather
+than one large piece. Trimmed first, each cut measured on x86_64 Linux slim
+and without a change of behaviour:
+
+- **No sort of descriptors**, 4,184 B: `close_range_except` sorted the
+  descriptors to keep with `sort_unstable`, the binary's only sort of
+  `RawFd`s, which brought in a whole quicksort, heapsort and pivot
+  selection. It now finds the lowest kept descriptor above each gap with a
+  scan; the list is a handful of numbers. Its test keeps descriptors out of
+  order, repeated and with a standard one among them.
+- **One owner helper, a `Vec` for the walk**, 672 B: the socket
+  directory's two refusals that name a user (`alice (uid 501)`) share one
+  function, and the symlink walk keeps its names to look up on a `Vec` used
+  as a stack rather than a `VecDeque`, which nothing else in the binary
+  used.
+
+Not cut: the code each fix added. What else turned up was under 300 B a
+cut — `print_out` taking `format_args!` rather than a `String` saved
+128 B — and was left. Then the budget was **raised to slim ≤ 1.2 MB and
+complete ≤ 2.4 MB**:
+
+| Target | Slim, 0.24.0 | Slim, trimmed | Complete, 0.24.0 | Complete, trimmed |
+| --- | --- | --- | --- | --- |
+| `x86_64-unknown-linux-musl` | 1,192,856 B | 1,188,000 B | 2,392,626 B | 2,382,097 B |
+| `aarch64-unknown-linux-musl` | 1,056,328 B | 1,052,096 B | 2,256,098 B | 2,246,193 B |
+| `aarch64-apple-darwin` | 874,336 B | 874,320 B | 2,084,160 B | 2,067,728 B |
+| `x86_64-apple-darwin` | 976,960 B | 976,960 B | 2,194,384 B | 2,190,256 B |
+
+That leaves 12,000 B of slim room and 17,903 B of complete room on x86_64
+Linux.
+
 **Build** is `cargo xtask dist`: (1) build slim for every target with
 `cargo-zigbuild`; (2) gzip them into `P`; (3) complete the Linux builds by
 appending the trailer and the macOS builds by rebuilding with
@@ -3663,3 +3702,4 @@ and **Remote self-install** make it a `dsh` replacement.
 | 20 | Port knocking's size budget (acs-fode) | Decided by the maintainer 2026-11-18: **trim, then raise**. Port knocking (KNOCK_DESIGN goal 6, §11.3) was expected to cost under 10 KB of the x86_64 musl slim build and measured 34,344 B against 0.21.0, taking slim to 1,177,552 B and complete to 2,360,963 B — past the 1.15 MB / 2.3 MB budget, so `cargo xtask dist` (and with it a release) failed. Trimmed first, without dropping anything the design promises: the stderr watch behind the hint (1,592 B), one key setter for `--knock` and the file's mapping (1,632 B), the UDP knock through the TCP knock's socket calls (616 B), no `Node` clone in `acs config` (688 B) and fewer `format!`s (400 B) — 4,928 B in all, leaving the knock at 29,416 B (§8.1 has every target and each cut). Then the overall budget was **raised to slim ≤ 1.18 MB and complete ≤ 2.36 MB** (goal 2), just above what remains — x86_64 Linux 1,172,624 B slim and 2,351,876 B complete; aarch64 Linux 1,039,960 B and 2,219,212 B; aarch64 macOS 874,080 B and 2,051,056 B; x86_64 macOS 968,568 B and 2,157,024 B — with 7,376 B and 8,124 B of x86_64 Linux room. The copy's own 100 KB (decision 13) is unchanged |
 | 21 | A command without a terminal, resumable (acs-182f, §5.5) | Decided 2026-11-19, carrying out decision 19's follow-up. `acs host -- cmd` without a terminal **runs on pipes in a session of its own** instead of exec'ing `ssh -T`: byte-exact, stderr apart, end of file passed and the exit status kept, as before, and now a dropped link resumes — a long `tar c \| acs host -- tar x` over a flaky link was the case. **Both streams share the one ring as records** (a tag, a `u16` length, the bytes) under its one offset, rather than a DATA per stream with a ring and an offset each, so HELLO, WELCOME, DATA and resume are unchanged and the client demultiplexes; **the client ACKs the output it has written out** and the master never overwrites past that ACK, attached or not, since a pipe has no screen to repaint a gap; **an empty INPUT is the end of input** at its sequence, resent after every WELCOME and applied once; **EXIT goes once all output is sent, and the master waits for the client's DETACH** before it ends, so an EXIT lost with a link is sent again on the resume. One trailing HELLO byte (`pipe`), no new frame type, `PROTO_VERSION` unchanged: only a master of the client's own version ever sees it. What it costs: acs on the host (installed as for any session), and a command whose client never returns stays until ended from the menu, like a detached session (bounded since, by decision 22). It fit the size budget (decision 20) with a trim: about 4.1 KB of x86_64 slim for the feature, and 6.4 KB saved by dropping the derived `Debug` of `Msg` from the two runtime messages that printed a whole frame — what acs-1cco's `Msg::kind` is for (§8.1) |
 | 22 | How long a piped command waits for a client that never returns (acs-f1sp, §5.5) | Decided 2026-11-19, bounding what decision 21 left open: a master on pipes waits for its client's DETACH so that an EXIT lost with a link is sent again, and a client killed with `SIGKILL`, or on a machine that is gone, left it — and its ring — until someone ended it from the menu. **Once the command has ended and nobody is attached, the master waits a week** (`ACS_PIPE_UNCLAIMED_MS`) and then ends as at a DETACH. The bound is set by how long a real client can be away and still come back, not by how long a link takes to fail: a client that has a session never stops redialling (the backoff tops out at 30 s, and `persist` pings every `reachability_interval`), so any client still running returns within seconds of its network — unless it was not running, which is a laptop asleep overnight or over a weekend, or a client stopped with Ctrl-Z. A day would strand the weekend; a week outlasts it with room, and costs one idle process and one ring (1 MiB by default) per abandoned command. **The clock runs only while nobody is attached and the command has ended** (its status, end of file on both streams): an attached client holds it back, EXIT in hand or not, and a command still writing — blocked on a ring full of unacknowledged output — is a running session and, like a detached one, never given up on. Every attach restarts it. Chosen over starting it only once all output has been sent, which would leave the case it is for — a client killed with output still in the ring — unbounded. **A client back after the bound is told so**: its resume finds no session, from the proxy or from a later session under the freed number, which a piped resume of another instance never attaches or takes over; acs says the command's session has ended and its exit status and unwritten output are lost, and exits 4. It costs 248 B of x86_64 slim and 664 B of complete (§8.1) |
+| 23 | The fixes of 0.24.0 over the size budget | Decided by the maintainer 2026-11-26: **trim, then raise**, as decision 20 did. The 36 fixes between 0.23.0 and 0.24.0 took x86_64 Linux to 1,192,856 B slim and 2,392,626 B complete — past the 1.18 MB / 2.36 MB budget, so `cargo xtask dist` failed and 0.24.0 was tagged but never published. Trimmed first, without dropping anything a design doc promises or any behaviour a fix added: no `sort_unstable` of the descriptors `close_range_except` keeps, a scan instead (4,184 B), and one owner helper for the socket directory's refusals with a `Vec` stack for its symlink walk (672 B) — 4,856 B in all (§8.1 has every target and each cut). Then the overall budget was **raised to slim ≤ 1.2 MB and complete ≤ 2.4 MB** (goal 2), just above what remains — x86_64 Linux 1,188,000 B slim and 2,382,097 B complete; aarch64 Linux 1,052,096 B and 2,246,193 B; aarch64 macOS 874,320 B and 2,067,728 B; x86_64 macOS 976,960 B and 2,190,256 B — with 12,000 B and 17,903 B of x86_64 Linux room. The copy's own 100 KB (decision 13) is unchanged |
