@@ -853,6 +853,8 @@ reached as `user@config`.
 | `ACS_NO_UPDATE_CHECK` | `1`: never look for a newer release |
 | `XDG_STATE_HOME` | where the update check and the host each alias used last keep their state (default `~/.local/state`) |
 
+Every `ACS_*_MS` timer is capped at a year (31 536 000 000 ms); a larger value is read as that.
+
 ## Development
 
 ```sh
