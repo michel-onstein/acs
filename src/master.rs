@@ -1515,17 +1515,22 @@ impl Master {
                     mlog!("{} was removed; re-created", self.master_path.display());
                     self.master_file = Some(f);
                 }
-                Ok(None) => mlog!(
-                    "{} now belongs to another master",
-                    self.master_path.display()
-                ),
+                Ok(None) => {
+                    mlog!(
+                        "{} now belongs to another master",
+                        self.master_path.display()
+                    );
+                    self.stand_down();
+                    return;
+                }
                 Err(e) => mlog!("cannot re-create {}: {e}", self.master_path.display()),
             }
         }
         match std::fs::metadata(&self.sock_path) {
             Ok(m) if (m.dev(), m.ino()) == self.sock_ino => return,
             Ok(_) if UnixStream::connect(&self.sock_path).is_ok() => {
-                mlog!("socket path now belongs to a live master; leaving it");
+                mlog!("socket path now belongs to a live master");
+                self.stand_down();
                 return;
             }
             // Nothing listens on what is there: a stale file, ours to replace.
@@ -1542,6 +1547,28 @@ impl Master {
             }
             Err(e) => mlog!("re-bind failed: {e}"),
         }
+    }
+
+    /// The name is demonstrably another master's now: a whole-directory
+    /// wipe took the socket and the `.master` file, and a client redialled
+    /// before our next check, starting a fresh master (DESIGN §4.1). No
+    /// client can reach this session again, so end it rather than keep its
+    /// child, pty and ring for good (acs-c152). A client still attached
+    /// keeps it until it leaves; the next check ends it then.
+    fn stand_down(&mut self) {
+        if self.ending {
+            return;
+        }
+        if self.active().is_some() {
+            mlog!("name lost to another master; kept while its client is attached");
+            return;
+        }
+        mlog!(
+            "session '{}' is unreachable: its name now belongs to another master \
+             (its directory was removed); ending it",
+            self.session
+        );
+        self.start_kill();
     }
 
     fn status(&self) -> StatusInfo {

@@ -258,6 +258,63 @@ fn socket_directory_is_recreated_after_deletion() {
     );
 }
 
+/// Regression (acs-c152): a whole-directory wipe takes the socket and the
+/// `.master` file, and a client redialling before the old master's next
+/// check starts a second master, which takes both. The old master used to
+/// log "now belongs to another master" and keep its shell, pty and ring
+/// for good, unreachable. It now ends the session it can no longer serve.
+///
+/// The check is set an hour away so the old master cannot win the name
+/// back first; `SIGUSR1` runs it on demand, repeated so a check landing
+/// before the client's detach is seen cannot hang the test.
+#[test]
+fn a_master_whose_name_was_taken_after_a_wipe_stands_down() {
+    let t = TempDir::new();
+    let dir = t.path().join("s");
+    let (mut c, w) = start_env(
+        &dir,
+        "wp",
+        &[&sh_c("echo PID:$$; exec sleep 300")],
+        "me",
+        &[("ACS_MASTER_REBIND_MS", "3600000")],
+    );
+    c.wait_output("PID:", T);
+    let out = String::from_utf8_lossy(&c.output).into_owned();
+    let child: i32 = out
+        .split("PID:")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no pid in {out:?}"));
+    let old = acs::testutil::session_pid(&sock(&dir, "wp")).unwrap() as i32;
+    c.send(&Msg::Detach);
+    drop(c);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    let (_c2, w2) = start_env(&dir, "wp", &[&sh_c("sleep 30")], "me", &[]);
+    assert_ne!(w2.instance, w.instance, "the old master answered");
+
+    wait_until(
+        T,
+        || {
+            let _ = acs::sys::kill(old, libc::SIGUSR1);
+            acs::sys::kill(child, 0).is_err()
+        },
+        || "the old master kept its unreachable shell",
+    );
+    wait_until(
+        T,
+        || acs::sys::kill(old, 0).is_err(),
+        || "the old master never exited",
+    );
+    // The new session is untouched.
+    let (_c3, m) = attach(&dir, "wp", "me", None);
+    assert!(
+        matches!(m, Msg::Welcome(ref x) if x.instance == w2.instance),
+        "{m:?}"
+    );
+}
+
 #[test]
 fn attach_to_a_session_that_is_not_there() {
     let t = TempDir::new();
