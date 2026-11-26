@@ -654,6 +654,40 @@ fn the_master_pings_a_silent_client() {
     }
 }
 
+/// Regression (acs-009c): a program that reads none of its input for
+/// longer than the dead interval does not cost the client its link. Past
+/// 1 MiB of queued input the master stops reading the client's socket,
+/// so the client's PONGs go unread too — and the master used to count that
+/// silence, its own, as the client's, drop the connection and force a
+/// redial. A paused pager or a blocked pipe is all it took.
+#[test]
+fn a_program_not_reading_its_input_does_not_drop_the_client() {
+    let t = TempDir::new();
+    const CHUNK: usize = 64 * 1024;
+    const TOTAL: usize = (1 << 20) + 4 * CHUNK;
+    let (mut c, w) = start_env(
+        t.path(),
+        "deaf",
+        // Reads nothing for several dead intervals, then all of it.
+        &[&sh_c(&format!(
+            "stty -echo -icanon min 1 time 0; echo ready; sleep 3; \
+             head -c {TOTAL} >/dev/null; echo drained"
+        ))],
+        "me",
+        FAST_LIVENESS,
+    );
+    c.wait_output("ready", T);
+    let mut seq = w.input_seq;
+    for _ in 0..TOTAL / CHUNK {
+        c.send(&Msg::Input {
+            seq,
+            bytes: vec![b'x'; CHUNK],
+        });
+        seq += CHUNK as u64;
+    }
+    c.wait_output("drained", T);
+}
+
 /// Regression (acs-evm): an ACK means the pty took the bytes. A program in
 /// raw mode that never reads fills its terminal's input buffer, and the
 /// master acknowledges only what the pty took — it used to acknowledge
@@ -1004,6 +1038,51 @@ fn an_input_sequence_that_cannot_fit_is_refused_and_the_session_lives() {
         Some(Msg::Welcome(w)) => w,
         other => panic!("expected WELCOME, got {other:?}"),
     };
+    c.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"alive\r".to_vec(),
+    });
+    c.wait_output("got:alive", T);
+}
+
+/// acs-zxep: a frame that fits but jumps the counter to next to
+/// `u64::MAX` used to be taken whole, and every client after it was
+/// welcomed at a position with no room for its input. The jump is refused
+/// and the next client is welcomed where the input really is.
+#[test]
+fn a_forward_jump_past_the_bound_is_refused_and_does_not_poison_the_counter() {
+    let t = TempDir::new();
+    let (mut a, _) = start(
+        t.path(),
+        "jmp",
+        &[&sh_c("echo armed; while read l; do echo got:$l; done")],
+        "me",
+    );
+    a.wait_output("armed", T);
+
+    let mut b = FrameConn::connect(&sock(t.path(), "jmp")).unwrap();
+    b.send(&Msg::Hello(hello("jmp", Mode::Attach, "me")));
+    let before = match b.recv_control(T) {
+        Some(Msg::Welcome(w)) => w.input_seq,
+        other => panic!("expected WELCOME, got {other:?}"),
+    };
+    b.send(&Msg::Input {
+        seq: u64::MAX - 10,
+        bytes: b"boom".to_vec(),
+    });
+    match b.recv_control(T) {
+        Some(Msg::Error { code, .. }) => assert_eq!(code, acs::proto::err::BAD_REQUEST),
+        other => panic!("expected an ERROR, got {other:?}"),
+    }
+
+    std::thread::sleep(Duration::from_millis(200));
+    let mut c = FrameConn::connect(&sock(t.path(), "jmp")).unwrap();
+    c.send(&Msg::Hello(hello("jmp", Mode::Attach, "me")));
+    let w = match c.recv_control(T) {
+        Some(Msg::Welcome(w)) => w,
+        other => panic!("expected WELCOME, got {other:?}"),
+    };
+    assert_eq!(w.input_seq, before, "the refused jump moved the counter");
     c.send(&Msg::Input {
         seq: w.input_seq,
         bytes: b"alive\r".to_vec(),

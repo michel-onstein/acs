@@ -533,6 +533,7 @@ the user who started it. Two cases need care.
 | --- | --- |
 | Session names collide (`main` for everyone) | One directory per uid: `/tmp/acs-1000/main.sock` and `/tmp/acs-1001/main.sock` are unrelated |
 | Another user pre-creates `/tmp/acs-<my uid>` (squatting, or a symlink to redirect sockets) | After `mkdir` (or on `EEXIST`), `lstat` the path: it must be a real directory, not a symlink, owned by my uid, mode `0700`. Otherwise refuse with an error naming the owner, and suggest `ACS_SOCKET_DIR`. The sticky bit on `/tmp` stops others from deleting it once it is mine |
+| Another user replaces a directory above mine (a pointed `ACS_SOCKET_DIR`) | Every directory the path passes through must be mine, or not writable by group or other, or sticky (acs-hjk). The parent is resolved link by link as the kernel does, so a symlink's target and the target's ancestors are what is judged, never the link's own `0777`: root's `/home -> var/home` is fine, a writable directory behind a link is not. A link must be mine or root's — its owner could remove it and point a new one anywhere (acs-vqdo) |
 | Another user connects to my socket | The directory is `0700`, and additionally the master checks the peer's uid on every accepted connection (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and closes anything that is not its own uid. `root` can always get in; nothing can stop that |
 | Binaries | Installed per user under `~/.local/share/acs/` (§8); no user runs another's binary |
 | `x` kills something else | The master signals only its own child's process group |
@@ -756,6 +757,12 @@ sequenceDiagram
   for sshd's keepalive period, the program stalled once the ring filled.
   Output queued ahead of a `PING` is capped (64 KiB), so a live client
   answers in time; one that does not only costs a resume.
+  **Silence the master caused is not counted** (acs-009c): past 1 MiB of
+  input the pty has not taken, the master stops reading the client's
+  socket, `PONG`s and all, and a program that reads nothing — a paused
+  pager, a blocked pipe — keeps it there as long as it likes. While that
+  mask holds the client's silence does not age; the dead interval counts
+  from when the master reads again.
 - Reconnect is **on by default**: the protocol distinguishes a clean end (`EXIT`,
   `DETACH` acknowledged, `TAKEOVER`) from a drop, so there is nothing to guess.
   `--no-reconnect` restores `dsh`'s default behaviour.

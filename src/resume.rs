@@ -12,6 +12,27 @@
 
 use std::collections::VecDeque;
 
+/// The furthest a forward jump may carry the master's input counter
+/// (acs-zxep). A frame that starts beyond what was written is taken whole
+/// and the counter jumps to its end, so the stream never stalls; but the
+/// sequence comes off the wire, and an unbounded jump let a peer park the
+/// counter next to `u64::MAX`, where every later client rebased onto it
+/// and had no room left to number its input. 2^62 bytes is more input
+/// than any session will take, and leaves as much again above it.
+pub const MAX_INPUT_JUMP: u64 = 1 << 62;
+
+/// The highest input position a client accepts in a WELCOME (acs-zxep).
+/// A master never reaches it: a jump stops at [`MAX_INPUT_JUMP`], and the
+/// bytes written after it would take longer than anyone lives. A WELCOME
+/// beyond it is from something that is not a master, and rebasing onto it
+/// would leave [`Unacked`] no room to number what is typed.
+pub const MAX_WELCOME_INPUT_SEQ: u64 = 1 << 63;
+
+/// Whether a WELCOME's input position leaves room for input (acs-zxep).
+pub fn welcome_input_seq_fits(input_seq: u64) -> bool {
+    input_seq <= MAX_WELCOME_INPUT_SEQ
+}
+
 /// Default output history kept for resume.
 pub const DEFAULT_RING: usize = 1 << 20;
 
@@ -111,16 +132,23 @@ impl Unacked {
         }
     }
 
-    /// Sequence number the next pushed byte gets.
+    /// Sequence number the next pushed byte gets. `base + len` always
+    /// fits: [`Unacked::push`] refuses bytes that would not.
     pub fn next_seq(&self) -> u64 {
         self.base + self.buf.len() as u64
     }
 
     /// Record bytes about to be sent; returns the sequence of the first one.
-    pub fn push(&mut self, bytes: &[u8]) -> u64 {
+    ///
+    /// `None`, recording nothing, when the end of the bytes would not fit
+    /// in a `u64` (acs-zxep): the base comes from a WELCOME, off the wire,
+    /// and an unchecked `base + len` aborted a debug build on the second
+    /// push and wrapped in a release one.
+    pub fn push(&mut self, bytes: &[u8]) -> Option<u64> {
         let seq = self.next_seq();
+        seq.checked_add(bytes.len() as u64)?;
         self.buf.extend(bytes);
-        seq
+        Some(seq)
     }
 
     /// The master has written everything before `seq`.
@@ -193,8 +221,16 @@ impl InputDedupe {
     /// `end` to a small number, which then travelled into the master's
     /// `written() - pty_in.len()` and underflowed the ACK the client uses to
     /// decide what it may forget. A debug build aborted the master outright.
+    ///
+    /// `None` too for a jump forward whose end lies beyond
+    /// [`MAX_INPUT_JUMP`] (acs-zxep): it would poison the counter for every
+    /// later client. Frames that continue from `written` are bounded only by
+    /// the end fitting.
     pub fn accept<'a>(&mut self, seq: u64, bytes: &'a [u8]) -> Option<&'a [u8]> {
         let end = seq.checked_add(bytes.len() as u64)?;
+        if seq > self.written && end > MAX_INPUT_JUMP {
+            return None;
+        }
         if end <= self.written {
             return Some(&[]);
         }
@@ -231,12 +267,71 @@ mod tests {
         assert_eq!(d.written(), before, "a refused frame moved the counter");
 
         // The largest frame that does fit is still taken, and the counter
-        // lands exactly on the end.
-        let mut d = InputDedupe::default();
+        // lands exactly on the end. (It continues from `written`: a jump
+        // this far is refused on its own account, acs-zxep.)
+        let mut d = InputDedupe {
+            written: u64::MAX - 3,
+        };
         assert_eq!(d.accept(u64::MAX - 3, b"abc"), Some(&b"abc"[..]));
         assert_eq!(d.written(), u64::MAX);
         // An empty frame at the very end fits too.
         assert_eq!(d.accept(u64::MAX, b""), Some(&b""[..]));
+    }
+
+    /// acs-zxep: a frame that jumps the counter forward may not carry it
+    /// beyond `MAX_INPUT_JUMP`. Unbounded, a peer parked the counter next
+    /// to `u64::MAX`, and every later client rebased onto it with no room
+    /// left to number its input.
+    #[test]
+    fn a_forward_jump_is_bounded() {
+        let mut d = InputDedupe::default();
+        d.accept(0, b"hello").unwrap();
+        assert_eq!(d.accept(u64::MAX - 10, b"boom"), None);
+        assert_eq!(d.accept(MAX_INPUT_JUMP, b"x"), None);
+        assert_eq!(d.written(), 5, "a refused jump moved the counter");
+
+        // A jump that ends on the bound is taken, as is the ordinary jump
+        // after input the master rewound.
+        assert_eq!(d.accept(MAX_INPUT_JUMP - 2, b"ab"), Some(&b"ab"[..]));
+        assert_eq!(d.written(), MAX_INPUT_JUMP);
+        let mut d = InputDedupe::default();
+        assert_eq!(d.accept(9, b"xy"), Some(&b"xy"[..]));
+
+        // Past the bound, input that continues from `written` still flows.
+        let mut d = InputDedupe {
+            written: MAX_INPUT_JUMP + 5,
+        };
+        assert_eq!(d.accept(MAX_INPUT_JUMP + 3, b"abcd"), Some(&b"cd"[..]));
+        assert_eq!(d.written(), MAX_INPUT_JUMP + 7);
+    }
+
+    /// acs-zxep: the client's base comes from a WELCOME, and `base + len`
+    /// was unchecked: a base near `u64::MAX` aborted a debug build on the
+    /// second push. Bytes that cannot be numbered are refused instead.
+    #[test]
+    fn unacked_refuses_bytes_it_cannot_number() {
+        let mut u = Unacked::new(u64::MAX - 3);
+        assert_eq!(u.push(b"abc"), Some(u64::MAX - 3));
+        assert_eq!(u.next_seq(), u64::MAX);
+        assert_eq!(u.push(b"d"), None);
+        assert_eq!(u.len(), 3, "a refused push was recorded");
+        assert_eq!(u.push(b""), Some(u64::MAX));
+
+        let mut u = Unacked::new(0);
+        u.rebase(u64::MAX, false);
+        assert_eq!(u.push(b"x"), None);
+        assert!(u.is_empty());
+    }
+
+    /// acs-zxep: a WELCOME whose input position leaves no room for input
+    /// is refused; anything a master can reach is not.
+    #[test]
+    fn a_welcome_input_seq_must_leave_room() {
+        assert!(welcome_input_seq_fits(0));
+        assert!(welcome_input_seq_fits(MAX_INPUT_JUMP));
+        assert!(welcome_input_seq_fits(MAX_WELCOME_INPUT_SEQ));
+        assert!(!welcome_input_seq_fits(MAX_WELCOME_INPUT_SEQ + 1));
+        assert!(!welcome_input_seq_fits(u64::MAX));
     }
 
     /// Regression (acs-evm): input dropped before it reached the pty was
@@ -308,8 +403,8 @@ mod tests {
     #[test]
     fn unacked_push_ack_pending() {
         let mut u = Unacked::new(100);
-        assert_eq!(u.push(b"hel"), 100);
-        assert_eq!(u.push(b"lo"), 103);
+        assert_eq!(u.push(b"hel"), Some(100));
+        assert_eq!(u.push(b"lo"), Some(103));
         u.ack(102);
         assert_eq!(u.pending(), (102, b"llo".to_vec()));
         u.ack(50);
@@ -360,8 +455,8 @@ mod tests {
         // Client sends 6 bytes; the master only saw the first 4 before the drop.
         let mut client = Unacked::new(0);
         let mut master = InputDedupe::default();
-        let seq = client.push(b"ls -l");
-        let seq2 = client.push(b"\r");
+        let seq = client.push(b"ls -l").unwrap();
+        let seq2 = client.push(b"\r").unwrap();
         let seen = master.accept(seq, &b"ls -l"[..4]).unwrap().to_vec();
         assert_eq!(seen, b"ls -");
         let _ = seq2;
