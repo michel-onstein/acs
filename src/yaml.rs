@@ -611,13 +611,7 @@ impl Flow<'_> {
     }
 
     fn node(&mut self) -> Result<Node> {
-        if self.depth >= MAX_DEPTH {
-            return too_deep(self.line);
-        }
-        self.depth += 1;
-        let v = self.value();
-        self.depth -= 1;
-        let v = v?;
+        let v = self.value()?;
         let flow = matches!(v, Value::Seq(_) | Value::Map(_));
         Ok(Node {
             line: self.line,
@@ -626,7 +620,19 @@ impl Flow<'_> {
         })
     }
 
+    /// Every entry to the parser, keys included, counts toward the depth
+    /// bound (acs-rc1g: a key position once bypassed it).
     fn value(&mut self) -> Result<Value> {
+        if self.depth >= MAX_DEPTH {
+            return too_deep(self.line);
+        }
+        self.depth += 1;
+        let v = self.value_inner();
+        self.depth -= 1;
+        v
+    }
+
+    fn value_inner(&mut self) -> Result<Value> {
         self.ws();
         match self.s.get(self.i) {
             Some(b'[') => {
@@ -971,6 +977,11 @@ mod tests {
         // Flow style: one line, thousands deep.
         let deep = format!("k: {}{}", "[".repeat(5000), "]".repeat(5000));
         let e = parse(&deep).expect_err("accepted 5000 levels of nesting");
+        assert!(e.to_string().contains("nested more than"), "{e}");
+
+        // acs-rc1g: nesting through a flow-mapping key bypassed the bound.
+        let deep_key = format!("k: {}", "{".repeat(5000));
+        let e = parse(&deep_key).expect_err("accepted 5000 levels of key nesting");
         assert!(e.to_string().contains("nested more than"), "{e}");
 
         // Block style: a map inside a map inside a map…
