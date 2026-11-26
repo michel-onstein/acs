@@ -1045,6 +1045,51 @@ fn an_input_sequence_that_cannot_fit_is_refused_and_the_session_lives() {
     c.wait_output("got:alive", T);
 }
 
+/// acs-zxep: a frame that fits but jumps the counter to next to
+/// `u64::MAX` used to be taken whole, and every client after it was
+/// welcomed at a position with no room for its input. The jump is refused
+/// and the next client is welcomed where the input really is.
+#[test]
+fn a_forward_jump_past_the_bound_is_refused_and_does_not_poison_the_counter() {
+    let t = TempDir::new();
+    let (mut a, _) = start(
+        t.path(),
+        "jmp",
+        &[&sh_c("echo armed; while read l; do echo got:$l; done")],
+        "me",
+    );
+    a.wait_output("armed", T);
+
+    let mut b = FrameConn::connect(&sock(t.path(), "jmp")).unwrap();
+    b.send(&Msg::Hello(hello("jmp", Mode::Attach, "me")));
+    let before = match b.recv_control(T) {
+        Some(Msg::Welcome(w)) => w.input_seq,
+        other => panic!("expected WELCOME, got {other:?}"),
+    };
+    b.send(&Msg::Input {
+        seq: u64::MAX - 10,
+        bytes: b"boom".to_vec(),
+    });
+    match b.recv_control(T) {
+        Some(Msg::Error { code, .. }) => assert_eq!(code, acs::proto::err::BAD_REQUEST),
+        other => panic!("expected an ERROR, got {other:?}"),
+    }
+
+    std::thread::sleep(Duration::from_millis(200));
+    let mut c = FrameConn::connect(&sock(t.path(), "jmp")).unwrap();
+    c.send(&Msg::Hello(hello("jmp", Mode::Attach, "me")));
+    let w = match c.recv_control(T) {
+        Some(Msg::Welcome(w)) => w,
+        other => panic!("expected WELCOME, got {other:?}"),
+    };
+    assert_eq!(w.input_seq, before, "the refused jump moved the counter");
+    c.send(&Msg::Input {
+        seq: w.input_seq,
+        bytes: b"alive\r".to_vec(),
+    });
+    c.wait_output("got:alive", T);
+}
+
 /// acs-ovq: an empty identity is unknown, not a name. It used to
 /// short-circuit the takeover comparison, so a client that simply left
 /// ACS_IDENTITY unset disabled the question for everybody: while it was

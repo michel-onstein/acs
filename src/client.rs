@@ -2177,8 +2177,12 @@ fn write_frame(state: &mut State, bytes: &[u8]) -> io::Result<()> {
 /// Send INPUT for bytes for the program: what the user typed, or the
 /// Ctrl-L after a reconnect.
 fn queue_input(state: &mut State, out: &mut Vec<u8>, bytes: &[u8]) {
+    // Bytes whose end cannot be numbered are not sent (acs-zxep); the
+    // WELCOME check keeps that from happening with a real master.
+    let Some(seq) = state.unacked.push(bytes) else {
+        return;
+    };
     state.paste.feed(bytes);
-    let seq = state.unacked.push(bytes);
     proto::encode_input(seq, bytes, out);
 }
 
@@ -2300,6 +2304,14 @@ fn serve(
             liveness.heard();
             match msg {
                 Msg::Welcome(w) if !welcomed => {
+                    // An input position with no room above it is not a
+                    // master's: rebasing onto it would leave our input
+                    // nothing to be numbered with (acs-zxep).
+                    if !crate::resume::welcome_input_seq_fits(w.input_seq) {
+                        note("the session's input sequence is out of range");
+                        link.close();
+                        return Outcome::Exit(code::ERROR);
+                    }
                     welcomed = true;
                     state.welcomed_at = Some(std::time::Instant::now());
                     timing.mark(Phase::WelcomeReceived);
