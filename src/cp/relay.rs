@@ -268,21 +268,30 @@ impl Relay {
             sys::set_nonblocking(fd, true).map_err(|e| e.to_string())?;
         }
         let mut buf = vec![0u8; 64 * 1024];
-        // What came after the markers.
-        self.pass(s, r)?;
+        // What came after the receiver's marker. The sender's is held
+        // until the receiver's `WELCOME` has been checked: nothing of the
+        // sender's may reach a receiver that is to be refused, which would
+        // place a `FILE` at the target path (acs-gcx0).
         self.pass(r, s)?;
+        let mut sender_read = false;
         loop {
             if self.need_dir && r.welcome == Some(false) {
                 return Err([&r.dest, ":", target, ": not a directory"].concat());
+            }
+            let open = r.welcome.is_some();
+            if open && !sender_read {
+                sender_read = true;
+                self.pass(s, r)?;
             }
             if self.done && (s.out.is_empty() || s.eof) {
                 return Ok(());
             }
             // Read a side only while the other has room for what it sends:
             // a slow target holds the source back rather than filling
-            // memory here. The side held back is not to blame for its
-            // silence meanwhile.
-            let (s_in, r_in) = (!s.eof && r.out.len() < HIGH, !r.eof && s.out.len() < HIGH);
+            // memory here, and the source waits for the target's `WELCOME`.
+            // The side held back is not to blame for its silence meanwhile.
+            let s_in = open && !s.eof && r.out.len() < HIGH;
+            let r_in = !r.eof && s.out.len() < HIGH;
             let pollin = |on: bool| if on { libc::POLLIN } else { 0 };
             let pollout = |q: &OutQueue| if q.is_empty() { 0 } else { libc::POLLOUT };
             let mut fds = [

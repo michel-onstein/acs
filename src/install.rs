@@ -450,6 +450,10 @@ fn finish(f: &Finish) -> Result<(), String> {
                 return Err("the uploaded binary is corrupt (checksum mismatch)".into());
             }
         }
+        // Written by the remote shell, which flushed nothing (acs-m6ir).
+        std::fs::File::open(&me)
+            .and_then(|f| crate::sys::sync_file(&f))
+            .map_err(|e| format!("{}: {e}", me.display()))?;
         rename(&me, &final_path)?;
     }
     match link_bin(&final_path) {
@@ -501,7 +505,8 @@ fn complete(f: &Finish, me: &Path, out: &mut std::fs::File) -> Result<(), String
 }
 
 fn rename(from: &Path, to: &Path) -> Result<(), String> {
-    std::fs::rename(from, to).map_err(|e| format!("rename to {}: {e}", to.display()))
+    // The directory flushed too, so the new name survives a crash (acs-m6ir).
+    crate::sys::rename_durable(from, to).map_err(|e| format!("rename to {}: {e}", to.display()))
 }
 
 /// Point `~/.local/bin/acs` at the newest install: a temporary symlink
