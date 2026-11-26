@@ -449,3 +449,45 @@ fn a_part_left_behind_is_resumed_or_written_whole() {
     names.sort();
     assert_eq!(names, ["big", "small"]);
 }
+
+/// A huge `ACS_CP_WINDOW` under macOS's default soft limit of 256
+/// descriptors: the sender holds each header's source open and, in a
+/// local copy, the receiver's parts are in the same process, so a window
+/// of thousands failed files with "Too many open files" (acs-d2kt). The
+/// window is clamped and the receiver holds only so many parts open.
+#[test]
+fn a_huge_window_stays_under_the_descriptor_limit() {
+    use std::os::unix::process::CommandExt;
+    let t = TempDir::new();
+    let src = t.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    let mut want = BTreeMap::new();
+    for i in 0..400 {
+        let b = body(16 + i, i as u8);
+        std::fs::write(src.join(format!("f{i}")), &b).unwrap();
+        want.insert(PathBuf::from(format!("f{i}")), Some(b));
+    }
+    let cp = Acscp::new();
+    let mut c = cp.cmd(t.path(), &["-rq", "src", "dst"]);
+    c.env("ACS_CP_WINDOW", "100000");
+    // SAFETY: only setrlimit, async-signal-safe, between fork and exec.
+    unsafe {
+        c.pre_exec(|| {
+            let mut l = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            l.rlim_cur = l.rlim_max.min(256);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &l) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let (status, err) = run(&mut c);
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(tree(&t.path().join("dst")), want);
+}

@@ -28,6 +28,11 @@
 //!   part locked answers nothing until the lock is free — then measures
 //!   and hashes what the old one left — and after twice `ACS_DEAD_MS`
 //!   fails the file "in use by another copy", leaving the part alone.
+//! - **Open parts are capped** at [`OPEN_PARTS`] (acs-d2kt): a `FILE`
+//!   past them is placed but not opened, and answered once a part closes,
+//!   in the order the headers came. The sender only waits for its `GO`, as
+//!   it would on a slow disk, so a sender running further ahead than that,
+//!   an older one included, no longer runs the receiver out of descriptors.
 //! - **Directories** are made `0700 | mode`, so their contents can be
 //!   written, and get their final mode and, with `-p`, their times once
 //!   everything inside them is done — which, since the sender's headers
@@ -43,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::proto::{err, Hello, Meta, Msg, Role, Time};
 use super::walk::{reason, MAX_DEPTH};
-use super::{note_on, Endpoint, Halt, Options, Outcome, Prefix};
+use super::{note_on, Endpoint, Halt, Options, Outcome, Prefix, OPEN_PARTS};
 use crate::outq::OutQueue;
 use crate::sys;
 
@@ -84,6 +89,18 @@ struct Part {
     wait: Option<Instant>,
 }
 
+/// A file placed but not yet opened: [`OPEN_PARTS`] are open already.
+/// Its directory counts it as not done, so it is not settled under it.
+struct Deferred {
+    id: u32,
+    part: PathBuf,
+    dest: PathBuf,
+    name: String,
+    size: u64,
+    meta: Meta,
+    dir: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Hello,
@@ -109,6 +126,10 @@ pub struct Receiver {
     /// or failed, whose data may still be on the way. One map rather than
     /// a map and a set, which would be two copies of the table code.
     parts: HashMap<u32, Option<Part>>,
+    /// Files waiting for a part to close before theirs is opened, oldest
+    /// first. A `Vec`, as the sender's window is: at most a window's worth,
+    /// and no second ring buffer in the binary (DESIGN §8.1).
+    deferred: Vec<Deferred>,
     /// Files this run placed or gave up on, and directories it made:
     /// what a new link sends again is not written, or made, twice.
     placed: HashSet<PathBuf>,
@@ -228,6 +249,7 @@ impl Receiver {
             dirs: Vec::new(),
             levels: Vec::new(),
             parts: HashMap::new(),
+            deferred: Vec::new(),
             placed: HashSet::new(),
             made: HashSet::new(),
             told: HashSet::new(),
@@ -442,7 +464,7 @@ impl Receiver {
         meta: Meta,
         out: &mut OutQueue,
     ) -> Result<(), Halt> {
-        if id == 0 || self.parts.contains_key(&id) {
+        if id == 0 || self.parts.contains_key(&id) || self.deferred.iter().any(|d| d.id == id) {
             return Err(Halt::Protocol(format!("FILE with id {id} out of place")));
         }
         let (dest, dir) = match self.place(&name) {
@@ -471,33 +493,67 @@ impl Receiver {
             self.fail(id, &shown, "has no file name to write".into(), out);
             return Ok(());
         };
-        let (file, have) = match open_part(&part, meta.mode & 0o777 & !self.umask) {
-            Ok(x) => x,
-            Err(e) => {
-                self.fail(id, &shown, reason(&e), out);
-                return Ok(());
-            }
-        };
         if let Some(d) = dir {
             self.dirs[d].open += 1;
         }
-        self.parts.insert(
+        self.deferred.push(Deferred {
             id,
+            part,
+            dest,
+            name: shown,
+            size,
+            meta,
+            dir,
+        });
+        self.admit(out);
+        Ok(())
+    }
+
+    /// The parts open now.
+    fn open_parts(&self) -> usize {
+        self.parts.values().flatten().count()
+    }
+
+    /// Open the deferred files, oldest first, while fewer than
+    /// [`OPEN_PARTS`] are open, and answer each.
+    fn admit(&mut self, out: &mut OutQueue) {
+        while self.open_parts() < OPEN_PARTS {
+            if self.deferred.is_empty() {
+                return;
+            }
+            let f = self.deferred.remove(0);
+            self.start(f, out);
+        }
+    }
+
+    /// Open a placed file's part and answer it, or fail it.
+    fn start(&mut self, f: Deferred, out: &mut OutQueue) {
+        let (file, have) = match open_part(&f.part, f.meta.mode & 0o777 & !self.umask) {
+            Ok(x) => x,
+            Err(e) => {
+                if let Some(d) = f.dir {
+                    self.dirs[d].open -= 1;
+                    self.settle(d);
+                }
+                return self.fail(f.id, &f.name, reason(&e), out);
+            }
+        };
+        self.parts.insert(
+            f.id,
             Some(Part {
                 file,
-                part,
-                dest,
-                name: shown,
-                size,
+                part: f.part,
+                dest: f.dest,
+                name: f.name,
+                size: f.size,
                 written: 0,
-                meta,
-                dir,
+                meta: f.meta,
+                dir: f.dir,
                 check: None,
                 wait: Some(Instant::now() + self.lock_wait),
             }),
         );
-        self.locked(id, have, out);
-        Ok(())
+        self.locked(f.id, have, out);
     }
 
     /// Part `id` was opened, and is locked if `have` is its length: start
@@ -717,12 +773,8 @@ impl Receiver {
     }
 }
 
-impl Endpoint for Receiver {
-    fn pump(&mut self, out: &mut OutQueue) -> Result<(), Halt> {
-        self.check(out)
-    }
-
-    fn on_msg(&mut self, m: Msg<'_>, out: &mut OutQueue) -> Result<(), Halt> {
+impl Receiver {
+    fn handle(&mut self, m: Msg<'_>, out: &mut OutQueue) -> Result<(), Halt> {
         match (self.state, m) {
             (_, Msg::Error { message, .. }) => return Err(Halt::Ended(message)),
             (State::Hello, Msg::Hello(h)) => return self.hello(h, out),
@@ -754,7 +806,10 @@ impl Endpoint for Receiver {
                 }
             }
             (State::Running, Msg::End) => {
-                if !self.levels.is_empty() || self.parts.values().any(Option::is_some) {
+                if !self.levels.is_empty()
+                    || !self.deferred.is_empty()
+                    || self.parts.values().any(Option::is_some)
+                {
                     return Err(Halt::Protocol("END with entries still open".into()));
                 }
                 Msg::Done {
@@ -771,6 +826,21 @@ impl Endpoint for Receiver {
                 )))
             }
         }
+        Ok(())
+    }
+}
+
+impl Endpoint for Receiver {
+    fn pump(&mut self, out: &mut OutQueue) -> Result<(), Halt> {
+        self.check(out)?;
+        self.admit(out);
+        Ok(())
+    }
+
+    fn on_msg(&mut self, m: Msg<'_>, out: &mut OutQueue) -> Result<(), Halt> {
+        // A part closed by this message makes room for a deferred one.
+        self.handle(m, out)?;
+        self.admit(out);
         Ok(())
     }
 
@@ -809,6 +879,7 @@ impl Endpoint for Receiver {
         self.levels.clear();
         self.dirs.clear();
         self.parts.clear();
+        self.deferred.clear();
     }
 }
 
@@ -1573,5 +1644,60 @@ mod tests {
             Path::new(".x.acscp-part")
         );
         assert_eq!(part_path(Path::new("/")), None);
+    }
+
+    /// A sender running more headers ahead than the receiver holds parts
+    /// open — an older one, or one with a large `ACS_CP_WINDOW` — is not
+    /// failed for it, and does not run the receiver out of descriptors: a
+    /// `FILE` past [`OPEN_PARTS`] is answered once a part closes, in the
+    /// order the headers came (acs-d2kt).
+    #[test]
+    fn files_past_the_open_parts_wait_for_their_go() {
+        let t = TempDir::new();
+        let (mut rx, r) = Rx::new(t.path(), &["d"]);
+        r.unwrap();
+        rx.send(Msg::Dir {
+            name: "d".into(),
+            meta: dir_meta(),
+        })
+        .unwrap();
+        let n = OPEN_PARTS as u32 + 10;
+        let body = |id: u32| format!("file {id}").into_bytes();
+        for id in 1..=n {
+            rx.send(Msg::File {
+                id,
+                name: format!("f{id}"),
+                size: body(id).len() as u64,
+                meta: Meta {
+                    mode: 0o644,
+                    ..Meta::default()
+                },
+            })
+            .unwrap();
+        }
+        rx.send(Msg::DirEnd).unwrap();
+        let first = rx.answers();
+        let gos: Vec<String> = (1..=OPEN_PARTS).map(|i| format!("GO {i} 0")).collect();
+        assert_eq!(first[0], "WELCOME dir=true");
+        assert_eq!(first[1..], gos[..], "{first:?}");
+        assert_eq!(rx.r.open_parts(), OPEN_PARTS);
+        // Each file finished lets the next one waiting in.
+        rx.file_rest(1, &body(1));
+        let next = OPEN_PARTS + 1;
+        assert_eq!(rx.answers(), ["OK 1".to_string(), format!("GO {next} 0")]);
+        for id in 2..=n {
+            rx.file_rest(id, &body(id));
+        }
+        rx.send(Msg::End).unwrap();
+        let rest = rx.answers();
+        assert!(!rest.iter().any(|a| a.starts_with("FAIL")), "{rest:?}");
+        assert_eq!(
+            rest.last().map(String::as_str),
+            Some(format!("DONE {n} 0").as_str())
+        );
+        for id in 1..=n {
+            let got = std::fs::read(t.path().join("d").join(format!("f{id}"))).unwrap();
+            assert_eq!(got, body(id));
+        }
     }
 }

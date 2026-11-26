@@ -71,6 +71,25 @@ const HIGH: usize = 256 * 1024;
 /// (`ACS_CP_WINDOW`, ACSCP_DESIGN §5.3).
 pub const WINDOW: usize = 64;
 
+/// The most file headers a sender runs ahead, whatever `ACS_CP_WINDOW`
+/// says. Each holds its source open, and in a local copy the receiver's
+/// parts are in the same process: this many plus [`OPEN_PARTS`] stays well
+/// under macOS's soft limit of 256 descriptors (ACSCP_DESIGN §5.3, acs-d2kt).
+pub const MAX_WINDOW: usize = 96;
+
+/// The most parts a receiver holds open. A `FILE` past them is answered
+/// once one closes, not failed, so a sender with a larger window (an older
+/// one, or one told so) only waits (ACSCP_DESIGN §5.3, acs-d2kt).
+pub const OPEN_PARTS: usize = 64;
+
+// Both together, with room for the rest, under macOS's soft limit of 256.
+const _: () = assert!(MAX_WINDOW + OPEN_PARTS < 200);
+
+/// The window `ACS_CP_WINDOW` asks for, kept between 1 and [`MAX_WINDOW`].
+fn window(asked: usize) -> usize {
+    asked.clamp(1, MAX_WINDOW)
+}
+
 /// How a copy is to be run, apart from what it copies.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -94,7 +113,7 @@ impl Options {
             verbose: false,
             meter: false,
             report: true,
-            window: sys::env_or("ACS_CP_WINDOW", WINDOW).max(1),
+            window: window(sys::env_or("ACS_CP_WINDOW", WINDOW)),
         }
     }
 }
@@ -968,5 +987,15 @@ mod liveness_tests {
         took_read(&mut ep, &mut dec, &msg, &mut out, &mut live).unwrap();
         let mut ping = Vec::new();
         assert_eq!(live.tick(&mut ping), Health::Ok);
+    }
+
+    /// `ACS_CP_WINDOW` is kept under the descriptor limit: each header
+    /// ahead holds its source open, so a window of thousands failed files
+    /// with "Too many open files" (acs-d2kt).
+    #[test]
+    fn the_window_is_clamped() {
+        assert_eq!(window(0), 1);
+        assert_eq!(window(WINDOW), WINDOW);
+        assert_eq!(window(100_000), MAX_WINDOW);
     }
 }
