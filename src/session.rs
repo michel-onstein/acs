@@ -132,7 +132,6 @@ struct Walk {
 /// the leaf was just made or found under this parent, so in practice that
 /// is a race, and the directories already passed are still judged.
 fn resolve_parent(path: &Path, lstat: Lstat) -> Result<Walk, String> {
-    use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::path::Component;
 
@@ -155,9 +154,12 @@ fn resolve_parent(path: &Path, lstat: Lstat) -> Result<Walk, String> {
     let Some(parent) = path.parent() else {
         return Ok(walk);
     };
-    let mut todo: VecDeque<OsString> = names(parent).into();
+    // The names still to look up, as a stack: the next one is last. A
+    // `Vec` rather than a `VecDeque`, which nothing else in the binary uses.
+    let mut todo = names(parent);
+    todo.reverse();
     let mut cur = PathBuf::from("/");
-    while let Some(name) = todo.pop_front() {
+    while let Some(name) = todo.pop() {
         if name == ".." {
             // `cur` is a real path, so its lexical parent is its real one.
             cur.pop();
@@ -176,9 +178,7 @@ fn resolve_parent(path: &Path, lstat: Lstat) -> Result<Walk, String> {
                 if target.is_absolute() {
                     cur = PathBuf::from("/");
                 }
-                for n in names(target).into_iter().rev() {
-                    todo.push_front(n);
-                }
+                todo.extend(names(target).into_iter().rev());
                 walk.links.push((next, e));
             }
             None => cur = next,
@@ -222,11 +222,6 @@ fn check_ancestors_with(path: &Path, my_uid: u32, lstat: Lstat) -> Result<(), Di
         why,
     };
     let walk = resolve_parent(path, lstat).map_err(|e| DirError::Io(path.to_path_buf(), e))?;
-    let owner = |uid: u32| {
-        sys::user_name(uid)
-            .map(|n| format!("{n} (uid {uid})"))
-            .unwrap_or_else(|| format!("uid {uid}"))
-    };
     for (link, e) in &walk.links {
         if e.uid != my_uid && e.uid != 0 {
             return Err(replaceable(format!(
@@ -303,6 +298,15 @@ impl fmt::Display for DirError {
     }
 }
 
+/// A user as the refusals name one: `alice (uid 501)`, or `uid 501`
+/// without a name.
+fn owner(uid: u32) -> String {
+    match sys::user_name(uid) {
+        Some(n) => format!("{n} (uid {uid})"),
+        None => format!("uid {uid}"),
+    }
+}
+
 /// Decide whether an existing directory may hold our sockets. `Ok(true)`
 /// means it is ours but its mode must be tightened to `0700`.
 pub fn check_dir(path: &Path, facts: DirFacts, my_uid: u32) -> Result<bool, DirError> {
@@ -313,12 +317,9 @@ pub fn check_dir(path: &Path, facts: DirFacts, my_uid: u32) -> Result<bool, DirE
         return Err(DirError::NotDir(path.into()));
     }
     if facts.uid != my_uid {
-        let owner = sys::user_name(facts.uid)
-            .map(|n| format!("{n} (uid {})", facts.uid))
-            .unwrap_or_else(|| format!("uid {}", facts.uid));
         return Err(DirError::Foreign {
             path: path.into(),
-            owner,
+            owner: owner(facts.uid),
         });
     }
     Ok(facts.mode & 0o777 != 0o700)

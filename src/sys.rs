@@ -931,15 +931,17 @@ fn close_inherited_from(keep: &[RawFd], dirs: &[&str]) {
 /// platform) lacks it, leaving the caller to loop.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn close_range_except(keep: &[RawFd]) -> bool {
-    let mut keep: Vec<RawFd> = keep.iter().copied().filter(|&fd| fd > 2).collect();
-    keep.sort_unstable();
     let mut start: libc::c_uint = 3;
-    for fd in keep.into_iter().chain([-1]) {
-        let end = if fd < 0 {
-            libc::c_uint::MAX
-        } else {
-            fd as libc::c_uint - 1
-        };
+    loop {
+        // The lowest kept descriptor from `start` up; the gap below it is
+        // closed. A scan rather than a sort: `keep` is a handful of numbers,
+        // and a sort of `RawFd`s would be the binary's only one (3 KB).
+        let next = keep
+            .iter()
+            .filter(|&&fd| fd > 2 && fd as libc::c_uint >= start)
+            .map(|&fd| fd as libc::c_uint)
+            .min();
+        let end = next.map_or(libc::c_uint::MAX, |fd| fd - 1);
         if start <= end {
             // SAFETY: close_range only closes descriptor numbers.
             let r = unsafe { libc::syscall(libc::SYS_close_range, start, end, 0 as libc::c_uint) };
@@ -947,11 +949,11 @@ fn close_range_except(keep: &[RawFd]) -> bool {
                 return false;
             }
         }
-        if fd >= 0 {
-            start = fd as libc::c_uint + 1;
+        match next {
+            Some(fd) => start = fd + 1,
+            None => return true,
         }
     }
-    true
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1088,19 +1090,27 @@ mod tests {
         unsafe {
             let leaked = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
             let kept = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
-            assert!(leaked > 2 && kept > 2);
+            let between = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+            let kept2 = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+            assert!(leaked > 2 && kept > 2 && between > 2 && kept2 > 2);
             match libc::fork() {
                 0 => {
-                    close_inherited_from(&[kept], &["/nonexistent/fd", "/nonexistent/fd2"]);
+                    // Out of order, repeated and with a standard descriptor
+                    // in it: close_range's gaps come from a scan, not a sort.
+                    let keep = [kept2, 1, kept, kept2];
+                    close_inherited_from(&keep, &["/nonexistent/fd", "/nonexistent/fd2"]);
                     let ok = libc::fcntl(leaked, libc::F_GETFD) == -1
-                        && libc::fcntl(kept, libc::F_GETFD) != -1;
+                        && libc::fcntl(between, libc::F_GETFD) == -1
+                        && libc::fcntl(kept, libc::F_GETFD) != -1
+                        && libc::fcntl(kept2, libc::F_GETFD) != -1;
                     libc::_exit(if ok { 0 } else { 1 });
                 }
                 pid if pid > 0 => {
                     let mut status = 0;
                     libc::waitpid(pid, &mut status, 0);
-                    libc::close(leaked);
-                    libc::close(kept);
+                    for fd in [leaked, kept, between, kept2] {
+                        libc::close(fd);
+                    }
                     assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
                 }
                 _ => panic!("fork failed"),
