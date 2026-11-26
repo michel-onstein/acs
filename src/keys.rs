@@ -93,8 +93,10 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// Escape key pressed (or repeated).
+    /// Escape key pressed.
     EscPress,
+    /// Escape key auto-repeated (kitty event type 2): never a new press.
+    EscRepeat,
     /// Escape key released (kitty event types).
     EscRelease,
     /// Any other key; `Some(c)` when it is a plain character.
@@ -139,6 +141,12 @@ enum State {
         bytes: Vec<u8>,
         until: u64,
     },
+    /// A press that was not the command key came right after the double tap
+    /// (a held key's legacy auto-repeat): forwarded without arming again until
+    /// a gap of the escape window passes between presses.
+    Cooldown {
+        until: u64,
+    },
 }
 
 pub struct Detector {
@@ -178,7 +186,7 @@ impl Detector {
     /// The earliest time [`Detector::tick`] must be called.
     pub fn deadline(&self) -> Option<u64> {
         let s = match &self.state {
-            State::Idle => None,
+            State::Idle | State::Cooldown { .. } => None,
             State::Held { until, .. } | State::Command { until, .. } => Some(*until),
         };
         let p = self.seq_since.map(|t| t + PENDING_MS);
@@ -208,7 +216,7 @@ impl Detector {
         }
         let expired = match &self.state {
             State::Held { until, .. } | State::Command { until, .. } => now >= *until,
-            State::Idle => false,
+            State::Idle | State::Cooldown { .. } => false,
         };
         if expired {
             if let State::Held { bytes, .. } | State::Command { bytes, .. } =
@@ -427,6 +435,8 @@ impl Detector {
                 if key == self.cfg.codepoint() && ctrl_only(mods) {
                     if event == 3 {
                         Kind::EscRelease
+                    } else if event == 2 {
+                        Kind::EscRepeat
                     } else {
                         Kind::EscPress
                     }
@@ -452,8 +462,29 @@ impl Detector {
     }
 
     fn token(&mut self, kind: Kind, bytes: Vec<u8>, now: u64, out: &mut Output) {
-        let state = std::mem::replace(&mut self.state, State::Idle);
+        let state = match std::mem::replace(&mut self.state, State::Idle) {
+            State::Cooldown { until } if now >= until => State::Idle,
+            s => s,
+        };
         self.state = match (state, kind) {
+            (State::Idle, Kind::EscRepeat) => {
+                out.forward.extend_from_slice(&bytes);
+                State::Idle
+            }
+            (State::Cooldown { .. }, Kind::EscPress | Kind::EscRepeat) => {
+                out.forward.extend_from_slice(&bytes);
+                State::Cooldown {
+                    until: now + self.cfg.window_ms,
+                }
+            }
+            (State::Cooldown { until }, Kind::EscRelease | Kind::Release) => {
+                out.forward.extend_from_slice(&bytes);
+                State::Cooldown { until }
+            }
+            (State::Cooldown { .. }, _) => {
+                out.forward.extend_from_slice(&bytes);
+                State::Idle
+            }
             (State::Idle, Kind::EscPress) => State::Held {
                 bytes,
                 until: now + self.cfg.window_ms,
@@ -471,7 +502,7 @@ impl Detector {
                     bytes: mut held,
                     until,
                 },
-                Kind::EscRelease | Kind::Release,
+                Kind::EscRelease | Kind::Release | Kind::EscRepeat,
             ) => {
                 held.extend_from_slice(&bytes);
                 State::Held { bytes: held, until }
@@ -493,7 +524,7 @@ impl Detector {
                     bytes: mut held,
                     until,
                 },
-                Kind::EscRelease | Kind::Release,
+                Kind::EscRelease | Kind::Release | Kind::EscRepeat,
             ) => {
                 held.extend_from_slice(&bytes);
                 State::Command { bytes: held, until }
@@ -508,6 +539,13 @@ impl Detector {
                     }
                 }
                 State::Idle
+            }
+            (State::Command { bytes: held, .. }, Kind::EscPress) => {
+                out.forward.extend_from_slice(&held);
+                out.forward.extend_from_slice(&bytes);
+                State::Cooldown {
+                    until: now + self.cfg.window_ms,
+                }
             }
             (State::Held { bytes: held, .. } | State::Command { bytes: held, .. }, _) => {
                 out.forward.extend_from_slice(&held);
@@ -755,6 +793,49 @@ mod tests {
             run(&[(0, b"\x1b[93;69u\x1b[93;69ud")], 0),
             (vec![], Some(Action::Detach))
         );
+    }
+
+    #[test]
+    fn kitty_auto_repeats_of_the_held_key_are_not_presses() {
+        // Press then n repeats, then `x`: for n = 1 (mod 3) the old cycle
+        // left the client armed and `x` killed the session.
+        for n in 0..8 {
+            let mut seq = b"\x1b[93;5:1u".to_vec();
+            for _ in 0..n {
+                seq.extend_from_slice(b"\x1b[93;5:2u");
+            }
+            seq.extend_from_slice(b"\x1b[93;5:3u\x1b[120;1:1u");
+            let (_, act) = run(&[(0, &seq)], 0);
+            assert_eq!(act, None, "press + {n} repeats then x");
+        }
+        // A real double tap with repeats between still arms.
+        let seq: &[u8] = b"\x1b[93;5:1u\x1b[93;5:2u\x1b[93;5:3u\x1b[93;5:1u\x1b[120;1:1u";
+        assert_eq!(run(&[(0, seq)], 0), (vec![], Some(Action::Exit)));
+    }
+
+    #[test]
+    fn legacy_auto_repeat_of_the_held_key_does_not_rearm() {
+        // A held key sends ^] bytes 30 ms apart: the double tap arms, the
+        // third press is forwarded, and further repeats never arm again, so
+        // a following `x` is a plain character.
+        for n in 3..10u64 {
+            let mut d = Detector::new(Config::default());
+            let mut act = None;
+            for i in 0..n {
+                act = act.or(d.feed(&[CB], i * 30).action);
+            }
+            let o = d.feed(b"x", n * 30 + 10);
+            assert_eq!((act, o.action), (None, None), "{n} presses then x");
+        }
+        // After a gap longer than the window, a double tap arms again.
+        let mut d = Detector::new(Config::default());
+        for i in 0..4 {
+            d.feed(&[CB], i * 30);
+        }
+        d.feed(&[CB], 5000);
+        assert_eq!(d.feed(&[CB], 5050).action, None);
+        assert!(d.armed());
+        assert_eq!(d.feed(b"d", 5100).action, Some(Action::Detach));
     }
 
     #[test]
