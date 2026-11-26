@@ -104,7 +104,8 @@ highest level among them is the release:
 
 **Shipped code** is `src/`, `build.rs`, `Cargo.toml` and `Cargo.lock`;
 everything else (docs, tests, `xtask/`, `scripts/`, `.beads/`) changes nothing
-a user runs.
+a user runs. A file moved into or out of `src/` touches shipped code, and
+counts the lines the move changes.
 
 So: write pull request titles in Conventional Commits form (`fix: …`,
 `feat: …`) — the squash commit takes the title — and mark a small-looking fix

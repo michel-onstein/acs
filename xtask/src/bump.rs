@@ -322,25 +322,66 @@ fn pr_label(repo: &Path, pr: &str) -> Option<Level> {
         .find_map(|l| l.strip_prefix("semver:").and_then(Level::parse))
 }
 
+/// The files one commit changes, as `(path, lines added + deleted)`.
+///
+/// `-z` gives every path verbatim and NUL-terminated — no `"\303\251"`
+/// quoting of non-ASCII names, no `{a => b}` or `a => b` rename forms — so
+/// [`is_shipping`] sees the real path. Rename detection stays on, so a move
+/// counts only the lines it changes, and both of its paths are listed: a move
+/// into or out of `src/` touches shipped code.
+fn commit_files(repo: &Path, sha: &str) -> Result<Vec<(String, u64)>, String> {
+    let stat = git(
+        repo,
+        &[
+            "show",
+            "--numstat",
+            "-z",
+            "--format=",
+            "--first-parent",
+            sha,
+        ],
+    )?;
+    Ok(parse_numstat_z(&stat))
+}
+
+/// Parse `git show --numstat -z`. A record is `added\tdeleted\tpath\0`, or for
+/// a rename or copy `added\tdeleted\t\0old\0new\0`; binary files show `-`
+/// and count 0. A rename yields both paths, the line count on the one that
+/// ships if only one does, so the larger-fix threshold counts it.
+pub fn parse_numstat_z(stat: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let mut fields = stat.split('\0');
+    while let Some(rec) = fields.next() {
+        let mut it = rec.splitn(3, '\t');
+        let (Some(a), Some(d), Some(path)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let n = a.parse::<u64>().unwrap_or(0) + d.parse::<u64>().unwrap_or(0);
+        if !path.is_empty() {
+            out.push((path.to_string(), n));
+            continue;
+        }
+        let (Some(old), Some(new)) = (fields.next(), fields.next()) else {
+            break;
+        };
+        let (counted, other) = if is_shipping(old) && !is_shipping(new) {
+            (old, new)
+        } else {
+            (new, old)
+        };
+        out.push((counted.to_string(), n));
+        out.push((other.to_string(), 0));
+    }
+    out
+}
+
 fn commits(o: &Opts, range: &str) -> Result<Vec<Commit>, String> {
     let shas = git(&o.repo, &["rev-list", "--first-parent", "--reverse", range])?;
     let mut out = Vec::new();
     for sha in shas.lines().filter(|l| !l.is_empty()) {
         let msg = git(&o.repo, &["show", "-s", "--format=%s%x00%b", sha])?;
         let (subject, body) = msg.split_once('\0').unwrap_or((&msg, ""));
-        let stat = git(
-            &o.repo,
-            &["show", "--numstat", "--format=", "--first-parent", sha],
-        )?;
-        let files = stat
-            .lines()
-            .filter_map(|l| {
-                let mut it = l.splitn(3, '\t');
-                let a = it.next()?.parse::<u64>().unwrap_or(0);
-                let d = it.next()?.parse::<u64>().unwrap_or(0);
-                Some((it.next()?.to_string(), a + d))
-            })
-            .collect();
+        let files = commit_files(&o.repo, sha)?;
         let label = if o.labels {
             subject
                 .rsplit_once("(#")
@@ -643,5 +684,84 @@ mod tests {
         assert!(
             set_package_version("[dependencies]\n", Version::parse("1.0.0").unwrap()).is_none()
         );
+    }
+
+    /// A real repository: a move into `src/` and a non-ASCII path inside it
+    /// must both read as shipped code (acs-gs6v). Before `-z`, git reported
+    /// the move as `{scripts => src}/tool.rs` and the second path quoted, and
+    /// `is_shipping` missed both.
+    #[test]
+    fn moved_and_non_ascii_paths_count_as_shipped() {
+        let dir =
+            std::env::temp_dir().join(format!("acs-bump-numstat-{}", acs::sys::random_token()));
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q"]);
+        let body: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join("scripts/tool.rs"), &body).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "start"]);
+
+        run(&["mv", "scripts", "src"]);
+        std::fs::write(dir.join("src/tool.rs"), format!("{body}one more\n")).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "Move the tool into the binary"]);
+        let moved = commit_files(&dir, &run(&["rev-parse", "HEAD"])).unwrap();
+
+        std::fs::write(dir.join("src/café.rs"), "fn x() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "Add the café module"]);
+        let accented = commit_files(&dir, &run(&["rev-parse", "HEAD"])).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(moved.contains(&("src/tool.rs".to_string(), 1)), "{moved:?}");
+        assert!(
+            moved.contains(&("scripts/tool.rs".to_string(), 0)),
+            "{moved:?}"
+        );
+        assert_eq!(accented, vec![("src/café.rs".to_string(), 1)]);
+        for files in [moved, accented] {
+            let c = Commit {
+                files,
+                ..commit("A subject without a prefix", "", &[])
+            };
+            assert_eq!(classify(&c, 300).level, Level::Patch, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn numstat_z_records() {
+        let stat = "3\t1\tsrc/a.rs\0-\t-\tlogo.png\0\
+                    0\t0\t\0src/old.rs\0scripts/old.rs\0\
+                    5\t2\t\0docs/x.md\0src/x.rs\0";
+        assert_eq!(
+            parse_numstat_z(stat),
+            vec![
+                ("src/a.rs".to_string(), 4),
+                ("logo.png".to_string(), 0),
+                ("src/old.rs".to_string(), 0),
+                ("scripts/old.rs".to_string(), 0),
+                ("src/x.rs".to_string(), 7),
+                ("docs/x.md".to_string(), 0),
+            ]
+        );
+        assert_eq!(parse_numstat_z(""), vec![]);
     }
 }
