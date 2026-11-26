@@ -160,8 +160,10 @@ impl RawMode {
 
     /// The key that interrupts in the cooked settings (Ctrl-C, usually),
     /// which [`RawMode::dialing`] reads as a plain byte.
-    pub fn intr(&self) -> u8 {
-        self.orig.c_cc[libc::VINTR]
+    /// `None` when the key is disabled (`stty intr undef`), so a NUL typed
+    /// during a redial is not mistaken for an interrupt (acs-am6n).
+    pub fn intr(&self) -> Option<u8> {
+        control_char(self.orig.c_cc[libc::VINTR])
     }
 
     pub fn resume(&mut self) -> io::Result<()> {
@@ -193,8 +195,32 @@ impl Drop for RawMode {
     }
 }
 
+/// A `c_cc` entry as a byte to match against typed input: `None` when it is
+/// `_POSIX_VDISABLE` (0 on Linux, 0xff on macOS), which no byte may match.
+pub fn control_char(c: libc::cc_t) -> Option<u8> {
+    (c != libc::_POSIX_VDISABLE).then_some(c)
+}
+
+/// Whether `forward` holds the interrupt key; never when it is disabled.
+pub fn has_interrupt(forward: &[u8], intr: Option<u8>) -> bool {
+    intr.is_some_and(|c| forward.contains(&c))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nul_is_not_an_interrupt_when_vintr_is_disabled() {
+        let off = super::control_char(libc::_POSIX_VDISABLE);
+        assert!(!super::has_interrupt(&[0, 0xff], off));
+        assert!(super::has_interrupt(&[b'a', 3], Some(3)));
+    }
+
+    #[test]
+    fn disabled_control_char_is_none() {
+        assert_eq!(super::control_char(libc::_POSIX_VDISABLE as _), None);
+        assert_eq!(super::control_char(0x03), Some(0x03));
+    }
+
     use super::*;
 
     #[test]
