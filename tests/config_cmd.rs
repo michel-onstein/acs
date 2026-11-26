@@ -939,3 +939,31 @@ fn a_knock_is_added_set_listed_and_unset() {
     assert!(!after.contains("sequence"), "{after}");
     assert!(after.contains("# the gated box") && after.contains("# my hosts"));
 }
+
+/// `acs config host list | true`: the reader closes the pipe while acs still
+/// has output to write. Rust ignores SIGPIPE, so a bare `print!` panicked on
+/// EPIPE and exited 101; a reader that stops early is not a failure (acs-nxfq).
+#[test]
+fn output_to_a_closed_pipe_is_not_a_panic() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.local().parent().unwrap()).unwrap();
+    // Far more than any pipe buffer holds.
+    let mut yaml = String::from("aliases:\n");
+    for i in 0..4000 {
+        yaml.push_str(&format!(
+            "  box-with-a-long-alias-name-{i:05}:\n    - host: host-{i:05}.example.com\n"
+        ));
+    }
+    std::fs::write(h.local(), yaml).unwrap();
+    let mut child = h
+        .cmd(&["config", "host", "list"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+}

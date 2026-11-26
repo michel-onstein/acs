@@ -221,12 +221,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
     if opts.help {
-        println!("{USAGE}");
+        crate::print_out(&format!("{USAGE}\n"));
         return ExitCode::SUCCESS;
     }
     match run(&opts) {
         Ok(msg) => {
-            println!("{msg}");
+            crate::print_out(&format!("{msg}\n"));
             ExitCode::SUCCESS
         }
         Err(Error::Usage(e)) => {
