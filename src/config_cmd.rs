@@ -824,16 +824,35 @@ fn alias_at(map: &[(String, Node)], alias: &str) -> Option<(usize, usize)> {
 
 /// Remove the alias at `ai` of the `aliases` at `hi`, and `aliases` with it
 /// when it was the last.
-fn remove_alias(map: &mut Vec<(String, Node)>, hi: usize, ai: usize) {
+///
+/// `extra` is comment lines from inside the alias that nothing else holds
+/// (acs-mrfq). Returns the comment lines that found no entry to go above, for
+/// the end of the document.
+fn remove_alias(
+    map: &mut Vec<(String, Node)>,
+    hi: usize,
+    ai: usize,
+    extra: Vec<String>,
+) -> Vec<String> {
     let aliases = map[hi].1.value.map_mut().expect("a mapping");
-    remove_entry(aliases, ai);
+    let orphans = remove_entry_with(aliases, ai, extra);
     if aliases.is_empty() {
-        remove_entry(map, hi);
+        remove_entry_with(map, hi, orphans)
+    } else {
+        keep_comments(orphans, map.get_mut(hi + 1).map(|(_, n)| n))
     }
 }
 
 /// Apply an edit to `doc`; returns what was done.
 pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
+    let mut orphans = Vec::new();
+    let done = edit_with(doc, cmd, &mut orphans);
+    // Comment lines whose entry was the last of the file lead its end.
+    doc.tail.splice(0..0, orphans);
+    done
+}
+
+fn edit_with(doc: &mut Document, cmd: &Cmd, orphans: &mut Vec<String>) -> Result<String, String> {
     match cmd {
         Cmd::Set(key, value) => {
             if global(key).is_none() {
@@ -859,7 +878,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
             let Some(i) = map.iter().position(|(k, _)| k == key) else {
                 return Err(format!("{key} is not set in this file"));
             };
-            remove_entry(map, i);
+            orphans.extend(remove_entry(map, i));
             Ok(format!("removed {key}"))
         }
         Cmd::HostAdd {
@@ -952,7 +971,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                 .iter()
                 .position(|(k, _)| k == key)
                 .ok_or_else(missing)?;
-            remove_entry(settings, ki);
+            orphans.extend(remove_entry(settings, ki));
             let left: Vec<String> = settings
                 .iter()
                 .filter(|(_, n)| n.value != Value::Null)
@@ -960,7 +979,7 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                 .collect();
             if left.is_empty() {
                 // Only the setting was here: the hosts are in the other file.
-                remove_alias(map, hi, ai);
+                orphans.extend(remove_alias(map, hi, ai, Vec::new()));
                 return Ok(format!(
                     "removed {key} of {alias}, and {alias}, which has no hosts in this file"
                 ));
@@ -990,11 +1009,12 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
             };
             match host {
                 None => {
-                    remove_alias(map, hi, ai);
+                    orphans.extend(remove_alias(map, hi, ai, Vec::new()));
                     Ok(format!("removed alias {alias}"))
                 }
                 Some(h) => {
                     let node = &mut map[hi].1.value.map_mut().expect("a mapping")[ai].1;
+                    let mut lost = Vec::new();
                     let (removed, empty) = match listed_hosts(node) {
                         None => (0, true),
                         Some(list) => {
@@ -1005,7 +1025,10 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                                     while i < items.len() {
                                         if entry_host(&items[i]) == Some(h.as_str()) {
                                             let gone = items.remove(i);
-                                            keep_comments(gone.before, items.get_mut(i));
+                                            lost.extend(keep_comments(
+                                                gone.before,
+                                                items.get_mut(i),
+                                            ));
                                         } else {
                                             i += 1;
                                         }
@@ -1026,11 +1049,15 @@ pub fn edit(doc: &mut Document, cmd: &Cmd) -> Result<String, String> {
                         return Err(format!("{h} is not a host of {alias} in this file"));
                     }
                     if empty {
-                        remove_alias(map, hi, ai);
+                        orphans.extend(remove_alias(map, hi, ai, lost));
                         Ok(format!(
                             "removed {h}, the last host of {alias}, and the alias"
                         ))
                     } else {
+                        // The comments above the last host go above the next alias.
+                        let aliases = map[hi].1.value.map_mut().expect("a mapping");
+                        let next = aliases.get_mut(ai + 1).map(|(_, n)| n);
+                        orphans.extend(keep_comments(lost, next));
                         Ok(format!("removed {h} from {alias}"))
                     }
                 }
@@ -1167,17 +1194,31 @@ fn entry_host(n: &Node) -> Option<&str> {
 }
 
 /// Remove entry `i`, keeping the comment lines above it for what follows.
-fn remove_entry(map: &mut Vec<(String, Node)>, i: usize) {
-    let (_, gone) = map.remove(i);
-    keep_comments(gone.before, map.get_mut(i).map(|(_, n)| n));
+/// Returns the lines that found no entry to go above.
+fn remove_entry(map: &mut Vec<(String, Node)>, i: usize) -> Vec<String> {
+    remove_entry_with(map, i, Vec::new())
+}
+
+/// [`remove_entry`], with `extra` comment lines kept after the entry's own.
+fn remove_entry_with(map: &mut Vec<(String, Node)>, i: usize, extra: Vec<String>) -> Vec<String> {
+    let (_, mut gone) = map.remove(i);
+    gone.before.extend(extra);
+    keep_comments(gone.before, map.get_mut(i).map(|(_, n)| n))
 }
 
 /// Put the comment lines of a removed node above the node that took its
-/// place (they are dropped with the last one).
-fn keep_comments(mut before: Vec<String>, next: Option<&mut Node>) {
-    if let Some(next) = next {
-        before.append(&mut next.before);
-        next.before = before;
+/// place. When it was the last of its mapping or list, they go above the
+/// next entry of the level above (the next alias for a host, the next
+/// top-level setting for an alias); the lines that still find no entry are
+/// returned, for the end of the document (acs-mrfq).
+fn keep_comments(mut before: Vec<String>, next: Option<&mut Node>) -> Vec<String> {
+    match next {
+        Some(next) => {
+            before.append(&mut next.before);
+            next.before = before;
+            Vec::new()
+        }
+        None => before,
     }
 }
 
@@ -1710,6 +1751,47 @@ aliases:
         assert!(e.contains("not set in this file"), "{e}");
     }
 
+    /// Regression (acs-mrfq): the comment above the last entry of a mapping
+    /// was dropped with it; it goes above the next entry of the level above,
+    /// or to the end of the document.
+    #[test]
+    fn unset_of_the_last_setting_keeps_its_header_comment() {
+        let src = "install_on_remote: true\n# about the check\nupdate_check: false\n";
+        assert_eq!(
+            apply(src, "unset update_check").unwrap(),
+            "install_on_remote: true\n# about the check\n"
+        );
+    }
+
+    #[test]
+    fn removing_the_last_host_keeps_the_comment_above_it() {
+        // The list keeps a host: the comment moves above the next alias.
+        let src =
+            "aliases:\n  a:\n    - host: x\n    # the spare\n    - host: y\n  b:\n    - host: z\n";
+        assert_eq!(
+            apply(src, "host remove a y").unwrap(),
+            "aliases:\n  a:\n    - host: x\n  # the spare\n  b:\n    - host: z\n"
+        );
+        // The last alias: the comment ends the document.
+        let src = "aliases:\n  a:\n    - host: x\n    # the spare\n    - host: y\n";
+        assert_eq!(
+            apply(src, "host remove a y").unwrap(),
+            "aliases:\n  a:\n    - host: x\n# the spare\n"
+        );
+        // Removing the whole alias, with a header above it.
+        let src = "aliases:\n  a:\n    - host: x\n  # the b alias\n  b:\n    - host: z\n";
+        assert_eq!(
+            apply(src, "host remove b").unwrap(),
+            "aliases:\n  a:\n    - host: x\n# the b alias\n"
+        );
+        // Removing the only host takes the alias and `aliases`, not the header.
+        let src = "# my hosts\naliases:\n  # box\n  a:\n    - host: x\n";
+        assert_eq!(
+            apply(src, "host remove a x").unwrap(),
+            "# my hosts\n# box\n"
+        );
+    }
+
     #[test]
     fn host_add_creates_appends_and_refuses_duplicates() {
         let out = apply("install_on_remote: true\n", "host add devbox devbox.lan").unwrap();
@@ -1801,10 +1883,10 @@ aliases:
             apply(&set, "host remove d a").unwrap(),
             "aliases:\n  # the dev box\n  d: # mine\n    identity_file: ~/.ssh/id_d\n    hosts:\n      - host: b\n"
         );
-        // The last host takes the alias, key and all.
+        // The last host takes the alias, key and all; its header comment stays.
         assert_eq!(
             apply(&apply(&set, "host remove d a").unwrap(), "host remove d b").unwrap(),
-            ""
+            "# the dev box\n"
         );
         assert_eq!(apply(&set, "host unset d identity_file").unwrap(), src);
         let e = apply(src, "host unset d identity_file").unwrap_err();
