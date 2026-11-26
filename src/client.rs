@@ -2708,18 +2708,18 @@ fn serve(
                 crate::reconnect::Health::Dead => return lost(link, LinkEnd::Silent),
             }
         } else if sys::now_ms() >= handshake_until {
-            // Accepted, then silent: a redial goes back to its backoff; a
-            // first connection gives up.
-            if state.instance.is_some() {
-                return lost(link, LinkEnd::Silent);
+            // Accepted, then silent: a redial goes back to its backoff, and
+            // so does a first connection when persisting; otherwise the
+            // reconnect loop gives up on it, as for any other first-link
+            // failure (acs-ddck).
+            if state.instance.is_none() {
+                note(&format!(
+                    "no answer from {} within {} s",
+                    args.conn.transport.destination,
+                    handshake.as_secs_f32()
+                ));
             }
-            link.close();
-            note(&format!(
-                "no answer from {} within {} s",
-                args.conn.transport.destination,
-                handshake.as_secs_f32()
-            ));
-            return Outcome::Exit(code::UNREACHABLE);
+            return lost(link, LinkEnd::Silent);
         }
     }
 }

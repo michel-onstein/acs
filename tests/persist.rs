@@ -129,6 +129,27 @@ fn a_lost_host_is_pinged_fast_at_first_then_every_interval() {
     assert_eq!(net.pinged().len(), settled, "still pinging fast after 3 s");
 }
 
+/// Regression (acs-ddck): with `--persist`, a first connection that is
+/// accepted and then goes silent is retried like a dial error or a lost
+/// pre-WELCOME link, not given up on with 255: once the host answers, the
+/// session starts.
+#[test]
+fn a_persisting_first_link_that_goes_silent_is_retried() {
+    let remote = Remote::installed();
+    remote.silence(Some(acs::proto::ready_line().as_str()));
+    let net = Net::new(&[]);
+    let env =
+        net.env("aliases:\n  devbox:\n    - host: devbox.lan\n      reachability_check: false\n");
+    let mut env = refs(&env);
+    env.extend([("ACS_DIAL_TIMEOUT_MS", "500"), ("ACS_BACKOFF_MS", "100")]);
+    let mut c = Client::start_env(&remote, &session("devbox", &["--persist"]), &env);
+    c.wait_for("no answer from devbox.lan within 0.5 s", T);
+    remote.silence(None);
+    c.wait_for("up", T);
+    c.send(b"hi\r");
+    c.wait_for("got:hi", T);
+}
+
 #[test]
 fn an_unchecked_host_keeps_the_dial_backoff() {
     let remote = Remote::installed();
