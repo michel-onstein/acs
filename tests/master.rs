@@ -81,6 +81,15 @@ fn wait_gone(path: &Path) {
     );
 }
 
+/// The master with `pid` is dead within [`T`] (acs-97ox).
+fn assert_master_ends(pid: u32) {
+    wait_until(
+        T,
+        || acs::sys::kill(pid as i32, 0).is_err(),
+        || format!("master {pid} is still running"),
+    );
+}
+
 // ---- lifecycle (acs-5v9.9) --------------------------------------------------
 
 #[test]
@@ -665,17 +674,23 @@ fn a_program_not_reading_its_input_does_not_drop_the_client() {
     let t = TempDir::new();
     const CHUNK: usize = 64 * 1024;
     const TOTAL: usize = (1 << 20) + 4 * CHUNK;
+    // acs-97ox: a test killed before it reads `drained` leaves `head` waiting
+    // for input for good, and the master with it (a detached session lives
+    // on). The shell ends itself after this long, and the master follows.
+    const WATCHDOG: u64 = 120;
     let (mut c, w) = start_env(
         t.path(),
         "deaf",
         // Reads nothing for several dead intervals, then all of it.
         &[&sh_c(&format!(
-            "stty -echo -icanon min 1 time 0; echo ready; sleep 3; \
+            "stty -echo -icanon min 1 time 0; echo ready; \
+             (sleep {WATCHDOG}; kill $$) & sleep 3; \
              head -c {TOTAL} >/dev/null; echo drained"
         ))],
         "me",
         FAST_LIVENESS,
     );
+    let pid = acs::testutil::session_pid(&sock(t.path(), "deaf")).expect("the master's pid");
     c.wait_output("ready", T);
     let mut seq = w.input_seq;
     for _ in 0..TOTAL / CHUNK {
@@ -686,6 +701,11 @@ fn a_program_not_reading_its_input_does_not_drop_the_client() {
         seq += CHUNK as u64;
     }
     c.wait_output("drained", T);
+    // acs-97ox: the master is gone once its session has ended and the client
+    // has gone, success or not; one left behind outlives the test for hours.
+    assert_eq!(wait_exit(&mut c), 0);
+    drop(c);
+    assert_master_ends(pid);
 }
 
 /// Regression (acs-evm): an ACK means the pty took the bytes. A program in
