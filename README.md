@@ -845,7 +845,7 @@ reached as `user@config`.
 | `ACS_RING` | remote output history kept for resume, bytes (default 1 MiB) |
 | `ACS_CP_WINDOW` | how many file headers `acs cp` sends ahead of their data (default 64) |
 | `ACS_DIAL_TIMEOUT_MS` | how long a new connection may take to answer (default 120 s, time for a password or a key touch; 30 s for each host of `acs list`) |
-| `ACS_REDIAL_TIMEOUT_MS` | how long a reconnect may take to answer before acs goes back to waiting and tries again (default 30 s); it does not change `ACS_DIAL_TIMEOUT_MS` |
+| `ACS_REDIAL_TIMEOUT_MS` | how long a reconnect may take to answer before acs goes back to waiting and tries again (default 30 s); once ssh asks for a password, the reconnect has `ACS_DIAL_TIMEOUT_MS` from that prompt instead; it does not change `ACS_DIAL_TIMEOUT_MS` |
 | `XDG_CONFIG_HOME` | where your configuration file is (default `~/.config`) |
 | `ACS_GLOBAL_CONFIG` | global configuration file (default `/etc/acs/config.yaml`) |
 | `ACS_PING` | ping program for alias reachability checks (default `ping`) |
