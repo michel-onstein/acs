@@ -56,7 +56,7 @@ pub fn main(args: &[OsString], list: bool) -> ExitCode {
     };
     let (mut args, every_alias) = match parsed {
         Parsed::Help => {
-            println!("{}", cli::USAGE);
+            crate::print_out(&format!("{}\n", cli::USAGE));
             return ExitCode::SUCCESS;
         }
         Parsed::Version => {
