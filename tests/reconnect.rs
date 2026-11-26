@@ -515,6 +515,40 @@ fn a_password_prompt_during_a_redial_gets_the_terminal() {
     assert!(!text.contains("hunter2"), "{text:?}");
 }
 
+/// Regression (acs-u904): a redial's deadline no longer runs out under a
+/// prompt. It was counted from ssh's spawn even after ssh took the terminal,
+/// so a password typed slower than the redial timeout was killed with ssh,
+/// and the dial made again. The answer here takes three times that timeout;
+/// from the hand-off the prompt has the first connection's window, so the
+/// one dial goes through with it.
+#[test]
+fn a_slow_answer_at_a_redial_prompt_is_not_cut_off() {
+    let remote = Remote::installed();
+    let mut env = FAST.to_vec();
+    env.push(("ACS_REDIAL_TIMEOUT_MS", "300"));
+    let mut c = start(
+        &remote,
+        "sp",
+        "echo ready; while read l; do echo got:$l; done",
+        &env,
+    );
+    c.wait_for("ready", T);
+    let answer = remote.prompt_on_next_dial();
+    let dialled = remote.connections();
+    remote.cut_link();
+    c.wait_for("Password: ", T);
+    // The person is slow; the stimulus, so a starved host only lengthens it.
+    std::thread::sleep(Duration::from_millis(900));
+    c.send(b"hunter2\r");
+    c.wait_for("\x1b[23;0t", T);
+    c.send(b"after\r");
+    c.wait_for("got:\x0cafter", T);
+    let said = std::fs::read_to_string(&answer).unwrap_or_default();
+    assert_eq!(said.trim(), "hunter2");
+    assert_eq!(remote.connections(), dialled + 1, "{}", c.text());
+    assert!(!c.text().contains("no answer"), "{}", c.text());
+}
+
 /// Regression (acs-9t7p): a redial's prompt does not run under the remote
 /// program's input modes. With bracketed paste left on by the program, a
 /// password pasted at ssh's prompt arrived wrapped in the paste markers and
