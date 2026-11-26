@@ -654,6 +654,40 @@ fn the_master_pings_a_silent_client() {
     }
 }
 
+/// Regression (acs-009c): a program that reads none of its input for
+/// longer than the dead interval does not cost the client its link. Past
+/// 1 MiB of queued input the master stops reading the client's socket,
+/// so the client's PONGs go unread too — and the master used to count that
+/// silence, its own, as the client's, drop the connection and force a
+/// redial. A paused pager or a blocked pipe is all it took.
+#[test]
+fn a_program_not_reading_its_input_does_not_drop_the_client() {
+    let t = TempDir::new();
+    const CHUNK: usize = 64 * 1024;
+    const TOTAL: usize = (1 << 20) + 4 * CHUNK;
+    let (mut c, w) = start_env(
+        t.path(),
+        "deaf",
+        // Reads nothing for several dead intervals, then all of it.
+        &[&sh_c(&format!(
+            "stty -echo -icanon min 1 time 0; echo ready; sleep 3; \
+             head -c {TOTAL} >/dev/null; echo drained"
+        ))],
+        "me",
+        FAST_LIVENESS,
+    );
+    c.wait_output("ready", T);
+    let mut seq = w.input_seq;
+    for _ in 0..TOTAL / CHUNK {
+        c.send(&Msg::Input {
+            seq,
+            bytes: vec![b'x'; CHUNK],
+        });
+        seq += CHUNK as u64;
+    }
+    c.wait_output("drained", T);
+}
+
 /// Regression (acs-evm): an ACK means the pty took the bytes. A program in
 /// raw mode that never reads fills its terminal's input buffer, and the
 /// master acknowledges only what the pty took — it used to acknowledge
