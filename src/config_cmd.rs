@@ -341,7 +341,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     match target.and_then(|t| run(&cmd, &t)) {
         Ok(out) => {
-            print!("{out}");
+            crate::print_out(&out);
             ExitCode::SUCCESS
         }
         Err(e) => {

@@ -127,6 +127,17 @@ impl Role {
     }
 }
 
+/// Write `text` to stdout, treating a reader that has gone away as done.
+///
+/// Rust ignores SIGPIPE, so `print!` to a closed pipe (`acs config show |
+/// true`) panics on EPIPE and exits 101. A reader that stops early is not
+/// an error of ours, so any write failure ends the output quietly (acs-nxfq).
+pub fn print_out(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+}
+
 /// `acs --version`: version, protocol, build target, and the remote
 /// targets this binary can install (DESIGN §8.1).
 pub fn print_version() {
