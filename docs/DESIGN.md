@@ -2765,9 +2765,13 @@ acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
 - **State** is `$XDG_STATE_HOME/acs/update-check` (default
   `~/.local/state/acs/update-check`): `checked=<unix time>`,
   `latest=<version>`, `shown=<version>`. It is a cache — unreadable or
-  garbled means "never checked". The client writes it before starting the
-  check, which re-reads it before adding `latest`, so neither undoes the
-  other.
+  garbled means "never checked". Every read-modify-write of it holds an
+  `flock` on `update-check.lock` beside it, so two clients starting
+  together, or a client and the check, cannot write a stale copy back over
+  each other's change. The wait for that lock is at most a second; a lock
+  that cannot be had (a read-only directory, a stopped holder) is done
+  without, as a cache can afford. The client writes before starting the
+  check, which reads only after its fetch, before adding `latest`.
 - **Silent when it cannot ask**: offline, rate-limited or no curl, nothing is
   shown and the next attempt is a week later.
 - **Off** with `ACS_NO_UPDATE_CHECK=1` or `update_check: false` (§7.2). The
