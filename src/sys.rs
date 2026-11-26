@@ -334,10 +334,10 @@ pub fn write_atomic(path: &std::path::Path, mode: u32, bytes: &[u8]) -> io::Resu
     use std::io::Write;
     let tmp = temp_beside(path, "")?;
     let mut f = create_new_mode(&tmp, mode)?;
-    let written = f.write_all(bytes);
+    let written = f.write_all(bytes).and_then(|()| sync_file(&f));
     drop(f);
     written
-        .and_then(|()| std::fs::rename(&tmp, path))
+        .and_then(|()| rename_durable(&tmp, path))
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })
@@ -350,9 +350,82 @@ pub fn write_atomic(path: &std::path::Path, mode: u32, bytes: &[u8]) -> io::Resu
 pub fn symlink_atomic(target: &std::path::Path, link: &std::path::Path) -> io::Result<()> {
     let tmp = temp_beside(link, ".link")?;
     std::os::unix::fs::symlink(target, &tmp)?;
-    std::fs::rename(&tmp, link).inspect_err(|_| {
+    rename_durable(&tmp, link).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Flush `f`'s data and metadata to the disk, before it is renamed over
+/// the file it replaces (acs-m6ir). Without it a power loss just after the
+/// rename can leave the new name pointing at a zero-length or partial file
+/// on filesystems that do not order the two (XFS; ext4 without
+/// `auto_da_alloc`).
+pub fn sync_file(f: &File) -> io::Result<()> {
+    durability::record(durability::Event::SyncFile);
+    f.sync_all()
+}
+
+/// Rename `from` over `to`, then flush the directory holding `to`, so the
+/// rename itself survives a crash rather than only the file's contents
+/// (acs-m6ir). The caller has synced the file with [`sync_file`] first. A
+/// failure to flush the directory is reported, after the rename has
+/// happened: `to` is the new file either way.
+pub fn rename_durable(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+    std::fs::rename(from, to)?;
+    durability::record(durability::Event::Rename(to.to_path_buf()));
+    let dir = match to.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    sync_dir(dir)
+}
+
+/// Flush the directory `dir`, making the names created, renamed or removed
+/// in it durable (acs-m6ir). A filesystem that cannot sync a directory
+/// (`EINVAL`, some network and FUSE mounts) is not an error: there is
+/// nothing more to be done there.
+pub fn sync_dir(dir: &std::path::Path) -> io::Result<()> {
+    durability::record(durability::Event::SyncDir(dir.to_path_buf()));
+    let d = File::open(dir)?;
+    // SAFETY: a valid open descriptor, borrowed for the call.
+    match retry(|| unsafe { libc::fsync(d.as_raw_fd()) }) {
+        Err(e) if e.raw_os_error() != Some(libc::EINVAL) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// What [`sync_file`], [`rename_durable`] and [`sync_dir`] did, in order,
+/// on this thread — recorded under test only, so a test can check that a
+/// file is flushed before its rename and its directory after (acs-m6ir).
+pub mod durability {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    // Only read back under test; recording it costs nothing otherwise.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub enum Event {
+        SyncFile,
+        Rename(std::path::PathBuf),
+        SyncDir(std::path::PathBuf),
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static EVENTS: std::cell::RefCell<Vec<Event>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record(e: Event) {
+        EVENTS.with(|v| v.borrow_mut().push(e));
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn record(_: Event) {}
+
+    /// The events recorded on this thread since the last call, cleared.
+    #[cfg(test)]
+    pub(crate) fn take() -> Vec<Event> {
+        EVENTS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
 }
 
 /// Open `path` as a directory without following a symlink at its last
@@ -1074,6 +1147,38 @@ mod tests {
             ["exe", "link", "plain", "state"],
             "a temporary name was left behind"
         );
+    }
+
+    #[test]
+    fn write_atomic_flushes_the_file_before_the_rename_and_the_directory_after() {
+        // acs-m6ir: nothing was flushed, so a crash just after a config
+        // write could leave it empty.
+        use durability::{take, Event};
+        let t = crate::testutil::TempDir::new();
+        let f = t.path().join("config");
+        take();
+        write_atomic(&f, 0o600, b"new").unwrap();
+        assert_eq!(
+            take(),
+            [
+                Event::SyncFile,
+                Event::Rename(f.clone()),
+                Event::SyncDir(t.path().to_path_buf())
+            ]
+        );
+        let link = t.path().join("link");
+        symlink_atomic(&f, &link).unwrap();
+        assert_eq!(
+            take(),
+            [Event::Rename(link), Event::SyncDir(t.path().to_path_buf())]
+        );
+    }
+
+    #[test]
+    fn sync_dir_flushes_a_directory_and_reports_a_missing_one() {
+        let t = crate::testutil::TempDir::new();
+        sync_dir(t.path()).unwrap();
+        sync_dir(&t.path().join("missing")).expect_err("no such directory");
     }
 
     /// acs-g4uc: `create_new_mode` refuses a name already there, a planted

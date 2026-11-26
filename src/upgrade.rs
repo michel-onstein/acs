@@ -436,7 +436,11 @@ impl Staged {
         (|| -> std::io::Result<()> {
             let mut out = crate::sys::create_new_mode(&tmp, mode)?;
             let mut src = std::fs::File::open(from)?;
-            std::io::copy(&mut src, &mut out).map(drop)
+            std::io::copy(&mut src, &mut out)?;
+            // On the disk before it is renamed over the running binary
+            // (acs-m6ir): otherwise a crash just after `acs upgrade` can
+            // leave a zero-length `acs` where XFS reorders the two.
+            crate::sys::sync_file(&out)
         })()
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
@@ -454,7 +458,7 @@ impl Staged {
 
     /// Rename it over `to`: the path is never missing or half-written.
     fn commit(mut self, to: &Path) -> Result<(), String> {
-        std::fs::rename(&self.tmp, to)
+        crate::sys::rename_durable(&self.tmp, to)
             .map_err(|e| format!("cannot install {}: {e}", to.display()))?;
         self.committed = true;
         Ok(())
@@ -635,6 +639,30 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), "new");
         link_copy_beside(&bin.join("acs"));
         assert_eq!(std::fs::read_link(&copy).unwrap(), Path::new("acs"));
+    }
+
+    /// acs-m6ir: the staged binary is flushed before it is renamed over the
+    /// destination and the directory after, so a crash just after an
+    /// upgrade cannot leave a zero-length `acs`.
+    #[test]
+    fn a_staged_copy_is_flushed_before_its_rename_and_its_directory_after() {
+        use crate::sys::durability::{take, Event};
+        let d = TempDir::new();
+        let new = d.path().join("new");
+        std::fs::write(&new, "new").unwrap();
+        let dest = d.path().join("dir/acs");
+        take();
+        let staged = Staged::new(&new, &dest, 0o755).unwrap();
+        assert_eq!(take(), [Event::SyncFile], "flushed when staged");
+        staged.commit(&dest).unwrap();
+        assert_eq!(
+            take(),
+            [
+                Event::Rename(dest.clone()),
+                Event::SyncDir(d.path().join("dir"))
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
     }
 
     /// A staged copy that is not committed leaves nothing behind (acs-x1k).
