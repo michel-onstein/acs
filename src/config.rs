@@ -1401,6 +1401,23 @@ mod tests {
         })
     }
 
+    /// acs-whco: an unquoted `~` or `null` is unset, never the text "~"
+    /// (which became `-i $HOME` and `-l '~'`); a quoted one stays a string.
+    #[test]
+    fn an_unquoted_tilde_or_null_is_unset_not_text() {
+        let src = "aliases:\n  devbox:\n    identity_file: ~\n    user: null\n    hosts:\n      - host: devbox.lan\n        user: ~\n        identity_file: Null\n";
+        let c = load("", src).unwrap();
+        let d = c.alias("devbox").unwrap();
+        assert!(d.identity_file.is_none());
+        assert!(d.user.is_none());
+        assert!(d.entries[0].identity_file.is_none());
+        assert!(d.entries[0].user.is_none());
+
+        let src = "aliases:\n  devbox:\n    user: '~'\n    hosts:\n      - host: devbox.lan\n";
+        let c = load("", src).unwrap();
+        assert_eq!(c.alias("devbox").unwrap().user.as_ref().unwrap().value, "~");
+    }
+
     #[test]
     fn identity_files_at_the_alias_and_the_entry() {
         let l = "\
