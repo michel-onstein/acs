@@ -145,6 +145,7 @@ fn a_persisting_first_link_that_goes_silent_is_retried() {
     let mut c = Client::start_env(&remote, &session("devbox", &["--persist"]), &env);
     c.wait_for("no answer from devbox.lan within 0.5 s", T);
     remote.silence(None);
+    c.wait_for("new session 's' on devbox", T);
     c.wait_for("up", T);
     c.send(b"hi\r");
     c.wait_for("got:hi", T);
