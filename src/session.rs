@@ -83,6 +83,111 @@ fn mode_lets_others_replace(mode: u32) -> bool {
     mode & 0o022 != 0 && mode & 0o1000 == 0
 }
 
+/// One entry as `lstat` sees it, with its target read when it is a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    uid: u32,
+    mode: u32,
+    link: Option<PathBuf>,
+}
+
+/// How [`check_ancestors_with`] looks at an entry: [`lstat_entry`], or a
+/// made-up file system in the tests, where owners other than the tester
+/// and root can be had without being root.
+type Lstat<'a> = &'a dyn Fn(&Path) -> io::Result<Entry>;
+
+fn lstat_entry(p: &Path) -> io::Result<Entry> {
+    let m = std::fs::symlink_metadata(p)?;
+    let link = if m.file_type().is_symlink() {
+        Some(std::fs::read_link(p)?)
+    } else {
+        None
+    };
+    Ok(Entry {
+        uid: m.uid(),
+        mode: m.mode(),
+        link,
+    })
+}
+
+/// As many links as Linux follows in one lookup before `ELOOP`.
+const MAX_LINKS: usize = 40;
+
+/// What the kernel passes through to reach the directory holding a path's
+/// leaf.
+#[derive(Debug, Default)]
+struct Walk {
+    /// Every directory a name is looked up in, as a real path, in order.
+    dirs: Vec<PathBuf>,
+    /// Every symlink followed, by the path it was found at.
+    links: Vec<(PathBuf, Entry)>,
+}
+
+/// Resolve `path`'s parent the way the kernel does, one name at a time,
+/// following each symlink into its target (acs-vqdo). A path with no links
+/// gives exactly its lexical ancestors, so for real directories this is
+/// the walk acs-hjk always did.
+///
+/// A name that cannot be looked up ends the walk with what was gathered:
+/// the leaf was just made or found under this parent, so in practice that
+/// is a race, and the directories already passed are still judged.
+fn resolve_parent(path: &Path, lstat: Lstat) -> Result<Walk, String> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    fn names(p: &Path) -> Vec<OsString> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                _ => None,
+            })
+            .collect()
+    }
+    fn record(dirs: &mut Vec<PathBuf>, d: &Path) {
+        if !dirs.iter().any(|x| x == d) {
+            dirs.push(d.to_path_buf());
+        }
+    }
+
+    let mut walk = Walk::default();
+    let Some(parent) = path.parent() else {
+        return Ok(walk);
+    };
+    let mut todo: VecDeque<OsString> = names(parent).into();
+    let mut cur = PathBuf::from("/");
+    while let Some(name) = todo.pop_front() {
+        if name == ".." {
+            // `cur` is a real path, so its lexical parent is its real one.
+            cur.pop();
+            continue;
+        }
+        record(&mut walk.dirs, &cur);
+        let next = cur.join(&name);
+        let Ok(e) = lstat(&next) else {
+            return Ok(walk);
+        };
+        match &e.link {
+            Some(target) => {
+                if walk.links.len() >= MAX_LINKS {
+                    return Err(format!("more than {MAX_LINKS} symbolic links to follow"));
+                }
+                if target.is_absolute() {
+                    cur = PathBuf::from("/");
+                }
+                for n in names(target).into_iter().rev() {
+                    todo.push_front(n);
+                }
+                walk.links.push((next, e));
+            }
+            None => cur = next,
+        }
+    }
+    record(&mut walk.dirs, &cur);
+    Ok(walk)
+}
+
 /// Refuse a socket directory that anyone else could replace: an ancestor
 /// writable by group or other and not sticky (acs-hjk).
 ///
@@ -90,18 +195,45 @@ fn mode_lets_others_replace(mode: u32) -> bool {
 /// only the owner remove or rename. Without it, whoever can write the
 /// parent can move our directory aside and put theirs in its place, and
 /// the next client connects to their master and hands it every keystroke.
+///
+/// Through a symlink, the directories judged are the ones the link leads
+/// to — its target's whole chain — and never the link's own mode, which
+/// is `0777` on Linux and says nothing (acs-vqdo). The directory holding
+/// the link is judged like any other, and the link must be ours or root's:
+/// whoever owns it can remove it, even from a sticky directory, and point
+/// a new one anywhere.
 fn check_ancestors(path: &Path) -> Result<(), DirError> {
-    for dir in path.ancestors().skip(1) {
-        let meta = match std::fs::symlink_metadata(dir) {
-            Ok(m) => m,
+    check_ancestors_with(path, sys::getuid(), &lstat_entry)
+}
+
+fn check_ancestors_with(path: &Path, my_uid: u32, lstat: Lstat) -> Result<(), DirError> {
+    let replaceable = |why: String| DirError::Replaceable {
+        path: path.to_path_buf(),
+        why,
+    };
+    let walk = resolve_parent(path, lstat).map_err(|e| DirError::Io(path.to_path_buf(), e))?;
+    for (link, e) in &walk.links {
+        if e.uid != my_uid && e.uid != 0 {
+            let owner = sys::user_name(e.uid)
+                .map(|n| format!("{n} (uid {})", e.uid))
+                .unwrap_or_else(|| format!("uid {}", e.uid));
+            return Err(replaceable(format!(
+                "{} is a symlink owned by {owner}, who could repoint it",
+                link.display()
+            )));
+        }
+    }
+    for dir in &walk.dirs {
+        let e = match lstat(dir) {
+            Ok(e) => e,
             // Not readable by us is not our business to judge.
             Err(_) => continue,
         };
-        if mode_lets_others_replace(meta.mode()) && meta.uid() != sys::getuid() {
-            return Err(DirError::Replaceable {
-                path: path.to_path_buf(),
-                why: format!("{} is writable by others and not sticky", dir.display()),
-            });
+        if mode_lets_others_replace(e.mode) && e.uid != my_uid {
+            return Err(replaceable(format!(
+                "{} is writable by others and not sticky",
+                dir.display()
+            )));
         }
     }
     Ok(())
@@ -359,6 +491,173 @@ mod tests {
 
         // And the real path this check runs on is accepted.
         assert!(check_ancestors(&under).is_ok(), "{}", under.display());
+    }
+
+    const ME: u32 = 501;
+    const STRANGER: u32 = 1234;
+
+    /// A made-up file system for [`check_ancestors_with`]: as a normal user
+    /// a test cannot make root's symlinks or a stranger's directories, and
+    /// those are the cases acs-vqdo is about. `/` is root's and `0755`.
+    struct FakeFs(std::collections::HashMap<PathBuf, Entry>);
+
+    impl FakeFs {
+        fn new() -> FakeFs {
+            let mut fs = FakeFs(Default::default());
+            fs.dir("/", 0, 0o755);
+            fs
+        }
+        fn dir(&mut self, p: &str, uid: u32, perm: u32) -> &mut Self {
+            let e = Entry {
+                uid,
+                mode: 0o040000 | perm,
+                link: None,
+            };
+            self.0.insert(p.into(), e);
+            self
+        }
+        /// A link's mode as Linux has it, `0777`, which must not count.
+        fn link(&mut self, p: &str, uid: u32, target: &str) -> &mut Self {
+            let e = Entry {
+                uid,
+                mode: 0o120777,
+                link: Some(target.into()),
+            };
+            self.0.insert(p.into(), e);
+            self
+        }
+        fn check(&self, path: &str) -> Result<(), DirError> {
+            let lstat = |p: &Path| {
+                self.0
+                    .get(p)
+                    .cloned()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            };
+            check_ancestors_with(Path::new(path), ME, &lstat)
+        }
+    }
+
+    fn why(r: Result<(), DirError>) -> String {
+        match r {
+            Err(DirError::Replaceable { why, .. }) => why,
+            other => panic!("expected Replaceable, got {other:?}"),
+        }
+    }
+
+    /// acs-vqdo: Fedora Silverblue's `/home -> var/home` is root's and, as
+    /// every Linux link, `0777`. Judged by its own mode it made every
+    /// ACS_SOCKET_DIR under a home directory unusable; it is the directories
+    /// it leads to that decide.
+    #[test]
+    fn a_root_owned_symlink_in_the_path_is_followed_not_judged() {
+        let mut fs = FakeFs::new();
+        fs.link("/home", 0, "var/home")
+            .dir("/var", 0, 0o755)
+            .dir("/var/home", 0, 0o755)
+            .dir("/var/home/me", ME, 0o700);
+        assert_eq!(fs.check("/home/me/s"), Ok(()));
+    }
+
+    /// acs-vqdo: the target's own ancestors are where the directory really
+    /// sits, so one others may write there is refused, however tidy the
+    /// path through the link looks.
+    #[test]
+    fn a_replaceable_directory_behind_a_symlink_is_refused() {
+        let mut fs = FakeFs::new();
+        fs.link("/link", ME, "/loose/me")
+            .dir("/loose", STRANGER, 0o777)
+            .dir("/loose/me", ME, 0o700);
+        assert_eq!(
+            why(fs.check("/link/s")),
+            "/loose is writable by others and not sticky"
+        );
+        // A relative link leading the same way, through `..`.
+        let mut fs = FakeFs::new();
+        fs.dir("/a", 0, 0o755)
+            .link("/a/l", ME, "../loose/me")
+            .dir("/loose", STRANGER, 0o775)
+            .dir("/loose/me", ME, 0o700);
+        assert_eq!(
+            why(fs.check("/a/l/s")),
+            "/loose is writable by others and not sticky"
+        );
+        // And a link to a link: every target is followed.
+        let mut fs = FakeFs::new();
+        fs.link("/one", 0, "/two")
+            .link("/two", 0, "/deep/me")
+            .dir("/deep", STRANGER, 0o777)
+            .dir("/deep/me", ME, 0o700);
+        assert_eq!(
+            why(fs.check("/one/s")),
+            "/deep is writable by others and not sticky"
+        );
+    }
+
+    /// Whoever owns a link can remove it, even from a sticky `/tmp`, and
+    /// make a new one pointing anywhere: a stranger's link is refused, as
+    /// it was before acs-vqdo (when its `0777` refused it by accident).
+    #[test]
+    fn a_strangers_symlink_in_the_path_is_refused() {
+        let mut fs = FakeFs::new();
+        fs.dir("/tmp", 0, 0o1777)
+            .link("/tmp/l", STRANGER, "/home/me")
+            .dir("/home", 0, 0o755)
+            .dir("/home/me", ME, 0o700);
+        let w = why(fs.check("/tmp/l/s"));
+        assert!(w.starts_with("/tmp/l is a symlink owned by"), "{w}");
+        // Ours is fine there.
+        fs.link("/tmp/l", ME, "/home/me");
+        assert_eq!(fs.check("/tmp/l/s"), Ok(()));
+    }
+
+    /// Without links nothing changed: the lexical ancestors, judged as
+    /// acs-hjk judged them.
+    #[test]
+    fn real_directories_are_judged_as_before() {
+        let mut fs = FakeFs::new();
+        fs.dir("/a", 0, 0o775).dir("/a/me", ME, 0o700);
+        assert_eq!(
+            why(fs.check("/a/me/s")),
+            "/a is writable by others and not sticky"
+        );
+        fs.dir("/a", 0, 0o1777);
+        assert_eq!(fs.check("/a/me/s"), Ok(()));
+        // Our own loose directory is ours to keep loose.
+        fs.dir("/a", ME, 0o777);
+        assert_eq!(fs.check("/a/me/s"), Ok(()));
+        // The directory holding the link is still judged.
+        let mut fs = FakeFs::new();
+        fs.dir("/loose", STRANGER, 0o777)
+            .link("/loose/l", ME, "/home/me")
+            .dir("/home", 0, 0o755)
+            .dir("/home/me", ME, 0o700);
+        assert_eq!(
+            why(fs.check("/loose/l/s")),
+            "/loose is writable by others and not sticky"
+        );
+    }
+
+    #[test]
+    fn a_symlink_loop_is_an_error_not_a_hang() {
+        let mut fs = FakeFs::new();
+        fs.link("/x", ME, "/x");
+        assert!(matches!(fs.check("/x/s"), Err(DirError::Io(..))));
+    }
+
+    /// The walk on a real file system: through a link into its target.
+    #[test]
+    fn resolve_parent_follows_real_symlinks() {
+        let t = crate::testutil::TempDir::new();
+        let base = t.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("real/me")).unwrap();
+        std::os::unix::fs::symlink("real", base.join("link")).unwrap();
+        let walk = resolve_parent(&base.join("link/me/s"), &lstat_entry).unwrap();
+        assert_eq!(walk.dirs.last(), Some(&base.join("real/me")));
+        assert!(walk.dirs.contains(&base.join("real")));
+        assert!(!walk.dirs.contains(&base.join("link")));
+        assert_eq!(walk.links.len(), 1);
+        assert_eq!(walk.links[0].0, base.join("link"));
+        assert!(check_ancestors(&base.join("link/me/s")).is_ok());
     }
     use crate::testutil::TempDir;
 

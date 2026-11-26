@@ -267,6 +267,32 @@ fn take_msgs(
     Ok(())
 }
 
+/// How long the protocol-error flush may take before it gives up.
+const ERROR_FLUSH: Duration = Duration::from_secs(2);
+
+/// Write `buf` to the nonblocking `fd`, waiting for room with `poll` but
+/// giving up with `TimedOut` once `limit` has passed: a dead link with a full
+/// channel never drains, and the flush must not hang the process.
+fn write_bounded(fd: RawFd, mut buf: &[u8], limit: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + limit;
+    while !buf.is_empty() {
+        match sys::write(fd, buf) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                let mut p = [sys::pollfd(fd, libc::POLLOUT)];
+                sys::poll(&mut p, sys::poll_timeout(deadline - now))?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Run `ep` over the link `rfd`/`wfd` (one socket, or a pipe each way)
 /// until it is finished or stops: `dec` holds what was read already (what
 /// came after the remote's marker), and `out` what is still to be written
@@ -296,9 +322,9 @@ pub(crate) fn drive(
                     message: m.clone(),
                 }
                 .encode(out.tail());
-                // Best effort: the far end is broken, and may not read.
-                let _ = sys::set_nonblocking(wfd, false);
-                let _ = sys::write_all(wfd, out.queued());
+                // Best effort: the far end is broken, and may not read, so
+                // the flush gives up after `ERROR_FLUSH`.
+                let _ = write_bounded(wfd, out.queued(), ERROR_FLUSH);
                 Stop::Fatal(format!("protocol error: {m}"))
             }
             Halt::Ended(m) => {
@@ -835,4 +861,39 @@ pub fn main(args: &[OsString]) -> ExitCode {
         ));
     }
     ExitCode::from(o.status())
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// A reader that never reads must not hold the protocol-error flush
+    /// past its deadline (acs-6a73). The call runs on a thread so that the
+    /// unfixed, blocking flush fails the test instead of hanging the suite.
+    #[test]
+    fn bounded_write_gives_up_on_a_reader_that_never_reads() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        sys::set_nonblocking(a.as_raw_fd(), true).unwrap();
+        let fd = a.as_raw_fd();
+        let big = vec![0u8; 16 * 1024 * 1024];
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(write_bounded(fd, &big, Duration::from_millis(200)));
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the flush hung on a full link");
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn bounded_write_delivers_what_fits() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        sys::set_nonblocking(a.as_raw_fd(), true).unwrap();
+        write_bounded(a.as_raw_fd(), b"hello", Duration::from_secs(1)).unwrap();
+        let mut got = [0u8; 5];
+        b.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello");
+    }
 }

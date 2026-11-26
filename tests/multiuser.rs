@@ -148,6 +148,54 @@ fn a_symlinked_socket_directory_is_refused() {
     reset(&d);
 }
 
+/// acs-vqdo: a root-owned symlink above ACS_SOCKET_DIR — Fedora
+/// Silverblue's `/home -> var/home` — is followed, not refused for the
+/// `0777` every Linux link has; and a directory others may write behind a
+/// link is refused, though the path through the link never names it.
+#[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
+fn a_socket_directory_is_judged_through_symlinks() {
+    require();
+    let (alice, bob) = (user("alice"), user("bob"));
+    let top = Path::new("/acs-vqdo");
+    reset(top);
+    let mkdir = |p: &Path, uid: u32, mode: u32| {
+        std::fs::create_dir_all(p).unwrap();
+        std::os::unix::fs::chown(p, Some(uid), None).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mkdir(top, 0, 0o755);
+    mkdir(&top.join("var/home"), 0, 0o755);
+    mkdir(&top.join("var/home/alice"), alice.uid, 0o700);
+    std::os::unix::fs::symlink("var/home", top.join("home")).unwrap();
+    let list = |dir: &str| {
+        let out = as_user(&alice, exe())
+            .args(["_proxy", "--list"])
+            .env("ACS_SOCKET_DIR", dir)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (ok, err) = list("/acs-vqdo/home/alice/s");
+    assert!(ok, "{err}");
+
+    // Bob's loose directory, reached through alice's own link.
+    mkdir(&top.join("loose"), bob.uid, 0o777);
+    mkdir(&top.join("loose/alice"), alice.uid, 0o700);
+    std::os::unix::fs::symlink("loose/alice", top.join("alink")).unwrap();
+    std::os::unix::fs::lchown(top.join("alink"), Some(alice.uid), None).unwrap();
+    let (ok, err) = list("/acs-vqdo/alink/s");
+    assert!(!ok);
+    assert!(
+        err.contains("/acs-vqdo/loose is writable by others and not sticky"),
+        "{err}"
+    );
+    reset(top);
+}
+
 /// Child side of the peer test: connect to a socket and report whether the
 /// master answered a HELLO. Not a check of its own: ignored, and run only by
 /// `another_uid_is_dropped_by_the_master` with `--ignored --exact`, so
