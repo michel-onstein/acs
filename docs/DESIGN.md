@@ -2591,6 +2591,10 @@ their YAML shape:
   file the client would refuse — nor overwrites one that is already broken.
   A path that is a symlink is resolved first, so a configuration kept in
   dotfiles is edited where it really lives and the link survives.
+  An edit holds `flock(<file>.lock)`, beside the file the path leads to,
+  from the read to the rename, so two edits at once both land rather than
+  the second dropping the first (acs-f6nd); the lock is a separate file
+  because the rename puts a new inode in the configuration's place.
   It is also checked merged with the other file, so the hosts under an
   alias's key in one file cannot be removed from the other; `host set` on an
   alias that has no host yet says to add one first.
