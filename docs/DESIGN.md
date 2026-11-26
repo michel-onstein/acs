@@ -245,6 +245,13 @@ shells).
   close the same window with two platform back-ends; the prod closes it on
   demand, and the 5 s check is left only for a cleaner that took the
   `.master` file too — a whole-directory wipe.
+- **A master that lost its name stands down.** After a wipe, a client
+  redialling inside those 5 s starts a fresh master that takes the new
+  `.master` file and socket. The old master's check then finds the name
+  held by a live master and nothing can reach it again, so with no client
+  attached it ends its session — logged, as it ends the user's shell —
+  instead of keeping child, pty and ring for good; a client still attached
+  keeps it until it leaves (acs-c152).
 
 ### 4.2 Master
 
