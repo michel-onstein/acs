@@ -158,6 +158,10 @@ fn system_time(t: Time) -> SystemTime {
 
 /// Set `f`'s times to `m`'s, with their sub-second part.
 fn set_times(f: &File, m: &Meta) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_SET_TIMES.with(|c| c.get()) {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
     let t = std::fs::FileTimes::new()
         .set_accessed(system_time(m.atime))
         .set_modified(system_time(m.mtime));
@@ -686,21 +690,29 @@ impl Receiver {
             if self.preserve {
                 sys::fchmod(p.file.as_raw_fd(), p.meta.mode)?;
             }
-            std::fs::rename(&p.part, &p.dest)?;
-            if self.preserve {
-                set_times(&p.file, &p.meta)?;
-            }
-            Ok::<(), std::io::Error>(())
+            std::fs::rename(&p.part, &p.dest)
         })();
-        match done {
-            Ok(()) => {
-                self.outcome.written += 1;
-                self.placed.insert(p.dest.clone());
-                Msg::Ok { id }.encode(out.tail());
-                self.close(p);
-            }
-            Err(e) => self.abandon(id, p, reason(&e), out),
+        if let Err(e) = done {
+            self.abandon(id, p, reason(&e), out);
+            return Ok(());
         }
+        // Renamed: the content is in place under its name, and `p.part` is
+        // no longer ours (a concurrent copy may have made a new one), so
+        // from here the file is kept whatever happens. Times that cannot be
+        // set are reported, as scp -p does, and fail the run, but the file
+        // is written and answered OK.
+        if self.preserve {
+            if let Err(e) = set_times(&p.file, &p.meta) {
+                let shown = p.name.clone();
+                if self.tell(&shown, &format!("set times: {}", reason(&e))) {
+                    self.outcome.failed += 1;
+                }
+            }
+        }
+        self.outcome.written += 1;
+        self.placed.insert(p.dest.clone());
+        Msg::Ok { id }.encode(out.tail());
+        self.close(p);
         Ok(())
     }
 }
@@ -805,6 +817,13 @@ mod tests {
     use super::*;
     use crate::proto::Decoder;
     use crate::testutil::TempDir;
+
+    thread_local! {
+        /// Makes `set_times` fail, which no real file can be made to do
+        /// the same way on every platform.
+        pub(super) static FAIL_SET_TIMES: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 
     fn opts() -> Options {
         let mut o = Options::new(true, false);
@@ -1450,6 +1469,40 @@ mod tests {
 
     /// With headers running ahead, a directory's `DIR_END` can come before
     /// its files' data: its mode and times wait for them.
+    /// acs-n19p: with `-p`, a file renamed into place whose times then
+    /// could not be set was abandoned: FAIL, its content kept but not
+    /// counted written, the message not saying "set times". It is kept,
+    /// answered OK, counted written, and the failure reported as scp -p does.
+    #[test]
+    fn a_file_whose_times_cannot_be_set_is_kept_and_reported() {
+        let t = TempDir::new();
+        let mut o = opts();
+        o.preserve = true;
+        let mut rx = Rx {
+            r: Receiver::serving(&o),
+            out: OutQueue::default(),
+        };
+        rx.send(Msg::Hello(Hello {
+            version: crate::VERSION.into(),
+            role: Role::Receive,
+            recursive: true,
+            preserve: true,
+            verbose: false,
+            target: t.path().to_string_lossy().into(),
+            paths: vec!["f".into()],
+        }))
+        .unwrap();
+        FAIL_SET_TIMES.with(|c| c.set(true));
+        rx.file(1, "f", b"data").unwrap();
+        FAIL_SET_TIMES.with(|c| c.set(false));
+        assert_eq!(std::fs::read(t.path().join("f")).unwrap(), b"data");
+        assert!(!t.path().join(".f.acscp-part").exists());
+        let a = rx.answers();
+        assert!(a.contains(&"OK 1".to_string()), "{a:?}");
+        assert!(!a.iter().any(|l| l.starts_with("FAIL")), "{a:?}");
+        assert_eq!((rx.r.outcome.written, rx.r.outcome.failed), (1, 1));
+    }
+
     #[test]
     fn a_directory_settles_after_its_contents() {
         let t = TempDir::new();

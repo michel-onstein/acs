@@ -245,17 +245,28 @@ pub fn joinable(tr: &Transport, call: Call) -> bool {
     tr.multiplexes(call) && tr.control_path().is_some_and(|p| p.exists()) && control(tr, "check")
 }
 
-/// Kill the master, if there is one: `ssh -O exit`. Always bounded — it
-/// talks to the control socket and never to the network — and harmless
-/// when the socket is stale, which is why nothing here checks first.
+/// Kill the master, if there is one: `ssh -O exit`. It talks to the control
+/// socket and never to the network, and is bounded by [`CONTROL_DEADLINE`]
+/// all the same — a frozen master answers nothing. Harmless when the
+/// socket is stale, which is why nothing here checks first.
 pub fn stop(tr: &Transport) {
     if tr.control_path().is_some_and(|p| p.exists()) {
         control(tr, "exit");
     }
 }
 
-/// `ssh -O <op>`: did it succeed?
+/// How long `ssh -O check|exit` gets. A live master answers in
+/// milliseconds; one that is frozen (SIGSTOP, an uninterruptible sleep, a
+/// debugger) never does, and must not hold the caller with it.
+const CONTROL_DEADLINE: Duration = Duration::from_secs(5);
+
+/// `ssh -O <op>`: did it succeed? A call still running at the deadline is
+/// killed and counts as no: not joinable, not stopped.
 fn control(tr: &Transport, op: &str) -> bool {
+    control_within(tr, op, CONTROL_DEADLINE)
+}
+
+fn control_within(tr: &Transport, op: &str, deadline: Duration) -> bool {
     let Some(argv) = tr.control_argv(op) else {
         return false;
     };
@@ -264,7 +275,23 @@ fn control(tr: &Transport, op: &str) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    matches!(sys::spawn(&mut c).and_then(|mut ch| ch.wait()), Ok(s) if s.success())
+    let Ok(mut ch) = sys::spawn(&mut c) else {
+        return false;
+    };
+    let end = std::time::Instant::now() + deadline;
+    loop {
+        match ch.try_wait() {
+            Ok(Some(s)) => return s.success(),
+            Ok(None) if std::time::Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = ch.kill();
+                let _ = ch.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// `-o <key>=<value>` as two arguments, where the value may not be UTF-8.
@@ -451,6 +478,45 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path.into()
+    }
+
+    /// acs-g1m4: `ssh -O check|exit` against a frozen master used to wait
+    /// forever. It now gives up at the deadline, kills the child, and
+    /// reports "not joinable" / "not stopped".
+    #[test]
+    fn a_frozen_master_does_not_hold_the_control_call() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = TempDir::new();
+        let pidfile = d.path().join("pid");
+        let path = d.path().join("ssh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut t = tr();
+        t.ssh = path.into();
+        configure_at(&mut t, d.path().join("mux"), 300);
+        assert!(t.control_path().is_some());
+
+        let t0 = std::time::Instant::now();
+        assert!(!control_within(&t, "check", Duration::from_millis(300)));
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "the frozen ssh must be killed"
+        );
     }
 
     /// acs-hmv: a batch joins the master that is up, and only that one.

@@ -513,6 +513,9 @@ file and tries again every 100 ms; past twice `ACS_DEAD_MS` the file fails
   them — through `std::fs::File::set_times`, which takes both with
   sub-second precision, rather than `sys::set_mtime`, which sets one
   whole-second time for both.
+  Times that cannot be set after the rename do not undo it: the file stays,
+  is answered `OK` and counted written, and `set times: ...` is reported and
+  makes the run exit 1, as `scp -p` does.
 - **Symlinks** are followed on the sending side and sent as what they point
   at, as `scp` does; a dangling one is a `SKIP`.
 - **Special files** (devices, sockets, fifos) are a `SKIP` with a reason.
