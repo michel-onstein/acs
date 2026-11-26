@@ -44,7 +44,8 @@ options:
       --version       print the version
   --                  end of options: a source may begin with -
 
-environment: ACS_CP_WINDOW (file headers sent ahead of their data, default 64)
+environment: ACS_CP_WINDOW (file headers sent ahead of their data, default 64,
+               at most 96)
              ACS_KNOCK (as --knock)";
 
 /// A `[user@]host:path` argument (ACSCP_DESIGN §4.1).

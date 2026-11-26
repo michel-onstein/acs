@@ -400,6 +400,32 @@ link never pulls a whole file into memory, and the receiver writes each
 chunk as it lands. The control frames going back are small and few, so
 they never fill the reverse direction.
 
+**The window and the open parts are capped** (acs-d2kt). Each header ahead
+holds its source open on the sender, and each answered `FILE` holds its
+part open on the receiver — in a local copy both in the one process. A
+window of thousands therefore failed files with "Too many open files"
+under macOS's soft limit of 256 descriptors. Two fixed ceilings, rather
+than one derived from `RLIMIT_NOFILE`, keep it under that limit with room
+for everything else the process holds:
+
+- `ACS_CP_WINDOW` is clamped to **96** (`cp::MAX_WINDOW`); asking for more
+  gets 96, and a window of 0 gets 1.
+- The receiver holds at most **64** parts open (`cp::OPEN_PARTS`). A
+  `FILE` past them is placed — its name checked, its directory kept open
+  — but its part is not opened and it is not answered: its `GO` (or
+  `HAVE`) is sent once a part closes, in the order the headers came,
+  never `FAIL`. The sender cannot tell this from a slow disk: it waits
+  for the answer as it always has, streaming the file it is on, whose
+  `GO` came first, so the copy cannot deadlock. A sender that runs further
+  ahead — an older one, or one built with another ceiling — is therefore
+  served without any change to the protocol, and a newer receiver needs
+  nothing of an older sender.
+
+96 + 64 = 160 descriptors at most, plus a handful of pipes and sockets
+(the walk reads each directory whole, so it holds none open). A
+window past 64 still helps a little: the next headers are already on
+the wire when a part closes.
+
 ### 5.4 Names
 
 The receiver trusts nothing about a name (goal 6, CVE-2019-6111):

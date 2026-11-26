@@ -44,11 +44,23 @@ pub fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     parse_or(std::env::var(name).ok().as_deref(), default)
 }
 
-/// A millisecond timer knob (`ACS_*_MS`): [`env_or`] as a [`Duration`].
+/// The largest a millisecond timer knob (`ACS_*_MS`) can be: a year. Anything
+/// longer means "never" in practice, and an unbounded `u64` made the sums
+/// built on it (`heard + dead_after`, `Instant::now() + orphan_after()`,
+/// the backoff's doubling) wrap or panic (acs-5oh2).
+pub const MAX_MS: u64 = 365 * 24 * 3600 * 1000;
+
+/// A millisecond timer knob (`ACS_*_MS`) as a number: [`env_or`], clamped to
+/// [`MAX_MS`].
+pub fn env_ms_u64(name: &str, default_ms: u64) -> u64 {
+    env_or(name, default_ms).min(MAX_MS)
+}
+
+/// A millisecond timer knob (`ACS_*_MS`): [`env_ms_u64`] as a [`Duration`].
 ///
 /// [`Duration`]: std::time::Duration
 pub fn env_ms(name: &str, default_ms: u64) -> std::time::Duration {
-    std::time::Duration::from_millis(env_or(name, default_ms))
+    std::time::Duration::from_millis(env_ms_u64(name, default_ms))
 }
 
 /// `v` parsed as a `T`, else `default` — [`env_or`] without the lookup.
@@ -1019,6 +1031,23 @@ mod tests {
         assert_eq!(parse_or(Some("-5"), 7u64), 7);
         assert_eq!(parse_or(Some("70000"), 7u16), 7);
         assert_eq!(parse_or(Some("4096"), 1usize), 4096);
+    }
+
+    #[test]
+    fn a_huge_timer_knob_is_clamped_so_sums_on_it_cannot_overflow() {
+        const VAR: &str = "ACS_TEST_SYS_KNOB_HUGE";
+        // SAFETY: the name is used by this test alone.
+        unsafe { std::env::set_var(VAR, u64::MAX.to_string()) };
+        assert_eq!(env_ms_u64(VAR, 5), MAX_MS);
+        assert_eq!(env_ms(VAR, 5), std::time::Duration::from_millis(MAX_MS));
+        // The clamped value survives the arithmetic the callers do on it.
+        assert!(std::time::Instant::now()
+            .checked_add(env_ms(VAR, 5))
+            .is_some());
+        assert!(MAX_MS.checked_add(MAX_MS).is_some());
+        unsafe { std::env::remove_var(VAR) };
+        // A value within the ceiling is untouched.
+        assert_eq!(env_ms_u64("ACS_TEST_SYS_KNOB_NEVER_SET", 9), 9);
     }
 
     #[test]

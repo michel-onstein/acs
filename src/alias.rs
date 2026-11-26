@@ -311,7 +311,13 @@ fn pick(
         .and_then(|h| entries.iter().position(|e| e.host == h))
         .filter(|&r| match &known {
             Some(ranked) => candidates(&entries, ranked)[1..].contains(&r),
-            None => true,
+            // Host-side matching leaves the rank unknown: take the memory
+            // only where it would beat every unchecked entry even if the
+            // resolver put both on a local network, since the walk takes
+            // an unchecked entry outright where it is reached.
+            None => entries.iter().enumerate().all(|(u, o)| {
+                o.reachability_check || u == r || (!entries[r].prefer, r) < (!o.prefer, u)
+            }),
         });
     let mut answered = vec![None; entries.len()];
     if let (Some(r), Some(m)) = (last, &memory) {
@@ -1591,6 +1597,35 @@ aliases:
             "{log:?}"
         );
         assert_eq!(home.recall("abc"), None);
+    }
+
+    #[test]
+    fn with_prefer_local_network_a_memory_behind_an_unchecked_entry_is_ignored() {
+        // lab3 was used last, but lab2 is unchecked and ahead of it: the walk
+        // takes lab2 outright whatever the resolver says, so the memory must
+        // not send the connection to lab3 (the bug: it did, with the rank
+        // unknown under prefer_local_network).
+        let dir = TempDir::new();
+        let home = memory_at(&dir, HOME);
+        home.remember("lab", Some("lab3")).unwrap();
+        let yaml = "aliases:\n  lab:\n    prefer_local_network: true\n    hosts:\n      \
+                    - host: lab1\n      - host: lab2\n        reachability_check: false\n      \
+                    - host: lab3\n";
+        let c = config(yaml);
+        let fake = Fake::up(&["lab3"]);
+        let mut log = Vec::new();
+        let r = resolve_remembering(
+            "lab",
+            &c,
+            fake.reachable(),
+            &|| on(&["192.168.1.5/24"], HOME_NAMES, 0),
+            Some(&home),
+            &[crate::ssh::program()],
+            None,
+            &mut |m| log.push(m),
+        );
+        assert_eq!(r.unwrap().unwrap().destination(), "lab2");
+        assert!(!log.iter().any(|l| l.contains("used last")), "{log:?}");
     }
 
     #[test]

@@ -71,6 +71,25 @@ const HIGH: usize = 256 * 1024;
 /// (`ACS_CP_WINDOW`, ACSCP_DESIGN §5.3).
 pub const WINDOW: usize = 64;
 
+/// The most file headers a sender runs ahead, whatever `ACS_CP_WINDOW`
+/// says. Each holds its source open, and in a local copy the receiver's
+/// parts are in the same process: this many plus [`OPEN_PARTS`] stays well
+/// under macOS's soft limit of 256 descriptors (ACSCP_DESIGN §5.3, acs-d2kt).
+pub const MAX_WINDOW: usize = 96;
+
+/// The most parts a receiver holds open. A `FILE` past them is answered
+/// once one closes, not failed, so a sender with a larger window (an older
+/// one, or one told so) only waits (ACSCP_DESIGN §5.3, acs-d2kt).
+pub const OPEN_PARTS: usize = 64;
+
+// Both together, with room for the rest, under macOS's soft limit of 256.
+const _: () = assert!(MAX_WINDOW + OPEN_PARTS < 200);
+
+/// The window `ACS_CP_WINDOW` asks for, kept between 1 and [`MAX_WINDOW`].
+fn window(asked: usize) -> usize {
+    asked.clamp(1, MAX_WINDOW)
+}
+
 /// How a copy is to be run, apart from what it copies.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -94,7 +113,7 @@ impl Options {
             verbose: false,
             meter: false,
             report: true,
-            window: sys::env_or("ACS_CP_WINDOW", WINDOW).max(1),
+            window: window(sys::env_or("ACS_CP_WINDOW", WINDOW)),
         }
     }
 }
@@ -267,6 +286,28 @@ fn take_msgs(
     Ok(())
 }
 
+/// Take one read's `bytes`: hand `ep` what they complete, and tell `live`
+/// what it cost. Handling a message can block on this end's own disk, and
+/// that is not the far end's silence (acs-wufw, as acs-spd is for the
+/// client's terminal): the time is told to [`Liveness::wrote_for`], so a
+/// netcheck's answer, unread in the pipe meanwhile, is not given up on, and
+/// the read counts as heard once it is handled rather than before, so the
+/// dead interval does not age over the stall either.
+fn took_read(
+    ep: &mut dyn Endpoint,
+    dec: &mut Decoder,
+    bytes: &[u8],
+    out: &mut OutQueue,
+    live: &mut Liveness,
+) -> Result<(), Halt> {
+    dec.push(bytes);
+    let began = sys::now_ms();
+    let res = take_msgs(ep, dec, out, live);
+    live.wrote_for(sys::now_ms().saturating_sub(began));
+    live.heard();
+    res
+}
+
 /// How long the protocol-error flush may take before it gives up.
 const ERROR_FLUSH: Duration = Duration::from_secs(2);
 
@@ -375,9 +416,7 @@ pub(crate) fn drive(
                     }
                 }
                 Ok(n) => {
-                    live.heard();
-                    dec.push(&buf[..n]);
-                    if let Err(h) = take_msgs(ep, &mut dec, &mut out, &mut live) {
+                    if let Err(h) = took_read(ep, &mut dec, &buf[..n], &mut out, &mut live) {
                         return Err(fail(h, &mut out));
                     }
                 }
@@ -895,5 +934,68 @@ mod flush_tests {
         let mut got = [0u8; 5];
         b.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"hello");
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    /// An endpoint whose every message takes `stall` to handle: a disk
+    /// that is slow to write.
+    struct Slow {
+        stall: Duration,
+    }
+
+    impl Endpoint for Slow {
+        fn pump(&mut self, _: &mut OutQueue) -> Result<(), Halt> {
+            Ok(())
+        }
+        fn on_msg(&mut self, _: Msg<'_>, _: &mut OutQueue) -> Result<(), Halt> {
+            std::thread::sleep(self.stall);
+            Ok(())
+        }
+        fn on_eof(&mut self) -> Result<(), Halt> {
+            Ok(())
+        }
+        fn finished(&self) -> bool {
+            false
+        }
+        fn welcomed(&self) -> bool {
+            true
+        }
+    }
+
+    /// acs-wufw: a message that takes the local disk longer than
+    /// `ACS_NETCHECK_MS` to write, handled while a netcheck is out, is not
+    /// the far end's silence: its `PONG` is still unread in the pipe, and
+    /// the link is not declared dead for it.
+    #[test]
+    fn a_slow_disk_does_not_fail_an_outstanding_netcheck() {
+        let mut live = Liveness::new();
+        let mut asked = Vec::new();
+        live.netcheck(&mut asked);
+        let mut msg = Vec::new();
+        Msg::DirEnd.encode(&mut msg);
+        // Longer than the netcheck's deadline (default 2 s), well short of
+        // the dead interval.
+        let mut ep = Slow {
+            stall: Duration::from_millis(sys::env_or("ACS_NETCHECK_MS", 2000u64) + 300),
+        };
+        let mut out = OutQueue::default();
+        let mut dec = Decoder::new();
+        took_read(&mut ep, &mut dec, &msg, &mut out, &mut live).unwrap();
+        let mut ping = Vec::new();
+        assert_eq!(live.tick(&mut ping), Health::Ok);
+    }
+
+    /// `ACS_CP_WINDOW` is kept under the descriptor limit: each header
+    /// ahead holds its source open, so a window of thousands failed files
+    /// with "Too many open files" (acs-d2kt).
+    #[test]
+    fn the_window_is_clamped() {
+        assert_eq!(window(0), 1);
+        assert_eq!(window(WINDOW), WINDOW);
+        assert_eq!(window(100_000), MAX_WINDOW);
     }
 }
