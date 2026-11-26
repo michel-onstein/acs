@@ -157,7 +157,7 @@ fn connect_or_start(
         match master::spawn(&exe, dir.path(), name) {
             Ok(()) => {}
             // Another proxy's master won the race: just connect to it.
-            Err(e) if e.to_string().contains("already has a master") => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(format!("cannot start session '{name}': {e}")),
         }
         tried_spawn = true;
