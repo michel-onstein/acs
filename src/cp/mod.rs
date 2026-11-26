@@ -192,9 +192,9 @@ const SLICE: u64 = 1024 * 1024;
 /// hashed by then (acs-qeqj). A megabyte is a few milliseconds in a release
 /// build, but a third of a second in a debug build on a loaded machine, and
 /// a turn that long costs the far end two of them before it hears a `PONG`:
-/// the `PING` read in one turn is answered only after the next turn's
-/// slice. With the tests' 800 ms dead interval that ran out with both ends
-/// alive. Bounded by time, a turn is short on any machine.
+/// the `PING` read in one turn was answered only after the next turn's
+/// slice (now flushed straight after the read, acs-wo8h). With the tests'
+/// 800 ms dead interval that ran out with both ends alive. Bounded by time, a turn is short on any machine.
 const SLICE_TIME: Duration = Duration::from_millis(20);
 
 /// How often, in ms, an endpoint that is [`Endpoint::waiting`] tries again.
@@ -399,6 +399,9 @@ pub(crate) fn drive(
     if let Err(h) = take_msgs(ep, &mut dec, &mut out, &mut live) {
         return Err(fail(h, &mut out));
     }
+    if !out.flush(wfd) {
+        return lost("the link closed before the copy finished");
+    }
     loop {
         let room = out.len() < HIGH;
         if room {
@@ -439,6 +442,11 @@ pub(crate) fn drive(
                 Ok(n) => {
                     if let Err(h) = took_read(ep, &mut dec, &buf[..n], &mut out, &mut live) {
                         return Err(fail(h, &mut out));
+                    }
+                    // What the read asked for goes out now, a `PONG` before
+                    // the next turn's work rather than after it (acs-wo8h).
+                    if !out.flush(wfd) {
+                        return lost("the link closed before the copy finished");
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -1008,6 +1016,70 @@ mod liveness_tests {
         took_read(&mut ep, &mut dec, &msg, &mut out, &mut live).unwrap();
         let mut ping = Vec::new();
         assert_eq!(live.tick(&mut ping), Health::Ok);
+    }
+
+    /// An endpoint whose every `pump` is slow work, as a turn of hashing is.
+    struct Busy;
+
+    impl Endpoint for Busy {
+        fn pump(&mut self, _: &mut OutQueue) -> Result<(), Halt> {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        }
+        fn on_msg(&mut self, _: Msg<'_>, _: &mut OutQueue) -> Result<(), Halt> {
+            Ok(())
+        }
+        fn on_eof(&mut self) -> Result<(), Halt> {
+            Err(Halt::Ended("done".into()))
+        }
+        fn finished(&self) -> bool {
+            false
+        }
+        fn welcomed(&self) -> bool {
+            true
+        }
+        fn busy(&self) -> bool {
+            true
+        }
+    }
+
+    /// acs-wo8h: a `PING` read in a turn is answered before that turn's
+    /// work, not after the next turn's slice: the far end waits for the
+    /// `PONG` however long a turn runs.
+    #[test]
+    fn a_ping_is_answered_before_the_next_turns_work() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let peer = std::thread::spawn(move || {
+            // Let the first turn's work begin, so the PING lands in a
+            // turn that has more work queued behind it.
+            std::thread::sleep(Duration::from_millis(100));
+            let mut ping = Vec::new();
+            Msg::Ping(7).encode(&mut ping);
+            std::io::Write::write_all(&mut b, &ping).unwrap();
+            let sent = Instant::now();
+            let mut dec = Decoder::new();
+            let mut buf = [0u8; 64];
+            let answered = loop {
+                let n = b.read(&mut buf).unwrap();
+                assert!(n > 0, "closed before the PONG");
+                dec.push(&buf[..n]);
+                if let Some(Msg::Pong(7)) = Msg::next(&mut dec).unwrap() {
+                    break sent.elapsed();
+                }
+            };
+            answered
+        });
+        let fd = a.as_raw_fd();
+        let r = drive(&mut Busy, fd, fd, Decoder::new(), OutQueue::default(), None);
+        drop(a);
+        assert!(r.is_err() || peer.is_finished());
+        let answered = peer.join().unwrap();
+        assert!(
+            // The turn under way (500 ms, sent 100 ms in) ends first; the
+            // next one's 500 ms must not come before the answer.
+            answered < Duration::from_millis(700),
+            "the PONG took {answered:?}, a turn's work first"
+        );
     }
 
     /// `ACS_CP_WINDOW` is kept under the descriptor limit: each header

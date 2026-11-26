@@ -346,7 +346,8 @@ Receiver → sender:
 Both ways: `PING`/`PONG` with a nonce, the session's liveness
 (`reconnect::Liveness`, `ACS_PING_MS`, `ACS_DEAD_MS`): a receiver that has
 gone quiet because its disk is slow still answers pings, so slowness is not
-death. `Liveness` writes its pings itself, as the session's
+death; a `PING` read in a turn is answered before that turn's work
+(acs-wo8h). `Liveness` writes its pings itself, as the session's
 `Msg::Ping(nonce)`, so **the copy's `PING` and `PONG` are the session's**:
 the same type numbers (8 and 9) and the same `u64` nonce, and `Liveness` is
 used unchanged. The rest of the copy's numbering is its own. A network
