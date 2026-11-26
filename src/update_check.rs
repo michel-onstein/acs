@@ -141,6 +141,98 @@ fn write(path: &Path, s: &State) {
     let _ = crate::sys::write_atomic(path, 0o600, s.format().as_bytes());
 }
 
+/// How long a read-modify-write waits for the state file's lock before
+/// going ahead without it (acs-fqcm).
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The lock beside the state file, `update-check.lock`: a separate, stable
+/// file, since `write_atomic` renames a new state file over the old one and
+/// a lock on a file that gets replaced locks nothing.
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_file_name("update-check.lock")
+}
+
+/// Take the state file's lock, polling for up to `LOCK_WAIT`; `None` when
+/// it cannot be had — a read-only directory, or a holder that is stuck —
+/// and the caller then goes ahead unlocked, as before the lock existed.
+///
+/// Polling rather than a blocking `flock`: the section it guards is a read
+/// and a write of a few bytes, so a free lock comes at once, but a client
+/// start must never hang on a holder stopped (^Z) mid-write. A lost race
+/// costs a week's delay or a missed message, not worth more than a second
+/// of anyone's start.
+fn lock_state(path: &Path) -> Option<crate::sys::Flock> {
+    let lock = lock_path(path);
+    std::fs::create_dir_all(lock.parent()?).ok()?;
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match crate::sys::Flock::try_lock(&lock) {
+            Ok(Some(held)) => return Some(held),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Read the state, let `f` change it, and write it back if it changed — all
+/// under the state file's lock, so two processes doing this at once cannot
+/// write a stale copy back over the other's change (acs-fqcm): a client
+/// start undoing the `latest` or the regression flag a background check
+/// just recorded, or two clients both showing the same message.
+fn update<R>(path: &Path, f: impl FnOnce(&mut State) -> R) -> R {
+    let _lock = lock_state(path);
+    let mut state = read(path);
+    let before = state.clone();
+    let out = f(&mut state);
+    if state != before {
+        write(path, &state);
+    }
+    out
+}
+
+/// The client start's part: take the pending warning and message, and
+/// claim the check when one is due. Returns the lines to show and whether
+/// to start the check.
+fn client_start_step(path: &Path, current: &str, upgrade: &str, now: u64) -> (Vec<String>, bool) {
+    update(path, |state| {
+        let mut lines = Vec::new();
+        if let Some(w) = state.take_warning() {
+            lines.push(w);
+        }
+        if let Some(msg) = state.take_message(current, upgrade) {
+            lines.push(msg);
+        }
+        let due = state.due(now);
+        if due {
+            // Recorded before the check, so an offline laptop asks once a
+            // week, not on every start.
+            state.checked = now;
+        }
+        (lines, due)
+    })
+}
+
+/// Record what a check found: keep the newest release ever seen, and say
+/// so when a check offers something older (acs-2zj).
+fn record_found(path: &Path, version: String, now: u64) {
+    update(path, |state| {
+        let older = state.latest.as_deref().is_some_and(|known| {
+            release::compare(&version, known) == Some(std::cmp::Ordering::Less)
+        });
+        if older {
+            state.regressed = Some(version);
+        } else {
+            state.latest = Some(version);
+            state.regressed = None;
+        }
+        if state.checked == 0 {
+            state.checked = now;
+        }
+    })
+}
+
 /// Whether checking is turned off.
 pub fn disabled(config: &Config) -> bool {
     let env = std::env::var("ACS_NO_UPDATE_CHECK").unwrap_or_default();
@@ -154,23 +246,14 @@ pub fn on_client_start(config: &Config) {
         return;
     }
     let Some(path) = state_path() else { return };
-    let mut state = read(&path);
-    let before = state.clone();
-    if let Some(w) = state.take_warning() {
-        eprintln!("acs: {w}");
-    }
-    if let Some(msg) = state.take_message(crate::VERSION, crate::upgrade::command()) {
-        eprintln!("acs: {msg}");
-    }
-    let now = crate::sys::unix_now();
-    let due = state.due(now);
-    if due {
-        // Recorded before the check, so an offline laptop asks once a week,
-        // not on every start.
-        state.checked = now;
-    }
-    if state != before {
-        write(&path, &state);
+    let (lines, due) = client_start_step(
+        &path,
+        crate::VERSION,
+        crate::upgrade::command(),
+        crate::sys::unix_now(),
+    );
+    for line in lines {
+        eprintln!("acs: {line}");
     }
     // Only after writing: the check re-reads the file and adds `latest`,
     // which a later write of ours would otherwise undo.
@@ -222,23 +305,9 @@ pub fn check_main() -> ExitCode {
     let _ = std::fs::remove_dir_all(&tmp);
     match found {
         Ok(asset) => {
-            // Re-read: a client may have written `shown` meanwhile.
-            let mut state = read(&path);
-            // Keep the newest release ever seen, and say so when a check
-            // offers something older (acs-2zj).
-            let older = state.latest.as_deref().is_some_and(|known| {
-                release::compare(&asset.version, known) == Some(std::cmp::Ordering::Less)
-            });
-            if older {
-                state.regressed = Some(asset.version);
-            } else {
-                state.latest = Some(asset.version);
-                state.regressed = None;
-            }
-            if state.checked == 0 {
-                state.checked = crate::sys::unix_now();
-            }
-            write(&path, &state);
+            // Read only now, after the network and under the lock: a client
+            // may have written `shown` meanwhile.
+            record_found(&path, asset.version, crate::sys::unix_now());
             ExitCode::SUCCESS
         }
         Err(_) => ExitCode::from(1),
@@ -297,6 +366,89 @@ mod tests {
         let back = State::parse(&s.format());
         assert_eq!(back.regressed.as_deref(), Some("0.3.0"));
         assert_eq!(back.latest.as_deref(), Some("0.9.0"));
+    }
+
+    /// A scratch directory removed on drop, holding `update-check`.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new() -> Dir {
+            Dir(crate::upgrade::scratch_dir("acs-update-check-test").unwrap())
+        }
+        fn state(&self) -> PathBuf {
+            self.0.join("update-check")
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// acs-fqcm: a client start and the background check both read, change
+    /// and write the state file. Unlocked, a client that read before the
+    /// check recorded `latest` wrote its stale copy back after it, and the
+    /// news was lost for another week. Here the client is held between its
+    /// read and its write until the check has had its chance; with the
+    /// lock the check waits for the client, so both changes survive.
+    #[test]
+    fn a_client_start_does_not_undo_a_concurrent_check() {
+        let dir = Dir::new();
+        let path = dir.state();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let done_rx = done_rx;
+                update(&path, |state| {
+                    read_tx.send(()).unwrap();
+                    // Unlocked, the check finishes in here; locked, it
+                    // cannot until this returns, so this times out.
+                    let _ = done_rx.recv_timeout(std::time::Duration::from_millis(300));
+                    state.checked = 1_000;
+                })
+            });
+            read_rx.recv().unwrap();
+            s.spawn(|| {
+                record_found(&path, "0.9.0".into(), 2_000);
+                // Locked, the client gave up waiting and is gone: fine.
+                let _ = done_tx.send(());
+            });
+        });
+        let state = read(&path);
+        assert_eq!(state.latest.as_deref(), Some("0.9.0"), "{state:?}");
+        assert_eq!(state.checked, 1_000, "{state:?}");
+    }
+
+    /// acs-fqcm: the lock never costs a client start more than `LOCK_WAIT`
+    /// — a stuck holder is waited out, then the start goes ahead unlocked.
+    #[test]
+    fn a_stuck_lock_holder_does_not_hold_up_a_client_start() {
+        let dir = Dir::new();
+        let path = dir.state();
+        let _held = crate::sys::Flock::lock(&lock_path(&path)).unwrap();
+        let t = std::time::Instant::now();
+        let (lines, due) = client_start_step(&path, "0.1.0", "acs upgrade", 5_000);
+        assert!(t.elapsed() < LOCK_WAIT * 3, "{:?}", t.elapsed());
+        assert!(lines.is_empty());
+        assert!(due);
+        assert_eq!(read(&path).checked, 5_000);
+    }
+
+    /// acs-fqcm: a lock that cannot be opened at all is no reason to fail
+    /// or wait: the start goes ahead at once, as before the lock existed.
+    #[test]
+    fn an_unopenable_lock_falls_back_to_no_lock() {
+        let dir = Dir::new();
+        let path = dir.state();
+        std::fs::create_dir(lock_path(&path)).unwrap();
+        let t = std::time::Instant::now();
+        record_found(&path, "0.9.0".into(), 7);
+        assert!(t.elapsed() < LOCK_WAIT, "{:?}", t.elapsed());
+        let state = read(&path);
+        assert_eq!(state.latest.as_deref(), Some("0.9.0"));
+        assert_eq!(state.checked, 7);
     }
 
     #[test]
