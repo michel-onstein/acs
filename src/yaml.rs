@@ -671,8 +671,14 @@ impl Flow<'_> {
                         self.i += 1;
                         return Ok(Value::Map(entries));
                     }
+                    let key_start = self.i;
                     let key = match self.value()? {
                         Value::Scalar(s) => s.text,
+                        // A plain `null` or `~` key is the text it spells
+                        // (acs-39tf); acs has no use for a null key.
+                        Value::Null => self.text[key_start..self.i]
+                            .trim_end_matches(YAML_WS)
+                            .to_string(),
                         _ => return err(self.line, "a mapping key must be a single value"),
                     };
                     self.ws();
@@ -1269,6 +1275,22 @@ list: [a, \"b c\", 3]
             let mut d = parse("k: v\n").unwrap();
             d.root.value.map_mut().unwrap()[0].1 = Node::string(s);
             assert_eq!(emit(&d), format!("k: {s}\n"));
+        }
+    }
+
+    /// acs-39tf: a mapping key spelled `null` or `~` is the text, in a flow
+    /// mapping as in a block one.
+    #[test]
+    fn null_spelled_key_is_a_string_key() {
+        for n in ["~", "null", "Null", "NULL"] {
+            let d = parse(&format!("m: {{{n}: x, y: z}}\n")).unwrap();
+            let Value::Map(m) = &get(&d.root, "m").value else {
+                panic!("not a map")
+            };
+            assert_eq!(m[0].0, n, "flow {n}");
+            assert_eq!(text(&m[0].1), "x", "flow {n}");
+            let d = parse(&format!("{n}: x\n")).unwrap();
+            assert_eq!(text(get(&d.root, n)), "x", "block {n}");
         }
     }
 
