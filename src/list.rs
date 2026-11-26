@@ -72,8 +72,8 @@ impl Failure {
 pub fn run(args: &ClientArgs) -> ExitCode {
     let host = args.conn.host_name();
     match query(args, Call::Side, client::answer_timeout(false)) {
-        Ok(Some(sessions)) => print!("{}", render(host, &sessions, sys::unix_now())),
-        Ok(None) => println!("{}", not_installed(host)),
+        Ok(Some(sessions)) => crate::print_out(&render(host, &sessions, sys::unix_now())),
+        Ok(None) => crate::print_out(&format!("{}\n", not_installed(host))),
         Err(f) => {
             eprintln!("acs: {}", f.message(host));
             return ExitCode::from(f.code());
@@ -126,7 +126,7 @@ pub fn run_all(args: &ClientArgs) -> ExitCode {
             Err(Failure::BadReply(e)) => failed.push(format!("acs: bad reply from {alias}: {e}")),
         }
     }
-    print!("{}{quiet}", render_all(&listed, sys::unix_now()));
+    crate::print_out(&format!("{}{quiet}", render_all(&listed, sys::unix_now())));
     for f in &failed {
         eprintln!("{f}");
     }

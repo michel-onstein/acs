@@ -189,7 +189,17 @@ fn resolve_parent(path: &Path, lstat: Lstat) -> Result<Walk, String> {
 }
 
 /// Refuse a socket directory that anyone else could replace: an ancestor
-/// writable by group or other and not sticky (acs-hjk).
+/// writable by group or other and not sticky (acs-hjk), or one owned by
+/// anyone but us or root, whatever its mode (acs-9imr).
+///
+/// The owner of a directory can rename or remove anything in it — sticky
+/// or not, `0755` or not, since they can always chmod it first — so every
+/// directory on the way must be ours or root's. That is the shape of every
+/// tree a user legitimately keeps sockets under: `/`, `/tmp`, `/home`,
+/// `/var`, macOS's `/Users` and `/var/folders/xx` are root's, and the
+/// home directory, `/run/user/<uid>` and `$TMPDIR` below them are the
+/// user's own. A directory under another user's home, or under one a
+/// service account owns, is that account's to swap out, and is refused.
 ///
 /// The sticky bit is what makes `/tmp` safe — it lets anyone create, but
 /// only the owner remove or rename. Without it, whoever can write the
@@ -212,14 +222,17 @@ fn check_ancestors_with(path: &Path, my_uid: u32, lstat: Lstat) -> Result<(), Di
         why,
     };
     let walk = resolve_parent(path, lstat).map_err(|e| DirError::Io(path.to_path_buf(), e))?;
+    let owner = |uid: u32| {
+        sys::user_name(uid)
+            .map(|n| format!("{n} (uid {uid})"))
+            .unwrap_or_else(|| format!("uid {uid}"))
+    };
     for (link, e) in &walk.links {
         if e.uid != my_uid && e.uid != 0 {
-            let owner = sys::user_name(e.uid)
-                .map(|n| format!("{n} (uid {})", e.uid))
-                .unwrap_or_else(|| format!("uid {}", e.uid));
             return Err(replaceable(format!(
-                "{} is a symlink owned by {owner}, who could repoint it",
-                link.display()
+                "{} is a symlink owned by {}, who could repoint it",
+                link.display(),
+                owner(e.uid)
             )));
         }
     }
@@ -229,10 +242,22 @@ fn check_ancestors_with(path: &Path, my_uid: u32, lstat: Lstat) -> Result<(), Di
             // Not readable by us is not our business to judge.
             Err(_) => continue,
         };
-        if mode_lets_others_replace(e.mode) && e.uid != my_uid {
+        if e.uid == my_uid {
+            continue;
+        }
+        if mode_lets_others_replace(e.mode) {
             return Err(replaceable(format!(
                 "{} is writable by others and not sticky",
                 dir.display()
+            )));
+        }
+        // Its owner can chmod it writable, or just rename and replace
+        // what is in it, whatever the mode says now (acs-9imr).
+        if e.uid != 0 {
+            return Err(replaceable(format!(
+                "{} is owned by {}, who could replace what is in it",
+                dir.display(),
+                owner(e.uid)
             )));
         }
     }
@@ -527,13 +552,16 @@ mod tests {
             self
         }
         fn check(&self, path: &str) -> Result<(), DirError> {
+            self.check_as(path, ME)
+        }
+        fn check_as(&self, path: &str, uid: u32) -> Result<(), DirError> {
             let lstat = |p: &Path| {
                 self.0
                     .get(p)
                     .cloned()
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
             };
-            check_ancestors_with(Path::new(path), ME, &lstat)
+            check_ancestors_with(Path::new(path), uid, &lstat)
         }
     }
 
@@ -635,6 +663,77 @@ mod tests {
             why(fs.check("/loose/l/s")),
             "/loose is writable by others and not sticky"
         );
+    }
+
+    /// acs-9imr: a stranger's `0755` directory gives nobody else write
+    /// access, but its owner can rename what is in it — our directory, or
+    /// the next one on the way — and put their own in its place.
+    #[test]
+    fn a_strangers_directory_on_the_way_is_refused_whatever_its_mode() {
+        let mut fs = FakeFs::new();
+        fs.dir("/home", 0, 0o755)
+            .dir("/home/them", STRANGER, 0o755)
+            .dir("/home/them/me", ME, 0o700);
+        let w = why(fs.check("/home/them/me/s"));
+        assert!(
+            w.starts_with("/home/them is owned by")
+                && w.contains(&format!("uid {STRANGER}"))
+                && w.ends_with(", who could replace what is in it"),
+            "{w}"
+        );
+        // Sticky does not help: the owner may rename anything in it.
+        fs.dir("/home/them", STRANGER, 0o1755);
+        assert!(why(fs.check("/home/them/me/s")).starts_with("/home/them is owned by"));
+        // Nor does a private mode: the owner chmods it back.
+        fs.dir("/home/them", STRANGER, 0o700);
+        assert!(why(fs.check("/home/them/me/s")).starts_with("/home/them is owned by"));
+        // Behind a link of ours it is the same directory.
+        fs.dir("/home/me", ME, 0o700)
+            .link("/home/me/l", ME, "/home/them/me");
+        assert!(why(fs.check("/home/me/l/s")).starts_with("/home/them is owned by"));
+    }
+
+    /// The trees acs-9imr must keep working: root's top levels with the
+    /// user's own directories below, as Linux and macOS lay them out.
+    #[test]
+    fn root_and_own_directories_on_the_way_are_fine() {
+        let run_me = format!("/run/user/{ME}");
+        let mut fs = FakeFs::new();
+        fs.dir("/home", 0, 0o755)
+            .dir("/home/me", ME, 0o750)
+            .dir("/home/me/.acs", ME, 0o700)
+            .dir("/run", 0, 0o755)
+            .dir("/run/user", 0, 0o755)
+            .dir(&run_me, ME, 0o700)
+            .dir("/tmp", 0, 0o1777)
+            .dir("/Users", 0, 0o755)
+            .dir("/Users/me", ME, 0o755)
+            .dir("/private", 0, 0o755)
+            .dir("/private/var", 0, 0o755)
+            .dir("/private/var/folders", 0, 0o755)
+            .dir("/private/var/folders/nd", 0, 0o755)
+            .dir("/private/var/folders/nd/xyz", ME, 0o755)
+            .dir("/private/var/folders/nd/xyz/T", ME, 0o700)
+            .link("/var", 0, "private/var");
+        for ok in [
+            "/home/me/.acs/s",
+            &format!("{run_me}/acs"),
+            "/tmp/acs-501",
+            "/Users/me/s",
+            "/var/folders/nd/xyz/T/acs",
+        ] {
+            assert_eq!(fs.check(ok), Ok(()), "{ok}");
+        }
+    }
+
+    /// Run as root, only root's directories pass: any other owner could
+    /// swap root's sockets out from under it just the same.
+    #[test]
+    fn as_root_another_users_directory_is_refused() {
+        let mut fs = FakeFs::new();
+        fs.dir("/home", 0, 0o755).dir("/home/me", ME, 0o700);
+        assert!(why(fs.check_as("/home/me/s", 0)).starts_with("/home/me is owned by"));
+        assert_eq!(fs.check_as("/home/s", 0), Ok(()));
     }
 
     #[test]

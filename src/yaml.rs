@@ -271,7 +271,7 @@ pub fn parse(src: &str) -> Result<Document> {
 }
 
 fn is_seq_item(text: &str) -> bool {
-    text == "-" || text.starts_with("- ")
+    text == "-" || text.starts_with("- ") || text.starts_with("-\t")
 }
 
 impl Parser {
@@ -354,7 +354,7 @@ impl Parser {
                 return err(no, "unexpected indentation");
             }
             let before = self.take_before(i);
-            let rest = text[1..].trim_start_matches(' ');
+            let rest = text[1..].trim_start_matches([' ', '\t']);
             let mut node = if rest.is_empty() || rest.starts_with('#') {
                 // `-` alone: the item is the block below it, or nothing.
                 self.pos = i + 1;
@@ -609,7 +609,7 @@ struct Flow<'a> {
 
 impl Flow<'_> {
     fn ws(&mut self) {
-        while self.i < self.s.len() && self.s[self.i] == b' ' {
+        while self.i < self.s.len() && matches!(self.s[self.i], b' ' | b'\t') {
             self.i += 1;
         }
     }
@@ -1046,6 +1046,22 @@ hosts:
   - {host: nas.lan, reachability_check: false}
 list: [a, \"b c\", 3]
 ";
+
+    /// Regression (acs-v2in): a tab separates `- ` from its item and the
+    /// items of a flow collection, but still may not indent a block.
+    #[test]
+    fn tabs_separate_after_a_dash_and_in_flow_collections() {
+        let d = parse("aliases:\n  nas:\n    - \thost: a\n    -\thost: b\nl: [a,\tb,\t\"c\"]\n")
+            .unwrap();
+        let nas = items(get(get(&d.root, "aliases"), "nas"));
+        assert_eq!(text(get(&nas[0], "host")), "a");
+        assert_eq!(text(get(&nas[1], "host")), "b");
+        let l = items(get(&d.root, "l"));
+        let l: Vec<_> = l.iter().map(text).collect();
+        assert_eq!(l, ["a", "b", "c"]);
+        // Tab indentation is still refused.
+        assert!(parse("a:\n\t- b\n").is_err());
+    }
 
     /// Regression (acs-qjx): YAML 1.2 separates a key from its value with a
     /// space or a tab, and a leading BOM belongs to no key.

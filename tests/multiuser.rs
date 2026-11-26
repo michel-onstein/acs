@@ -196,6 +196,52 @@ fn a_socket_directory_is_judged_through_symlinks() {
     reset(top);
 }
 
+/// acs-9imr: an ACS_SOCKET_DIR inside a directory another user owns is
+/// refused even at `0755`, which lets nobody else write — its owner can
+/// still rename what is in it. Root's and the user's own directories on
+/// the way are fine.
+#[test]
+#[ignore = "needs root and users alice and bob: run by scripts/test_linux.sh"]
+fn a_socket_directory_under_another_users_directory_is_refused() {
+    require();
+    let (alice, bob) = (user("alice"), user("bob"));
+    let top = Path::new("/acs-9imr");
+    reset(top);
+    let mkdir = |p: &Path, uid: u32, mode: u32| {
+        std::fs::create_dir_all(p).unwrap();
+        std::os::unix::fs::chown(p, Some(uid), None).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mkdir(top, 0, 0o755);
+    mkdir(&top.join("bobs"), bob.uid, 0o755);
+    mkdir(&top.join("bobs/alice"), alice.uid, 0o700);
+    mkdir(&top.join("alice"), alice.uid, 0o755);
+    let list = |dir: &str| {
+        let out = as_user(&alice, exe())
+            .args(["_proxy", "--list"])
+            .env("ACS_SOCKET_DIR", dir)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (ok, err) = list("/acs-9imr/bobs/alice/s");
+    assert!(!ok);
+    assert!(
+        err.contains("/acs-9imr/bobs is owned by bob")
+            && err.contains("who could replace what is in it"),
+        "{err}"
+    );
+    assert!(err.contains("ACS_SOCKET_DIR"), "{err}");
+
+    // Root's directory and her own: fine.
+    let (ok, err) = list("/acs-9imr/alice/s");
+    assert!(ok, "{err}");
+    reset(top);
+}
+
 /// Child side of the peer test: connect to a socket and report whether the
 /// master answered a HELLO. Not a check of its own: ignored, and run only by
 /// `another_uid_is_dropped_by_the_master` with `--ignored --exact`, so
