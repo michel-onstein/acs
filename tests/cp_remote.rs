@@ -11,7 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use acs::cp::proto::{Meta, Msg};
+use acs::cp::proto::{ty, Meta, Msg};
 use acs::testutil::TempDir;
 use common::*;
 
@@ -690,6 +690,65 @@ fn a_remote_wildcard_is_relayed_between_two_hosts() {
     assert_eq!(status, 1, "{err}");
     assert!(err.contains("two:one.gz: not a directory"), "{err}");
     assert!(!two.home().join("one.gz").exists());
+}
+
+/// A target host whose `WELCOME`, saying its target is not a directory,
+/// comes a second after the marker, and which records what it is sent:
+/// the script and the file it records to.
+fn slow_target(dir: &Path) -> (String, PathBuf) {
+    let ready = dir.join("ready");
+    std::fs::write(&ready, acs::proto::ready_line()).unwrap();
+    let mut bytes = Vec::new();
+    welcome().encode(&mut bytes);
+    let frames = dir.join("welcome");
+    std::fs::write(&frames, bytes).unwrap();
+    let got = dir.join("got");
+    let script = dir.join("slow.sh");
+    write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\n{{ cat '{}'; sleep 1; cat '{}'; }} &\nexec cat >'{}'\n",
+            ready.display(),
+            frames.display(),
+            got.display()
+        ),
+    );
+    (script.display().to_string(), got)
+}
+
+/// Several sources between two hosts into what is not a directory: the
+/// relay forwards nothing from the source host until the target host's
+/// `WELCOME` has said its target is a directory. A `WELCOME` that comes
+/// after the sender's first `FILE` once let that `FILE` through, to a
+/// receiver placing it at the target path (acs-gcx0).
+#[test]
+fn a_relay_forwards_no_file_before_the_target_says_it_is_a_directory() {
+    let good = Remote::installed();
+    std::fs::write(good.home().join("a.txt"), b"a").unwrap();
+    std::fs::write(good.home().join("b.txt"), b"b").unwrap();
+    let t = TempDir::new();
+    let (slow, got) = slow_target(t.path());
+    let ssh = router(t.path(), &[("slow", &slow), ("good", &good.transport())]);
+    let cp = Acscp::new();
+    let (status, err) = run(&mut cp.via(&ssh, &["good:a.txt", "good:b.txt", "slow:dst"]));
+    assert_eq!(status, 1, "{err}");
+    assert!(err.contains("slow:dst: not a directory"), "{err}");
+
+    // What the relay sent went a second before the `WELCOME` came back;
+    // a moment more lets the recording catch up with the pipe.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let bytes = std::fs::read(&got).expect("the target host's recording");
+    let mut dec = acs::proto::Decoder::new();
+    dec.push(&bytes);
+    let mut types = Vec::new();
+    while let Ok(Some(m)) = Msg::next(&mut dec) {
+        types.push(m.ty());
+    }
+    assert_eq!(types.first(), Some(&ty::HELLO), "{types:?}");
+    assert!(
+        !types.contains(&ty::FILE),
+        "a FILE reached the target: {types:?}"
+    );
 }
 
 /// Two hosts that have never seen acs are each installed on their own
