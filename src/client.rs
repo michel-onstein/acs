@@ -872,6 +872,27 @@ pub fn redial_timeout() -> Duration {
     sys::env_ms("ACS_REDIAL_TIMEOUT_MS", 30_000)
 }
 
+/// When a dial spawned at `started` with `timeout` is given up on, ssh
+/// having taken the terminal for a prompt at `handed_at`, if it has
+/// (acs-u904, DESIGN §5.3). A prompt is a person answering: from the
+/// hand-off they get `prompt` — the first connection's two minutes — so a
+/// redial's 30 s, counted from the spawn, no longer kills ssh under a
+/// password half-typed. Bounded still, never cut short: a prompt nobody
+/// answers ends the dial, and the client goes back to its backoff wait, the
+/// way out of a hung prompt that does not end acs.
+fn dial_deadline(
+    started: Instant,
+    timeout: Duration,
+    handed_at: Option<Instant>,
+    prompt: Duration,
+) -> Instant {
+    let own = started + timeout;
+    match handed_at {
+        Some(at) => own.max(at + prompt),
+        None => own,
+    }
+}
+
 /// The command keys through a redial (acs-8ax, DESIGN §5.2).
 ///
 /// ssh runs in a process group of its own, in the background of the
@@ -1253,7 +1274,10 @@ fn dial_once(
     joining: bool,
 ) -> io::Result<(Link, Marker)> {
     let Watch { netwatch, mut keys } = w;
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let mut deadline = dial_deadline(started, timeout, None, answer_timeout(false));
+    // When ssh took the terminal for a prompt, if it has (acs-u904).
+    let mut handed_at = None;
     // Asked on every dial, not once: through a proxy the session goes
     // without ssh's ConnectTimeout, and an alias may have moved the
     // destination since the last one (acs-7sti, DESIGN §3). A dial that
@@ -1355,6 +1379,10 @@ fn dial_once(
                 let _ = child.wait();
                 return Err(io::ErrorKind::Interrupted.into());
             }
+            if k.handed && handed_at.is_none() {
+                handed_at = Some(Instant::now());
+                deadline = dial_deadline(started, timeout, handed_at, answer_timeout(false));
+            }
         }
         // This machine's network moved while the dial waits (acs-xo1). The
         // drain is unconditional, as in `serve`; a change that only added
@@ -1391,7 +1419,7 @@ fn dial_once(
                 format!(
                     "no answer from {} within {} s",
                     conn.transport.destination,
-                    timeout.as_secs_f32()
+                    deadline.duration_since(started).as_secs_f32()
                 ),
             ));
         }
@@ -2820,6 +2848,31 @@ mod tests {
         assert_eq!(data_span(10, 10, 5), Some((0, 15)));
         assert_eq!(data_span(12, 10, 5), Some((2, 15)));
         assert_eq!(data_span(20, 10, 5), Some((10, 15)));
+    }
+
+    /// Regression (acs-u904): a redial's deadline was counted from the
+    /// spawn even after ssh took the terminal for a prompt, so a password
+    /// typed in more than 30 s was killed under the user. From the hand-off
+    /// the prompt gets its own window; it is still a deadline, so a hung
+    /// prompt ends the dial, and one that leaves longer stays as it was.
+    #[test]
+    fn a_prompt_gets_its_own_window_from_the_hand_off() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        // Not handed: the dial's own timeout from the spawn.
+        assert_eq!(dial_deadline(t0, s(30), None, s(120)), t0 + s(30));
+        // Handed at 25 s: two minutes from there, not 5 s.
+        assert_eq!(
+            dial_deadline(t0, s(30), Some(t0 + s(25)), s(120)),
+            t0 + s(145)
+        );
+        // Still bounded: nothing hands out more than the prompt's window.
+        assert!(dial_deadline(t0, s(30), Some(t0 + s(25)), s(120)) < t0 + s(146));
+        // A prompt never shortens a longer timeout already running.
+        assert_eq!(
+            dial_deadline(t0, s(300), Some(t0 + s(1)), s(120)),
+            t0 + s(300)
+        );
     }
 
     /// acs-n1m: which endings take the shared ssh master down with them.
