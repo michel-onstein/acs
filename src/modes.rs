@@ -274,6 +274,36 @@ impl ModeObserver {
         self.seq_full = false;
     }
 
+    /// Lex the byte that follows an ESC.
+    fn after_esc(&mut self, b: u8) -> Lex {
+        match b {
+            b'[' => Lex::Csi,
+            b']' => {
+                self.osc = Some(Vec::new());
+                Lex::Str { esc: false }
+            }
+            b'P' | b'_' | b'^' | b'X' => {
+                self.osc = None;
+                Lex::Str { esc: false }
+            }
+            b'=' => {
+                self.keypad_app = true;
+                Lex::Ground
+            }
+            b'>' => {
+                self.keypad_app = false;
+                Lex::Ground
+            }
+            b'c' => {
+                // RIS: full reset.
+                self.clear();
+                Lex::Ground
+            }
+            0x1b => Lex::Esc,
+            _ => Lex::Ground,
+        }
+    }
+
     fn step(&mut self, b: u8) {
         let lex = self.lex.unwrap_or(Lex::Ground);
         self.lex = Some(match lex {
@@ -303,32 +333,7 @@ impl ModeObserver {
                     Lex::Ground
                 }
             }
-            Lex::Esc => match b {
-                b'[' => Lex::Csi,
-                b']' => {
-                    self.osc = Some(Vec::new());
-                    Lex::Str { esc: false }
-                }
-                b'P' | b'_' | b'^' | b'X' => {
-                    self.osc = None;
-                    Lex::Str { esc: false }
-                }
-                b'=' => {
-                    self.keypad_app = true;
-                    Lex::Ground
-                }
-                b'>' => {
-                    self.keypad_app = false;
-                    Lex::Ground
-                }
-                b'c' => {
-                    // RIS: full reset.
-                    self.clear();
-                    Lex::Ground
-                }
-                0x1b => Lex::Esc,
-                _ => Lex::Ground,
-            },
+            Lex::Esc => self.after_esc(b),
             Lex::Csi => {
                 if (0x20..=0x3f).contains(&b) {
                     if self.seq.len() < 64 {
@@ -355,12 +360,24 @@ impl ModeObserver {
                     self.end_osc();
                     Lex::Ground
                 }
+                // CAN and SUB abort the string, as in xterm, VTE and the
+                // VT500 parser; no byte cap, sixel and kitty graphics are
+                // legitimately megabytes.
+                (_, 0x18 | 0x1a) => {
+                    self.osc = None;
+                    Lex::Ground
+                }
                 (_, 0x1b) => Lex::Str { esc: true },
+                // ESC then anything but `\` or ESC aborts the string and the
+                // byte is lexed as after any ESC. ESC ESC stays inside it:
+                // tmux passthrough doubles its ESCs.
+                (true, _) => {
+                    self.osc = None;
+                    self.start_seq();
+                    self.after_esc(b)
+                }
                 _ => {
                     if let Some(body) = self.osc.as_mut() {
-                        if esc {
-                            body.push(0x1b);
-                        }
                         body.push(b);
                         if body.len() > TITLE_MAX {
                             self.osc = None;
@@ -624,13 +641,56 @@ mod tests {
     #[test]
     fn sequences_inside_strings_are_ignored() {
         let mut o = ModeObserver::new();
-        o.observe(b"\x1b]2;\x1b[?1000h\x07\x1bP\x1b[?2004h\x1b\\");
-        // The OSC ends at BEL; the DCS body swallows its sequence until ST.
+        o.observe(b"\x1b]2;[?1000h\x07\x1bP[?2004h\x1b\\");
+        // The OSC ends at BEL; the DCS body swallows text that looks like a
+        // sequence until ST. (An ESC inside would abort it, which
+        // `can_sub_and_esc_x_abort_an_unterminated_string` covers.)
         assert!(
             o.is_clean(),
             "{:?}",
             String::from_utf8_lossy(&o.reset_sequence())
         );
+    }
+
+    #[test]
+    fn can_sub_and_esc_x_abort_an_unterminated_string() {
+        // Each leaves the string, so the stream is at a boundary and the
+        // DECSET that follows is seen instead of swallowed.
+        for (name, abort) in [("CAN", &b"\x18"[..]), ("SUB", b"\x1a"), ("ESC x", b"\x1bx")] {
+            for opener in [&b"\x1b]0;t"[..], b"\x1bPq#0", b"\x1b_Gf=100"] {
+                let mut o = ModeObserver::new();
+                o.observe(opener);
+                assert!(!o.at_boundary(), "{name}: inside the string");
+                o.observe(abort);
+                assert!(o.at_boundary(), "{name} after {opener:?}");
+                o.observe(b"\x1b[?1000h");
+                assert!(!o.is_clean(), "{name}: DECSET after the abort is seen");
+            }
+        }
+    }
+
+    #[test]
+    fn esc_x_after_a_string_is_lexed_as_after_any_esc() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1bPq\x1b[?1000h");
+        assert!(!o.is_clean(), "ESC [ aborts the DCS and opens a CSI");
+    }
+
+    #[test]
+    fn a_doubled_esc_stays_inside_the_string() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1bPtmux;\x1b\x1b");
+        assert!(!o.at_boundary(), "ESC ESC does not end the string");
+        o.observe(b"\\");
+        assert!(o.at_boundary(), "ESC ESC \\ still ends at ST");
+    }
+
+    #[test]
+    fn an_aborted_title_is_not_remembered() {
+        let mut o = ModeObserver::new();
+        o.observe(b"\x1b]2;gone\x18");
+        assert!(o.at_boundary());
+        assert!(o.is_clean());
     }
 
     #[test]
