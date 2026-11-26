@@ -259,6 +259,15 @@ shells).
   socket is unlinked first). Double-fork, `setsid`, stdio to `/dev/null`, bind
   the socket **before** forking the shell, then report readiness to the proxy
   over a pipe so the proxy never races the bind (dtach's `statusfd`).
+  The pipe carries one line: `ok`, `busy: <why>` when another master holds
+  the name — the proxy then connects to that one — or `err: <why>`. The
+  proxy goes by the token, never the words (acs-2mfo). Proxy and master can
+  be different versions across an upgrade — without `/proc/self/exe`
+  (macOS) the proxy execs whatever binary is at its path now — so both
+  directions stay readable: the busy text
+  keeps "already has a master", which proxies before the token search for,
+  and an `err:` with those words, from a master before the token, reads as
+  busy.
   Creation holds `flock(<dir>/<session>.lock)` so two simultaneous attaches do
   not start two masters. For its whole life the master also holds
   `flock(<dir>/<session>.master)`, with its pid inside, so a master starting

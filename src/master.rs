@@ -129,14 +129,40 @@ pub fn spawn_with_env(
         }
         msg.extend_from_slice(&buf[..n]);
     }
-    let msg = String::from_utf8_lossy(&msg);
-    match msg.trim() {
-        "ok" => Ok(()),
-        "" => Err(io::Error::other("master exited before it was ready")),
-        other => Err(io::Error::other(
-            other.trim_start_matches("err: ").to_string(),
-        )),
+    ready_reply(&String::from_utf8_lossy(&msg))
+}
+
+/// The status token a starting master writes on the ready pipe when another
+/// master already holds the name (DESIGN §4.2, acs-2mfo).
+const READY_BUSY: &str = "busy";
+
+/// What a master wrote on the ready pipe, as [`spawn`]'s result: `ok`;
+/// `busy: <why>` — another master won the race, `ErrorKind::AlreadyExists`,
+/// so the caller connects to that one instead; `err: <why>` — it failed.
+///
+/// An `err:` that says "already has a master" is a master from before the
+/// `busy` token (acs 0.23.0 and earlier), which an upgrade can still leave a proxy
+/// talking to; its text is frozen, so matching it is safe where matching a
+/// current master's wording was not.
+fn ready_reply(msg: &str) -> io::Result<()> {
+    let msg = msg.trim();
+    if msg == "ok" {
+        return Ok(());
     }
+    if msg.is_empty() {
+        return Err(io::Error::other("master exited before it was ready"));
+    }
+    if let Some(why) = msg
+        .strip_prefix(READY_BUSY)
+        .and_then(|r| r.strip_prefix(':'))
+    {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, why.trim()));
+    }
+    let why = msg.strip_prefix("err:").map_or(msg, str::trim);
+    if why.contains("already has a master") {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, why));
+    }
+    Err(io::Error::other(why.to_string()))
 }
 
 // ---- `acs _master` ---------------------------------------------------------
@@ -225,7 +251,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     let master = match Master::bind(&args) {
         Ok(m) => m,
-        Err(e) => {
+        // The text after the token keeps "already has a master": a proxy
+        // from before the token matches on it (acs-2mfo).
+        Err(BindErr::Busy(e)) => {
+            mlog!("not starting: {e}");
+            report(args.ready_fd, &format!("{READY_BUSY}: {e}\n"));
+            return ExitCode::from(1);
+        }
+        Err(BindErr::Failed(e)) => {
             mlog!("bind failed: {e}");
             report(args.ready_fd, &format!("err: {e}\n"));
             return ExitCode::from(1);
@@ -466,8 +499,21 @@ fn bind(path: &Path) -> io::Result<(UnixListener, (u64, u64))> {
     Ok((l, (m.dev(), m.ino())))
 }
 
+/// Why [`Master::bind`] did not bind.
+enum BindErr {
+    /// Another master holds the name: the race was lost, not a failure.
+    Busy(String),
+    Failed(String),
+}
+
+impl From<String> for BindErr {
+    fn from(e: String) -> Self {
+        BindErr::Failed(e)
+    }
+}
+
 impl Master {
-    fn bind(args: &Args) -> Result<Master, String> {
+    fn bind(args: &Args) -> Result<Master, BindErr> {
         let dir = SocketDir::open_at(args.dir.clone()).map_err(|e| e.to_string())?;
         let sock_path = dir.socket_path(&args.session)?;
         // Check and bind atomically against other masters of this name.
@@ -475,7 +521,10 @@ impl Master {
         // A stale socket (nobody listening) is replaced; a live one means
         // another master won the race.
         if UnixStream::connect(&sock_path).is_ok() {
-            return Err(format!("session '{}' already has a master", args.session));
+            return Err(BindErr::Busy(format!(
+                "session '{}' already has a master",
+                args.session
+            )));
         }
         // No socket answers, but the master may still be alive: a cleaner
         // can delete the socket under it. Then it re-binds, not us.
@@ -484,9 +533,12 @@ impl Master {
             Ok(Some(f)) => f,
             Ok(None) => {
                 MasterFile::prod_holder(&master_path);
-                return Err(format!("session '{}' already has a master", args.session));
+                return Err(BindErr::Busy(format!(
+                    "session '{}' already has a master",
+                    args.session
+                )));
             }
-            Err(e) => return Err(format!("lock {}: {e}", master_path.display())),
+            Err(e) => return Err(format!("lock {}: {e}", master_path.display()).into()),
         };
         let _ = std::fs::remove_file(&sock_path);
         let (listener, sock_ino) =
@@ -1664,6 +1716,30 @@ fn too_long(e: io::Error, line: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (acs-2mfo): a lost creation race is the `busy` token, not
+    /// the words after it. The proxy matched "already has a master", so a
+    /// reworded message made a client that lost the race fail with "cannot
+    /// start session" instead of connecting to the winner.
+    #[test]
+    fn a_lost_spawn_race_is_the_busy_token_whatever_its_words() {
+        let e = ready_reply("busy: session 's' is taken\n").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(e.to_string(), "session 's' is taken");
+        // A master from before the token (acs 0.23.0 and earlier) still reads as busy.
+        let e = ready_reply("err: session 's' already has a master\n").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        // A real failure is not, and loses its prefix.
+        let e = ready_reply("err: bind /x: denied\n").unwrap_err();
+        assert_ne!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(e.to_string(), "bind /x: denied");
+        // Neither is a word that merely starts like the token.
+        let e = ready_reply("busybox: no\n").unwrap_err();
+        assert_ne!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert!(ready_reply("ok\n").is_ok());
+        let e = ready_reply("").unwrap_err();
+        assert!(e.to_string().contains("before it was ready"), "{e}");
+    }
 
     /// Regression (acs-5jok): an exec refused for its size says it was
     /// the command, how long, and what to do; other errors pass as they are.
