@@ -882,19 +882,81 @@ pub fn peer_uid(fd: RawFd) -> io::Result<u32> {
 /// pipe's write end, say) cannot keep someone else's pipe open for the
 /// daemon's whole life.
 pub fn close_inherited(keep: &[RawFd]) {
-    let Ok(dir) = std::fs::read_dir("/dev/fd") else {
+    close_inherited_from(keep, &["/dev/fd", "/proc/self/fd"]);
+}
+
+/// [`close_inherited`] with the descriptor directories to try, in order.
+/// When none can be read (a chroot without /dev or /proc), fall back to
+/// `close_range(2)` where the kernel has it, then to closing every number
+/// up to the descriptor limit.
+fn close_inherited_from(keep: &[RawFd], dirs: &[&str]) {
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let fds: Vec<RawFd> = entries
+                .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                .collect();
+            for fd in fds {
+                if fd > 2 && !keep.contains(&fd) {
+                    // SAFETY: closing a descriptor number; EBADF (the
+                    // listing's own descriptor, already closed) is harmless.
+                    unsafe { libc::close(fd) };
+                }
+            }
+            return;
+        }
+    }
+    if close_range_except(keep) {
         return;
+    }
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
     };
-    let fds: Vec<RawFd> = dir
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-        .collect();
-    for fd in fds {
-        if fd > 2 && !keep.contains(&fd) {
-            // SAFETY: closing a descriptor number; EBADF (the listing's own
-            // descriptor, already closed) is harmless.
+    // SAFETY: getrlimit fills the struct we pass.
+    let max = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+        // Capped: an unlimited or huge limit must not mean a billion close calls.
+        lim.rlim_cur.min(65_536) as RawFd
+    } else {
+        1024
+    };
+    for fd in 3..max {
+        if !keep.contains(&fd) {
+            // SAFETY: closing a descriptor number; EBADF is harmless.
             unsafe { libc::close(fd) };
         }
     }
+}
+
+/// Close 3.. except `keep` with `close_range(2)`; false when the kernel (or
+/// platform) lacks it, leaving the caller to loop.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn close_range_except(keep: &[RawFd]) -> bool {
+    let mut keep: Vec<RawFd> = keep.iter().copied().filter(|&fd| fd > 2).collect();
+    keep.sort_unstable();
+    let mut start: libc::c_uint = 3;
+    for fd in keep.into_iter().chain([-1]) {
+        let end = if fd < 0 {
+            libc::c_uint::MAX
+        } else {
+            fd as libc::c_uint - 1
+        };
+        if start <= end {
+            // SAFETY: close_range only closes descriptor numbers.
+            let r = unsafe { libc::syscall(libc::SYS_close_range, start, end, 0 as libc::c_uint) };
+            if r != 0 {
+                return false;
+            }
+        }
+        if fd >= 0 {
+            start = fd as libc::c_uint + 1;
+        }
+    }
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn close_range_except(_keep: &[RawFd]) -> bool {
+    false
 }
 
 // ---- processes and signals -------------------------------------------------
@@ -1017,6 +1079,34 @@ pub mod signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_inherited_closes_without_a_descriptor_directory() {
+        // Run in a child: closing every descriptor would break the other
+        // tests sharing this process.
+        // SAFETY: the child only opens, closes and exits.
+        unsafe {
+            let leaked = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+            let kept = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+            assert!(leaked > 2 && kept > 2);
+            match libc::fork() {
+                0 => {
+                    close_inherited_from(&[kept], &["/nonexistent/fd", "/nonexistent/fd2"]);
+                    let ok = libc::fcntl(leaked, libc::F_GETFD) == -1
+                        && libc::fcntl(kept, libc::F_GETFD) != -1;
+                    libc::_exit(if ok { 0 } else { 1 });
+                }
+                pid if pid > 0 => {
+                    let mut status = 0;
+                    libc::waitpid(pid, &mut status, 0);
+                    libc::close(leaked);
+                    libc::close(kept);
+                    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+                }
+                _ => panic!("fork failed"),
+            }
+        }
+    }
 
     #[test]
     fn a_knob_falls_back_on_anything_it_cannot_read() {
