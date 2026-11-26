@@ -420,47 +420,55 @@ pub fn run(cmd: &Cmd, target: &Path) -> Result<String, Error> {
         | Cmd::HostAdd { .. }
         | Cmd::HostRemove { .. }
         | Cmd::HostSet { .. }
-        | Cmd::HostUnset { .. } => {
-            // Each file is read and parsed once, here, and handed to every
-            // check that needs it (acs-siqo): a host set used to parse both
-            // files to find its alias, the target again to edit it, and the
-            // other file again to check the two together.
-            let mut docs = [config::read_doc(&files[0]), config::read_doc(&files[1])];
-            // A setting of an alias with no hosts anywhere would leave a
-            // configuration the client refuses.
-            if let Cmd::HostSet { alias, .. } = cmd {
-                if Config::merge(&files, &docs)?.alias(alias).is_none() {
-                    return Err(format!(
-                        "no alias '{alias}' (add its first host with: acs config host add {alias} <host>)"
-                    )
-                    .into());
-                }
-            }
-            // Edited where it lies, not moved out.
-            let [first, second] = &mut docs;
-            let (mine, theirs, other) = if target == files[0] {
-                (first, &*second, &files[1])
-            } else {
-                (second, &*first, &files[0])
-            };
-            let doc = match mine {
-                Ok(d) => d.get_or_insert_with(empty_doc),
-                Err(e) => return Err(std::mem::take(e).into()),
-            };
-            // The other file only informs: a broken one is left alone.
-            let theirs = theirs.as_ref().ok().and_then(Option::as_ref);
-            let msg = edit(doc, cmd).map_err(|e| {
-                // Point at the other file when the thing is defined there.
-                match defined_in(other, theirs, cmd) {
-                    Some(hint) => format!("{e}; {hint}"),
-                    None => e,
-                }
-            })?;
-            together(doc, target, &files, theirs)?;
-            write(target, doc)?;
-            Ok(format!("{msg} in {}\n", pretty(target)))
+        | Cmd::HostUnset { .. } => edit_file(cmd, target, &files),
+    }
+}
+
+/// Apply the edit `cmd` to `target`, one of `files`, holding the target's
+/// lock from the read to the rename (acs-f6nd).
+fn edit_file(cmd: &Cmd, target: &Path, files: &[PathBuf; 2]) -> Result<String, Error> {
+    // Without the lock two edits at once both read the old file and the
+    // second rename silently dropped the first edit. A lock on the file
+    // itself would be useless: the write renames a new inode into place.
+    let _lock = lock(target)?;
+    // Each file is read and parsed once, here, and handed to every
+    // check that needs it (acs-siqo): a host set used to parse both
+    // files to find its alias, the target again to edit it, and the
+    // other file again to check the two together.
+    let mut docs = [config::read_doc(&files[0]), config::read_doc(&files[1])];
+    // A setting of an alias with no hosts anywhere would leave a
+    // configuration the client refuses.
+    if let Cmd::HostSet { alias, .. } = cmd {
+        if Config::merge(files, &docs)?.alias(alias).is_none() {
+            return Err(format!(
+                "no alias '{alias}' (add its first host with: acs config host add {alias} <host>)"
+            )
+            .into());
         }
     }
+    // Edited where it lies, not moved out.
+    let [first, second] = &mut docs;
+    let (mine, theirs, other) = if target == files[0] {
+        (first, &*second, &files[1])
+    } else {
+        (second, &*first, &files[0])
+    };
+    let doc = match mine {
+        Ok(d) => d.get_or_insert_with(empty_doc),
+        Err(e) => return Err(std::mem::take(e).into()),
+    };
+    // The other file only informs: a broken one is left alone.
+    let theirs = theirs.as_ref().ok().and_then(Option::as_ref);
+    let msg = edit(doc, cmd).map_err(|e| {
+        // Point at the other file when the thing is defined there.
+        match defined_in(other, theirs, cmd) {
+            Some(hint) => format!("{e}; {hint}"),
+            None => e,
+        }
+    })?;
+    together(doc, target, files, theirs)?;
+    write(target, doc)?;
+    Ok(format!("{msg} in {}\n", pretty(target)))
 }
 
 /// Refuse an edit that leaves `doc`, merged with `theirs` (the other
@@ -1173,6 +1181,47 @@ fn keep_comments(mut before: Vec<String>, next: Option<&mut Node>) {
     }
 }
 
+/// The file `path` leads to, following links by hand when it does not
+/// exist yet (acs-5mmu).
+fn real_path(path: &Path) -> PathBuf {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return p;
+    }
+    let mut real = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(to) = std::fs::read_link(&real) else {
+            break;
+        };
+        real = real.parent().unwrap_or(Path::new("")).join(to);
+    }
+    real
+}
+
+/// A failure to write `what`, with the hint a global file needs.
+fn io(e: std::io::Error, what: &Path) -> Error {
+    let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
+        " (run with sudo for --global)"
+    } else {
+        ""
+    };
+    Error::Io(format!("cannot write {}: {e}{hint}", what.display()))
+}
+
+/// Lock the configuration `path` against other edits (acs-f6nd): an
+/// exclusive `flock` of `<file>.lock` beside the file it leads to, so two
+/// links to one file share one lock. The lock file is left in place:
+/// removing it would let a later edit lock a new inode while an earlier
+/// one still holds the old.
+fn lock(path: &Path) -> Result<crate::sys::Flock, Error> {
+    let real = real_path(path);
+    let dir = real.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| io(e, dir))?;
+    let mut name = real.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    let lock = dir.join(name);
+    crate::sys::Flock::lock(&lock).map_err(|e| io(e, &lock))
+}
+
 /// Validate `doc` as a configuration file and write it in place atomically.
 fn write(path: &Path, doc: &Document) -> Result<(), Error> {
     // Checked as edited, so an error names a line of the file on disk (or
@@ -1204,28 +1253,9 @@ fn write(path: &Path, doc: &Document) -> Result<(), Error> {
     // file behind (acs-q8e). A hard-linked file still gets a new inode,
     // as any atomic replace does. A link made before its file exists
     // does not canonicalize, so it is followed by hand (acs-5mmu).
-    let mut real = path.to_path_buf();
-    match std::fs::canonicalize(path) {
-        Ok(p) => real = p,
-        Err(_) => {
-            for _ in 0..40 {
-                let Ok(to) = std::fs::read_link(&real) else {
-                    break;
-                };
-                real = real.parent().unwrap_or(Path::new("")).join(to);
-            }
-        }
-    }
+    let real = real_path(path);
     let path = real.as_path();
     let dir = path.parent().unwrap_or(Path::new("."));
-    let io = |e: std::io::Error, what: &Path| {
-        let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
-            " (run with sudo for --global)"
-        } else {
-            ""
-        };
-        Error::Io(format!("cannot write {}: {e}{hint}", what.display()))
-    };
     std::fs::create_dir_all(dir).map_err(|e| io(e, dir))?;
     // 0600 when new, else the existing file's mode (acs-q4f). `fs::write`
     // used the process umask, typically 0644, and the mode was copied only
@@ -1265,6 +1295,37 @@ mod tests {
         write(&path, &doc).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o640, "the file's own mode was not kept");
+    }
+
+    /// acs-f6nd: two `acs config` edits at once used to both succeed with
+    /// the second silently dropping the first, each having read the file
+    /// before the other renamed its edit into place. Two writers adding
+    /// hosts under different aliases must keep every host.
+    #[test]
+    fn concurrent_edits_of_one_file_all_survive() {
+        let t = crate::testutil::TempDir::new();
+        let files = [t.path().join("global.yaml"), t.path().join("local.yaml")];
+        let n = 40;
+        std::thread::scope(|s| {
+            for alias in ["left", "right"] {
+                let files = &files;
+                s.spawn(move || {
+                    for i in 0..n {
+                        let c = cmd(&format!("host add {alias} {alias}{i}.lan"));
+                        edit_file(&c, &files[1], files).unwrap();
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(&files[1]).unwrap();
+        for alias in ["left", "right"] {
+            for i in 0..n {
+                let host = format!("host: {alias}{i}.lan\n");
+                assert!(text.contains(&host), "{host:?} was lost:\n{text}");
+            }
+        }
+        // The lock lives beside the file, under the file's own name.
+        assert!(t.path().join("local.yaml.lock").exists());
     }
 
     /// acs-8l1v.5: an alias's knock is written as the scalar when the

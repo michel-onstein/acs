@@ -2591,6 +2591,10 @@ their YAML shape:
   file the client would refuse — nor overwrites one that is already broken.
   A path that is a symlink is resolved first, so a configuration kept in
   dotfiles is edited where it really lives and the link survives.
+  An edit holds `flock(<file>.lock)`, beside the file the path leads to,
+  from the read to the rename, so two edits at once both land rather than
+  the second dropping the first (acs-f6nd); the lock is a separate file
+  because the rename puts a new inode in the configuration's place.
   It is also checked merged with the other file, so the hosts under an
   alias's key in one file cannot be removed from the other; `host set` on an
   alias that has no host yet says to add one first.
@@ -2765,9 +2769,13 @@ acs: acs 0.3.0 is available (you have 0.2.0) — run: acs upgrade
 - **State** is `$XDG_STATE_HOME/acs/update-check` (default
   `~/.local/state/acs/update-check`): `checked=<unix time>`,
   `latest=<version>`, `shown=<version>`. It is a cache — unreadable or
-  garbled means "never checked". The client writes it before starting the
-  check, which re-reads it before adding `latest`, so neither undoes the
-  other.
+  garbled means "never checked". Every read-modify-write of it holds an
+  `flock` on `update-check.lock` beside it, so two clients starting
+  together, or a client and the check, cannot write a stale copy back over
+  each other's change. The wait for that lock is at most a second; a lock
+  that cannot be had (a read-only directory, a stopped holder) is done
+  without, as a cache can afford. The client writes before starting the
+  check, which reads only after its fetch, before adding `latest`.
 - **Silent when it cannot ask**: offline, rate-limited or no curl, nothing is
   shown and the next attempt is a week later.
 - **Off** with `ACS_NO_UPDATE_CHECK=1` or `update_check: false` (§7.2). The
