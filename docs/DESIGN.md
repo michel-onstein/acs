@@ -1440,6 +1440,11 @@ sequenceDiagram
 | … then `x` | **Exit.** `KILL` to the master, wait for `EXIT`, restore the terminal, exit with the child's status. Needs the link; if it is down the client says so and stays in the session. |
 | … then any other key, or nothing for **2 s** (longer if the escape window is, below) | All the held keys are sent to the remote as typed. |
 
+Holding the key is not a double tap: kitty auto-repeat events (`:2`) are
+ignored, and after a double tap further legacy repeated bytes are forwarded
+without arming again until a gap of the escape window passes between presses
+(acs-jo3k).
+
 The only cost is that a lone Ctrl-] reaches the remote up to 400 ms late. The
 window is a setting (`ACS_ESCAPE_TIMEOUT_MS`), and so is the key.
 
