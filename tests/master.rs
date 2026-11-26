@@ -133,7 +133,8 @@ fn concurrent_starts_produce_one_master() {
     let ok = results.iter().filter(|r| r.is_ok()).count();
     assert_eq!(ok, 1, "{results:?}");
     for r in results.iter().filter_map(|r| r.as_ref().err()) {
-        assert!(r.to_string().contains("already has a master"), "{r}");
+        // The race is lost by token, not by wording (acs-2mfo).
+        assert_eq!(r.kind(), std::io::ErrorKind::AlreadyExists, "{r}");
     }
     // The winner answers; create the session and end it.
     let mut c = FrameConn::connect(&sock(&dir, "race")).unwrap();
@@ -171,7 +172,7 @@ fn socket_is_rebound_after_deletion() {
 }
 
 /// The proxy's `connect_or_start`: connect, and start a master while
-/// nothing answers, treating "already has a master" as "try again".
+/// nothing answers, treating a lost race (`AlreadyExists`) as "try again".
 fn connect_or_start(dir: &Path, name: &str) -> (FrameConn, Vec<String>) {
     let mut refusals = Vec::new();
     let c = poll(
@@ -182,7 +183,7 @@ fn connect_or_start(dir: &Path, name: &str) -> (FrameConn, Vec<String>) {
             }
             match acs::master::spawn(&exe(), dir, name) {
                 Ok(()) => {}
-                Err(e) if e.to_string().contains("already has a master") => {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     refusals.push(e.to_string());
                 }
                 Err(e) => panic!("spawn: {e}"),
