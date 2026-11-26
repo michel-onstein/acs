@@ -30,7 +30,7 @@ const DEAD_MS: u64 = 10_000;
 
 /// Send a PING after this much silence (`ACS_PING_MS`).
 fn ping_after() -> u64 {
-    sys::env_or("ACS_PING_MS", PING_MS)
+    sys::env_ms_u64("ACS_PING_MS", PING_MS)
 }
 
 /// How long a link must have served, WELCOME to loss, for the backoff to
@@ -41,7 +41,7 @@ pub(crate) fn backoff_reset_after() -> Duration {
 
 /// Declare the link dead after this much silence (`ACS_DEAD_MS`).
 pub(crate) fn dead_after() -> u64 {
-    sys::env_or("ACS_DEAD_MS", DEAD_MS)
+    sys::env_ms_u64("ACS_DEAD_MS", DEAD_MS)
 }
 
 /// How long the host has to answer the PING a network change sends while
@@ -49,7 +49,7 @@ pub(crate) fn dead_after() -> u64 {
 /// is only "is this link still the one" and the answer is one round trip;
 /// the full `ACS_DEAD_MS` stands for every other kind of silence.
 fn netcheck_after() -> u64 {
-    sys::env_or("ACS_NETCHECK_MS", 2000)
+    sys::env_ms_u64("ACS_NETCHECK_MS", 2000)
 }
 
 /// Waits between redials (acs-iyq): **the first attempt after a drop goes
@@ -72,7 +72,7 @@ pub struct Backoff {
 impl Backoff {
     pub fn new(first_ms: u64) -> Backoff {
         Backoff {
-            first: first_ms,
+            first: first_ms.min(sys::MAX_MS),
             next: None,
         }
     }
@@ -107,7 +107,7 @@ impl Backoff {
         let d = self.next.unwrap_or(0);
         self.next = Some(match self.next {
             None => self.first,
-            Some(n) => (n * 2).min(30_000.max(self.first)),
+            Some(n) => n.saturating_mul(2).min(30_000.max(self.first)),
         });
         Duration::from_millis(d)
     }
@@ -126,7 +126,7 @@ pub fn run(
     mut timing: Timing,
     netwatch: Option<&crate::netwatch::NetWatch>,
 ) -> u8 {
-    let mut backoff = Backoff::new(sys::env_or("ACS_BACKOFF_MS", 1000));
+    let mut backoff = Backoff::new(sys::env_ms_u64("ACS_BACKOFF_MS", 1000));
     let mut last_early: Option<Instant> = None;
     let mut resuming = false;
     // A dial after a wait; `gated`: the host has just answered the ping
@@ -721,7 +721,7 @@ impl Liveness {
     /// not counted, since no question was outstanding yet.
     pub fn wrote_for(&mut self, ms: u64) {
         if let Some((_, until)) = self.probe.as_mut() {
-            *until += ms;
+            *until = until.saturating_add(ms);
         }
     }
 
@@ -731,12 +731,12 @@ impl Liveness {
         }
         Msg::Ping(now).encode(out);
         self.pinged = now;
-        self.probe = Some((now, now + self.netcheck_after));
+        self.probe = Some((now, now.saturating_add(self.netcheck_after)));
     }
 
     pub fn next_deadline_ms(&self) -> u64 {
-        let ping = self.heard.max(self.pinged) + self.ping_after;
-        let next = ping.min(self.heard + self.dead_after);
+        let ping = self.heard.max(self.pinged).saturating_add(self.ping_after);
+        let next = ping.min(self.heard.saturating_add(self.dead_after));
         match self.probe {
             Some((_, until)) => next.min(until),
             None => next,
@@ -748,7 +748,7 @@ impl Liveness {
     }
 
     fn tick_at(&mut self, now: u64, out: &mut Vec<u8>) -> Health {
-        if now >= self.heard + self.dead_after {
+        if now >= self.heard.saturating_add(self.dead_after) {
             return Health::Dead;
         }
         // A question a network change asked, and nothing answering it: the
@@ -759,7 +759,7 @@ impl Liveness {
                 return Health::Dead;
             }
         }
-        if now >= self.heard.max(self.pinged) + self.ping_after {
+        if now >= self.heard.max(self.pinged).saturating_add(self.ping_after) {
             Msg::Ping(now).encode(out);
             self.pinged = now;
         }
@@ -834,6 +834,24 @@ mod tests {
         b.link_ended(Some(thirty), thirty);
         assert_eq!(b.step(), Duration::ZERO);
         assert_eq!(b.step(), Duration::from_millis(1000));
+    }
+
+    /// acs-5oh2: a huge `ACS_*_MS` is clamped, and the sums on the knobs
+    /// cannot wrap even when a value gets past the clamp.
+    #[test]
+    fn a_huge_backoff_base_or_deadline_does_not_overflow() {
+        let mut b = Backoff::new(u64::MAX);
+        assert_eq!(b.step(), Duration::ZERO);
+        for _ in 0..4 {
+            assert_eq!(b.step(), Duration::from_millis(sys::MAX_MS));
+        }
+        let mut l = liveness(10, u64::MAX, u64::MAX);
+        l.netcheck_after = u64::MAX;
+        let mut out = Vec::new();
+        assert_eq!(l.next_deadline_ms(), u64::MAX);
+        assert!(matches!(l.tick_at(20, &mut out), Health::Ok));
+        l.netcheck_at(30, &mut out);
+        assert!(matches!(l.tick_at(40, &mut out), Health::Ok));
     }
 
     fn liveness(heard: u64, ping_after: u64, dead_after: u64) -> Liveness {
