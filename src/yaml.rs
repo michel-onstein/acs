@@ -523,10 +523,14 @@ fn inline(text: &str, line: usize) -> Result<(Option<(Value, bool)>, Option<Stri
             if s.contains(": ") || s.ends_with(':') {
                 return err(line, format!("a value containing ': ' must be quoted: {s}"));
             }
-            let v = Value::Scalar(Scalar {
-                text: s.to_string(),
-                style: Style::Plain,
-            });
+            let v = if is_plain_null(s) {
+                Value::Null
+            } else {
+                Value::Scalar(Scalar {
+                    text: s.to_string(),
+                    style: Style::Plain,
+                })
+            };
             (v, end, false)
         }
     };
@@ -730,6 +734,9 @@ impl Flow<'_> {
                 if text.is_empty() {
                     return err(self.line, "expected a value");
                 }
+                if is_plain_null(&text) {
+                    return Ok(Value::Null);
+                }
                 Ok(Value::Scalar(Scalar {
                     text,
                     style: Style::Plain,
@@ -761,6 +768,12 @@ fn plain_ok(s: &str, flow: bool) -> bool {
         || s.contains(": ")
         || s.contains(" #")
         || s.chars().any(|c| c.is_control()))
+}
+
+/// Whether an unquoted scalar is YAML's null: `~`, `null`, `Null` or `NULL`
+/// (acs-whco). A quoted `'~'` stays a string.
+fn is_plain_null(s: &str) -> bool {
+    matches!(s, "~" | "null" | "Null" | "NULL")
 }
 
 /// Whether a plain `s` would read as a boolean, null or number.
@@ -1241,6 +1254,39 @@ list: [a, \"b c\", 3]
             d.root.value.map_mut().unwrap()[0].1 = Node::string(s);
             assert_eq!(emit(&d), format!("k: {s}\n"));
         }
+    }
+
+    /// acs-whco: an unquoted `~` or `null` is null, a quoted one a string,
+    /// and a write after a read keeps each as it was.
+    #[test]
+    fn unquoted_null_is_null_and_quoted_stays_a_string() {
+        for n in ["~", "null", "Null", "NULL"] {
+            let d = parse(&format!("a: {n}\nb: {n} # c\nl: [{n}, x]\n")).unwrap();
+            assert_eq!(get(&d.root, "a").value, Value::Null, "{n}");
+            assert_eq!(get(&d.root, "b").value, Value::Null, "{n}");
+            let Value::Seq(l) = &get(&d.root, "l").value else {
+                panic!("not a list")
+            };
+            assert_eq!(l[0].value, Value::Null, "{n}");
+        }
+        for q in ["'~'", "\"~\"", "'null'", "\"null\""] {
+            let d = parse(&format!("a: {q}\n")).unwrap();
+            assert!(matches!(get(&d.root, "a").value, Value::Scalar(_)), "{q}");
+        }
+        // Text that merely contains a null word stays text.
+        let d = parse("a: ~/x\nb: nullable\n").unwrap();
+        assert_eq!(text(get(&d.root, "a")), "~/x");
+        assert_eq!(text(get(&d.root, "b")), "nullable");
+
+        // Round trip: quoted '~' remains a string, unquoted ~ remains null.
+        let d = parse("a: '~'\nb: ~\n").unwrap();
+        let back = parse(&emit(&d)).unwrap();
+        assert_eq!(text(get(&back.root, "a")), "~");
+        assert_eq!(get(&back.root, "b").value, Value::Null);
+        let mut d = parse("a: x\n").unwrap();
+        d.root.value.map_mut().unwrap()[0].1 = Node::string("~");
+        let back = parse(&emit(&d)).unwrap();
+        assert_eq!(text(get(&back.root, "a")), "~");
     }
 
     #[test]
