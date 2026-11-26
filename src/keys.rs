@@ -337,6 +337,9 @@ impl Detector {
                     self.str_bytes += 1;
                     self.lex = match (esc, b) {
                         (_, 0x07) | (true, b'\\') => Lex::Ground,
+                        // CAN and SUB abort the string, as in xterm and VTE
+                        // (acs-yoym); the byte is still forwarded above.
+                        (_, 0x18 | 0x1a) => Lex::Ground,
                         // Long enough to be no terminal reply acs asked
                         // for. The idle timeout above frees a Meta key
                         // that was mistaken for a string, but only once
@@ -925,6 +928,20 @@ mod tests {
         t += 1;
         let o = d.feed(b"d", t);
         assert_eq!(o.action, Some(Action::Detach));
+    }
+
+    /// acs-yoym: CAN and SUB abort a string in terminal input, so an
+    /// unterminated reply cannot hold the detector and swallow the command key.
+    #[test]
+    fn can_and_sub_end_an_input_string() {
+        for abort in [0x18u8, 0x1a] {
+            let mut d = Detector::new(Config::default());
+            let o = d.feed(&[0x1b, b']', b'5', b'2', b';', abort], 0);
+            assert_eq!(o.forward, vec![0x1b, b']', b'5', b'2', b';', abort]);
+            d.feed(&[CB], 1);
+            d.feed(&[CB], 2);
+            assert_eq!(d.feed(b"d", 3).action, Some(Action::Detach), "{abort:#x}");
+        }
     }
 
     /// acs-55v: a reply of an ordinary size is still read as one, so the
