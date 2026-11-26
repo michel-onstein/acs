@@ -952,7 +952,7 @@ impl DialKeys<'_> {
         };
         follow_detector(self.state, was);
         // Everything else typed into the dial is dropped (DESIGN §5.2).
-        if o.forward.contains(&self.raw.intr()) {
+        if crate::tty::has_interrupt(&o.forward, self.raw.intr()) {
             self.left = Some(Left::Interrupt);
         }
         match o.action {
