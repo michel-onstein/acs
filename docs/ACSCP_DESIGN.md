@@ -606,8 +606,9 @@ part first. Both hashes are of the bytes actually on disk, so a part cut
 mid-write by a crash resumes from what reached the disk. The cost is one
 read of the part on each side at disk speed: ten seconds for a few GB on a
 laptop, against sending them again over the link that just failed. The
-hashing runs in slices inside the poll loop, a megabyte per turn, so pings
-are still answered while it goes (§5.2).
+hashing runs in slices inside the poll loop, a megabyte or 20 ms per turn,
+whichever ends first, so pings are still answered while it goes (§5.2) on
+a slow or loaded machine too (acs-qeqj).
 
 **An interrupted run resumed by a later run** is the same mechanism with
 no extra state: a Ctrl-C, a `--no-reconnect` ending, a laptop that died —

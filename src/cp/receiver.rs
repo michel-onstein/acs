@@ -1376,7 +1376,8 @@ mod tests {
             rx.answers().is_empty(),
             "answered before the part was hashed"
         );
-        assert_eq!(hash_all(&mut rx), 3, "a slice per turn");
+        let turns = hash_all(&mut rx);
+        assert!(turns >= 3, "a slice at most per turn, {turns} turns");
         assert_eq!(rx.answers(), [have(1, &body[..kept])]);
         rx.send(Msg::Data {
             id: 1,

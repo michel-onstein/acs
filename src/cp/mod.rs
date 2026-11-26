@@ -188,6 +188,15 @@ impl Stop {
 /// `HAVE` never keeps the pings from being answered.
 const SLICE: u64 = 1024 * 1024;
 
+/// How long one turn's slice may run, however little of [`SLICE`] it has
+/// hashed by then (acs-qeqj). A megabyte is a few milliseconds in a release
+/// build, but a third of a second in a debug build on a loaded machine, and
+/// a turn that long costs the far end two of them before it hears a `PONG`:
+/// the `PING` read in one turn is answered only after the next turn's
+/// slice. With the tests' 800 ms dead interval that ran out with both ends
+/// alive. Bounded by time, a turn is short on any machine.
+const SLICE_TIME: Duration = Duration::from_millis(20);
+
 /// How often, in ms, an endpoint that is [`Endpoint::waiting`] tries again.
 const WAIT_STEP: u64 = 100;
 
@@ -211,9 +220,21 @@ impl Prefix {
     /// Hash the next slice from `f`: the digest once all `len` bytes are
     /// in, `UnexpectedEof` if the file is shorter.
     pub fn step(&mut self, f: &mut File) -> std::io::Result<Option<[u8; 32]>> {
+        self.step_within(f, SLICE_TIME)
+    }
+
+    /// [`Prefix::step`], the slice ending at [`SLICE`] bytes or once
+    /// `budget` has passed, whichever comes first; always at least one read.
+    fn step_within(&mut self, f: &mut File, budget: Duration) -> std::io::Result<Option<[u8; 32]>> {
+        let began = Instant::now();
         let mut buf = [0u8; 64 * 1024];
         let mut slice = self.left.min(SLICE);
+        let mut first = true;
         while slice > 0 {
+            if !first && began.elapsed() >= budget {
+                break;
+            }
+            first = false;
             let want = slice.min(buf.len() as u64) as usize;
             let n = f.read(&mut buf[..want])?;
             if n == 0 {
@@ -997,5 +1018,40 @@ mod liveness_tests {
         assert_eq!(window(0), 1);
         assert_eq!(window(WINDOW), WINDOW);
         assert_eq!(window(100_000), MAX_WINDOW);
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+    use crate::testutil::TempDir;
+
+    /// A slice stops once its time is up, not only at [`SLICE`] bytes
+    /// (acs-qeqj): a megabyte per turn took a third of a second in a debug
+    /// build under load, and the far end, owed a `PONG` two turns later,
+    /// gave the live link up. With no time at all a turn is one read.
+    #[test]
+    fn a_slice_ends_when_its_time_is_up() {
+        let t = TempDir::new();
+        let path = t.path().join("f");
+        let body: Vec<u8> = (0..2 * SLICE + 10).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &body).unwrap();
+        let len = body.len() as u64;
+        let mut f = File::open(&path).unwrap();
+        let mut p = Prefix::new(len);
+
+        assert_eq!(p.step_within(&mut f, Duration::ZERO).unwrap(), None);
+        assert_eq!(p.left, len - 64 * 1024, "one read, not a whole slice");
+        assert_eq!(p.step_within(&mut f, Duration::MAX).unwrap(), None);
+        assert_eq!(p.left, len - 64 * 1024 - SLICE, "never past a slice");
+        let mut turns = 2;
+        let hash = loop {
+            turns += 1;
+            if let Some(h) = p.step_within(&mut f, Duration::ZERO).unwrap() {
+                break h;
+            }
+        };
+        assert_eq!(hash, crate::sha256::digest(&body), "the same digest");
+        assert!(turns > 3, "{turns} turns");
     }
 }
