@@ -756,6 +756,12 @@ sequenceDiagram
   for sshd's keepalive period, the program stalled once the ring filled.
   Output queued ahead of a `PING` is capped (64 KiB), so a live client
   answers in time; one that does not only costs a resume.
+  **Silence the master caused is not counted** (acs-009c): past 1 MiB of
+  input the pty has not taken, the master stops reading the client's
+  socket, `PONG`s and all, and a program that reads nothing — a paused
+  pager, a blocked pipe — keeps it there as long as it likes. While that
+  mask holds the client's silence does not age; the dead interval counts
+  from when the master reads again.
 - Reconnect is **on by default**: the protocol distinguishes a clean end (`EXIT`,
   `DETACH` acknowledged, `TAKEOVER`) from a drop, so there is nothing to guess.
   `--no-reconnect` restores `dsh`'s default behaviour.

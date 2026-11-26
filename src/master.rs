@@ -603,10 +603,18 @@ impl Master {
             // stays silent: a client that vanished without closing (a laptop
             // powered off, no FIN reaching the host) would otherwise hold
             // the pty back for good once the ring is full (acs-ode).
+            //
+            // Not while its socket is masked for the pty's high water,
+            // though: we are not reading it, so its silence is ours
+            // (acs-009c).
             let mut wake = u64::MAX;
+            let deaf = self.pty_in.len() >= PTY_IN_HIGH_WATER;
             for c in &mut self.conns {
                 if !matches!(c.state, ConnState::Active { .. }) || c.dead {
                     continue;
+                }
+                if deaf {
+                    c.live.not_listening();
                 }
                 match c.live.tick(c.out.tail()) {
                     Health::Dead => {
@@ -662,6 +670,8 @@ impl Master {
             let conn_base = fds.len();
             for c in &self.conns {
                 let mut ev = 0;
+                // Masked past the high water (acs-009c: liveness above
+                // excuses the silence this causes).
                 if self.pty_in.len() < PTY_IN_HIGH_WATER && c.state != ConnState::Closing {
                     ev |= libc::POLLIN;
                 }

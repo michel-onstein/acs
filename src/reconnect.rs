@@ -657,6 +657,18 @@ impl Liveness {
         self.heard = sys::now_ms();
     }
 
+    /// We are not reading what the other side sends (acs-009c): the
+    /// master masks a client's socket while the pty's input queue is past
+    /// its high water, and a program that reads nothing — a paused pager, a
+    /// blocked pipe — keeps it there for as long as it likes. Silence we
+    /// are not listening for is not the other side's, so it does not age:
+    /// called on every pass while the mask holds, the dead interval counts
+    /// from when we start reading again. A vanished client is still found
+    /// then, one dead interval after the program drains.
+    pub fn not_listening(&mut self) {
+        self.heard();
+    }
+
     /// This machine's network changed under a link that is still up
     /// (DESIGN §5.3, acs-ft1): ask the host now and give it
     /// `ACS_NETCHECK_MS` to answer instead of the whole dead interval.
