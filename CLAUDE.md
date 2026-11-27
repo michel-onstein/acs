@@ -9,10 +9,12 @@ Work is tracked as beads (`br`, prefix `acs`): start with `bv --robot-triage`.
 
 ## Build and verify
 
-- `scripts/verify.sh` — fmt, clippy (`-D warnings`), tests, shellcheck, the
-  scripts' Python suites, the project logs, markdownlint; must pass before
-  landing. Each step runs through `scripts/quiet.sh`: one `ok:` line when it
-  passes, the lines that explain a failure when it fails, the whole output in
+- `scripts/verify.sh` — fmt, clippy (`-D warnings`), tests, the size budget
+  (`cargo xtask size`: both Linux release builds, about 25 s after a source
+  change; `ACS_SKIP_SIZE=1` skips it), shellcheck, the scripts' Python
+  suites, the project logs, markdownlint; must pass before landing. Each
+  step runs through `scripts/quiet.sh`: one `ok:` line when it passes, the
+  lines that explain a failure when it fails, the whole output in
   `build/quiet/<step>.log`; `ACS_QUIET=0` streams everything. Run any other
   long command the same way: `scripts/quiet.sh --label NAME -- <command>`.
 - `scripts/markdownlint.sh` — markdownlint-cli2 at the version pinned in
@@ -68,7 +70,7 @@ keeps it in step. Fix it there first.
 | [DESIGN.md](docs/DESIGN.md) | Architecture, protocol, command mode, remote install | Built |
 | [ACSCP_DESIGN.md](docs/ACSCP_DESIGN.md) | acscp / `acs cp`: scp-style copies over acs's dial, resume, relay, wildcards (epic acs-hofu) | Built; by-hand checks pass |
 | [KNOCK_DESIGN.md](docs/KNOCK_DESIGN.md) | Port knocking (knockd) before every dial that opens a connection: sequence, timing, proxies, configuration (epic acs-8l1v) | Built; checked against a real knockd on Linux |
-| [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning, release tags (bare from 0.19.0), release binaries on GitHub, the Homebrew tap, what a fork must point at itself | Built |
+| [VERSIONING.md](docs/VERSIONING.md) | Automatic semantic versioning, the size check before a tag, release tags (bare from 0.19.0), release binaries on GitHub, the Homebrew tap, what a fork must point at itself | Built |
 | [bugs/](docs/project_notes/bugs/) | Bug log: one file per bug, each with its regression test | Current |
 | [work_log/](docs/project_notes/work_log/) | What landed when: one file per landed change | Current |
 | [VERIFICATION.md](docs/VERIFICATION.md) | End-to-end results over real ssh; checks still to do by hand | Automated checks pass |

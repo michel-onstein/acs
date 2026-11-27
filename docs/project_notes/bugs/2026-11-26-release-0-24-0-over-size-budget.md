@@ -22,3 +22,7 @@ LTO release builds and the macOS signing to every landing, minutes each time. A 
 x86_64 musl slim binary, the tight target, and compare it with `SLIM_BUDGET` (one LTO build, about a minute and a
 half). It is not added here. Until it is, whoever lands a batch of fixes should run `cargo xtask dist` before
 `scripts/version-bump.sh`.
+
+Since added (acs-i3vj): `cargo xtask size` builds both Linux slim binaries with `dist`'s own code, in about 25 s,
+and runs in `scripts/verify.sh` and in `cargo xtask bump` before it commits or tags (docs/VERSIONING.md, "The
+size check").

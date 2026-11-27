@@ -3152,7 +3152,9 @@ with the copy (`src/cp`, below), port knocking
 ([KNOCK_DESIGN.md](KNOCK_DESIGN.md), trimmed: below), commands on pipes
 (§5.5, below) and the fixes of 0.24.0 (trimmed: below) in release builds. The
 budget `cargo xtask dist` enforces is slim ≤ 1.2 MB and complete ≤ 2.4 MB
-(goal 2). It was raised from 1 MB / 2 MB when x86_64 Linux passed them,
+(goal 2). `cargo xtask size` checks the Linux builds against it with
+`dist`'s own code, in the gate and in the version bump before anything is
+tagged (acs-i3vj; VERSIONING, "The size check"). It was raised from 1 MB / 2 MB when x86_64 Linux passed them,
 from 1.18 MB / 2.36 MB for the fixes of 0.24.0 (decision 23),
 from 1.15 MB / 2.3 MB for port knocking (decision 20), and
 from 1.1 MB / 2.1 MB to make room for the copy (acs-hofu.9): built into a

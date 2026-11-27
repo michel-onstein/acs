@@ -1,6 +1,7 @@
 //! `cargo xtask bump` end to end against a scratch repository with a bare
 //! remote: tags, release commits, Cargo.toml/Cargo.lock, the level rules,
-//! re-runs and --major.
+//! re-runs and --major, and the size check that refuses a release over
+//! budget before anything is tagged (acs-i3vj).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,9 +72,12 @@ fn setup(name: &str) -> Scratch {
         &["remote", "add", "origin", s.remote().to_str().unwrap()],
     );
     std::fs::create_dir_all(w.join("src")).unwrap();
+    // A package named acs with an `acs` binary: every release runs the size
+    // check, which builds that binary for both Linux targets as `dist` does.
+    std::fs::write(w.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(
         w.join("Cargo.toml"),
-        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        "[package]\nname = \"acs\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
     )
     .unwrap();
     std::fs::write(w.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
@@ -106,10 +110,20 @@ fn change(s: &Scratch, subject: &str, file: &str, lines: usize) {
 }
 
 fn bump(s: &Scratch, extra: &[&str]) -> String {
+    let (ok, text) = bump_env(s, extra, &[]);
+    assert!(ok, "{text}");
+    text
+}
+
+/// A bump with these environment variables set, and whether it succeeded.
+fn bump_env(s: &Scratch, extra: &[&str], env: &[(&str, &str)]) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
         .args(["bump", "--no-labels", "--repo"])
         .arg(s.work())
         .args(extra)
+        .env_remove("ACS_SLIM_BUDGET")
+        .env_remove("ACS_COMPLETE_BUDGET")
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let text = format!(
@@ -117,8 +131,7 @@ fn bump(s: &Scratch, extra: &[&str]) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(out.status.success(), "{text}");
-    text
+    (out.status.success(), text)
 }
 
 /// The remote's release tags in either form, oldest first by version.
@@ -276,4 +289,41 @@ fn two_spellings_of_one_version_on_one_commit_are_one_release() {
     assert!(out.contains("0.19.0 → 0.19.1 (patch)"), "{out}");
     assert!(!out.contains("bare tags"), "{out}");
     assert_eq!(remote_tags(&s).last().unwrap(), "0.19.1");
+}
+
+/// acs-i3vj: 0.24.0 was tagged and pushed, and only then did `cargo xtask
+/// dist` find it over the size budget. The bump now builds the tree it is
+/// about to tag and refuses, before committing, tagging or pushing, when it
+/// is over — here with the budget lowered so the demo's binary is over it.
+#[test]
+fn an_over_budget_release_is_refused_before_anything_is_tagged() {
+    let s = setup("budget");
+    bump(&s, &[]);
+    change(&s, "fix: grow", "src/lib.rs", 2);
+    let main_before = git(&s.remote(), &["rev-parse", "main"]);
+    let tiny = [("ACS_SLIM_BUDGET", "1000")];
+
+    for extra in [&[][..], &["--dry-run"][..]] {
+        let (ok, out) = bump_env(&s, extra, &tiny);
+        assert!(!ok, "{extra:?}: {out}");
+        assert!(out.contains("over the size budget"), "{extra:?}: {out}");
+        assert!(out.contains("not releasing 0.1.1"), "{extra:?}: {out}");
+        assert!(!out.contains("would"), "{extra:?}: {out}");
+        assert_eq!(remote_tags(&s), ["0.1.0"], "{extra:?}");
+        assert_eq!(git(&s.remote(), &["rev-parse", "main"]), main_before);
+        assert_eq!(git(&s.work(), &["tag", "--list", "0.1.1"]), "");
+        let list = git(&s.work(), &["worktree", "list"]);
+        assert_eq!(list.lines().count(), 1, "{list}");
+    }
+
+    // The environment can only lower the budget: a raise is refused
+    // before anything is looked at.
+    let (ok, out) = bump_env(&s, &[], &[("ACS_SLIM_BUDGET", "999999999")]);
+    assert!(!ok && out.contains("can only lower"), "{out}");
+    assert_eq!(remote_tags(&s), ["0.1.0"]);
+
+    // Within budget, the same release goes out.
+    let out = bump(&s, &[]);
+    assert!(out.contains("released 0.1.1"), "{out}");
+    assert_eq!(remote_tags(&s), ["0.1.0", "0.1.1"]);
 }
