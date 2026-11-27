@@ -17,6 +17,10 @@ Work is tracked as beads (`br`, prefix `acs`): start with `bv --robot-triage`.
   lines that explain a failure when it fails, the whole output in
   `build/quiet/<step>.log`; `ACS_QUIET=0` streams everything. Run any other
   long command the same way: `scripts/quiet.sh --label NAME -- <command>`.
+  Every run ends with one line, `verify: PASS`, `verify: FAIL (<step>)` or
+  `verify: FAIL (interrupted)`, after `== ok` on a pass. Wait on the process
+  (the background-run notification, or `wait $pid`); if you must poll a log,
+  poll only for `^verify: (PASS|FAIL)` — never guess at a step's last line.
 - `scripts/markdownlint.sh` — markdownlint-cli2 at the version pinned in
   `scripts/lib/markdownlint-cli2.version`; `--fix` fixes what it can.
 - `scripts/install-hooks.sh`, once per clone — a commit on `main` in the shared
