@@ -131,6 +131,45 @@ scripts/version-bump.sh --major     # a new major version (manual only)
 - The `ship` skill runs it after every merge, then pulls again.
 - The first run on a repository without tags releases the current
   `Cargo.toml` version as it is.
+- It refuses a release over the size budget before it commits, tags or
+  pushes anything ("The size check").
+
+### The size check
+
+0.24.0 was tagged and pushed, and only then did `cargo xtask dist` find
+x86_64 Linux over the size budget (DESIGN decision 23); port knocking had
+done the same (decision 20). The budget is enforced only by a release build,
+which the gate did not make. Now `cargo xtask size` makes it: the slim
+release build of both Linux targets and the payload blob of the two —
+`dist`'s own steps 1, 2 and 5, in the same code, so the two cannot measure
+differently — and the x86_64 and aarch64 Linux slim and complete sizes
+against `SLIM_BUDGET` and `COMPLETE_BUDGET`. x86_64 Linux is the tightest
+target, slim and complete; a complete Linux build is its slim build with the
+blob appended, so it costs no build of its own. The macOS builds are left
+out: they are smaller on both counts (DESIGN §8.1) and need a macOS host and
+a rebuild each.
+
+It runs in two places:
+
+- **In the version bump, always.** After setting the new version in its
+  throwaway worktree and before committing, `cargo xtask bump` builds that
+  tree — exactly what the tag will hold, built as `release-binaries.sh`
+  builds it, in a fresh worktree with a target directory of its own — and
+  over budget it stops with nothing committed, tagged or pushed. A
+  `--dry-run` checks too, so it says whether the release would go. This is
+  the guarantee: nothing is ever tagged over budget. It costs the release
+  about half a minute.
+- **In the gate, by default.** `scripts/verify.sh`'s `size budget` step runs
+  `cargo xtask size` on the change, so the change that crosses the budget is
+  the one that finds out, not the release that adds it up. It costs about
+  25 s after a source change (two LTO builds of about 12 s each, measured
+  2026-11-26 on the maintainer's Mac) and 2 s with nothing to rebuild;
+  `ACS_SKIP_SIZE=1` skips it, since the bump still checks.
+
+`ACS_SLIM_BUDGET` and `ACS_COMPLETE_BUDGET`, in bytes, lower the budget for
+`size`, `dist` and `bump` alike, to try the refusal; a value above the
+release budget is refused, so no environment can let an over-budget build
+through. Over budget is past the figure: a build exactly at it passes.
 
 ### Who runs it: there is no CI
 

@@ -16,6 +16,14 @@
 //!    the releases URL and release key they were built for, which
 //!    `cargo xtask package` checks before it packages them (acs-u3qn).
 //!
+//! `cargo xtask size` is the size check alone, for the gate (acs-i3vj): the
+//! two Linux slim builds and the payload blob of steps 1–2, measured against
+//! the same budget as step 5 — x86_64 Linux is the tightest target, slim and
+//! complete. `cargo xtask bump` runs the same check on the tree it is about to
+//! tag, so nothing is tagged over budget (docs/VERSIONING.md, "The size
+//! check"). `ACS_SLIM_BUDGET` / `ACS_COMPLETE_BUDGET` lower the budget, to try
+//! the refusal; they cannot raise it.
+//!
 //! `--targets` takes only the targets acs releases ([`LINUX`], [`MAC`]): a
 //! typo is refused up front rather than leaving a `dist/` one platform
 //! short (acs-u3qn).
@@ -51,10 +59,68 @@ const MAC: &[&str] = &["aarch64-apple-darwin", "x86_64-apple-darwin"];
 const SLIM_BUDGET: u64 = 1_200_000;
 const COMPLETE_BUDGET: u64 = 2_400_000;
 
+/// The size budget a build is held to: the release one ([`SLIM_BUDGET`],
+/// [`COMPLETE_BUDGET`]), or lower to try the refusal (acs-i3vj).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Budget {
+    slim: u64,
+    complete: u64,
+}
+
+impl Budget {
+    const RELEASE: Budget = Budget {
+        slim: SLIM_BUDGET,
+        complete: COMPLETE_BUDGET,
+    };
+
+    /// The budget `ACS_SLIM_BUDGET` and `ACS_COMPLETE_BUDGET` ask for, each
+    /// in bytes; either unset keeps the release figure. Only ever lower: a
+    /// value above the release budget is refused, so no environment can let
+    /// an over-budget build through.
+    fn lowered(slim: Option<&str>, complete: Option<&str>) -> Result<Budget, String> {
+        let pick = |name: &str, value: Option<&str>, max: u64| -> Result<u64, String> {
+            let Some(v) = value else { return Ok(max) };
+            let n: u64 = v
+                .trim()
+                .parse()
+                .map_err(|_| format!("{name}={v:?} is not a number of bytes"))?;
+            if n > max {
+                return Err(format!(
+                    "{name}={n} would raise the budget past {max}; it can only lower it"
+                ));
+            }
+            Ok(n)
+        };
+        Ok(Budget {
+            slim: pick("ACS_SLIM_BUDGET", slim, Self::RELEASE.slim)?,
+            complete: pick("ACS_COMPLETE_BUDGET", complete, Self::RELEASE.complete)?,
+        })
+    }
+
+    fn from_env() -> Result<Budget, String> {
+        let var = |k| std::env::var(k).ok();
+        Budget::lowered(
+            var("ACS_SLIM_BUDGET").as_deref(),
+            var("ACS_COMPLETE_BUDGET").as_deref(),
+        )
+    }
+
+    /// Whether a build of these sizes is over: at the budget is within it.
+    fn over(&self, slim: u64, complete: u64) -> bool {
+        slim > self.slim || complete > self.complete
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("dist") => dist(&args[1..]),
+        Some("size") if args.len() == 1 => {
+            if let Err(e) = Budget::from_env().and_then(|b| size_check(&root(), b)) {
+                eprintln!("xtask size: {e}");
+                exit(1);
+            }
+        }
         Some("bump") => {
             if let Err(e) = bump::main(&args[1..]) {
                 eprintln!("xtask bump: {e}");
@@ -80,7 +146,7 @@ fn main() {
         Some("channel") if args.len() == 1 => print!("{}", channel::Channel::built().stamp()),
         _ => {
             eprintln!(
-                "usage: cargo xtask dist [--targets t1,t2] [--out dir]\n       cargo xtask bump [--dry-run] [--major|--minor|--patch] (see docs/VERSIONING.md)\n       cargo xtask package --dist DIR --version X.Y.Z --out DIR\n       cargo xtask formula --version X.Y.Z --sums SHA256SUMS [--out FILE]\n       cargo xtask channel"
+                "usage: cargo xtask dist [--targets t1,t2] [--out dir]\n       cargo xtask size\n       cargo xtask bump [--dry-run] [--major|--minor|--patch] (see docs/VERSIONING.md)\n       cargo xtask package --dist DIR --version X.Y.Z --out DIR\n       cargo xtask formula --version X.Y.Z --sums SHA256SUMS [--out FILE]\n       cargo xtask channel"
             );
             exit(2);
         }
@@ -95,25 +161,35 @@ fn root() -> PathBuf {
 }
 
 fn run(cmd: &mut Command) {
-    eprintln!("+ {cmd:?}");
-    let st = cmd.status().unwrap_or_else(|e| {
-        eprintln!("xtask: cannot run {:?}: {e}", cmd.get_program());
-        exit(1)
-    });
-    if !st.success() {
-        eprintln!("xtask: {:?} failed ({st})", cmd.get_program());
+    if let Err(e) = try_run(cmd) {
+        eprintln!("xtask: {e}");
         exit(1);
     }
+}
+
+fn try_run(cmd: &mut Command) -> Result<(), String> {
+    eprintln!("+ {cmd:?}");
+    let st = cmd
+        .status()
+        .map_err(|e| format!("cannot run {:?}: {e}", cmd.get_program()))?;
+    if !st.success() {
+        return Err(format!("{:?} failed ({st})", cmd.get_program()));
+    }
+    Ok(())
 }
 
 fn cargo() -> String {
     std::env::var("CARGO").unwrap_or_else(|_| "cargo".into())
 }
 
-fn build(target: &str, embed: Option<&Path>) -> PathBuf {
+/// A release build of acs for `target` from the tree at `src`, into that
+/// tree's own `target/`. `dist` builds this tree; `bump` builds the
+/// throwaway worktree it is about to tag.
+fn build(src: &Path, target: &str, embed: Option<&Path>) -> Result<PathBuf, String> {
     let linux = target.contains("-linux-");
+    let target_dir = src.join("target");
     let mut cmd = Command::new(cargo());
-    cmd.current_dir(root());
+    cmd.current_dir(src).env("CARGO_TARGET_DIR", &target_dir);
     if linux {
         cmd.arg("zigbuild");
     } else {
@@ -126,12 +202,78 @@ fn build(target: &str, embed: Option<&Path>) -> PathBuf {
     } else {
         cmd.env_remove("ACS_PAYLOADS_FILE");
     }
-    run(&mut cmd);
-    root()
-        .join("target")
-        .join(target)
-        .join("release")
-        .join("acs")
+    try_run(&mut cmd)?;
+    Ok(target_dir.join(target).join("release").join("acs"))
+}
+
+/// Step 1 of `dist`: the slim build of each target, read back.
+fn slim_builds(src: &Path, targets: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut slim = Vec::new();
+    for t in targets {
+        let bin = build(src, t, None)?;
+        let data = std::fs::read(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
+        slim.push((t.clone(), data));
+    }
+    Ok(slim)
+}
+
+/// Step 2 of `dist`: the payload blob of the Linux slim builds, and the
+/// gzip'd size of each.
+fn payload_blob(slim: &[(String, Vec<u8>)]) -> (Vec<u8>, Vec<usize>) {
+    let gz: Vec<(String, Vec<u8>, Vec<u8>)> = slim
+        .iter()
+        .filter(|(t, _)| t.contains("-linux-"))
+        .map(|(t, d)| (t.clone(), d.clone(), gzip(d)))
+        .collect();
+    let inputs: Vec<acs::payload::Input<'_>> = gz
+        .iter()
+        .map(|(t, raw, g)| acs::payload::Input {
+            target: t,
+            raw,
+            gz: g,
+        })
+        .collect();
+    let blob = acs::payload::build(&inputs);
+    (blob, gz.iter().map(|(_, _, g)| g.len()).collect())
+}
+
+/// Step 5 of `dist`: the size report, and whether any build is over.
+fn report(rows: &[(String, u64, u64)], blob: usize, gz: &[usize], budget: Budget) -> bool {
+    eprintln!();
+    eprintln!("{:<32} {:>10} {:>10}", "target", "slim", "complete");
+    for (t, s, f) in rows {
+        eprintln!("{t:<32} {s:>10} {f:>10}");
+    }
+    let gz_total: usize = gz.iter().sum();
+    eprintln!(
+        "payload blob: {blob} bytes ({} gzip'd builds, {gz_total} bytes)",
+        gz.len()
+    );
+    eprintln!(
+        "budget: slim ≤ {}, complete ≤ {}",
+        budget.slim, budget.complete
+    );
+    rows.iter().any(|(_, s, f)| budget.over(*s, *f))
+}
+
+/// The size check (acs-i3vj): steps 1, 2 and 5 of `dist` for the Linux
+/// targets, from the tree at `src`. A Linux complete build is its slim build
+/// with the blob appended, exactly as `dist` writes it, so this measures
+/// the bytes `dist` would. The macOS builds are left out: they are smaller
+/// than x86_64 Linux, slim and complete (DESIGN §8.1), and need a macOS
+/// host and a rebuild each.
+fn size_check(src: &Path, budget: Budget) -> Result<(), String> {
+    let targets: Vec<String> = LINUX.iter().map(|s| s.to_string()).collect();
+    let slim = slim_builds(src, &targets)?;
+    let (blob, gz) = payload_blob(&slim);
+    let rows: Vec<(String, u64, u64)> = slim
+        .iter()
+        .map(|(t, d)| (t.clone(), d.len() as u64, (d.len() + blob.len()) as u64))
+        .collect();
+    if report(&rows, blob.len(), &gz, budget) {
+        return Err("over the size budget (DESIGN §8.1)".into());
+    }
+    Ok(())
 }
 
 fn gzip(data: &[u8]) -> Vec<u8> {
@@ -252,39 +394,25 @@ fn dist(args: &[String]) {
     //    build that fails leaves no stamp at all.
     let stamp = source_stamp();
 
+    let budget = Budget::from_env().unwrap_or_else(|why| {
+        eprintln!("xtask dist: {why}");
+        exit(2)
+    });
+
     // 1. Slim builds.
-    let mut slim = Vec::new();
-    for t in &targets {
-        let bin = build(t, None);
-        let data = std::fs::read(&bin).unwrap_or_else(|e| {
-            eprintln!("xtask: {}: {e}", bin.display());
-            exit(1)
-        });
-        slim.push((t.clone(), data));
-    }
+    let slim = slim_builds(&root(), &targets).unwrap_or_else(|e| {
+        eprintln!("xtask: {e}");
+        exit(1)
+    });
 
     // 2. Payload blob of the Linux slim builds.
-    let gz: Vec<(String, Vec<u8>, Vec<u8>)> = slim
-        .iter()
-        .filter(|(t, _)| t.contains("-linux-"))
-        .map(|(t, d)| (t.clone(), d.clone(), gzip(d)))
-        .collect();
-    let inputs: Vec<acs::payload::Input<'_>> = gz
-        .iter()
-        .map(|(t, raw, g)| acs::payload::Input {
-            target: t,
-            raw,
-            gz: g,
-        })
-        .collect();
-    let blob = acs::payload::build(&inputs);
+    let (blob, gz) = payload_blob(&slim);
     let blob_path = out.join("payloads.bin");
     std::fs::write(&blob_path, &blob).unwrap();
     let blob_path = std::fs::canonicalize(&blob_path).unwrap();
 
     // 3./4. Complete builds.
-    let mut report = Vec::new();
-    let mut over = false;
+    let mut rows = Vec::new();
     for (t, data) in &slim {
         let dir = out.join(t);
         std::fs::create_dir_all(&dir).unwrap();
@@ -294,7 +422,10 @@ fn dist(args: &[String]) {
             full.extend_from_slice(&blob);
             std::fs::write(&dest, &full).unwrap();
         } else {
-            let bin = build(t, Some(&blob_path));
+            let bin = build(&root(), t, Some(&blob_path)).unwrap_or_else(|e| {
+                eprintln!("xtask: {e}");
+                exit(1)
+            });
             std::fs::copy(&bin, &dest).unwrap();
             run(Command::new("codesign").args(["-s", "-", "-f"]).arg(&dest));
             run(Command::new("codesign").arg("-v").arg(&dest));
@@ -303,23 +434,11 @@ fn dist(args: &[String]) {
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
         let slim_len = data.len() as u64;
         let full_len = size(&dest);
-        over |= slim_len > SLIM_BUDGET || full_len > COMPLETE_BUDGET;
-        report.push((t.clone(), slim_len, full_len));
+        rows.push((t.clone(), slim_len, full_len));
     }
 
     // 5. Report.
-    let gz_total: usize = gz.iter().map(|(_, _, g)| g.len()).sum();
-    eprintln!();
-    eprintln!("{:<32} {:>10} {:>10}", "target", "slim", "complete");
-    for (t, s, f) in &report {
-        eprintln!("{t:<32} {s:>10} {f:>10}");
-    }
-    eprintln!(
-        "payload blob: {} bytes ({} gzip'd builds, {gz_total} bytes)",
-        blob.len(),
-        gz.len()
-    );
-    eprintln!("budget: slim ≤ {SLIM_BUDGET}, complete ≤ {COMPLETE_BUDGET}");
+    let over = report(&rows, blob.len(), &gz, budget);
     eprintln!("output: {}", out.display());
     if over {
         eprintln!("xtask: over the size budget");
@@ -368,6 +487,52 @@ mod tests {
         assert!(design.contains(&goal), "DESIGN goal 2: {goal}");
         let table = format!("slim ≤ {slim} and complete ≤ {complete}");
         assert!(design.contains(&table), "DESIGN §8.1: {table}");
+    }
+
+    /// acs-i3vj: the comparison `dist`, `size` and `bump` share. At the
+    /// budget is within it; one byte over either figure is over.
+    #[test]
+    fn a_build_over_either_budget_is_over_and_one_at_it_is_not() {
+        let b = Budget::RELEASE;
+        assert!(!b.over(SLIM_BUDGET - 1, COMPLETE_BUDGET - 1), "under");
+        assert!(!b.over(SLIM_BUDGET, COMPLETE_BUDGET), "at");
+        assert!(b.over(SLIM_BUDGET + 1, COMPLETE_BUDGET), "slim over");
+        assert!(b.over(SLIM_BUDGET, COMPLETE_BUDGET + 1), "complete over");
+        // 0.24.0's x86_64 Linux build against the budget it failed
+        // (decision 23): over on both counts.
+        let old = Budget {
+            slim: 1_180_000,
+            complete: 2_360_000,
+        };
+        assert!(old.over(1_192_856, 2_392_626));
+        assert!(!Budget::RELEASE.over(1_188_000, 2_382_097), "0.24.1");
+    }
+
+    /// The environment may lower the budget, to try the refusal, but never
+    /// raise it: a raise would let an over-budget release through.
+    #[test]
+    fn the_environment_can_lower_the_budget_but_not_raise_it() {
+        assert_eq!(Budget::lowered(None, None).unwrap(), Budget::RELEASE);
+        assert_eq!(
+            Budget::lowered(Some("1000000"), None).unwrap(),
+            Budget {
+                slim: 1_000_000,
+                complete: COMPLETE_BUDGET
+            }
+        );
+        assert_eq!(
+            Budget::lowered(Some(&SLIM_BUDGET.to_string()), Some("5")).unwrap(),
+            Budget {
+                slim: SLIM_BUDGET,
+                complete: 5
+            }
+        );
+        let why = Budget::lowered(Some(&(SLIM_BUDGET + 1).to_string()), None).unwrap_err();
+        assert!(why.contains("can only lower"), "{why}");
+        let why = Budget::lowered(None, Some("99999999")).unwrap_err();
+        assert!(why.contains("ACS_COMPLETE_BUDGET"), "{why}");
+        let why = Budget::lowered(Some("1.1 MB"), None).unwrap_err();
+        assert!(why.contains("not a number"), "{why}");
     }
 
     #[test]

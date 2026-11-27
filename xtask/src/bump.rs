@@ -3,8 +3,10 @@
 //! Reads every commit on the release branch since the last `vX.Y.Z` tag,
 //! decides how far the version moves, and releases it: a `chore(release):
 //! vX.Y.Z` commit (Cargo.toml and Cargo.lock) and an annotated tag, pushed
-//! together to the remote from a throwaway worktree. The rules are in
-//! docs/VERSIONING.md:
+//! together to the remote from a throwaway worktree. Before it commits, the
+//! tree it is about to tag passes the size check (`cargo xtask size`), so a
+//! release over budget is refused before anything is tagged or pushed
+//! (acs-i3vj). The rules are in docs/VERSIONING.md:
 //!
 //! - PATCH for a small fix; MINOR for a feature or a larger fix;
 //! - MAJOR only when asked (`--major`), which resets MINOR and PATCH;
@@ -274,7 +276,13 @@ struct Opts {
     force: Option<Level>,
     large: u64,
     labels: bool,
+    /// The check the tree about to be tagged must pass, given that tree:
+    /// the size check, [`crate::size_check`]. A test swaps it.
+    check: Box<Check>,
 }
+
+/// A check run on the tree about to be tagged; an error refuses the release.
+type Check = dyn Fn(&Path) -> Result<(), String>;
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
@@ -457,15 +465,6 @@ fn release(
     // A bare X.Y.Z: 0.18.0 was the last release tagged with a `v`
     // (acs::release::LAST_V_TAG, docs/VERSIONING.md "Tags").
     let tag = new.to_string();
-    if o.dry_run {
-        println!(
-            "dry run: would {}tag {tag} and push to {}/{}",
-            if edit { "commit, " } else { "" },
-            o.remote,
-            o.branch
-        );
-        return Ok(());
-    }
     // Unguessable: /tmp is shared, and a name anyone can predict can be
     // planted ahead of us (acs-721).
     let tmp = std::env::temp_dir().join(format!("acs-release-{new}-{}", acs::sys::random_token()));
@@ -486,6 +485,22 @@ fn release(
             if !st.success() {
                 return Err("cargo update --workspace failed".into());
             }
+        }
+        // The tree exactly as it will be tagged, version and all, built as
+        // `dist` will build it from the tag; over budget, nothing is
+        // committed, tagged or pushed (acs-i3vj). A dry run checks it too,
+        // so it tells what the release would do.
+        (o.check)(&tmp).map_err(|e| format!("{e}: not releasing {tag}"))?;
+        if o.dry_run {
+            println!(
+                "dry run: would {}tag {tag} and push to {}/{}",
+                if edit { "commit, " } else { "" },
+                o.remote,
+                o.branch
+            );
+            return Ok(());
+        }
+        if edit {
             let mut msg = format!("chore(release): {tag}\n\n");
             for (c, d) in decisions {
                 if d.level != Level::None {
@@ -521,6 +536,9 @@ fn release(
         let _ = git(&o.repo, &["tag", "-d", &tag]);
     }
     result?;
+    if o.dry_run {
+        return Ok(());
+    }
     println!(
         "released {tag} on {}/{}; update local {} with: git pull --ff-only",
         o.remote, o.branch, o.branch
@@ -537,6 +555,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
         force: None,
         large: 300,
         labels: true,
+        check: Box::new(|_| Ok(())),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -562,6 +581,8 @@ pub fn main(args: &[String]) -> Result<(), String> {
     if o.force == Some(Level::None) {
         return Err("--level none makes no release".into());
     }
+    let budget = crate::Budget::from_env()?;
+    o.check = Box::new(move |tree| crate::size_check(tree, budget));
     run(&o)
 }
 

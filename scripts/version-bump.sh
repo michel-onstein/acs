@@ -5,7 +5,10 @@
 #   scripts/version-bump.sh [--dry-run] [--major|--minor|--patch]
 #
 # Safe to re-run: with nothing unreleased it does nothing. Run after a
-# merge to main (the ship skill does); it pushes a chore(release) commit
+# merge to main (the ship skill does); it builds the tree it is about to
+# tag and refuses a release over the size budget before committing or
+# tagging anything (`cargo xtask size`, docs/VERSIONING.md "The size
+# check"; a --dry-run checks too), then pushes a chore(release) commit
 # and an X.Y.Z tag to origin/main from a throwaway worktree, then publishes
 # that release's binaries to GitHub (scripts/release-binaries.sh; set
 # ACS_NO_PUBLISH=1 to skip).

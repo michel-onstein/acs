@@ -25,6 +25,17 @@ ignored=$(sed -n 's/^test result: .* \([0-9][0-9]*\) ignored;.*/\1/p' "$log" |
     awk '{ n += $1 } END { print n + 0 }')
 echo "== $ignored tests ignored: not run by this script," \
     'see scripts/test_linux.sh and scripts/e2e_ssh.sh'
+# The size budget (acs-i3vj): both Linux slim release builds and the payload
+# blob, measured as `cargo xtask dist` measures them, so a change that takes
+# x86_64 Linux over budget fails here and not after a release is tagged.
+# About 25 s after a source change, 2 s with nothing changed;
+# ACS_SKIP_SIZE=1 skips it. `scripts/version-bump.sh` runs the same check on
+# the tree it tags, and that one cannot be skipped (docs/VERSIONING.md).
+if [ -n "${ACS_SKIP_SIZE:-}" ]; then
+    echo '== size budget: skipped (ACS_SKIP_SIZE); the version bump still checks it'
+else
+    step 'size budget' cargo xtask size
+fi
 if command -v shellcheck >/dev/null; then
     step 'shellcheck' shellcheck -x scripts/*.sh scripts/e2e/*.sh scripts/git-hooks/pre-commit
 else
